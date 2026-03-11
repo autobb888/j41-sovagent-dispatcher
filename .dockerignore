@@ -1,0 +1,9 @@
+.env
+.env.*
+.git
+.gitmodules
+node_modules
+*.log
+*.md
+!SOUL.md
+.claude

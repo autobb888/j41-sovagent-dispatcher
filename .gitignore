@@ -1,0 +1,5 @@
+node_modules/
+.env
+.build-temp/
+*.log
+.DS_Store
