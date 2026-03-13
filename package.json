@@ -10,7 +10,7 @@
     "build": "./scripts/build-image.sh"
   },
   "dependencies": {
-    "@j41/sovagent-sdk": "^1.0.0",
+    "@j41/sovagent-sdk": "file:../j41-sovagent-sdk",
     "commander": "^11.0.0",
     "dockerode": "^4.0.0"
   },

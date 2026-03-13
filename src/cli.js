@@ -7,11 +7,23 @@
  */
 
 const { Command } = require('commander');
-const Docker = require('dockerode');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
+const { getRuntime, persistActiveJobs, loadActiveJobs, saveConfig, loadConfig } = require('./config');
+
+const RUNTIME = getRuntime();
+
+let Docker, docker;
+if (RUNTIME === 'docker') {
+  try {
+    Docker = require('dockerode');
+    docker = new Docker();
+  } catch {
+    // dockerode not available — will fail at runtime if docker commands are used
+  }
+}
 
 const J41_DIR = path.join(os.homedir(), '.j41');
 const DISPATCHER_DIR = path.join(J41_DIR, 'dispatcher');
@@ -26,7 +38,6 @@ const JOB_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour
 const MAX_RETRIES = 2;
 const SEEN_JOBS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-const docker = new Docker();
 const program = new Command();
 
 function ensureDirs() {
@@ -281,11 +292,34 @@ function createFinalizeHooks(agentId, identityName, profile, services = []) {
 }
 
 function getActiveJobs() {
-  // Find running containers named j41-job-*
+  if (RUNTIME === 'local') {
+    const jobs = loadActiveJobs();
+    return Promise.resolve(
+      Object.entries(jobs)
+        .filter(([_, info]) => {
+          if (!info.pid) return false;
+          try { process.kill(info.pid, 0); return true; } catch { return false; }
+        })
+        .map(([jobId, info]) => ({
+          Names: [`/j41-job-${jobId}`],
+          Status: `Running (PID ${info.pid}, ${Math.round((Date.now() - info.startedAt) / 60000)}m)`,
+        }))
+    );
+  }
+  // Docker mode
+  if (!docker) {
+    console.error('❌ Docker runtime selected but Docker is not available.');
+    console.error('   Install Docker or switch to local mode: node src/cli.js config --runtime local');
+    return Promise.resolve([]);
+  }
   return docker.listContainers().then(containers => {
-    return containers.filter(c => 
+    return containers.filter(c =>
       c.Names.some(n => n.startsWith('/j41-job-'))
     );
+  }).catch(e => {
+    console.error(`❌ Docker error: ${e.message}`);
+    console.error('   Install Docker or switch to local mode: node src/cli.js config --runtime local');
+    return [];
   });
 }
 
@@ -293,6 +327,41 @@ program
   .name('j41-dispatcher')
   .description('Ephemeral job container orchestrator for J41')
   .version('0.2.0');
+
+// Config command — view/change runtime settings
+program
+  .command('config')
+  .description('View or change dispatcher configuration')
+  .option('--runtime <mode>', 'Set runtime mode: docker or local')
+  .option('--show', 'Show current configuration')
+  .action(async (options) => {
+    ensureDirs();
+    const config = loadConfig();
+
+    if (options.runtime) {
+      if (!['docker', 'local'].includes(options.runtime)) {
+        console.error('❌ Invalid runtime mode. Use: docker or local');
+        process.exit(1);
+      }
+      config.runtime = options.runtime;
+      saveConfig(config);
+      console.log(`✅ Runtime set to: ${options.runtime}`);
+      if (options.runtime === 'docker') {
+        console.log('\nMake sure Docker is installed and running.');
+        console.log('Build the job image: ./scripts/build-image.sh');
+      } else {
+        console.log('\nLocal process mode — no Docker required.');
+        console.log('Jobs will run as child processes on this machine.');
+      }
+      return;
+    }
+
+    // Default: show config
+    console.log('\nJ41 Dispatcher Configuration:');
+    console.log(`  Runtime: ${config.runtime}`);
+    console.log(`  Config:  ${require('./config').CONFIG_PATH}`);
+    console.log('');
+  });
 
 // Init command — create N agent identities
 program
@@ -665,10 +734,13 @@ program
     console.log('║     Ephemeral Job Containers             ║');
     console.log('║     with Privacy Attestation             ║');
     console.log('╚══════════════════════════════════════════╝\n');
+    console.log(`Runtime: ${RUNTIME} mode`);
     console.log(`Registered agents: ${agents.length}`);
     console.log(`Max concurrent: ${MAX_AGENTS}`);
     console.log(`Job timeout: ${JOB_TIMEOUT_MS / 60000} min`);
-    console.log(`Keep containers: ${process.env.J41_KEEP_CONTAINERS === '1' ? 'ON (debug)' : 'OFF'}`);
+    if (RUNTIME === 'docker') {
+      console.log(`Keep containers: ${process.env.J41_KEEP_CONTAINERS === '1' ? 'ON (debug)' : 'OFF'}`);
+    }
     console.log('Privacy: Deletion attestations\n');
     
     // Check which agents are registered on platform (+ optional finalize readiness)
@@ -815,12 +887,18 @@ program
       });
     }
     
-    console.log('Privacy Features:');
-    console.log('  ✅ Ephemeral containers (auto-remove)');
+    console.log(`Privacy Features (runtime: ${RUNTIME}):`);
+    if (RUNTIME === 'docker') {
+      console.log('  ✅ Ephemeral containers (auto-remove)');
+      console.log('  ✅ Isolated job data (per-container volumes)');
+      console.log('  ✅ Resource limits (2GB RAM, 1 CPU)');
+      console.log('  ✅ Security hardening (read-only rootfs, no capabilities)');
+    } else {
+      console.log('  ⚠️  Local process mode (no container isolation)');
+      console.log('  ✅ Ephemeral job data (cleaned up after completion)');
+    }
     console.log('  ✅ Creation attestation (signed proof of start)');
     console.log('  ✅ Deletion attestation (signed proof of destruction)');
-    console.log('  ✅ Isolated job data (per-container volumes)');
-    console.log('  ✅ Resource limits (2GB RAM, 1 CPU)');
     console.log('  ✅ Timeout protection (auto-kill after 1 hour)');
     console.log('');
   });
@@ -888,8 +966,8 @@ async function pollForJobs(state) {
           console.log(`   → Queueing (max capacity)`);
           state.queue.push({ ...job, assignedAgent: agentInfo });
         } else {
-          console.log(`   → Starting container with ${agentInfo.id}`);
-          await startJobContainer(state, job, agentInfo);
+          console.log(`   → Starting job with ${agentInfo.id} (${RUNTIME})`);
+          await startJob(state, job, agentInfo);
         }
       }
     } catch (e) {
@@ -905,9 +983,9 @@ async function pollForJobs(state) {
     const agent = state.available.pop();
     console.log(`   → Processing queued job ${queuedJob.id} with ${agent.id}`);
     try {
-      await startJobContainer(state, queuedJob, agent);
+      await startJob(state, queuedJob, agent);
     } catch (e) {
-      console.error(`   ❌ Failed to start container for queued job ${queuedJob.id}: ${e.message}`);
+      console.error(`   ❌ Failed to start job ${queuedJob.id}: ${e.message}`);
       // Return agent to pool and re-queue the job at the back
       state.available.push(agent);
       state.queue.push(queuedJob);
@@ -989,6 +1067,9 @@ function getExecutorEnvVars(agentInfo) {
 
 // Start a job container
 async function startJobContainer(state, job, agentInfo) {
+  if (!docker) {
+    throw new Error('Docker not available. Switch to local mode: node src/cli.js config --runtime local');
+  }
   const jobDir = path.join(JOBS_DIR, job.id);
   fs.mkdirSync(jobDir, { recursive: true });
   // Ensure writable across rootless/user-namespaced container runtimes
@@ -1167,46 +1248,214 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   }
 }
 
+// ─────────────────────────────────────────
+// Local process mode — spawn job-agent.js as child process
+// ─────────────────────────────────────────
+
+async function startJobLocal(state, job, agentInfo) {
+  const jobDir = path.join(JOBS_DIR, job.id);
+  fs.mkdirSync(jobDir, { recursive: true });
+
+  // Write job data (same as Docker mode)
+  fs.writeFileSync(path.join(jobDir, 'description.txt'), job.description);
+  fs.writeFileSync(path.join(jobDir, 'buyer.txt'), job.buyerVerusId);
+  fs.writeFileSync(path.join(jobDir, 'amount.txt'), String(job.amount));
+  fs.writeFileSync(path.join(jobDir, 'currency.txt'), job.currency);
+
+  const agentDir = path.join(AGENTS_DIR, agentInfo.id);
+  const keysPath = path.join(agentDir, 'keys.json');
+
+  // Build env vars — same set as the Docker container gets
+  const env = {
+    ...process.env,
+    J41_API_URL: process.env.J41_API_URL || 'https://api.autobb.app',
+    J41_AGENT_ID: agentInfo.id,
+    J41_IDENTITY: agentInfo.identity,
+    J41_JOB_ID: job.id,
+    JOB_TIMEOUT_MS: String(JOB_TIMEOUT_MS),
+    // Override /app/ paths for local mode
+    J41_KEYS_FILE: keysPath,
+    J41_SOUL_FILE: path.join(agentDir, 'SOUL.md'),
+    J41_JOB_DIR: jobDir,
+  };
+
+  // Per-agent executor env vars
+  const executorVars = getExecutorEnvVars(agentInfo);
+  executorVars.forEach(v => {
+    const [key, ...rest] = v.split('=');
+    env[key] = rest.join('=');
+  });
+
+  try {
+    const child = spawn('node', [path.join(__dirname, 'job-agent.js')], {
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: path.resolve(__dirname, '..'),
+    });
+
+    const shortId = job.id.substring(0, 8);
+    child.stdout.on('data', (data) => {
+      data.toString().trim().split('\n').forEach(line => {
+        if (line.trim()) console.log(`  [${shortId}] ${line.trim()}`);
+      });
+    });
+    child.stderr.on('data', (data) => {
+      data.toString().trim().split('\n').forEach(line => {
+        if (line.trim()) console.error(`  [${shortId}] ${line.trim()}`);
+      });
+    });
+
+    state.active.set(job.id, {
+      agentId: agentInfo.id,
+      process: child,
+      pid: child.pid,
+      startedAt: Date.now(),
+      agentInfo,
+    });
+
+    state.seen.set(job.id, Date.now());
+    saveSeenJobs(state.seen);
+    state.available = state.available.filter(a => a.id !== agentInfo.id);
+    persistActiveJobs(state.active);
+
+    console.log(`✅ Local process started for job ${job.id} (PID ${child.pid})`);
+
+    child.on('exit', (code) => {
+      console.log(`🗑️  Process for job ${job.id} exited (code ${code})`);
+    });
+
+    // Timeout
+    setTimeout(async () => {
+      const active = state.active.get(job.id);
+      if (active) {
+        console.log(`⏰ Job ${job.id} timeout, killing process`);
+        await stopJobLocal(state, job.id);
+      }
+    }, JOB_TIMEOUT_MS + 60000);
+
+  } catch (e) {
+    console.error(`❌ Failed to start local process for ${job.id}:`, e.message);
+    state.available.push(agentInfo);
+  }
+}
+
+async function stopJobLocal(state, jobId, skipReturnAgent = false) {
+  const active = state.active.get(jobId);
+  if (!active) return;
+
+  // Kill the child process
+  try {
+    if (active.process && !active.process.killed) {
+      active.process.kill('SIGTERM');
+      // Give 5s for graceful shutdown, then SIGKILL
+      await new Promise(resolve => {
+        const forceTimer = setTimeout(() => {
+          try { if (!active.process.killed) active.process.kill('SIGKILL'); } catch {}
+          resolve();
+        }, 5000);
+        active.process.on('exit', () => { clearTimeout(forceTimer); resolve(); });
+      });
+    }
+  } catch {
+    // already dead
+  }
+
+  // Cleanup job dir
+  const jobDir = path.join(JOBS_DIR, jobId);
+  if (fs.existsSync(jobDir) && process.env.J41_KEEP_CONTAINERS !== '1') {
+    fs.rmSync(jobDir, { recursive: true });
+  }
+
+  if (!skipReturnAgent) {
+    state.available.push(active.agentInfo);
+    state.retries.delete(jobId);
+  }
+  state.active.delete(jobId);
+  persistActiveJobs(state.active);
+
+  if (!skipReturnAgent) {
+    console.log(`✅ Job ${jobId} complete, agent returned to pool`);
+  }
+}
+
+// Unified dispatch — routes to Docker or local based on runtime config
+async function startJob(state, job, agentInfo) {
+  if (RUNTIME === 'docker') {
+    await startJobContainer(state, job, agentInfo);
+  } else {
+    await startJobLocal(state, job, agentInfo);
+  }
+}
+
 // Cleanup completed jobs — includes retry logic (F-14)
 async function cleanupCompletedJobs(state) {
   for (const [jobId, active] of state.active) {
-    try {
-      const container = docker.getContainer(`j41-job-${jobId}`);
-      const info = await container.inspect();
+    if (RUNTIME === 'local') {
+      // Local mode: check if child process exited
+      if (active.process && active.process.exitCode !== null) {
+        const exitCode = active.process.exitCode;
+        console.log(`🗑️  Process for job ${jobId} stopped (exit ${exitCode})`);
 
-      if (!info.State.Running) {
-        const exitCode = info.State.ExitCode;
-        console.log(`🗑️  Container for job ${jobId} stopped (exit ${exitCode})`);
-
-        // Retry on non-zero exit if under MAX_RETRIES
         if (exitCode !== 0) {
           const retries = state.retries.get(jobId) || 0;
           if (retries < MAX_RETRIES) {
             state.retries.set(jobId, retries + 1);
             console.log(`🔄 Retrying job ${jobId} (attempt ${retries + 2}/${MAX_RETRIES + 1})`);
             const agentInfo = active.agentInfo;
-            // Re-fetch job data from API before retrying (D1 fix: stopJobContainer deletes jobDir)
             let job;
             try {
               const agent = await getAgentSession(state, agentInfo);
               job = await agent.client.getJob(jobId);
             } catch (fetchErr) {
               console.error(`❌ Could not re-fetch job ${jobId} for retry: ${fetchErr.message}`);
-              await stopJobContainer(state, jobId);
+              await stopJobLocal(state, jobId);
               continue;
             }
-            await stopJobContainer(state, jobId, true); // skip returning agent
-            await startJobContainer(state, job, agentInfo);
+            await stopJobLocal(state, jobId, true);
+            await startJobLocal(state, job, agentInfo);
             continue;
           }
           console.log(`❌ Job ${jobId} failed after ${MAX_RETRIES + 1} attempts`);
         }
+        await stopJobLocal(state, jobId);
+      }
+    } else {
+      // Docker mode
+      try {
+        const container = docker.getContainer(`j41-job-${jobId}`);
+        const info = await container.inspect();
+
+        if (!info.State.Running) {
+          const exitCode = info.State.ExitCode;
+          console.log(`🗑️  Container for job ${jobId} stopped (exit ${exitCode})`);
+
+          if (exitCode !== 0) {
+            const retries = state.retries.get(jobId) || 0;
+            if (retries < MAX_RETRIES) {
+              state.retries.set(jobId, retries + 1);
+              console.log(`🔄 Retrying job ${jobId} (attempt ${retries + 2}/${MAX_RETRIES + 1})`);
+              const agentInfo = active.agentInfo;
+              let job;
+              try {
+                const agent = await getAgentSession(state, agentInfo);
+                job = await agent.client.getJob(jobId);
+              } catch (fetchErr) {
+                console.error(`❌ Could not re-fetch job ${jobId} for retry: ${fetchErr.message}`);
+                await stopJobContainer(state, jobId);
+                continue;
+              }
+              await stopJobContainer(state, jobId, true);
+              await startJobContainer(state, job, agentInfo);
+              continue;
+            }
+            console.log(`❌ Job ${jobId} failed after ${MAX_RETRIES + 1} attempts`);
+          }
+          await stopJobContainer(state, jobId);
+        }
+      } catch (e) {
+        console.log(`🗑️  Container for job ${jobId} gone`);
         await stopJobContainer(state, jobId);
       }
-    } catch (e) {
-      // Container doesn't exist anymore
-      console.log(`🗑️  Container for job ${jobId} gone`);
-      await stopJobContainer(state, jobId);
     }
   }
 }

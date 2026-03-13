@@ -20,9 +20,9 @@ const JOB_ID = process.env.J41_JOB_ID;
 const TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS || '3600000');
 const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '120000'); // 2 min idle → deliver
 
-const KEYS_FILE = '/app/keys.json';
-const SOUL_FILE = '/app/SOUL.md';
-const JOB_DIR = '/app/job';
+const KEYS_FILE = process.env.J41_KEYS_FILE || '/app/keys.json';
+const SOUL_FILE = process.env.J41_SOUL_FILE || '/app/SOUL.md';
+const JOB_DIR = process.env.J41_JOB_DIR || '/app/job';
 
 // Container metadata (from Docker labels)
 const CONTAINER_ID = process.env.HOSTNAME || 'unknown'; // Docker sets HOSTNAME to container ID

@@ -75,7 +75,7 @@
     protobufjs "^7.5.3"
     yargs "^17.7.2"
 
-"@j41/sovagent-sdk@file:../j41-sdk":
+"@j41/sovagent-sdk@file:../j41-sovagent-sdk":
   version "1.0.0"
   dependencies:
     "@bitgo/utxo-lib" "github:VerusCoin/BitGoJS#5e82f4fd"
@@ -174,9 +174,9 @@
   integrity sha512-fh+pAqt4xRzPfqA6eh3Z2y6fyZavRIumvjhaCL753+TVkGKGhpPeyrJG2JftD0T9q4GF00KjefsQ+PQNDdWQaQ==
 
 "@types/node@>=13.7.0":
-  version "25.4.0"
-  resolved "https://registry.yarnpkg.com/@types/node/-/node-25.4.0.tgz#f25d8467984d6667cc4c1be1e2f79593834aaedb"
-  integrity sha512-9wLpoeWuBlcbBpOY3XmzSTG3oscB6xjBEEtn+pYXTfhyXhIxC5FsBer2KTopBlvKEiW9l13po9fq+SJY/5lkhw==
+  version "25.5.0"
+  resolved "https://registry.yarnpkg.com/@types/node/-/node-25.5.0.tgz#5c99f37c443d9ccc4985866913f1ed364217da31"
+  integrity sha512-jp2P3tQMSxWugkCUKLRPVUpGaL5MVFwF8RDuSRztfwgN1wmqJeMSbKlnEtQqU8UrhTmzEmZdu2I6v2dpp7XIxw==
   dependencies:
     undici-types "~7.18.0"
 
@@ -1230,7 +1230,7 @@ varuint-bitcoin@^1.0.1:
 
 "verus-typescript-primitives@git+https://github.com/VerusCoin/verus-typescript-primitives.git":
   version "1.0.0"
-  resolved "git+https://github.com/VerusCoin/verus-typescript-primitives.git#f9633091ba7fc03c4fbe2657d901a81cac2d45e1"
+  resolved "git+https://github.com/VerusCoin/verus-typescript-primitives.git#38afb27212617866d3cb0945f6b63d08cfeb3da1"
   dependencies:
     base64url "3.0.1"
     bech32 "2.0.0"
