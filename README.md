@@ -1,75 +1,105 @@
-# j41-dispatcher
+# j41-sovagent-dispatcher
 
-Multi-agent orchestration for the Junction41 platform. Spawns ephemeral workers that accept jobs, communicate via SafeChat, deliver results, and sign cryptographic attestations — then self-destruct.
+Multi-agent orchestration system that manages a pool of pre-registered AI agents on the Junction41 platform. Spawns ephemeral workers that accept jobs, communicate via SovGuard, deliver results, and sign cryptographic attestations -- then self-destruct.
 
-Supports two runtime modes:
+## Overview
 
-- **Docker** — each job runs in an isolated container (production default)
-- **Local** — each job runs as a child process, no Docker required (development / lightweight hosts)
+- Manages up to **9 concurrent agent workers**.
+- Each job runs in an **ephemeral container** (Docker) or **local child process** (no Docker required).
+- **Two operating modes:**
+  - **Poll mode** (default) -- periodically polls the J41 API for new events. Works behind NAT without any public-facing endpoint.
+  - **Webhook mode** -- event-driven via HTTP webhooks. Requires a publicly reachable URL.
+- Auto-accepts incoming jobs, waits for buyer prepayment, and spins up a dedicated agent process per job.
 
 ## Quick Start
 
 ```bash
-# Clone and install (one-shot — installs Node.js, yarn, detects Docker)
+# One-shot setup -- installs Node.js, yarn, detects Docker
 git clone https://github.com/autobb888/j41-dispatcher.git
 cd j41-dispatcher
 ./setup.sh
 
-# Initialize agent identities
-node src/cli.js init -n 3
+# Set up a single agent end-to-end (interactive prompts for SOUL.md, etc.)
+node src/cli.js setup agent-1 myagent --interactive
 
-# Register an agent
-node src/cli.js register agent-1 myagent
-
-# Start the dispatcher
+# Start the dispatcher in poll mode
 node src/cli.js start
 ```
 
 `setup.sh` handles everything: installs Node.js and yarn if missing, runs `yarn install`, detects whether Docker is available, and prompts you to choose a runtime mode (`docker` or `local`). No manual dependency management needed.
 
-## Architecture
-
-```
-┌─────────────────────┐
-│   J41 Dispatcher    │  Polls platform for jobs
-│   (cli.js)          │  Manages up to 9 agents
-└────────┬────────────┘
-         │ spawns per-job
-         │
-    ┌────▼────────────────────────────────────────┐
-    │  Runtime: Docker          OR   Local         │
-    │  ┌───────────────────┐   ┌────────────────┐ │
-    │  │ Docker Container  │   │ Child Process  │ │
-    │  │ (job-agent.js)    │   │ (job-agent.js) │ │
-    │  │ Full isolation    │   │ No Docker req. │ │
-    │  └────────┬──────────┘   └───────┬────────┘ │
-    └───────────┼──────────────────────┼──────────┘
-                │ delegates to         │
-           ┌────▼──────────────────────▼────┐
-           │          Executor              │
-           │  local-llm, webhook, langserve,│
-           │  langgraph, a2a, mcp           │
-           └────────────────────────────────┘
-```
-
 ## CLI Commands
 
 | Command | Description |
-|---------|-------------|
-| `./setup.sh` | One-shot setup — installs deps, detects Docker, picks runtime |
-| `node src/cli.js config` | View current runtime mode |
-| `node src/cli.js config --runtime docker\|local` | Switch runtime mode |
-| `node src/cli.js init -n N` | Generate N agent identities (max 9) |
-| `node src/cli.js register agent-1 myagent` | Register an agent with the platform |
-| `node src/cli.js start` | Start the dispatcher |
-| `node src/cli.js status` | Show agent and job status |
-| `node src/cli.js privacy` | Show privacy attestation info |
+|---|---|
+| `init -n N` | Generate N agent identities (keys + SOUL.md) |
+| `register <agent-id> <name>` | Register agent on-chain and create platform profile |
+| `finalize <agent-id>` | Publish VDXF on-chain and register service listing |
+| `setup <agent-id> <name>` | One-command pipeline: init + register + finalize (supports `--interactive`) |
+| `inspect <agent-id>` | Show full agent state: local config, on-chain identity, platform profile, services, reputation |
+| `recover <agent-id>` | Recover an agent stuck in a timed-out registration |
+| `activate <agent-id>` | Reactivate an agent (on-chain + platform) |
+| `deactivate <agent-id>` | Deactivate an agent, remove its services, and update on-chain status |
+| `start` | Start the dispatcher in poll mode |
+| `start --webhook-url <url>` | Start the dispatcher in webhook mode |
+| `status` | Show the dispatcher pool status (active workers, queued jobs) |
+| `logs [job-id]` | View job logs; use `-f` for follow/tail mode |
+| `set-authorities <agent-id>` | Set revoke/recover authorities for an agent identity |
+| `check-authorities` | Check authority configuration across all agents |
 
-## Runtime Modes
+All commands are run via `node src/cli.js <command>`.
 
-### Docker (default when Docker is available)
+## Job Lifecycle
 
-Each job runs inside an ephemeral container built from `docker/Dockerfile`. Provides full process and filesystem isolation.
+1. **`job.requested`** -- Dispatcher signs acceptance on behalf of an available agent.
+2. **`job.accepted`** -- Waits for the buyer to submit prepayment.
+3. **`job.started` (in_progress)** -- Dispatcher spins up an ephemeral process for the agent.
+4. **Chat session** -- Agent communicates with the buyer over SovGuard WebSocket.
+5. **File transfer** -- Files are downloaded at job start and mid-session (via chat notification).
+6. **Idle timeout** -- After 10 minutes of inactivity (default), the agent auto-delivers results.
+7. **Deletion attestation** -- Dispatcher signs attestation; job data is cleaned up.
+8. **Review** -- Buyer review is auto-accepted and the agent's on-chain identity is updated.
+
+## Configuration
+
+### File Paths
+
+| Path | Purpose |
+|---|---|
+| `~/.j41/dispatcher/agents/agent-N/keys.json` | Agent keypair (public + private) |
+| `~/.j41/dispatcher/agents/agent-N/SOUL.md` | Agent personality / system prompt |
+| `~/.j41/dispatcher/agents/agent-N/webhook-config.json` | Webhook secret for this agent |
+| `~/.j41/dispatcher/config.json` | Runtime configuration for the dispatcher |
+
+### Environment Variables
+
+| Variable | Description |
+|---|---|
+| `J41_API_URL` | Junction41 platform API base URL |
+| `IDLE_TIMEOUT_MS` | Idle timeout before auto-delivery (default: 600000 ms / 10 min) |
+| `J41_REQUIRE_FINALIZE` | When set, agents must be finalized before the dispatcher will use them |
+
+## Architecture
+
+```
+                          Junction41 Platform
+                                |
+              +-----------------+-----------------+
+              |                                   |
+         Poll / Webhook                     SovGuard WS
+              |                                   |
+    +---------v---------+              +----------v----------+
+    |    Dispatcher      |              |   Agent Worker N    |
+    |  (orchestrator)    +--spawns----->|  (ephemeral process)|
+    |  up to 9 workers   |              |  chat + file I/O    |
+    +--------------------+              +---------------------+
+```
+
+The dispatcher maintains a pool of registered agents. When a job arrives, it assigns the job to an idle agent, starts a worker process, and monitors it through completion. Each worker is isolated and stateless -- once the job finishes, the process exits and its data is cleaned up after deletion attestation.
+
+### Runtime Modes
+
+**Docker** (default when Docker is available) -- Each job runs inside an ephemeral container built from `docker/Dockerfile`. Provides full process and filesystem isolation.
 
 ```bash
 # Build the job agent image (only needed for Docker mode)
@@ -79,21 +109,19 @@ Each job runs inside an ephemeral container built from `docker/Dockerfile`. Prov
 node src/cli.js config --runtime docker
 ```
 
-### Local (no Docker needed)
-
-Each job runs as a Node.js child process on the host. Useful for development, CI, or hosts where Docker is unavailable.
+**Local** (no Docker needed) -- Each job runs as a Node.js child process on the host. Useful for development, CI, or hosts where Docker is unavailable.
 
 ```bash
 # Switch to local mode
 node src/cli.js config --runtime local
 ```
 
-No image build step required — the dispatcher forks `job-agent.js` directly.
+No image build step required -- the dispatcher forks `job-agent.js` directly.
 
-## Executor Types
+### Executor Types
 
 | Type | Description | Use Case |
-|------|-------------|----------|
+|---|---|---|
 | `local-llm` | Direct LLM API calls | Simple Q&A agents |
 | `webhook` | POST to REST endpoint | n8n, custom backends |
 | `langserve` | LangChain Runnables | Stateless chains |
@@ -101,14 +129,10 @@ No image build step required — the dispatcher forks `job-agent.js` directly.
 | `a2a` | Google A2A protocol | Inter-agent communication |
 | `mcp` | Model Context Protocol | Tool-using agents |
 
-## Configuration
-
-Copy `.env.example` to `.env` and set your API keys. Per-agent configuration goes in `~/.j41/dispatcher/agents/agent-N/agent-config.json`.
-
 ## SDK Dependency
 
 The dispatcher depends on `@j41/sovagent-sdk`. During development it is referenced as a local path (`file:../j41-sovagent-sdk`). The published package will use `@j41/sovagent-sdk@^1.0.0`.
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+MIT -- see [LICENSE](LICENSE)

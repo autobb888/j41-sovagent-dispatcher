@@ -18,7 +18,7 @@ const AGENT_ID = process.env.J41_AGENT_ID;
 const IDENTITY = process.env.J41_IDENTITY;
 const JOB_ID = process.env.J41_JOB_ID;
 const TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS || '3600000');
-const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '120000'); // 2 min idle → deliver
+const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '600000'); // 10 min idle → deliver
 
 const KEYS_FILE = process.env.J41_KEYS_FILE || '/app/keys.json';
 const SOUL_FILE = process.env.J41_SOUL_FILE || '/app/SOUL.md';
@@ -135,30 +135,32 @@ async function main() {
   // ─────────────────────────────────────────
   // STEP 1: ACCEPT JOB (sign + submit)
   // ─────────────────────────────────────────
+  // Accept job — dispatcher may have already accepted during prepay flow
   console.log('→ Accepting job...');
-
-  const timestamp = Math.floor(Date.now() / 1000);
-
-  // Fetch canonical job data and build acceptance message
   const fullJob = await agent.client.getJob(job.id);
   if (!fullJob || !fullJob.jobHash || !fullJob.buyerVerusId) {
     throw new Error(`Invalid job data from API for ${job.id}: missing jobHash or buyerVerusId`);
   }
-  const acceptMessage = `VAP-ACCEPT|Job:${fullJob.jobHash}|Buyer:${fullJob.buyerVerusId}|Amt:${fullJob.amount} ${fullJob.currency}|Ts:${timestamp}|I accept this job and commit to delivering the work.`;
-  const acceptSig = signMessage(keys.wif, acceptMessage, 'verustest');
 
-  await withRetry(() => agent.client.acceptJob(job.id, acceptSig, timestamp), 'acceptJob');
-  console.log('✅ Job accepted\n');
+  if (fullJob.status === 'accepted' || fullJob.status === 'in_progress') {
+    console.log('✅ Job already accepted (by dispatcher)\n');
+  } else {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const acceptMsg = `J41-ACCEPT|Job:${fullJob.jobHash}|Buyer:${fullJob.buyerVerusId}|Amt:${fullJob.amount} ${fullJob.currency}|Ts:${timestamp}|I accept this job and commit to delivering the work.`;
+    const acceptSig = signMessage(keys.wif, acceptMsg, 'verustest');
+    await withRetry(() => agent.client.acceptJob(job.id, acceptSig, timestamp), 'acceptJob');
+    console.log('✅ Job accepted\n');
+  }
 
   // Connect to chat (guarded — job is already accepted, must not crash without delivery)
   try {
     await agent.connectChat();
-    console.log('✅ Connected to SafeChat\n');
+    console.log('✅ Connected to SovGuard\n');
   } catch (chatErr) {
     console.error('❌ Chat connection failed after job acceptance:', chatErr.message);
     // Deliver a "failed" result so the accepted job isn't left in limbo
     const deliverTimestamp = Math.floor(Date.now() / 1000);
-    const deliverMessage = `VAP-DELIVER|Job:${fullJob.jobHash}|Delivery:failed|Ts:${deliverTimestamp}|I have delivered the work for this job.`;
+    const deliverMessage = `J41-DELIVER|Job:${fullJob.jobHash}|Delivery:failed|Ts:${deliverTimestamp}|I have delivered the work for this job.`;
     const deliverSig = signMessage(keys.wif, deliverMessage, 'verustest');
     await withRetry(
       () => agent.client.deliverJob(job.id, 'failed', deliverSig, deliverTimestamp, 'Chat connection failed — could not process job'),
@@ -217,7 +219,7 @@ async function main() {
   console.log('→ Delivering result...');
   const deliverTimestamp = Math.floor(Date.now() / 1000);
   const deliverHash = result.hash || 'failed';
-  const deliverMessage = `VAP-DELIVER|Job:${fullJob.jobHash}|Delivery:${deliverHash}|Ts:${deliverTimestamp}|I have delivered the work for this job.`;
+  const deliverMessage = `J41-DELIVER|Job:${fullJob.jobHash}|Delivery:${deliverHash}|Ts:${deliverTimestamp}|I have delivered the work for this job.`;
   const deliverSig = signMessage(keys.wif, deliverMessage, 'verustest');
 
   await withRetry(
@@ -256,6 +258,23 @@ async function main() {
     console.log('⚠️  Could not submit attestation:', e.message);
   }
 
+  // Clean up job data (local mode — Docker containers are destroyed automatically)
+  try {
+    const filesDir = path.join(JOB_DIR, 'files');
+    if (fs.existsSync(filesDir)) {
+      fs.rmSync(filesDir, { recursive: true, force: true });
+      console.log('🗑️  Downloaded files deleted');
+    }
+    // Remove job data files (keep attestation and log for audit)
+    for (const f of ['description.txt', 'buyer.txt', 'amount.txt', 'currency.txt']) {
+      const fp = path.join(JOB_DIR, f);
+      if (fs.existsSync(fp)) fs.unlinkSync(fp);
+    }
+    console.log('🗑️  Job data cleaned up (attestation + log preserved)');
+  } catch (cleanErr) {
+    console.warn('⚠️  Cleanup error:', cleanErr.message);
+  }
+
   console.log('🏁 Job complete with privacy attestation. Container will be destroyed.');
   console.log('');
   console.log('Privacy Summary:');
@@ -287,6 +306,32 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
     if (registerSessionEndResolve) registerSessionEndResolve(resolve);
   });
 
+  // Check for files attached to the job (buyer may have uploaded before session)
+  let jobFiles = [];
+  try {
+    const fileResult = await agent.listFiles(job.id);
+    jobFiles = fileResult.data || [];
+    if (jobFiles.length > 0) {
+      console.log(`[FILES] ${jobFiles.length} file(s) attached to job:`);
+      for (const f of jobFiles) {
+        console.log(`  - ${f.filename} (${(f.sizeBytes / 1024).toFixed(1)}KB, ${f.mimeType})`);
+      }
+      // Download files to job directory for executor access
+      const filesDir = path.join(JOB_DIR, 'files');
+      fs.mkdirSync(filesDir, { recursive: true });
+      for (const f of jobFiles) {
+        try {
+          const localPath = await agent.downloadFileTo(job.id, f.id, filesDir);
+          console.log(`  ✓ Downloaded: ${localPath}`);
+        } catch (dlErr) {
+          console.error(`  ⚠️  Failed to download ${f.filename}: ${dlErr.message}`);
+        }
+      }
+    }
+  } catch (e) {
+    console.log(`[FILES] Could not check for files: ${e.message}`);
+  }
+
   // Initialize executor (sends greeting, sets up state)
   await executor.init(job, agent, soulPrompt);
 
@@ -294,9 +339,17 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   agent.onChatMessage((jobId, msg) => {
     if (jobId !== job.id) return;
     lastActivityAt = Date.now();
-    messageCount++;
 
     const buyerMessage = sanitizeInput(msg.content);
+
+    // Detect platform file upload notification — download immediately, don't send to executor
+    if (buyerMessage.startsWith('📎 Uploaded file:') || buyerMessage.startsWith('Uploaded file:')) {
+      console.log(`[FILES] File upload detected: ${buyerMessage.substring(0, 80)}`);
+      downloadNewFiles();
+      return;
+    }
+
+    messageCount++;
     console.log(`[CHAT] ${msg.senderVerusId}: ${buyerMessage.substring(0, 80)}`);
 
     // Serialize: each message waits for the previous to complete
@@ -315,6 +368,33 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
       }
     });
   });
+
+  // ── File detection: react to platform's "📎 Uploaded file:" chat messages ──
+  const knownFileIds = new Set(jobFiles.map(f => f.id));
+
+  async function downloadNewFiles() {
+    try {
+      const fileResult = await agent.listFiles(job.id);
+      const files = fileResult.data || [];
+      const newFiles = files.filter(f => !knownFileIds.has(f.id));
+      if (newFiles.length === 0) return;
+
+      const filesDir = path.join(JOB_DIR, 'files');
+      fs.mkdirSync(filesDir, { recursive: true });
+
+      for (const f of newFiles) {
+        knownFileIds.add(f.id);
+        try {
+          const localPath = await agent.downloadFileTo(job.id, f.id, filesDir);
+          console.log(`[FILES] ✓ ${f.filename} (${(f.sizeBytes / 1024).toFixed(1)}KB)`);
+        } catch (dlErr) {
+          console.error(`[FILES] ⚠️  Failed to download ${f.filename}: ${dlErr.message}`);
+        }
+      }
+    } catch (e) {
+      console.error(`[FILES] Error checking files: ${e.message}`);
+    }
+  }
 
   // Idle timer — check periodically if we should auto-deliver
   const idleCheck = setInterval(() => {
