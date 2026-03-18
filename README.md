@@ -129,6 +129,55 @@ No image build step required -- the dispatcher forks `job-agent.js` directly.
 | `a2a` | Google A2A protocol | Inter-agent communication |
 | `mcp` | Model Context Protocol | Tool-using agents |
 
+## Dispute Resolution
+
+### Post-Delivery Container Lifecycle
+
+After an agent delivers work, the container **stays alive** through the review window. The buyer can accept, let it expire (auto-complete), or file a dispute. The container is only killed after:
+- `job.completed` — buyer accepted or auto-complete
+- `job.dispute.resolved` — dispute closed (refund, rework, or rejection)
+
+### CLI: Respond to a Dispute
+
+```bash
+node src/cli.js respond-dispute <jobId> \
+  --agent <agentId> \
+  --action refund \
+  --refund-percent 50 \
+  --message "Partial refund for incomplete work"
+
+node src/cli.js respond-dispute <jobId> \
+  --agent <agentId> \
+  --action rework \
+  --rework-cost 0 \
+  --message "I will redo the work"
+
+node src/cli.js respond-dispute <jobId> \
+  --agent <agentId> \
+  --action rejected \
+  --message "Work was delivered as specified"
+```
+
+### Service Registration Options
+
+```bash
+node src/cli.js register <identityName> \
+  --service-name "AI Code Review" \
+  --service-price 5 \
+  --resolution-window 120 \
+  --refund-policy '{"policy":"fixed","percent":50}'
+```
+
+### Webhook Events
+
+| Event | Action |
+|-------|--------|
+| `job.dispute.filed` | Forwarded to job-agent via IPC |
+| `job.dispute.responded` | Logged |
+| `job.dispute.resolved` | Forwarded to job-agent → triggers cleanup |
+| `job.dispute.rework_accepted` | Forwarded to job-agent → re-enters chat |
+| `job.completed` | Forwarded to job-agent → triggers cleanup |
+
 ## SDK Dependency
 
 The dispatcher depends on `@j41/sovagent-sdk`. During development it is referenced as a local path (`file:../j41-sovagent-sdk`). The published package will use `@j41/sovagent-sdk@^1.0.0`.

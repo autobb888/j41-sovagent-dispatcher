@@ -216,6 +216,17 @@ function buildServiceFromOptions(options, descriptionFallback) {
   if (!svc.acceptedCurrencies) {
     svc.acceptedCurrencies = [{ currency: svc.currency, price: parseFloat(svc.price) || 0 }];
   }
+  // Dispute resolution fields
+  svc.resolutionWindow = parseInt(options.resolutionWindow, 10) || 60;
+  if (options.refundPolicy) {
+    try {
+      svc.refundPolicy = typeof options.refundPolicy === 'string'
+        ? JSON.parse(options.refundPolicy)
+        : options.refundPolicy;
+    } catch (e) {
+      console.warn(`⚠️  Invalid --refund-policy JSON: ${e.message}`);
+    }
+  }
   return [svc];
 }
 
@@ -233,7 +244,9 @@ function addServiceOptions(cmd) {
     .option('--service-payment-terms <terms>', 'Payment terms (prepay|postpay|split)', 'prepay')
     .option('--service-private-mode', 'Enable private mode for this service')
     .option('--service-sovguard', 'Require SovGuard protection (default: true)')
-    .option('--service-accepted-currencies <json>', 'Accepted currencies as JSON array: [{"currency":"VRSC","price":10}]');
+    .option('--service-accepted-currencies <json>', 'Accepted currencies as JSON array: [{"currency":"VRSC","price":10}]')
+    .option('--resolution-window <minutes>', 'Resolution window in minutes (default: 60)', '60')
+    .option('--refund-policy <json>', 'Refund policy JSON: {"policy":"fixed","percent":50}');
 }
 
 /**
@@ -2182,7 +2195,34 @@ async function pollForJobs(state) {
       console.error(`[Poll] Error for ${agentInfo.id}:`, e.message);
     }
   }
-  
+
+  // Check for post-delivery status transitions (poll mode fallback)
+  // Track last-sent status per job to avoid duplicate IPC messages
+  if (!state._lastSentStatus) state._lastSentStatus = new Map();
+  for (const [jobId, activeInfo] of state.active.entries()) {
+    try {
+      const agentSession = await getAgentSession(state, activeInfo.agentInfo);
+      const currentJob = await agentSession.client.getJob(jobId);
+      const lastStatus = state._lastSentStatus.get(jobId);
+      if (currentJob.status === lastStatus) continue; // Already sent this status
+      if (currentJob.status === 'completed' && activeInfo.process?.send) {
+        activeInfo.process.send({ type: 'job.completed', data: { jobId } });
+        state._lastSentStatus.set(jobId, currentJob.status);
+      } else if (currentJob.status === 'disputed' && activeInfo.process?.send) {
+        activeInfo.process.send({ type: 'dispute.filed', data: { jobId, reason: currentJob.dispute?.reason } });
+        state._lastSentStatus.set(jobId, currentJob.status);
+      } else if ((currentJob.status === 'resolved' || currentJob.status === 'resolved_rejected') && activeInfo.process?.send) {
+        activeInfo.process.send({ type: 'dispute.resolved', data: { jobId, action: currentJob.dispute?.action } });
+        state._lastSentStatus.set(jobId, currentJob.status);
+      } else if (currentJob.status === 'rework' && activeInfo.process?.send) {
+        activeInfo.process.send({ type: 'dispute.rework_accepted', data: { jobId } });
+        state._lastSentStatus.set(jobId, currentJob.status);
+      }
+    } catch (e) {
+      // Job may have been deleted — ignore
+    }
+  }
+
   // Process queue if slots available (D3: re-queue on failure instead of dropping)
   while (state.queue.length > 0 && state.active.size < MAX_AGENTS && state.available.length > 0) {
     const queuedJob = state.queue.shift();
@@ -2297,8 +2337,52 @@ async function handleWebhookEvent(state, agentId, payload) {
       break;
     }
 
-    case 'job.disputed': {
-      console.log(`[Webhook] ⚠️  Job ${jobId?.substring(0, 8)} disputed by ${data?.disputedBy || '?'}`);
+    case 'job.disputed':
+    case 'job.dispute.filed': {
+      console.log(`[Webhook] ⚠️  Dispute filed for job ${jobId?.substring(0, 8)} by ${data?.disputedBy || '?'}: ${data?.reason || '?'}`);
+      // Forward to running job-agent via IPC
+      const activeJob = state.active.get(jobId);
+      if (activeJob?.process?.send) {
+        activeJob.process.send({ type: 'dispute.filed', data: { reason: data?.reason, disputedBy: data?.disputedBy } });
+      }
+      break;
+    }
+
+    case 'job.dispute.responded': {
+      console.log(`[Webhook] Dispute response for job ${jobId?.substring(0, 8)}: action=${data?.action || '?'}`);
+      break;
+    }
+
+    case 'job.dispute.resolved': {
+      console.log(`[Webhook] ✅ Dispute resolved for job ${jobId?.substring(0, 8)}: ${data?.action || '?'}`);
+      const resolvedJob = state.active.get(jobId);
+      if (resolvedJob?.process?.send) {
+        resolvedJob.process.send({ type: 'dispute.resolved', data });
+      }
+      break;
+    }
+
+    case 'job.dispute.rework_accepted': {
+      console.log(`[Webhook] 🔄 Rework accepted for job ${jobId?.substring(0, 8)}`);
+      const reworkJob = state.active.get(jobId);
+      if (reworkJob?.process?.send) {
+        reworkJob.process.send({ type: 'dispute.rework_accepted', data });
+      }
+      break;
+    }
+
+    case 'job.completed': {
+      console.log(`[Webhook] ✅ Job ${jobId?.substring(0, 8)} completed`);
+      const completedJob = state.active.get(jobId);
+      if (completedJob?.process?.send) {
+        completedJob.process.send({ type: 'job.completed', data });
+      } else {
+        // Job not active — just mark as seen
+        if (jobId) {
+          state.seen.set(jobId, Date.now());
+          saveSeenJobs(state.seen);
+        }
+      }
       break;
     }
 
@@ -2603,7 +2687,7 @@ async function startJobLocal(state, job, agentInfo) {
   try {
     const child = spawn('node', [path.join(__dirname, 'job-agent.js')], {
       env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       cwd: path.resolve(__dirname, '..'),
     });
 
@@ -2782,5 +2866,53 @@ async function cleanupCompletedJobs(state) {
     }
   }
 }
+
+program
+  .command('respond-dispute <jobId>')
+  .description('Respond to a dispute on a job')
+  .requiredOption('--agent <agentId>', 'Agent ID to respond as')
+  .requiredOption('--action <action>', 'Response action: refund, rework, or rejected')
+  .option('--refund-percent <percent>', 'Refund percentage (1-100, required for refund action)')
+  .option('--rework-cost <cost>', 'Additional cost for rework (default: 0)', '0')
+  .requiredOption('--message <message>', 'Agent statement / reason')
+  .action(async (jobId, options) => {
+    try {
+      const { action, agent: agentId, message } = options;
+      if (!['refund', 'rework', 'rejected'].includes(action)) {
+        console.error('❌ --action must be refund, rework, or rejected');
+        process.exit(1);
+      }
+      if (action === 'refund' && !options.refundPercent) {
+        console.error('❌ --refund-percent is required for refund action');
+        process.exit(1);
+      }
+
+      const agentDir = path.join(AGENTS_DIR, agentId);
+      const keysPath = path.join(agentDir, 'keys.json');
+      if (!fs.existsSync(keysPath)) {
+        console.error(`❌ Agent ${agentId} not found (no keys.json)`);
+        process.exit(1);
+      }
+
+      const keys = JSON.parse(fs.readFileSync(keysPath, 'utf-8'));
+      const { J41Agent } = require('@j41/sovagent-sdk');
+      const agent = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif, identityName: keys.identity, iAddress: keys.iAddress });
+      await agent.authenticate();
+
+      const result = await agent.respondToDispute(jobId, {
+        action,
+        refundPercent: options.refundPercent ? parseInt(options.refundPercent, 10) : undefined,
+        reworkCost: parseFloat(options.reworkCost) ?? 0,
+        message,
+      });
+
+      console.log('✅ Dispute response submitted:');
+      console.log(JSON.stringify(result, null, 2));
+      agent.stop();
+    } catch (e) {
+      console.error(`❌ ${e.message}`);
+      process.exit(1);
+    }
+  });
 
 program.parse();

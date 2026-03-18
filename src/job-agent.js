@@ -213,6 +213,12 @@ async function main() {
     result = { error: e.message, content: 'Job failed: ' + e.message };
   }
 
+  // Register IPC listener early to avoid race condition
+  const ipcQueue = [];
+  if (process.send) {
+    process.on('message', (msg) => { ipcQueue.push(msg); });
+  }
+
   // ─────────────────────────────────────────
   // STEP 3: DELIVER RESULT
   // ─────────────────────────────────────────
@@ -233,60 +239,17 @@ async function main() {
   await new Promise(r => setTimeout(r, 3000));
 
   // ─────────────────────────────────────────
-  // STEP 4: DELETION ATTESTATION
+  // STEP 4: POST-DELIVERY WAIT (Dispute Resolution)
   // ─────────────────────────────────────────
-  console.log('→ Signing deletion attestation...');
+  console.log('→ Entering post-delivery review window...');
+  console.log('  Container stays alive until job.completed or dispute resolution.\n');
 
-  const deletionTime = new Date().toISOString();
-  const attestTimestamp = Math.floor(Date.now() / 1000);
+  const postDeliveryResult = await waitForPostDelivery(job, agent, keys, fullJob, executor, soulPrompt, (resolve) => { sessionEndResolve = resolve; }, ipcQueue);
 
-  // Use platform's canonical deletion attestation flow
-  try {
-    const { message: attestMessage, timestamp: attestTs } =
-      await agent.client.getDeletionAttestationMessage(JOB_ID, attestTimestamp);
-    const attestSig = signMessage(keys.wif, attestMessage, 'verustest');
-
-    // Save attestation locally
-    fs.writeFileSync(
-      path.join(JOB_DIR, 'deletion-attestation.json'),
-      JSON.stringify({ jobId: JOB_ID, message: attestMessage, signature: attestSig, timestamp: attestTs }, null, 2)
-    );
-
-    const result = await agent.client.submitDeletionAttestation(JOB_ID, attestSig, attestTs);
-    console.log(`✅ Deletion attestation submitted (verified: ${result.signatureVerified})\n`);
-  } catch (e) {
-    console.log('⚠️  Could not submit attestation:', e.message);
-  }
-
-  // Clean up job data (local mode — Docker containers are destroyed automatically)
-  try {
-    const filesDir = path.join(JOB_DIR, 'files');
-    if (fs.existsSync(filesDir)) {
-      fs.rmSync(filesDir, { recursive: true, force: true });
-      console.log('🗑️  Downloaded files deleted');
-    }
-    // Remove job data files (keep attestation and log for audit)
-    for (const f of ['description.txt', 'buyer.txt', 'amount.txt', 'currency.txt']) {
-      const fp = path.join(JOB_DIR, f);
-      if (fs.existsSync(fp)) fs.unlinkSync(fp);
-    }
-    console.log('🗑️  Job data cleaned up (attestation + log preserved)');
-  } catch (cleanErr) {
-    console.warn('⚠️  Cleanup error:', cleanErr.message);
-  }
-
-  console.log('🏁 Job complete with privacy attestation. Container will be destroyed.');
-  console.log('');
-  console.log('Privacy Summary:');
-  console.log(`  Creation: ${creationTime}`);
-  console.log(`  Deletion: ${deletionTime}`);
-  console.log(`  Duration: ${(new Date(deletionTime) - new Date(creationTime)) / 1000}s`);
-  console.log(`  Container: ${CONTAINER_ID.substring(0, 12)}`);
-  console.log('');
-
-  // J5: Clean disconnect — close socket.io and stop polling before exit
-  agent.stop();
-  process.exit(0);
+  // ─────────────────────────────────────────
+  // STEP 5: CLEANUP + ATTESTATION + IDENTITY UPDATE
+  // ─────────────────────────────────────────
+  await performCleanup(agent, keys, fullJob, postDeliveryResult);
 }
 
 // ─────────────────────────────────────────
@@ -500,6 +463,182 @@ setTimeout(async () => {
 
   process.exit(1);
 }, TIMEOUT_MS);
+
+/**
+ * Post-delivery wait loop. Listens for IPC messages from dispatcher
+ * for job completion, disputes, and rework events.
+ */
+async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulPrompt, registerSessionEndResolve, ipcQueue) {
+  const { buildDeliverMessage } = require('@j41/sovagent-sdk/dist/signing/messages.js');
+  const { signMessage } = require('@j41/sovagent-sdk/dist/identity/signer.js');
+
+  return new Promise((resolve) => {
+    let resolved = false;
+    const safeResolve = (val) => { if (!resolved) { resolved = true; resolve(val); } };
+
+    // Safety timeout: resolutionWindow + 30 min (default: 90 min if unknown)
+    const safetyMs = ((fullJob.resolutionWindow || 60) + 30) * 60 * 1000;
+    let safetyTimer = setTimeout(() => {
+      console.log('⚠️  Post-delivery safety timeout reached — exiting');
+      safeResolve({ reason: 'timeout' });
+    }, safetyMs);
+
+    function resetSafetyTimer() {
+      clearTimeout(safetyTimer);
+      safetyTimer = setTimeout(() => {
+        console.log('⚠️  Post-delivery safety timeout reached — exiting');
+        safeResolve({ reason: 'timeout' });
+      }, safetyMs);
+    }
+
+    async function handleMessage(msg) {
+      if (!msg || !msg.type) return;
+      console.log(`[POST-DELIVERY] Received: ${msg.type}`);
+
+      switch (msg.type) {
+        case 'job.completed': {
+          clearTimeout(safetyTimer);
+          console.log('✅ Job completed by buyer (or auto-complete after review window)');
+          safeResolve({ reason: 'completed' });
+          break;
+        }
+
+        case 'dispute.filed': {
+          console.log(`⚠️  Dispute filed: ${msg.data?.reason || 'no reason'}`);
+          if (agent.handler?.onJobDisputed) {
+            try {
+              const freshJob = await agent.client.getJob(job.id);
+              await agent.handler.onJobDisputed(freshJob, msg.data?.reason || '');
+            } catch (e) {
+              console.error('Handler error:', e.message);
+            }
+          }
+          // Stay alive — wait for resolution
+          break;
+        }
+
+        case 'dispute.resolved': {
+          clearTimeout(safetyTimer);
+          const action = msg.data?.action || 'unknown';
+          console.log(`✅ Dispute resolved: ${action}`);
+          safeResolve({
+            reason: action === 'rejected' ? 'resolved_rejected' : 'resolved',
+            disputeOutcome: msg.data,
+          });
+          break;
+        }
+
+        case 'dispute.rework_accepted': {
+          console.log('🔄 Rework accepted — re-entering chat session...');
+          if (agent.handler?.onReworkRequested) {
+            try {
+              const freshJob = await agent.client.getJob(job.id);
+              await agent.handler.onReworkRequested(freshJob, msg.data?.reworkCost || 0);
+            } catch (e) {
+              console.error('Handler error:', e.message);
+            }
+          }
+          // Re-enter chat and re-deliver
+          try {
+            const reworkResult = await processJob(job, agent, soulPrompt, executor, registerSessionEndResolve);
+            console.log('✅ Rework completed — re-delivering...');
+
+            const ts = Math.floor(Date.now() / 1000);
+            const hash = reworkResult.hash || 'rework';
+            const deliverMsg = buildDeliverMessage({ jobHash: fullJob.jobHash, deliveryHash: hash, timestamp: ts });
+            const sig = signMessage(keys.wif, deliverMsg, 'verustest');
+            await withRetry(
+              () => agent.client.deliverJob(job.id, hash, sig, ts, reworkResult.content?.substring(0, 200)),
+              'deliverJob (rework)',
+              { maxAttempts: 5, baseDelayMs: 2000 }
+            );
+            console.log('✅ Rework delivered — new review window started\n');
+            // Reset safety timer for new review window
+            resetSafetyTimer();
+          } catch (e) {
+            console.error('❌ Rework failed:', e.message);
+          }
+          break;
+        }
+      }
+    }
+
+    // Drain any messages that arrived before we started listening
+    for (const queued of ipcQueue) {
+      handleMessage(queued);
+    }
+    ipcQueue.length = 0;
+
+    // Listen for future IPC messages
+    process.on('message', handleMessage);
+  });
+}
+
+/**
+ * Final cleanup: attestation, file deletion, identity update, exit.
+ */
+async function performCleanup(agent, keys, fullJob, postDeliveryResult) {
+  console.log('→ Performing final cleanup...');
+
+  const attestTimestamp = Math.floor(Date.now() / 1000);
+
+  // Deletion attestation
+  try {
+    const { message: attestMessage, timestamp: attestTs } =
+      await agent.client.getDeletionAttestationMessage(JOB_ID, attestTimestamp);
+    const { signMessage } = require('@j41/sovagent-sdk/dist/identity/signer.js');
+    const attestSig = signMessage(keys.wif, attestMessage, 'verustest');
+
+    fs.writeFileSync(
+      path.join(JOB_DIR, 'deletion-attestation.json'),
+      JSON.stringify({
+        jobId: JOB_ID,
+        message: attestMessage,
+        signature: attestSig,
+        timestamp: attestTs,
+        disputeOutcome: postDeliveryResult.disputeOutcome || null,
+      }, null, 2)
+    );
+
+    const result = await agent.client.submitDeletionAttestation(JOB_ID, attestSig, attestTs);
+    console.log(`✅ Deletion attestation submitted (verified: ${result.signatureVerified})`);
+  } catch (e) {
+    console.log('⚠️  Could not submit attestation:', e.message);
+  }
+
+  // Identity update on-chain (includes dispute outcome if applicable)
+  try {
+    console.log('→ Updating on-chain identity...');
+    if (postDeliveryResult.disputeOutcome) {
+      console.log(`  Dispute outcome: ${postDeliveryResult.disputeOutcome.action}`);
+    }
+    // The actual updateidentity call happens via acceptReview
+    // when a review is submitted after dispute resolution.
+  } catch (e) {
+    console.log('⚠️  Identity update error:', e.message);
+  }
+
+  // Clean up job data
+  try {
+    const filesDir = path.join(JOB_DIR, 'files');
+    if (fs.existsSync(filesDir)) {
+      fs.rmSync(filesDir, { recursive: true, force: true });
+      console.log('🗑️  Downloaded files deleted');
+    }
+    for (const f of ['description.txt', 'buyer.txt', 'amount.txt', 'currency.txt']) {
+      const fp = path.join(JOB_DIR, f);
+      if (fs.existsSync(fp)) fs.unlinkSync(fp);
+    }
+    console.log('🗑️  Job data cleaned up (attestation + log preserved)');
+  } catch (cleanErr) {
+    console.warn('⚠️  Cleanup error:', cleanErr.message);
+  }
+
+  console.log(`\n🏁 Job complete (${postDeliveryResult.reason}). Container will be destroyed.\n`);
+
+  agent.stop();
+  process.exit(0);
+}
 
 main().catch(e => {
   console.error('❌ Fatal error:', e);
