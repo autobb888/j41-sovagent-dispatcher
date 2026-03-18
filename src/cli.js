@@ -2386,6 +2386,37 @@ async function handleWebhookEvent(state, agentId, payload) {
       break;
     }
 
+    case 'workspace.ready': {
+      const activeInfo = state.active.get(jobId);
+      if (activeInfo?.process?.send) {
+        activeInfo.process.send({
+          type: 'workspace_ready',
+          jobId: jobId,
+          sessionId: data.sessionId,
+          permissions: data.permissions,
+          mode: data.mode,
+        });
+        console.log(`[Webhook] Workspace ready — notified job-agent ${jobId?.substring(0, 8)}`);
+      } else {
+        console.warn(`[Webhook] Workspace ready but no IPC channel (Docker mode not supported for workspace v1) job=${jobId?.substring(0, 8)}`);
+      }
+      break;
+    }
+
+    case 'workspace.disconnected':
+    case 'workspace.completed': {
+      const activeInfo2 = state.active.get(jobId);
+      if (activeInfo2?.process?.send) {
+        activeInfo2.process.send({
+          type: 'workspace_closed',
+          jobId: jobId,
+          reason: event,
+        });
+        console.log(`[Webhook] Workspace closed (${event}) — notified job-agent ${jobId?.substring(0, 8)}`);
+      }
+      break;
+    }
+
     default:
       // Log unhandled events for debugging
       break;
