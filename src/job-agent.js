@@ -53,6 +53,8 @@ async function withRetry(fn, label, { maxAttempts = 3, baseDelayMs = 1000 } = {}
 // Track agent+executor globally for SIGTERM cleanup
 let _agent = null;
 let _executor = null;
+let _workspaceConnected = false;
+let _workspaceTools = [];
 
 async function main() {
   // Check for required environment variables
@@ -201,6 +203,18 @@ async function main() {
   // ─────────────────────────────────────────
   console.log(`→ Starting chat session (executor: ${EXECUTOR_TYPE})...\n`);
 
+  // Workspace IPC handler — receives workspace_ready/workspace_closed from dispatcher
+  if (process.send) {
+    process.on('message', async (msg) => {
+      if (msg.type === 'workspace_ready') {
+        await connectWorkspace(msg.jobId, msg.permissions, msg.mode);
+      }
+      if (msg.type === 'workspace_closed') {
+        disconnectWorkspace();
+      }
+    });
+  }
+
   const executor = createExecutor();
   _executor = executor;
   let result;
@@ -249,6 +263,7 @@ async function main() {
   // ─────────────────────────────────────────
   // STEP 5: CLEANUP + ATTESTATION + IDENTITY UPDATE
   // ─────────────────────────────────────────
+  disconnectWorkspace();
   await performCleanup(agent, keys, fullJob, postDeliveryResult);
 }
 
@@ -377,6 +392,58 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
 
   // Finalize executor — get deliverable
   return await executor.finalize();
+}
+
+async function connectWorkspace(jobId, permissions, mode) {
+  if (_workspaceConnected) return;
+  try {
+    console.log(`[WORKSPACE] Connecting for job ${jobId?.substring(0, 8)} (mode=${mode})...`);
+    await _agent.workspace.connect(jobId);
+    _workspaceConnected = true;
+    _workspaceTools = _agent.workspace.getAvailableTools();
+    _agent.sendChatMessage(jobId, 'I now have access to your project files via workspace. Starting work.');
+    _agent.workspace.onStatusChanged((status, data) => {
+      console.log(`[WORKSPACE] Status changed: ${status}`);
+      if (status === 'aborted' || status === 'completed') {
+        disconnectWorkspace();
+      }
+    });
+    _agent.workspace.onDisconnected((reason) => {
+      console.warn(`[WORKSPACE] Disconnected: ${reason}`);
+      _workspaceConnected = false;
+      _workspaceTools = [];
+    });
+    console.log(`[WORKSPACE] Connected — ${_workspaceTools.length} tool(s) available`);
+  } catch (err) {
+    console.error(`[WORKSPACE] Failed to connect: ${err.message}`);
+    _agent.sendChatMessage(jobId, `Unable to connect to workspace: ${err.message}`);
+  }
+}
+
+function disconnectWorkspace() {
+  if (!_workspaceConnected) return;
+  _workspaceConnected = false;
+  _workspaceTools = [];
+  try { _agent.workspace.disconnect(); } catch {}
+  console.log('[WORKSPACE] Disconnected');
+}
+
+async function handleWorkspaceToolCall(toolName, args) {
+  if (!_workspaceConnected) return 'Workspace is not connected';
+  try {
+    switch (toolName) {
+      case 'workspace_list_directory':
+        return JSON.stringify(await _agent.workspace.listDirectory(args.path || '.'));
+      case 'workspace_read_file':
+        return await _agent.workspace.readFile(args.path);
+      case 'workspace_write_file':
+        return await _agent.workspace.writeFile(args.path, args.content);
+      default:
+        return `Unknown workspace tool: ${toolName}`;
+    }
+  } catch (err) {
+    return `Workspace error: ${err.message}`;
+  }
 }
 
 // J1: Graceful shutdown on SIGTERM — submit attestation before exit
