@@ -40,6 +40,38 @@ const MAX_RETRIES = 2;
 const SEEN_JOBS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 /**
+ * Validate that a URL is safe to use as an executor endpoint.
+ * Rejects non-https schemes and private/internal IP ranges.
+ */
+function validateExecutorUrl(url, varName) {
+  if (!url) return; // Optional — skip if not set
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`${varName}: invalid URL "${url}"`);
+  }
+  if (parsed.protocol !== 'https:') {
+    // Allow localhost/127.0.0.1 for development explicitly
+    if (parsed.hostname !== 'localhost' && parsed.hostname !== '127.0.0.1') {
+      throw new Error(`${varName}: only HTTPS URLs are allowed (got "${parsed.protocol}")`);
+    }
+  }
+  // Reject private IP ranges (SSRF protection)
+  const PRIVATE_PATTERNS = [
+    /^10\.\d+\.\d+\.\d+$/,
+    /^172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+$/,
+    /^192\.168\.\d+\.\d+$/,
+    /^169\.254\.\d+\.\d+$/,   // link-local
+    /^fc00::/i,               // IPv6 ULA
+    /^fe80::/i,               // IPv6 link-local
+  ];
+  if (PRIVATE_PATTERNS.some(p => p.test(parsed.hostname))) {
+    throw new Error(`${varName}: private/internal IP address rejected for "${url}" (SSRF protection)`);
+  }
+}
+
+/**
  * Build the canonical J41-ACCEPT message for job acceptance signing.
  */
 function buildAcceptMessage(job, timestamp) {
@@ -112,6 +144,7 @@ function loadSeenJobs() {
 function saveSeenJobs(seen) {
   const obj = Object.fromEntries(seen);
   fs.writeFileSync(SEEN_JOBS_PATH, JSON.stringify(obj, null, 2));
+  try { fs.chmodSync(SEEN_JOBS_PATH, 0o600); } catch {}
 }
 
 /**
@@ -1728,7 +1761,12 @@ program
       console.log(`Keep containers: ${process.env.J41_KEEP_CONTAINERS === '1' ? 'ON (debug)' : 'OFF'}`);
     }
     console.log('Privacy: Deletion attestations\n');
-    
+
+    // H5: Validate executor URLs at startup (SSRF protection)
+    validateExecutorUrl(process.env.J41_EXECUTOR_URL, 'J41_EXECUTOR_URL');
+    validateExecutorUrl(process.env.J41_MCP_URL, 'J41_MCP_URL');
+    validateExecutorUrl(process.env.KIMI_BASE_URL, 'KIMI_BASE_URL');
+
     // Check which agents are registered on platform (+ optional finalize readiness)
     const enforceFinalize = process.env.J41_REQUIRE_FINALIZE === '1';
     const readyAgents = [];
@@ -2579,15 +2617,16 @@ async function startJobContainer(state, job, agentInfo) {
   const agentDir = path.join(AGENTS_DIR, agentInfo.id);
   const keysPath = path.join(agentDir, 'keys.json');
 
-  // Ensure key file is readable inside rootless/uid-remapped containers
-  // (was 0600 from init, causing EACCES in job-agent)
-  // Use 0o640 (owner rw, group r) — NOT 0o644 which makes WIF world-readable
+  // H3 fix: Copy keys to a temp file at 0o640 — do NOT chmod the original.
+  // This ensures the original stays at 0o600 even if the process crashes.
+  const tmpKeysPath = path.join(jobDir, 'keys.json');
+  fs.copyFileSync(keysPath, tmpKeysPath);
   try {
-    fs.chmodSync(keysPath, 0o640);
+    fs.chmodSync(tmpKeysPath, 0o640);
   } catch {
-    // best effort
+    // best effort on systems that don't support chmod
   }
-  
+
   try {
     const keepContainers = process.env.J41_KEEP_CONTAINERS === '1';
 
@@ -2612,7 +2651,7 @@ async function startJobContainer(state, job, agentInfo) {
         Binds: [
           // job dir must be writable for attestation artifacts (creation/deletion json)
           `${jobDir}:/app/job`,
-          `${keysPath}:/app/keys.json:ro`,
+          `${tmpKeysPath}:/app/keys.json:ro`,
           `${path.join(agentDir, 'SOUL.md')}:/app/SOUL.md:ro`,
         ],
         AutoRemove: !keepContainers, // Keep container for debugging when J41_KEEP_CONTAINERS=1
@@ -2714,13 +2753,8 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
     }
   }
 
-  // Restore keys.json to 0o600 (was relaxed to 0o640 for container access)
-  try {
-    const agentDir = path.join(AGENTS_DIR, active.agentInfo.id);
-    fs.chmodSync(path.join(agentDir, 'keys.json'), 0o600);
-  } catch {
-    // best effort
-  }
+  // H3: No need to restore keys.json chmod — original was never modified.
+  // The temp copy in jobDir will be cleaned up below.
 
   // Cleanup job dir (retain for debugging if requested)
   const jobDir = path.join(JOBS_DIR, jobId);
@@ -2757,21 +2791,38 @@ async function startJobLocal(state, job, agentInfo) {
   const agentDir = path.join(AGENTS_DIR, agentInfo.id);
   const keysPath = path.join(agentDir, 'keys.json');
 
-  // Build env vars — same set as the Docker container gets
-  const env = {
-    ...process.env,
-    J41_API_URL: J41_API_URL,
-    J41_AGENT_ID: agentInfo.id,
-    J41_IDENTITY: agentInfo.identity,
-    J41_JOB_ID: job.id,
-    JOB_TIMEOUT_MS: String(JOB_TIMEOUT_MS),
-    // Override /app/ paths for local mode
-    J41_KEYS_FILE: keysPath,
-    J41_SOUL_FILE: path.join(agentDir, 'SOUL.md'),
-    J41_JOB_DIR: jobDir,
-  };
+  // Build env vars — explicit whitelist only (C2 fix: no ...process.env spread)
+  const WHITELISTED_ENV = [
+    'PATH', 'HOME', 'USER', 'SHELL', 'LANG', 'TERM', 'NODE_ENV',
+    'HOSTNAME', 'TZ', 'NODE_PATH',
+  ];
+  const env = {};
+  for (const key of WHITELISTED_ENV) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
 
-  // Per-agent executor env vars
+  // Platform config — required for job-agent
+  env.J41_API_URL = J41_API_URL;
+  env.J41_AGENT_ID = agentInfo.id;
+  env.J41_IDENTITY = agentInfo.identity;
+  env.J41_JOB_ID = job.id;
+  env.JOB_TIMEOUT_MS = String(JOB_TIMEOUT_MS);
+  env.J41_KEYS_FILE = keysPath;
+  env.J41_SOUL_FILE = path.join(agentDir, 'SOUL.md');
+  env.J41_JOB_DIR = jobDir;
+
+  // Optional LLM config — only pass through if set in parent
+  const OPTIONAL_PASSTHROUGH = [
+    'KIMI_API_KEY', 'KIMI_BASE_URL', 'KIMI_MODEL',
+    'IDLE_TIMEOUT_MS', 'J41_MCP_COMMAND', 'J41_MCP_URL',
+    'J41_EXECUTOR_AUTH', 'J41_EXECUTOR_TIMEOUT', 'J41_MCP_MAX_ROUNDS',
+    'J41_EXECUTOR', 'MAX_CONVERSATION_LOG',
+  ];
+  for (const key of OPTIONAL_PASSTHROUGH) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+
+  // Per-agent executor env vars (from agent-config.json)
   const executorVars = getExecutorEnvVars(agentInfo);
   executorVars.forEach(v => {
     const [key, ...rest] = v.split('=');

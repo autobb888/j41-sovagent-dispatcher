@@ -251,6 +251,18 @@ class MCPExecutor extends Executor {
   // ─── MCP Stdio Transport ───
 
   async _connectStdio() {
+    if (!MCP_COMMAND) throw new Error('J41_MCP_COMMAND is not set');
+
+    // Validate command: must be a non-empty string, must not contain shell metacharacters
+    // and must start with a known-safe path prefix or binary name.
+    const SAFE_COMMAND_PATTERN = /^(node|npx|python3?|\/usr\/|\/opt\/|\.\/|\/home\/)[^\0;&|`$<>]*$/;
+    if (!SAFE_COMMAND_PATTERN.test(MCP_COMMAND.trim())) {
+      throw new Error(
+        `J41_MCP_COMMAND validation failed: "${MCP_COMMAND.substring(0, 80)}" does not match allowed pattern. ` +
+        'Command must start with node, npx, python, or an absolute path.'
+      );
+    }
+
     const parts = MCP_COMMAND.split(/\s+/);
     const cmd = parts[0];
     const args = parts.slice(1);

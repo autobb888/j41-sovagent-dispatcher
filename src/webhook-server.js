@@ -38,7 +38,13 @@ function startWebhookServer(port, agentWebhooks, onEvent) {
     // Extract agent ID from URL path
     const urlParts = req.url.split('/');
     const agentId = urlParts[2]; // /webhook/:agentId
-    if (!agentId || !agentWebhooks.has(agentId)) {
+    // M10: Validate format — must match expected agent ID pattern
+    if (!agentId || !/^agent-[1-9][0-9]*$/.test(agentId)) {
+      res.writeHead(400);
+      res.end('Invalid agent ID');
+      return;
+    }
+    if (!agentWebhooks.has(agentId)) {
       res.writeHead(404);
       res.end('Unknown agent');
       return;

@@ -55,7 +55,6 @@ let _agent = null;
 let _executor = null;
 let _workspaceConnected = false;
 let _workspaceTools = [];
-let _workspaceIpcRegistered = false;
 let _workspaceStats = null;
 let _workspaceMode = 'supervised';
 
@@ -106,6 +105,19 @@ async function main() {
     soulPrompt = fs.readFileSync(SOUL_FILE, 'utf8').trim();
   } catch {
     soulPrompt = 'You are a helpful AI agent on the Junction41.';
+  }
+
+  // M13: Validate required job files before constructing the job object
+  const REQUIRED_JOB_FILES = ['description.txt', 'buyer.txt', 'amount.txt', 'currency.txt'];
+  for (const filename of REQUIRED_JOB_FILES) {
+    const fp = path.join(JOB_DIR, filename);
+    if (!fs.existsSync(fp)) {
+      throw new Error(`Required job file missing: ${fp}`);
+    }
+    const content = fs.readFileSync(fp, 'utf8').trim();
+    if (!content) {
+      throw new Error(`Required job file is empty: ${fp}`);
+    }
   }
 
   // Load job data with input validation (P2-1)
@@ -209,15 +221,22 @@ async function main() {
   const executor = createExecutor();
   _executor = executor;
 
-  // Workspace IPC handler — registered AFTER executor is assigned (fixes race condition)
-  if (process.send && !_workspaceIpcRegistered) {
-    _workspaceIpcRegistered = true;
+  // H6: Single consolidated IPC handler — replaces two separate listeners
+  const ipcQueue = [];
+  if (process.send) {
     process.on('message', async (msg) => {
-      if (msg.type === 'workspace_ready') {
-        await connectWorkspace(msg.jobId, msg.permissions, msg.mode);
-      }
-      if (msg.type === 'workspace_closed') {
-        disconnectWorkspace();
+      if (!msg || !msg.type) return;
+      switch (msg.type) {
+        case 'workspace_ready':
+          await connectWorkspace(msg.jobId, msg.permissions, msg.mode);
+          break;
+        case 'workspace_closed':
+          disconnectWorkspace();
+          break;
+        default:
+          // Queue for post-delivery handler
+          ipcQueue.push(msg);
+          break;
       }
     });
   }
@@ -230,16 +249,6 @@ async function main() {
     console.error('\n❌ Job failed:', e.message);
     await executor.cleanup().catch(() => {});
     result = { error: e.message, content: 'Job failed: ' + e.message };
-  }
-
-  // Register IPC listener early to avoid race condition
-  const ipcQueue = [];
-  if (process.send) {
-    process.on('message', (msg) => {
-      // Skip workspace IPC — handled by the workspace listener above
-      if (msg.type === 'workspace_ready' || msg.type === 'workspace_closed') return;
-      ipcQueue.push(msg);
-    });
   }
 
   // ─────────────────────────────────────────
@@ -397,7 +406,7 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
       console.log(`[CHAT] Idle for ${Math.round(idleMs / 1000)}s — auto-delivering`);
       agent.sendChatMessage(job.id, 'Session idle — delivering results. Thank you!');
       sessionEnded = true;
-      resolveSession();
+      resolveSession('idle-timeout');
     }
   }, 10000);
 
@@ -472,6 +481,14 @@ function disconnectWorkspace() {
 
 async function handleWorkspaceToolCall(toolName, args) {
   if (!_workspaceConnected) return 'Workspace is not connected';
+
+  // M11: Validate path arg for write operations (defense in depth — SDK also validates)
+  if (args.path) {
+    if (args.path.startsWith('/') || args.path.split(/[\\/]/).includes('..')) {
+      return `Workspace error: invalid path "${args.path}" — must be relative with no ".." segments`;
+    }
+  }
+
   try {
     switch (toolName) {
       case 'workspace_list_directory':
@@ -529,15 +546,16 @@ setTimeout(async () => {
     const attestTimestamp = Math.floor(Date.now() / 1000);
 
     // Try to use the platform's canonical attestation flow (J4)
+    // M14 fix: reuse existing _agent if available
     try {
-      const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
-      const agent = new J41Agent({
-        apiUrl: API_URL,
-        wif: keys.wif,
-        identityName: IDENTITY,
-        iAddress: keys.iAddress,
-      });
-      await agent.authenticate();
+      const agent = _agent || (() => {
+        const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
+        const a = new J41Agent({ apiUrl: API_URL, wif: keys.wif, identityName: IDENTITY, iAddress: keys.iAddress });
+        return a;
+      })();
+
+      // If using existing agent, skip re-authenticate (already authed)
+      if (!_agent) await agent.authenticate();
       const { message: attestMessage } = await agent.client.getDeletionAttestationMessage(JOB_ID, attestTimestamp);
       const { signMessage: signMsg } = require('@j41/sovagent-sdk/dist/identity/signer.js');
       const attestSig = signMsg(keys.wif, attestMessage, 'verustest');
