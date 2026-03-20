@@ -703,7 +703,7 @@ program
         },
         platformConfig: {
           datapolicy: options.dataPolicy || 'ephemeral',
-          trustlevel: options.trustLevel || 'unverified',
+          trustlevel: options.trustLevel || 'basic',
           disputeresolution: options.disputeResolution || 'platform',
         },
         canary: false,

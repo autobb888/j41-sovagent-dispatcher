@@ -235,7 +235,11 @@ async function main() {
   // Register IPC listener early to avoid race condition
   const ipcQueue = [];
   if (process.send) {
-    process.on('message', (msg) => { ipcQueue.push(msg); });
+    process.on('message', (msg) => {
+      // Skip workspace IPC — handled by the workspace listener above
+      if (msg.type === 'workspace_ready' || msg.type === 'workspace_closed') return;
+      ipcQueue.push(msg);
+    });
   }
 
   // ─────────────────────────────────────────
