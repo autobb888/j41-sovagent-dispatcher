@@ -156,16 +156,22 @@ function buildFullProfile(options) {
     type: options.profileType || 'autonomous',
     description: options.profileDescription,
     owner: options.profileOwner,
-    category: options.profileCategory,
-    tags: options.profileTags,
-    website: options.profileWebsite,
-    avatar: options.profileAvatar,
-    capabilities: options.profileCapabilities,
-    endpoints: options.profileEndpoints,
-    protocols: options.profileProtocols,
-    datapolicy: options.dataPolicy,
-    trustlevel: options.trustLevel,
-    disputeresolution: options.disputeResolution,
+    network: {
+      capabilities: options.profileCapabilities || [],
+      endpoints: options.profileEndpoints || [],
+      protocols: options.profileProtocols || [],
+    },
+    profile: {
+      category: options.profileCategory,
+      tags: options.profileTags,
+      website: options.profileWebsite,
+      avatar: options.profileAvatar,
+    },
+    platformConfig: {
+      datapolicy: options.dataPolicy,
+      trustlevel: options.trustLevel,
+      disputeresolution: options.disputeResolution,
+    },
   };
 
   // Session limits
@@ -365,22 +371,33 @@ function createFinalizeHooks(agentId, identityName, profile, services = []) {
 
       const fields = profile
         ? {
-            version: '1',
+            displayName: profile.name,
             type: profile.type,
-            name: profile.name,
             description: profile.description,
             status: 'active',
-            services: services.map((svc) => ({
+            services: JSON.stringify(services.map((svc) => ({
               name: svc.name,
               description: svc.description,
               category: svc.category,
-              price: svc.price,
-              currency: svc.currency,
+              pricing: [{ currency: svc.currency, amount: String(svc.price) }],
               turnaround: svc.turnaround,
               status: 'active',
-            })),
+              resolutionWindow: svc.resolutionWindow,
+              refundPolicy: svc.refundPolicy,
+            }))),
+            network: JSON.stringify({
+              capabilities: profile.network?.capabilities || [],
+              endpoints: profile.network?.endpoints || [],
+              protocols: profile.network?.protocols || [],
+            }),
+            profile: JSON.stringify({
+              tags: profile.profile?.tags || [],
+              website: profile.profile?.website,
+              avatar: profile.profile?.avatar,
+              category: profile.profile?.category,
+            }),
           }
-        : { services: [] };
+        : { services: '[]' };
 
       const payload = buildCanonicalAgentUpdate({
         fullName: identityName,
@@ -673,21 +690,25 @@ program
         name: options.profileName || defaultName,
         type: options.profileType || 'autonomous',
         description: options.profileDescription || defaultDesc,
-        category: options.profileCategory || 'ai-assistant',
-        tags: options.profileTags || ['dispatcher', 'worker', 'autonomous'],
-        protocols: options.profileProtocols || ['MCP'],
-        datapolicy: options.dataPolicy || 'ephemeral',
-        trustlevel: options.trustLevel || 'unverified',
-        disputeresolution: options.disputeResolution || 'platform',
+        network: {
+          capabilities: options.profileCapabilities || [],
+          endpoints: options.profileEndpoints || [],
+          protocols: options.profileProtocols || ['MCP'],
+        },
+        profile: {
+          category: options.profileCategory || 'ai-assistant',
+          tags: options.profileTags || ['dispatcher', 'worker', 'autonomous'],
+          website: options.profileWebsite || undefined,
+          avatar: options.profileAvatar || undefined,
+        },
+        platformConfig: {
+          datapolicy: options.dataPolicy || 'ephemeral',
+          trustlevel: options.trustLevel || 'unverified',
+          disputeresolution: options.disputeResolution || 'platform',
+        },
         canary: false,
       };
-
-      // Add optional fields from CLI flags
       if (options.profileOwner) profileData.owner = options.profileOwner;
-      if (options.profileWebsite) profileData.website = options.profileWebsite;
-      if (options.profileAvatar) profileData.avatar = options.profileAvatar;
-      if (options.profileCapabilities) profileData.capabilities = options.profileCapabilities;
-      if (options.profileEndpoints) profileData.endpoints = options.profileEndpoints;
 
       console.log(`\n→ Registering agent profile on J41 platform...`);
       try {
@@ -1413,6 +1434,15 @@ program
         const p = result.chain.decodedProfile;
         console.log(`  VDXF profile: ${p.name || '?'} (${p.type || '?'})`);
         if (p.description) console.log(`                ${p.description.substring(0, 80)}${p.description.length > 80 ? '...' : ''}`);
+        if (p.network) {
+          console.log(`  Network:      ${JSON.stringify(p.network)}`);
+        }
+        if (p.profile) {
+          console.log(`  Profile:      ${JSON.stringify(p.profile)}`);
+        }
+        if (p.platformConfig) {
+          console.log(`  Platform:     ${JSON.stringify(p.platformConfig)}`);
+        }
       }
       if (result.chain.decodedServices && result.chain.decodedServices.length) {
         console.log(`  VDXF services: ${result.chain.decodedServices.length}`);
@@ -1603,19 +1633,25 @@ program
       name: options.profileName || identityName,
       type: options.profileType || 'autonomous',
       description: options.profileDescription || 'J41 dispatcher worker agent.',
-      category: options.profileCategory || 'ai-assistant',
-      tags: options.profileTags || ['dispatcher', 'worker'],
-      protocols: options.profileProtocols || ['MCP'],
-      datapolicy: options.dataPolicy || 'ephemeral',
-      trustlevel: options.trustLevel || 'basic',
-      disputeresolution: options.disputeResolution || 'platform',
+      network: {
+        capabilities: options.profileCapabilities || [],
+        endpoints: options.profileEndpoints || [],
+        protocols: options.profileProtocols || ['MCP'],
+      },
+      profile: {
+        category: options.profileCategory || 'ai-assistant',
+        tags: options.profileTags || ['dispatcher', 'worker'],
+        website: options.profileWebsite || undefined,
+        avatar: options.profileAvatar || undefined,
+      },
+      platformConfig: {
+        datapolicy: options.dataPolicy || 'ephemeral',
+        trustlevel: options.trustLevel || 'basic',
+        disputeresolution: options.disputeResolution || 'platform',
+      },
       canary: false,
     };
     if (options.profileOwner) profileData.owner = options.profileOwner;
-    if (options.profileWebsite) profileData.website = options.profileWebsite;
-    if (options.profileAvatar) profileData.avatar = options.profileAvatar;
-    if (options.profileCapabilities) profileData.capabilities = options.profileCapabilities;
-    if (options.profileEndpoints) profileData.endpoints = options.profileEndpoints;
 
     try {
       const regResult = await profileAgent.registerWithJ41(profileData);

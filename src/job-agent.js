@@ -673,14 +673,63 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult) {
     console.log('⚠️  Could not submit attestation:', e.message);
   }
 
-  // Identity update on-chain (includes dispute outcome if applicable)
+  // On-chain identity update: job.record + review.record
   try {
-    console.log('→ Updating on-chain identity...');
+    console.log('→ Updating on-chain identity (job completion)...');
+
+    const { buildJobCompletionAdditions } = require('@j41/sovagent-sdk/dist/onboarding/vdxf.js');
+    const { buildIdentityUpdateTx } = require('@j41/sovagent-sdk/dist/identity/update.js');
+
+    const jobRecord = {
+      jobHash: fullJob.jobHash,
+      buyer: fullJob.buyerVerusId,
+      description: (fullJob.description || '').substring(0, 200),
+      amount: fullJob.amount,
+      currency: fullJob.currency,
+      completedAt: Math.floor(Date.now() / 1000),
+      completionSignature: fullJob.signatures?.completion || '',
+      paymentTxid: fullJob.payment?.txid || '',
+      hasWorkspace: false,
+      hasReview: !!fullJob.review,
+    };
+
+    let reviewRecord = undefined;
+    if (fullJob.review) {
+      reviewRecord = {
+        buyer: fullJob.buyerVerusId,
+        jobHash: fullJob.jobHash,
+        message: fullJob.review.message || '',
+        rating: fullJob.review.rating || 0,
+        signature: fullJob.review.signature || '',
+        timestamp: Math.floor(Date.now() / 1000),
+      };
+    }
+
     if (postDeliveryResult.disputeOutcome) {
       console.log(`  Dispute outcome: ${postDeliveryResult.disputeOutcome.action}`);
     }
-    // The actual updateidentity call happens via acceptReview
-    // when a review is submitted after dispute resolution.
+
+    const additions = buildJobCompletionAdditions({ jobRecord, reviewRecord });
+
+    // Read identity + UTXOs, build and broadcast signed tx
+    const identityRawResp = await agent.client.getIdentityRaw();
+    const identityData = identityRawResp.data || identityRawResp;
+    const utxoResp = await agent.client.getUtxos();
+    const utxos = utxoResp.utxos || utxoResp;
+
+    if (utxos.length > 0) {
+      const rawhex = buildIdentityUpdateTx({
+        wif: keys.wif,
+        identityData,
+        utxos,
+        vdxfAdditions: additions,
+        network: 'verustest',
+      });
+      const txResult = await agent.client.broadcast(rawhex);
+      console.log(`✅ On-chain identity updated: ${txResult.txid || txResult}`);
+    } else {
+      console.log('⚠️  No UTXOs available — skipping on-chain update');
+    }
   } catch (e) {
     console.log('⚠️  Identity update error:', e.message);
   }
