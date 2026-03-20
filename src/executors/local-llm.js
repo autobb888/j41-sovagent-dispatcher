@@ -11,6 +11,7 @@ const KIMI_API_KEY = process.env.KIMI_API_KEY || '';
 const KIMI_BASE_URL = process.env.KIMI_BASE_URL || 'https://api.kimi.com/coding/v1';
 const KIMI_MODEL = process.env.KIMI_MODEL || 'kimi-k2.5';
 const MAX_CONVERSATION_LOG = parseInt(process.env.MAX_CONVERSATION_LOG || '50');
+const MAX_TOOL_ROUNDS = parseInt(process.env.J41_MAX_TOOL_ROUNDS || '10');
 
 class LocalLLMExecutor extends Executor {
   constructor() {
@@ -20,6 +21,8 @@ class LocalLLMExecutor extends Executor {
     this.job = null;
     this.soulPrompt = '';
     this.llmBusy = false;
+    this.workspaceTools = [];
+    this.workspaceHandler = null;
   }
 
   async init(job, agent, soulPrompt) {
@@ -48,13 +51,11 @@ class LocalLLMExecutor extends Executor {
   async handleMessage(message, meta) {
     this.conversationLog.push({ role: 'user', content: message });
 
-    // Cap conversation log (J3)
     if (this.conversationLog.length > MAX_CONVERSATION_LOG) {
       const first = this.conversationLog[0];
       this.conversationLog.splice(0, this.conversationLog.length - MAX_CONVERSATION_LOG + 1, first);
     }
 
-    // J6: Serialize LLM calls
     if (KIMI_API_KEY && this.llmBusy) {
       console.log(`[CHAT] LLM busy, queuing acknowledgment`);
       return 'I received your message — one moment while I finish my current thought.';
@@ -64,7 +65,11 @@ class LocalLLMExecutor extends Executor {
     if (KIMI_API_KEY) {
       this.llmBusy = true;
       try {
-        response = await callLLM(this.systemPrompt, this.conversationLog);
+        if (this.workspaceTools.length > 0 && this.workspaceHandler) {
+          response = await this._agentLoop();
+        } else {
+          response = await callLLM(this.systemPrompt, this.conversationLog);
+        }
       } finally {
         this.llmBusy = false;
       }
@@ -82,6 +87,58 @@ class LocalLLMExecutor extends Executor {
       .join('\n\n');
     const hash = crypto.createHash('sha256').update(fullContent).digest('hex');
     return { content: fullContent, hash };
+  }
+
+  setWorkspaceTools(tools, handler) {
+    this.workspaceTools = tools;
+    this.workspaceHandler = handler;
+    if (tools.length > 0 && this.job) {
+      this.systemPrompt += '\n\nYou have access to the buyer\'s project files via workspace tools. Use them when the buyer asks you to read, write, or explore their code. Available tools: workspace_list_directory, workspace_read_file, workspace_write_file.';
+    }
+  }
+
+  clearWorkspaceTools() {
+    this.workspaceTools = [];
+    this.workspaceHandler = null;
+  }
+
+  async _agentLoop() {
+    const messages = [...this.conversationLog];
+
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      const llmResponse = await callLLMWithTools(this.systemPrompt, messages, this.workspaceTools);
+
+      if (!llmResponse.tool_calls || llmResponse.tool_calls.length === 0) {
+        return llmResponse.content || 'I could not generate a response.';
+      }
+
+      messages.push({
+        role: 'assistant',
+        content: llmResponse.content || null,
+        tool_calls: llmResponse.tool_calls,
+      });
+
+      for (const toolCall of llmResponse.tool_calls) {
+        const toolName = toolCall.function.name;
+        let args;
+        try {
+          args = JSON.parse(toolCall.function.arguments);
+        } catch {
+          args = {};
+        }
+
+        console.log(`[WORKSPACE] Tool call: ${toolName}`);
+        const toolResult = await this.workspaceHandler(toolName, args);
+
+        messages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
+        });
+      }
+    }
+
+    return 'I reached the maximum number of tool-calling rounds. Please try rephrasing your request.';
   }
 }
 
@@ -129,6 +186,61 @@ async function callLLM(systemPrompt, messages) {
   } catch (e) {
     console.error(`[LLM] Kimi call failed: ${e.message}`);
     return 'I experienced a temporary issue. Please try sending your message again.';
+  }
+}
+
+async function callLLMWithTools(systemPrompt, messages, tools) {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 60000);
+
+    const apiMessages = [
+      { role: 'system', content: systemPrompt },
+      ...messages.map(m => {
+        if (m.role === 'tool') {
+          return { role: 'tool', tool_call_id: m.tool_call_id, content: m.content };
+        }
+        if (m.tool_calls) {
+          return { role: 'assistant', content: m.content || null, tool_calls: m.tool_calls };
+        }
+        return { role: m.role, content: m.content };
+      }),
+    ];
+
+    const body = {
+      model: KIMI_MODEL,
+      messages: apiMessages,
+      temperature: 0.6,
+      max_tokens: 8192,
+    };
+    if (tools.length > 0) {
+      body.tools = tools;
+    }
+
+    const res = await fetch(`${KIMI_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${KIMI_API_KEY}`,
+        'User-Agent': 'j41-agent/1.0',
+      },
+      signal: controller.signal,
+      body: JSON.stringify(body),
+    });
+
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      const err = await res.text();
+      console.error(`[LLM] Kimi API error ${res.status}: ${err.substring(0, 200)}`);
+      return { content: 'I encountered an issue processing your request. Please try again.' };
+    }
+
+    const data = await res.json();
+    return data.choices?.[0]?.message || { content: 'No response generated.' };
+  } catch (e) {
+    console.error(`[LLM] Kimi call failed: ${e.message}`);
+    return { content: 'I experienced a temporary issue. Please try again.' };
   }
 }
 

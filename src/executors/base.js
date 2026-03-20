@@ -40,6 +40,23 @@ class Executor {
   async cleanup() {
     // Default: no-op
   }
+
+  /**
+   * Inject workspace tools into the executor.
+   * Called when workspace connects. Override in executors that support tool calling.
+   * @param {Array} tools - Tool definitions in OpenAI function-calling format
+   * @param {Function} handler - async (toolName, args) => result string
+   */
+  setWorkspaceTools(tools, handler) {
+    // Default: no-op (executor doesn't support tools)
+  }
+
+  /**
+   * Remove workspace tools. Called when workspace disconnects.
+   */
+  clearWorkspaceTools() {
+    // Default: no-op
+  }
 }
 
 module.exports = { Executor };

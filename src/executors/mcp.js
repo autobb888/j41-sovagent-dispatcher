@@ -42,6 +42,8 @@ class MCPExecutor extends Executor {
     this._rpcId = 0;
     this._pending = new Map();
     this._buffer = '';
+    this.workspaceToolNames = new Set();
+    this.workspaceHandler = null;
   }
 
   async init(job, agent, soulPrompt) {
@@ -128,6 +130,22 @@ class MCPExecutor extends Executor {
     }
   }
 
+  setWorkspaceTools(tools, handler) {
+    this.workspaceHandler = handler;
+    for (const tool of tools) {
+      this.workspaceToolNames.add(tool.function.name);
+      this.openaiTools.push(tool);
+    }
+    console.log(`[MCP] Workspace tools injected: ${tools.map(t => t.function.name).join(', ')}`);
+  }
+
+  clearWorkspaceTools() {
+    this.openaiTools = this.openaiTools.filter(t => !this.workspaceToolNames.has(t.function.name));
+    this.workspaceToolNames.clear();
+    this.workspaceHandler = null;
+    console.log(`[MCP] Workspace tools removed`);
+  }
+
   // Agent loop: LLM decides tools → execute via MCP → feed results back → repeat
   async _agentLoop() {
     const messages = [
@@ -163,10 +181,14 @@ class MCPExecutor extends Executor {
         console.log(`[MCP] Calling tool: ${toolName}`);
         let toolResult;
         try {
-          const result = await this._rpc('tools/call', { name: toolName, arguments: args });
-          toolResult = result.content
-            ?.map(c => c.type === 'text' ? c.text : JSON.stringify(c))
-            ?.join('\n') || JSON.stringify(result);
+          if (this.workspaceToolNames.has(toolName) && this.workspaceHandler) {
+            toolResult = await this.workspaceHandler(toolName, args);
+          } else {
+            const result = await this._rpc('tools/call', { name: toolName, arguments: args });
+            toolResult = result.content
+              ?.map(c => c.type === 'text' ? c.text : JSON.stringify(c))
+              ?.join('\n') || JSON.stringify(result);
+          }
         } catch (e) {
           toolResult = `Error: ${e.message}`;
           console.error(`[MCP] Tool ${toolName} failed: ${e.message}`);
