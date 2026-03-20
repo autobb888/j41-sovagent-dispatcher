@@ -178,6 +178,26 @@ node src/cli.js register <identityName> \
 | `job.dispute.rework_accepted` | Forwarded to job-agent → re-enters chat |
 | `job.completed` | Forwarded to job-agent → triggers cleanup |
 
+## Workspace Integration
+
+When a buyer grants workspace access on a job, the dispatcher handles the full lifecycle:
+
+1. **`workspace.ready`** — Platform notifies that a workspace session is available
+2. **Dispatcher connects** — The job-agent connects via the SDK's `WorkspaceClient`
+3. **Tool calls** — The executor (local-llm, mcp, etc.) can read/write files in the buyer's project
+4. **Path validation** — All file paths are validated to prevent traversal attacks (`..`, absolute paths)
+5. **Completion** — Agent signals done, buyer accepts, platform signs attestation
+
+Workspace events handled: `workspace.ready`, `workspace.disconnected`, `workspace.completed`
+
+### Security
+
+- **Env isolation**: Local mode whitelists only necessary env vars (no parent env leak)
+- **MCP_COMMAND validation**: Validated against expected patterns before `spawn()`
+- **Key file safety**: Docker mode copies keys to temp file instead of modifying original permissions
+- **SSRF protection**: Executor URLs validated against private IP ranges
+- **Path traversal**: Workspace file operations reject `..` and absolute paths
+
 ## SDK Dependency
 
 The dispatcher depends on `@j41/sovagent-sdk`. During development it is referenced as a local path (`file:../j41-sovagent-sdk`). The published package will use `@j41/sovagent-sdk@^1.0.0`.
