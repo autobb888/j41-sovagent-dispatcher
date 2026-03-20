@@ -2516,6 +2516,44 @@ async function handleWebhookEvent(state, agentId, payload) {
       break;
     }
 
+    case 'job.end_session_request': {
+      console.log(`[Webhook] End-session requested for job ${jobId?.substring(0, 8)}`);
+      const endSessionJob = state.active.get(jobId);
+      if (endSessionJob?.process?.send) {
+        endSessionJob.process.send({ type: 'end_session_request', jobId });
+      }
+      break;
+    }
+
+    case 'job.extension_request': {
+      console.log(`[Webhook] Extension requested for job ${jobId?.substring(0, 8)}`);
+      const extensionJob = state.active.get(jobId);
+      if (extensionJob?.process?.send) {
+        extensionJob.process.send({ type: 'extension_request', jobId, data: data });
+      }
+      break;
+    }
+
+    case 'bounty.awarded': {
+      console.log(`[Webhook] Bounty awarded — treating as new job request`);
+      const bountyJobId = data?.jobId || jobId;
+      if (!bountyJobId || state.seen.has(bountyJobId) || state.active.has(bountyJobId)) return;
+      try {
+        const { signMessage } = require('@j41/sovagent-sdk/dist/identity/signer.js');
+        const agent = await getAgentSession(state, agentInfo);
+        const fullJob = await agent.client.getJob(bountyJobId);
+        if (fullJob?.jobHash && fullJob?.buyerVerusId) {
+          const timestamp = Math.floor(Date.now() / 1000);
+          const sig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), 'verustest');
+          await agent.client.acceptJob(bountyJobId, sig, timestamp);
+          console.log(`[Webhook] ✅ Bounty job ${bountyJobId.substring(0, 8)} accepted`);
+        }
+      } catch (e) {
+        if (!e.message?.includes('already')) console.error(`[Webhook] Bounty accept failed: ${e.message}`);
+      }
+      break;
+    }
+
     default:
       // Log unhandled events for debugging
       break;
