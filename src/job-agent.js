@@ -55,6 +55,9 @@ let _agent = null;
 let _executor = null;
 let _workspaceConnected = false;
 let _workspaceTools = [];
+let _workspaceIpcRegistered = false;
+let _workspaceStats = null;
+let _workspaceMode = 'supervised';
 
 async function main() {
   // Check for required environment variables
@@ -203,8 +206,12 @@ async function main() {
   // ─────────────────────────────────────────
   console.log(`→ Starting chat session (executor: ${EXECUTOR_TYPE})...\n`);
 
-  // Workspace IPC handler — receives workspace_ready/workspace_closed from dispatcher
-  if (process.send) {
+  const executor = createExecutor();
+  _executor = executor;
+
+  // Workspace IPC handler — registered AFTER executor is assigned (fixes race condition)
+  if (process.send && !_workspaceIpcRegistered) {
+    _workspaceIpcRegistered = true;
     process.on('message', async (msg) => {
       if (msg.type === 'workspace_ready') {
         await connectWorkspace(msg.jobId, msg.permissions, msg.mode);
@@ -215,8 +222,6 @@ async function main() {
     });
   }
 
-  const executor = createExecutor();
-  _executor = executor;
   let result;
   try {
     result = await processJob(job, agent, soulPrompt, executor, (resolve) => { sessionEndResolve = resolve; });
@@ -248,6 +253,12 @@ async function main() {
     { maxAttempts: 5, baseDelayMs: 2000 }
   );
   console.log('✅ Job delivered\n');
+
+  // Signal workspace done to buyer
+  if (_workspaceConnected) {
+    _agent.workspace.signalDone();
+    console.log('[WORKSPACE] Signaled done to buyer');
+  }
 
   // Wait for chat to flush
   await new Promise(r => setTimeout(r, 3000));
@@ -396,12 +407,19 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
 
 async function connectWorkspace(jobId, permissions, mode) {
   if (_workspaceConnected) return;
+  _workspaceMode = mode || 'supervised';
   try {
-    console.log(`[WORKSPACE] Connecting for job ${jobId?.substring(0, 8)} (mode=${mode})...`);
+    console.log(`[WORKSPACE] Connecting for job ${jobId?.substring(0, 8)} (mode=${_workspaceMode})...`);
     await _agent.workspace.connect(jobId);
     _workspaceConnected = true;
     _workspaceTools = _agent.workspace.getAvailableTools();
-    _agent.sendChatMessage(jobId, 'I now have access to your project files via workspace. Starting work.');
+
+    // Inject workspace tools into executor
+    if (_executor && typeof _executor.setWorkspaceTools === 'function') {
+      _executor.setWorkspaceTools(_workspaceTools, handleWorkspaceToolCall);
+    }
+
+    _agent.sendChatMessage(jobId, 'I now have access to your project files. Let me know what you need.');
     _agent.workspace.onStatusChanged((status, data) => {
       console.log(`[WORKSPACE] Status changed: ${status}`);
       if (status === 'aborted' || status === 'completed') {
@@ -412,6 +430,9 @@ async function connectWorkspace(jobId, permissions, mode) {
       console.warn(`[WORKSPACE] Disconnected: ${reason}`);
       _workspaceConnected = false;
       _workspaceTools = [];
+      if (_executor && typeof _executor.clearWorkspaceTools === 'function') {
+        _executor.clearWorkspaceTools();
+      }
     });
     console.log(`[WORKSPACE] Connected — ${_workspaceTools.length} tool(s) available`);
   } catch (err) {
@@ -422,8 +443,25 @@ async function connectWorkspace(jobId, permissions, mode) {
 
 function disconnectWorkspace() {
   if (!_workspaceConnected) return;
+
+  // Accumulate stats across sessions (for rework cycles)
+  try {
+    const sessionStats = _agent.workspace.getStats();
+    if (_workspaceStats) {
+      _workspaceStats.filesRead += sessionStats.filesRead;
+      _workspaceStats.filesWritten += sessionStats.filesWritten;
+      _workspaceStats.listDirectoryCalls += sessionStats.listDirectoryCalls;
+      _workspaceStats.duration += sessionStats.duration;
+    } else {
+      _workspaceStats = { ...sessionStats };
+    }
+  } catch {}
+
   _workspaceConnected = false;
   _workspaceTools = [];
+  if (_executor && typeof _executor.clearWorkspaceTools === 'function') {
+    _executor.clearWorkspaceTools();
+  }
   try { _agent.workspace.disconnect(); } catch {}
   console.log('[WORKSPACE] Disconnected');
 }
@@ -689,7 +727,7 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult) {
       completedAt: Math.floor(Date.now() / 1000),
       completionSignature: fullJob.signatures?.completion || '',
       paymentTxid: fullJob.payment?.txid || '',
-      hasWorkspace: false,
+      hasWorkspace: !!_workspaceStats,
       hasReview: !!fullJob.review,
     };
 
@@ -705,11 +743,26 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult) {
       };
     }
 
+    // Build workspace attestation if workspace was used
+    let workspaceAttestation = undefined;
+    if (_workspaceStats) {
+      workspaceAttestation = {
+        jobId: JOB_ID,
+        buyer: fullJob.buyerVerusId,
+        duration: _workspaceStats.duration,
+        filesRead: _workspaceStats.filesRead,
+        filesWritten: _workspaceStats.filesWritten,
+        sovguardFlags: 0,
+        completedClean: true,
+        mode: _workspaceMode,
+      };
+    }
+
     if (postDeliveryResult.disputeOutcome) {
       console.log(`  Dispute outcome: ${postDeliveryResult.disputeOutcome.action}`);
     }
 
-    const additions = buildJobCompletionAdditions({ jobRecord, reviewRecord });
+    const additions = buildJobCompletionAdditions({ jobRecord, reviewRecord, workspaceAttestation });
 
     // Read identity + UTXOs, build and broadcast signed tx
     const identityRawResp = await agent.client.getIdentityRaw();

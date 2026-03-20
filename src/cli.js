@@ -2259,6 +2259,31 @@ async function pollForJobs(state) {
     }
   }
 
+  // Check workspace status for active jobs (poll mode only — webhook mode uses events)
+  for (const [activeJobId, activeInfo] of state.active) {
+    if (activeInfo.workspaceNotified || activeInfo.workspaceChecked) continue;
+    if (!activeInfo.process?.send) continue;
+    try {
+      const agentSession = await getAgentSession(state, activeInfo.agentInfo);
+      const wsStatus = await agentSession.client.getWorkspaceStatus(activeJobId);
+      if (wsStatus?.status === 'active') {
+        activeInfo.process.send({
+          type: 'workspace_ready',
+          jobId: activeJobId,
+          sessionId: wsStatus.sessionId || '',
+          permissions: wsStatus.permissions || { read: true, write: true },
+          mode: wsStatus.mode || 'supervised',
+        });
+        activeInfo.workspaceNotified = true;
+        console.log(`[Poll] Workspace active — notified job-agent ${activeJobId.substring(0, 8)}`);
+      } else if (!wsStatus || wsStatus.status === 'none') {
+        activeInfo.workspaceChecked = true;
+      }
+    } catch {
+      activeInfo.workspaceChecked = true;
+    }
+  }
+
   // Process queue if slots available (D3: re-queue on failure instead of dropping)
   while (state.queue.length > 0 && state.active.size < MAX_AGENTS && state.available.length > 0) {
     const queuedJob = state.queue.shift();
@@ -2619,6 +2644,8 @@ async function startJobContainer(state, job, agentInfo) {
       container,
       startedAt: Date.now(),
       agentInfo,
+      workspaceNotified: false,
+      workspaceChecked: false,
     });
 
     // Mark as seen immediately to avoid duplicate pickup loops while status remains requested
@@ -2789,6 +2816,8 @@ async function startJobLocal(state, job, agentInfo) {
       pid: child.pid,
       startedAt: Date.now(),
       agentInfo,
+      workspaceNotified: false,
+      workspaceChecked: false,
     });
 
     state.seen.set(job.id, Date.now());
