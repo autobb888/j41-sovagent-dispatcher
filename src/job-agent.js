@@ -53,6 +53,7 @@ async function withRetry(fn, label, { maxAttempts = 3, baseDelayMs = 1000 } = {}
 // Track agent+executor globally for SIGTERM cleanup
 let _agent = null;
 let _executor = null;
+let _postDeliveryHandler = null;
 let _workspaceConnected = false;
 let _workspaceTools = [];
 let _workspaceStats = null;
@@ -232,6 +233,14 @@ async function main() {
           break;
         case 'workspace_closed':
           disconnectWorkspace();
+          break;
+        case 'end_session_request':
+          console.log(`[IPC] end_session_request received for job ${msg.jobId}`);
+          if (sessionEndResolve) sessionEndResolve('end-session-request');
+          break;
+        case 'extension_request':
+          console.log(`[IPC] extension_request received for job ${msg.jobId}`);
+          ipcQueue.push(msg);
           break;
         default:
           // Queue for post-delivery handler
@@ -696,7 +705,9 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
     }
     ipcQueue.length = 0;
 
-    // Listen for future IPC messages
+    // Listen for future IPC messages (remove previous listener to prevent stacking)
+    if (_postDeliveryHandler) process.removeListener('message', _postDeliveryHandler);
+    _postDeliveryHandler = handleMessage;
     process.on('message', handleMessage);
   });
 }

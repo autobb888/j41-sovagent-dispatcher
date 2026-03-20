@@ -65,6 +65,8 @@ function validateExecutorUrl(url, varName) {
     /^169\.254\.\d+\.\d+$/,   // link-local
     /^fc00::/i,               // IPv6 ULA
     /^fe80::/i,               // IPv6 link-local
+    /^::1$/,                  // IPv6 loopback
+    /^0\.0\.0\.0$/,           // unspecified / wildcard
   ];
   if (PRIVATE_PATTERNS.some(p => p.test(parsed.hostname))) {
     throw new Error(`${varName}: private/internal IP address rejected for "${url}" (SSRF protection)`);
@@ -2547,6 +2549,7 @@ async function handleWebhookEvent(state, agentId, payload) {
           const sig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), 'verustest');
           await agent.client.acceptJob(bountyJobId, sig, timestamp);
           console.log(`[Webhook] ✅ Bounty job ${bountyJobId.substring(0, 8)} accepted`);
+          state.seen.set(bountyJobId, Date.now());
         }
       } catch (e) {
         if (!e.message?.includes('already')) console.error(`[Webhook] Bounty accept failed: ${e.message}`);
