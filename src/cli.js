@@ -1912,6 +1912,22 @@ program
                 pollForJobs(state).catch(e => console.error(`[WS Poll] ${e.message}`));
               }
             });
+            // Re-authenticate on reconnect failure (session may have expired)
+            chat.onReconnectFailed = async (err) => {
+              console.log(`[WS] ${agentInfo.id}: reconnect failed (${err.message}) — re-authenticating...`);
+              try {
+                const freshAgent = await getAgentSession(state, agentInfo);
+                await freshAgent.authenticate();
+                const freshToken = freshAgent.client.getSessionToken();
+                if (freshToken) {
+                  chat.config.sessionToken = freshToken;
+                  await chat.connect();
+                  console.log(`[WS] ${agentInfo.id}: reconnected with fresh session`);
+                }
+              } catch (reAuthErr) {
+                console.error(`[WS] ${agentInfo.id}: re-auth failed: ${reAuthErr.message}`);
+              }
+            };
             chat.connect();
             wsConnected++;
           }
@@ -2196,15 +2212,19 @@ async function pollForJobs(state) {
 
         // Check if already handling or already processed
         if (state.seen.has(job.id)) {
-          console.log(`[Poll] ${agentInfo.id} skipping ${job.id} (seen)`);
           continue;
         }
         if (state.active.has(job.id)) {
-          console.log(`[Poll] ${agentInfo.id} skipping ${job.id} (already active)`);
           continue;
         }
         if (state.queue.some(j => j.id === job.id)) {
-          console.log(`[Poll] ${agentInfo.id} skipping ${job.id} (already queued)`);
+          continue;
+        }
+
+        // Skip jobs in terminal states (delivered, completed, cancelled, resolved)
+        const TERMINAL_STATUSES = ['delivered', 'completed', 'cancelled', 'resolved', 'resolved_rejected'];
+        if (TERMINAL_STATUSES.includes(job.status)) {
+          state.seen.add(job.id);
           continue;
         }
 
