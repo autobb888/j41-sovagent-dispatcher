@@ -2314,8 +2314,45 @@ async function pollForJobs(state) {
         activeInfo.process.send({ type: 'dispute.rework_accepted', data: { jobId } });
         state._lastSentStatus.set(jobId, currentJob.status);
       }
+
+      // Poll-mode fallback: detect paused → in_progress (resume happened without webhook)
+      if (currentJob.status === 'in_progress' && activeInfo.paused) {
+        console.log(`[Poll] Job ${jobId.substring(0, 8)} resumed (was paused) — unthrottling`);
+        activeInfo.paused = false;
+        activeInfo.pausedAt = null;
+        activeInfo.resumedAt = Date.now();
+        state.available = state.available.filter(a => a.id !== activeInfo.agentInfo?.id);
+        if (activeInfo.process?.send) {
+          activeInfo.process.send({ type: 'reconnect', jobId });
+        }
+        state._lastSentStatus.set(jobId, currentJob.status);
+      }
     } catch (e) {
       // Job may have been deleted — ignore
+    }
+  }
+
+  // Poll-mode fallback: check for pending extension requests on active jobs
+  if (!state._lastExtensionCheck) state._lastExtensionCheck = new Map();
+  for (const [jobId, activeInfo] of state.active.entries()) {
+    if (activeInfo.paused) continue; // Don't check paused jobs
+    try {
+      const agentSession = await getAgentSession(state, activeInfo.agentInfo);
+      const extensions = await agentSession.client.request('GET', `/v1/jobs/${jobId}/extensions`);
+      const pending = extensions?.data?.filter(e => e.status === 'pending');
+      if (pending?.length > 0) {
+        for (const ext of pending) {
+          const lastNotified = state._lastExtensionCheck.get(ext.id);
+          if (lastNotified) continue; // Already notified for this extension
+          state._lastExtensionCheck.set(ext.id, Date.now());
+          if (activeInfo.process?.send) {
+            activeInfo.process.send({ type: 'extension_request', jobId, data: { extensionId: ext.id, amount: ext.amount, reason: ext.reason } });
+            console.log(`[Poll] Extension request ${ext.id.substring(0, 8)} → job-agent ${jobId.substring(0, 8)}`);
+          }
+        }
+      }
+    } catch {
+      // Ignore — extensions endpoint may not exist for this job
     }
   }
 
