@@ -18,7 +18,7 @@ const AGENT_ID = process.env.J41_AGENT_ID;
 const IDENTITY = process.env.J41_IDENTITY;
 const JOB_ID = process.env.J41_JOB_ID;
 const TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS || '3600000');
-const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '600000'); // 10 min idle → deliver
+const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '600000'); // idle → pause (not deliver)
 
 const KEYS_FILE = process.env.J41_KEYS_FILE || '/app/keys.json';
 const SOUL_FILE = process.env.J41_SOUL_FILE || '/app/SOUL.md';
@@ -53,6 +53,8 @@ async function withRetry(fn, label, { maxAttempts = 3, baseDelayMs = 1000 } = {}
 // Track agent+executor globally for SIGTERM cleanup
 let _agent = null;
 let _executor = null;
+let _paused = false;
+let _lastActivityAt = Date.now();
 let _postDeliveryHandler = null;
 let _workspaceConnected = false;
 let _workspaceTools = [];
@@ -81,7 +83,7 @@ async function main() {
     console.log('  J41_EXECUTOR_ASSISTANT  LangGraph assistant ID (default: agent)');
     console.log('  J41_MCP_COMMAND    MCP server command (mcp executor, stdio)');
     console.log('  J41_MCP_URL        MCP server URL (mcp executor, HTTP)');
-    console.log('  IDLE_TIMEOUT_MS    Idle timeout before auto-deliver (default: 120000)');
+    console.log('  IDLE_TIMEOUT_MS    Idle timeout before pausing session (default: 600000)');
     console.log('\nThis container is spawned by j41-dispatcher for each job.');
     process.exit(0);
   }
@@ -242,6 +244,29 @@ async function main() {
           console.log(`[IPC] extension_request received for job ${msg.jobId}`);
           ipcQueue.push(msg);
           break;
+        case 'reconnect':
+          console.log(`[IPC] reconnect requested for job ${msg.jobId}`);
+          _paused = false;
+          _lastActivityAt = Date.now();
+          try {
+            if (_agent?.chat?.isConnected === false || !_agent?.chat?.isConnected) {
+              await _agent.authenticate();
+              await _agent.chat.connect();
+              _agent.chat.joinJob(msg.jobId);
+              _agent.sendChatMessage(msg.jobId, 'I\'m back online. How can I help?');
+              console.log(`[IPC] Reconnected chat for job ${msg.jobId}`);
+            } else {
+              _agent.sendChatMessage(msg.jobId, 'I\'m still connected. What do you need?');
+            }
+          } catch (err) {
+            console.error(`[IPC] Reconnect failed: ${err.message}`);
+          }
+          break;
+        case 'ttl_expired':
+          console.log(`[IPC] Pause TTL expired for job ${msg.jobId} — auto-delivering`);
+          _agent?.sendChatMessage(msg.jobId, 'Session expired due to inactivity. Delivering results.');
+          if (sessionEndResolve) sessionEndResolve('ttl-expired');
+          break;
         default:
           // Queue for post-delivery handler
           ipcQueue.push(msg);
@@ -305,7 +330,8 @@ async function main() {
 // ─────────────────────────────────────────
 
 async function processJob(job, agent, soulPrompt, executor, registerSessionEndResolve) {
-  let lastActivityAt = Date.now();
+  _lastActivityAt = Date.now();
+  _paused = false;
   let sessionEnded = false;
   let resolveSession;
   let messageCount = 0;
@@ -349,8 +375,14 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   // Handle incoming messages — delegate to executor (J4: serialized via queue)
   agent.onChatMessage((jobId, msg) => {
     if (jobId !== job.id) return;
-    lastActivityAt = Date.now();
 
+    // Layer 3 message guard: refuse LLM calls when paused (don't update activity for dropped messages)
+    if (_paused) {
+      console.log(`[GUARD] Message received while paused — dropping (sender: ${msg.senderVerusId})`);
+      return;
+    }
+
+    _lastActivityAt = Date.now();
     const buyerMessage = sanitizeInput(msg.content);
 
     // Detect platform file upload notification — download immediately, don't send to executor
@@ -407,15 +439,21 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
     }
   }
 
-  // Idle timer — check periodically if we should auto-deliver
-  const idleCheck = setInterval(() => {
-    const idleMs = Date.now() - lastActivityAt;
-    console.log(`[CHAT] Heartbeat — idle ${Math.round(idleMs / 1000)}s, messages: ${messageCount}, timeout: ${IDLE_TIMEOUT_MS / 1000}s`);
-    if (idleMs >= IDLE_TIMEOUT_MS && !sessionEnded) {
-      console.log(`[CHAT] Idle for ${Math.round(idleMs / 1000)}s — auto-delivering`);
-      agent.sendChatMessage(job.id, 'Session idle — delivering results. Thank you!');
-      sessionEnded = true;
-      resolveSession('idle-timeout');
+  // Idle timer — check periodically if we should pause (not auto-deliver)
+  const idleCheck = setInterval(async () => {
+    const idleMs = Date.now() - _lastActivityAt;
+    console.log(`[CHAT] Heartbeat — idle ${Math.round(idleMs / 1000)}s, messages: ${messageCount}, timeout: ${IDLE_TIMEOUT_MS / 1000}s, paused: ${_paused}`);
+    if (idleMs >= IDLE_TIMEOUT_MS && !sessionEnded && !_paused) {
+      console.log(`[CHAT] Idle for ${Math.round(idleMs / 1000)}s — requesting pause`);
+      agent.sendChatMessage(job.id, 'Session going idle — I\'ll be here when you\'re ready to continue.');
+      try {
+        await agent.client.pauseJob(job.id);
+        _paused = true; // Only set after API confirms
+        // Signal dispatcher to throttle container and free slot
+        if (process.send) process.send({ type: 'job_idle', jobId: job.id });
+      } catch (err) {
+        console.error(`[CHAT] Pause failed: ${err.message}`);
+      }
     }
   }, 10000);
 

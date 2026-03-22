@@ -2319,6 +2319,24 @@ async function pollForJobs(state) {
     }
   }
 
+  // Check paused jobs for TTL expiry
+  for (const [jobId, info] of state.active) {
+    if (!info.paused || !info.pausedAt) continue;
+    const pauseMinutes = (Date.now() - info.pausedAt) / 60000;
+    const ttl = info.pauseTTL || 60;
+    if (pauseMinutes >= ttl) {
+      console.log(`[TTL] Job ${jobId.substring(0, 8)} paused for ${Math.round(pauseMinutes)}min (TTL: ${ttl}min) — auto-delivering`);
+      if (info.process?.send) {
+        info.process.send({ type: 'ttl_expired', jobId });
+      }
+      // Remove agent from available pool (was freed on pause) so stopJob can return it cleanly
+      state.available = state.available.filter(a => a.id !== info.agentInfo?.id);
+      // Mark as no longer paused to avoid re-sending
+      info.paused = false;
+      info.pausedAt = null;
+    }
+  }
+
   // Flush queued workspace messages for newly-spawned job-agents
   if (state._pendingWorkspace?.size) {
     for (const [pendingJobId, wsData] of state._pendingWorkspace) {
@@ -2577,6 +2595,51 @@ async function handleWebhookEvent(state, agentId, payload) {
       const extensionJob = state.active.get(jobId);
       if (extensionJob?.process?.send) {
         extensionJob.process.send({ type: 'extension_request', jobId, data: data });
+      }
+      break;
+    }
+
+    case 'job.reconnect': {
+      console.log(`[Webhook] Reconnect requested for job ${jobId?.substring(0, 8)}`);
+      const reconnectJob = state.active.get(jobId);
+      if (reconnectJob?.process?.send) {
+        reconnectJob.process.send({ type: 'reconnect', jobId });
+        console.log(`[Webhook] Sent reconnect IPC to job-agent ${jobId?.substring(0, 8)}`);
+      } else {
+        // Job-agent not active — try to re-pick it up on next poll
+        if (jobId) {
+          state.seen.delete(jobId);
+          console.log(`[Webhook] Job-agent not active — cleared from seen so it will be re-picked on next poll`);
+        }
+      }
+      break;
+    }
+
+    case 'job.resumed': {
+      console.log(`[Webhook] Job resumed — unthrottling ${jobId?.substring(0, 8)}`);
+      const resumeInfo = state.active.get(jobId);
+      if (resumeInfo) {
+        resumeInfo.paused = false;
+        resumeInfo.pausedAt = null;
+        resumeInfo.resumedAt = Date.now(); // Sentinel: prevents late job_idle IPC from re-pausing
+        // Reclaim slot — remove from available pool
+        state.available = state.available.filter(a => a.id !== resumeInfo.agentInfo?.id);
+        // Tell job-agent to resume
+        if (resumeInfo.process?.send) {
+          resumeInfo.process.send({ type: 'reconnect', jobId });
+        }
+      }
+      break;
+    }
+
+    case 'job.paused': {
+      // Platform confirmed pause — update local state if not already done via IPC
+      const pauseInfo = state.active.get(jobId);
+      if (pauseInfo && !pauseInfo.paused) {
+        pauseInfo.paused = true;
+        pauseInfo.pausedAt = Date.now();
+        state.available.push(pauseInfo.agentInfo);
+        console.log(`[Webhook] Job ${jobId?.substring(0, 8)} paused — slot freed`);
       }
       break;
     }
@@ -2848,9 +2911,11 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
     fs.rmSync(jobDir, { recursive: true });
   }
 
-  // Return agent to pool (unless retrying)
-  if (!skipReturnAgent) {
+  // Return agent to pool (unless retrying or already returned during pause)
+  if (!skipReturnAgent && !active.paused) {
     state.available.push(active.agentInfo);
+    state.retries.delete(jobId);
+  } else if (!skipReturnAgent && active.paused) {
     state.retries.delete(jobId);
   }
   state.active.delete(jobId);
@@ -2896,6 +2961,10 @@ async function startJobLocal(state, job, agentInfo) {
   env.J41_KEYS_FILE = keysPath;
   env.J41_SOUL_FILE = path.join(agentDir, 'SOUL.md');
   env.J41_JOB_DIR = jobDir;
+
+  // Session lifecycle config from service (passed via job API response)
+  if (job.lifecycle?.idleTimeout) env.IDLE_TIMEOUT_MS = String(job.lifecycle.idleTimeout * 60000);
+  if (job.lifecycle?.pauseTTL) env.PAUSE_TTL_MS = String(job.lifecycle.pauseTTL * 60000);
 
   // Optional LLM config — only pass through if set in parent
   const OPTIONAL_PASSTHROUGH = [
@@ -2947,6 +3016,25 @@ async function startJobLocal(state, job, agentInfo) {
       logStream.end();
     });
 
+    // Handle IPC from job-agent
+    child.on('message', (msg) => {
+      if (msg?.type === 'job_idle') {
+        const info = state.active.get(msg.jobId);
+        // Guard: don't re-pause if a resume webhook already cleared it (race condition)
+        if (info && !info.paused && !info.resumedAt) {
+          info.paused = true;
+          info.pausedAt = Date.now();
+          info.pauseTTL = parseInt(env.PAUSE_TTL_MS || '3600000') / 60000;
+          // Free the agent slot
+          if (info.agentInfo && !state.available.some(a => a.id === info.agentInfo.id)) {
+            state.available.push(info.agentInfo);
+          }
+          console.log(`[IDLE] Job ${msg.jobId.substring(0, 8)} paused — agent slot freed`);
+          persistActiveJobs(state.active);
+        }
+      }
+    });
+
     state.active.set(job.id, {
       agentId: agentInfo.id,
       process: child,
@@ -2955,6 +3043,9 @@ async function startJobLocal(state, job, agentInfo) {
       agentInfo,
       workspaceNotified: false,
       workspaceChecked: false,
+      paused: false,
+      pausedAt: null,
+      pauseTTL: job.lifecycle?.pauseTTL || 60,
     });
 
     state.seen.set(job.id, Date.now());
@@ -3006,8 +3097,12 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
     fs.rmSync(jobDir, { recursive: true });
   }
 
-  if (!skipReturnAgent) {
+  // Only return agent to pool if not already returned during pause
+  if (!skipReturnAgent && !active.paused) {
     state.available.push(active.agentInfo);
+    state.retries.delete(jobId);
+  } else if (!skipReturnAgent && active.paused) {
+    // Agent already in available pool from pause — just clean up retries
     state.retries.delete(jobId);
   }
   state.active.delete(jobId);
