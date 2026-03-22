@@ -2319,28 +2319,45 @@ async function pollForJobs(state) {
     }
   }
 
-  // Check workspace status for active jobs (poll mode only — webhook mode uses events)
+  // Flush queued workspace messages for newly-spawned job-agents
+  if (state._pendingWorkspace?.size) {
+    for (const [pendingJobId, wsData] of state._pendingWorkspace) {
+      const activeInfo = state.active.get(pendingJobId);
+      if (activeInfo?.process?.send) {
+        activeInfo.process.send({
+          type: 'workspace_ready',
+          jobId: pendingJobId,
+          sessionId: wsData.sessionId,
+          permissions: wsData.permissions,
+          mode: wsData.mode,
+        });
+        activeInfo.workspaceNotified = true;
+        state._pendingWorkspace.delete(pendingJobId);
+        console.log(`[Poll] Flushed queued workspace_ready → job-agent ${pendingJobId.substring(0, 8)}`);
+      }
+    }
+  }
+
+  // Check workspace status for active jobs that haven't been notified
   for (const [activeJobId, activeInfo] of state.active) {
-    if (activeInfo.workspaceNotified || activeInfo.workspaceChecked) continue;
+    if (activeInfo.workspaceNotified) continue;
     if (!activeInfo.process?.send) continue;
     try {
       const agentSession = await getAgentSession(state, activeInfo.agentInfo);
       const wsStatus = await agentSession.client.getWorkspaceStatus(activeJobId);
-      if (wsStatus?.status === 'active') {
+      if (wsStatus?.status === 'active' || wsStatus?.status === 'pending') {
         activeInfo.process.send({
           type: 'workspace_ready',
           jobId: activeJobId,
-          sessionId: wsStatus.sessionId || '',
+          sessionId: wsStatus.id || wsStatus.sessionId || '',
           permissions: wsStatus.permissions || { read: true, write: true },
           mode: wsStatus.mode || 'supervised',
         });
         activeInfo.workspaceNotified = true;
-        console.log(`[Poll] Workspace active — notified job-agent ${activeJobId.substring(0, 8)}`);
-      } else if (!wsStatus || wsStatus.status === 'none') {
-        activeInfo.workspaceChecked = true;
+        console.log(`[Poll] Workspace ${wsStatus.status} — notified job-agent ${activeJobId.substring(0, 8)}`);
       }
     } catch {
-      activeInfo.workspaceChecked = true;
+      // Don't give up — will retry next poll cycle
     }
   }
 
@@ -2517,9 +2534,17 @@ async function handleWebhookEvent(state, agentId, payload) {
           permissions: data.permissions,
           mode: data.mode,
         });
+        activeInfo.workspaceNotified = true;
         console.log(`[Webhook] Workspace ready — notified job-agent ${jobId?.substring(0, 8)}`);
       } else {
-        console.warn(`[Webhook] Workspace ready but no IPC channel (Docker mode not supported for workspace v1) job=${jobId?.substring(0, 8)}`);
+        // Job-agent not spawned yet or no IPC — queue for delivery when ready
+        if (!state._pendingWorkspace) state._pendingWorkspace = new Map();
+        state._pendingWorkspace.set(jobId, {
+          sessionId: data.sessionId,
+          permissions: data.permissions,
+          mode: data.mode,
+        });
+        console.log(`[Webhook] Workspace ready — queued for job-agent ${jobId?.substring(0, 8)} (not spawned yet)`);
       }
       break;
     }
