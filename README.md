@@ -4,12 +4,16 @@ Multi-agent orchestration system that manages a pool of pre-registered AI agents
 
 ## Overview
 
-- Manages up to **9 concurrent agent workers**.
+- Manages up to **N concurrent agent workers** (configurable, default 9).
 - Each job runs in an **ephemeral container** (Docker) or **local child process** (no Docker required).
 - **Two operating modes:**
   - **Poll mode** (default) -- periodically polls the J41 API for new events. Works behind NAT without any public-facing endpoint.
   - **Webhook mode** -- event-driven via HTTP webhooks. Requires a publicly reachable URL.
 - Auto-accepts incoming jobs, waits for buyer prepayment, and spins up a dedicated agent process per job.
+- **Graceful shutdown** -- delivers in-progress jobs, submits attestations, and marks agents offline on Ctrl+C or SIGTERM.
+- **Control plane** -- query live status, list jobs/agents, and trigger shutdown from another terminal via Unix socket.
+- **VDXF policy enforcement** -- reads on-chain identity at startup, blocks workspace connections for agents without `workspace.capability`.
+- **Extension auto-approve** -- approves session extensions when queue is empty, slots are open, and CPU/RAM are under configured thresholds.
 
 ## Quick Start
 
@@ -44,10 +48,17 @@ node src/cli.js start
 | `start --webhook-url <url>` | Start the dispatcher in webhook mode |
 | `status` | Show the dispatcher pool status (active workers, queued jobs) |
 | `logs [job-id]` | View job logs; use `-f` for follow/tail mode |
+| `config` | View/change dispatcher settings (max-concurrent, timeouts, extension thresholds) |
+| `ctl status` | Live status from running dispatcher (uptime, active, queue, agents) |
+| `ctl jobs` | List active jobs with PID, duration, workspace status |
+| `ctl agents` | List agents with workspace capability and service count |
+| `ctl shutdown` | Trigger graceful shutdown from another terminal |
+| `ctl canary --agent <id>` | Check canary leak status for an agent |
 | `set-authorities <agent-id>` | Set revoke/recover authorities for an agent identity |
 | `check-authorities` | Check authority configuration across all agents |
+| `respond-dispute <jobId>` | Respond to a buyer dispute (refund/rework/rejected) |
 
-All commands are run via `node src/cli.js <command>`.
+All commands are run via `node src/cli.js <command>`. Use `--json` with `ctl` commands for machine-readable output.
 
 ## Job Lifecycle
 
@@ -56,9 +67,10 @@ All commands are run via `node src/cli.js <command>`.
 3. **`job.started` (in_progress)** -- Dispatcher spins up an ephemeral process for the agent.
 4. **Chat session** -- Agent communicates with the buyer over SovGuard WebSocket.
 5. **File transfer** -- Files are downloaded at job start and mid-session (via chat notification).
-6. **Idle timeout** -- After 10 minutes of inactivity (default), the agent auto-delivers results.
-7. **Deletion attestation** -- Dispatcher signs attestation; job data is cleaned up.
-8. **Review** -- Buyer review is auto-accepted and the agent's on-chain identity is updated.
+6. **Idle timeout** -- After configurable minutes of inactivity, the agent pauses the session (frees agent slot).
+7. **Resume / TTL** -- Buyer can resume; if pause TTL expires, the agent auto-delivers results.
+8. **Deletion attestation** -- Dispatcher signs attestation; job data is cleaned up.
+9. **Review** -- Buyer review is auto-accepted and the agent's on-chain identity is updated.
 
 ## Configuration
 
@@ -71,13 +83,40 @@ All commands are run via `node src/cli.js <command>`.
 | `~/.j41/dispatcher/agents/agent-N/webhook-config.json` | Webhook secret for this agent |
 | `~/.j41/dispatcher/config.json` | Runtime configuration for the dispatcher |
 
+### Dispatcher Settings
+
+Configurable via `node src/cli.js config`:
+
+| Setting | Flag | Default | Description |
+|---|---|---|---|
+| Runtime | `--runtime` | docker | `docker` or `local` |
+| Max concurrent | `--max-concurrent` | 9 | Agent slots (1-1000) |
+| Job timeout | `--job-timeout` | 60 | Minutes per job (1-1440) |
+| Extension auto-approve | `--extension-auto-approve` | true | Auto-approve session extensions |
+| CPU threshold | `--extension-max-cpu` | 80 | Reject extensions if load avg > this % of cores |
+| RAM threshold | `--extension-min-free-mb` | 512 | Reject extensions if free RAM below this (MB) |
+
+### Service Lifecycle Fields
+
+Per-service settings passed during registration:
+
+| Field | Range | Default | Description |
+|---|---|---|---|
+| `--idle-timeout` | 5-2880 min | 10 | Minutes before agent goes idle |
+| `--pause-ttl` | 15-10080 min | 60 | Minutes paused before auto-cancel |
+| `--reactivation-fee` | 0-1000 | 0 | Cost to wake an idle agent |
+
 ### Environment Variables
 
 | Variable | Description |
 |---|---|
 | `J41_API_URL` | Junction41 platform API base URL |
-| `IDLE_TIMEOUT_MS` | Idle timeout before auto-delivery (default: 600000 ms / 10 min) |
+| `J41_MAX_CONCURRENT` | Override max concurrent from config |
+| `IDLE_TIMEOUT_MS` | Idle timeout before pause (default: 600000 ms / 10 min) |
 | `J41_REQUIRE_FINALIZE` | When set, agents must be finalized before the dispatcher will use them |
+| `KIMI_API_KEY` | API key for NVIDIA/Kimi LLM (local-llm executor) |
+| `KIMI_BASE_URL` | LLM API base URL |
+| `KIMI_MODEL` | LLM model name |
 
 ## Architecture
 
@@ -189,6 +228,39 @@ When a buyer grants workspace access on a job, the dispatcher handles the full l
 5. **Completion** — Agent signals done, buyer accepts, platform signs attestation
 
 Workspace events handled: `workspace.ready`, `workspace.disconnected`, `workspace.completed`
+
+## Control Plane
+
+The dispatcher exposes a Unix domain socket at `~/.j41/dispatcher/control.sock` for live management:
+
+```bash
+# From another terminal while dispatcher is running:
+node src/cli.js ctl status          # uptime, active jobs, queue, agents
+node src/cli.js ctl jobs            # active jobs with PID, duration
+node src/cli.js ctl agents          # agent list with workspace capability
+node src/cli.js ctl shutdown        # graceful shutdown
+node src/cli.js ctl canary --agent agent-2  # check canary status
+node src/cli.js ctl status --json   # machine-readable output
+```
+
+## Graceful Shutdown
+
+On `SIGINT` (Ctrl+C), `SIGTERM`, or `ctl shutdown`:
+
+1. Stops accepting new jobs
+2. Sends `shutdown` IPC to all active job-agents
+3. Each job-agent delivers current work, notifies the buyer, submits attestation
+4. Waits up to 30s for clean exit, then SIGTERM -> SIGKILL
+5. Marks all agents offline on platform
+6. Clears active-jobs.json and exits
+
+## VDXF Policy Enforcement
+
+At startup, the dispatcher reads each agent's on-chain identity and caches:
+- **`workspace.capability`** -- agents without this key are blocked from workspace connections
+- **Service list** -- future: match incoming jobs to declared services
+
+The `ctl agents` command shows which agents have workspace capability enabled.
 
 ### Security
 

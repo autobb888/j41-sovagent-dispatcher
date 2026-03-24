@@ -60,6 +60,8 @@ let _workspaceConnected = false;
 let _workspaceTools = [];
 let _workspaceStats = null;
 let _workspaceMode = 'supervised';
+let _shuttingDown = false;
+let _sessionEndResolve = null; // global ref so shutdown IPC can resolve the session
 
 async function main() {
   // Check for required environment variables
@@ -213,8 +215,11 @@ async function main() {
     },
   });
 
+
   // Session-end signal: when buyer or platform ends the session, we resolve processJob
   let sessionEndResolve = null;
+  // Keep global ref in sync so shutdown IPC can resolve from outside main()
+  const setSessionEndResolve = (fn) => { sessionEndResolve = fn; _sessionEndResolve = fn; };
 
   // ─────────────────────────────────────────
   // STEP 2: INTERACTIVE CHAT SESSION (Executor pattern — M6)
@@ -267,6 +272,12 @@ async function main() {
           _agent?.sendChatMessage(msg.jobId, 'Session expired due to inactivity. Delivering results.');
           if (sessionEndResolve) sessionEndResolve('ttl-expired');
           break;
+        case 'shutdown':
+          console.log(`[IPC] Dispatcher shutdown — delivering current work and exiting`);
+          _shuttingDown = true;
+          _agent?.sendChatMessage(msg.jobId, 'Service is shutting down. Delivering current work now.');
+          if (sessionEndResolve) sessionEndResolve('dispatcher-shutdown');
+          break;
         default:
           // Queue for post-delivery handler
           ipcQueue.push(msg);
@@ -277,7 +288,7 @@ async function main() {
 
   let result;
   try {
-    result = await processJob(job, agent, soulPrompt, executor, (resolve) => { sessionEndResolve = resolve; });
+    result = await processJob(job, agent, soulPrompt, executor, (resolve) => { setSessionEndResolve(resolve); });
     console.log('\n✅ Work completed\n');
   } catch (e) {
     console.error('\n❌ Job failed:', e.message);
@@ -313,10 +324,15 @@ async function main() {
   // ─────────────────────────────────────────
   // STEP 4: POST-DELIVERY WAIT (Dispute Resolution)
   // ─────────────────────────────────────────
-  console.log('→ Entering post-delivery review window...');
-  console.log('  Container stays alive until job.completed or dispute resolution.\n');
-
-  const postDeliveryResult = await waitForPostDelivery(job, agent, keys, fullJob, executor, soulPrompt, (resolve) => { sessionEndResolve = resolve; }, ipcQueue);
+  let postDeliveryResult;
+  if (_shuttingDown) {
+    console.log('→ Skipping post-delivery wait (dispatcher shutting down)');
+    postDeliveryResult = { reason: 'dispatcher-shutdown' };
+  } else {
+    console.log('→ Entering post-delivery review window...');
+    console.log('  Container stays alive until job.completed or dispute resolution.\n');
+    postDeliveryResult = await waitForPostDelivery(job, agent, keys, fullJob, executor, soulPrompt, (resolve) => { setSessionEndResolve(resolve); }, ipcQueue);
+  }
 
   // ─────────────────────────────────────────
   // STEP 5: CLEANUP + ATTESTATION + IDENTITY UPDATE
@@ -341,7 +357,14 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   const sessionPromise = new Promise((resolve) => {
     resolveSession = resolve;
     if (registerSessionEndResolve) registerSessionEndResolve(resolve);
+    // Keep global ref in sync for shutdown IPC
+    _sessionEndResolve = resolve;
   });
+
+  // If shutdown was requested before we got here, resolve immediately
+  if (_shuttingDown) {
+    resolveSession('dispatcher-shutdown');
+  }
 
   // Check for files attached to the job (buyer may have uploaded before session)
   let jobFiles = [];
@@ -482,7 +505,7 @@ async function connectWorkspace(jobId, permissions, mode) {
     _agent.sendChatMessage(jobId, 'I now have access to your project files. Let me know what you need.');
     _agent.workspace.onStatusChanged((status, data) => {
       console.log(`[WORKSPACE] Status changed: ${status}`);
-      if (status === 'aborted' || status === 'completed') {
+      if (status === 'aborted' || status === 'completed' || status === 'disconnected') {
         disconnectWorkspace();
       }
     });
@@ -699,6 +722,14 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
             reason: action === 'rejected' ? 'resolved_rejected' : 'resolved',
             disputeOutcome: msg.data,
           });
+          break;
+        }
+
+        case 'shutdown': {
+          clearTimeout(safetyTimer);
+          console.log('[POST-DELIVERY] Dispatcher shutdown — exiting post-delivery wait');
+          _shuttingDown = true;
+          safeResolve({ reason: 'dispatcher-shutdown' });
           break;
         }
 

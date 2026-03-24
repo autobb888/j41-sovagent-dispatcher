@@ -34,8 +34,9 @@ const SEEN_JOBS_PATH = path.join(DISPATCHER_DIR, 'seen-jobs.json');
 const FINALIZE_STATE_FILENAME = 'finalize-state.json';
 
 const J41_API_URL = process.env.J41_API_URL || 'https://api.autobb.app';
-const MAX_AGENTS = 9;
-const JOB_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour
+const _cfg = loadConfig();
+const MAX_AGENTS = parseInt(process.env.J41_MAX_CONCURRENT || _cfg.maxConcurrent || 9);
+const JOB_TIMEOUT_MS = (_cfg.jobTimeoutMin || 60) * 60 * 1000;
 const MAX_RETRIES = 2;
 const SEEN_JOBS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -268,6 +269,13 @@ function buildServiceFromOptions(options, descriptionFallback) {
       console.warn(`⚠️  Invalid --refund-policy JSON: ${e.message}`);
     }
   }
+  // Service lifecycle fields
+  const idleTimeout = parseInt(options.idleTimeout, 10);
+  if (idleTimeout >= 5 && idleTimeout <= 2880) svc.idleTimeout = idleTimeout;
+  const pauseTtl = parseInt(options.pauseTtl, 10);
+  if (pauseTtl >= 15 && pauseTtl <= 10080) svc.pauseTTL = pauseTtl;
+  const reactivationFee = parseFloat(options.reactivationFee);
+  if (reactivationFee >= 0 && reactivationFee <= 1000) svc.reactivationFee = reactivationFee;
   return [svc];
 }
 
@@ -287,7 +295,10 @@ function addServiceOptions(cmd) {
     .option('--service-sovguard', 'Require SovGuard protection (default: true)')
     .option('--service-accepted-currencies <json>', 'Accepted currencies as JSON array: [{"currency":"VRSC","price":10}]')
     .option('--resolution-window <minutes>', 'Resolution window in minutes (default: 60)', '60')
-    .option('--refund-policy <json>', 'Refund policy JSON: {"policy":"fixed","percent":50}');
+    .option('--refund-policy <json>', 'Refund policy JSON: {"policy":"fixed","percent":50}')
+    .option('--idle-timeout <minutes>', 'Minutes before auto-idle (5-2880, default: 10)', '10')
+    .option('--pause-ttl <minutes>', 'Minutes paused before auto-cancel (15-10080, default: 60)', '60')
+    .option('--reactivation-fee <amount>', 'Cost to wake idle agent (0-1000, default: 0)', '0');
 }
 
 /**
@@ -550,10 +561,16 @@ program
   .command('config')
   .description('View or change dispatcher configuration')
   .option('--runtime <mode>', 'Set runtime mode: docker or local')
+  .option('--max-concurrent <n>', 'Max concurrent jobs (agent slots)')
+  .option('--job-timeout <min>', 'Job timeout in minutes')
+  .option('--extension-auto-approve <bool>', 'Auto-approve extensions (true/false)')
+  .option('--extension-max-cpu <percent>', 'Max CPU load % before rejecting extensions (0-100)')
+  .option('--extension-min-free-mb <mb>', 'Min free RAM (MB) before rejecting extensions')
   .option('--show', 'Show current configuration')
   .action(async (options) => {
     ensureDirs();
     const config = loadConfig();
+    let changed = false;
 
     if (options.runtime) {
       if (!['docker', 'local'].includes(options.runtime)) {
@@ -561,22 +578,79 @@ program
         process.exit(1);
       }
       config.runtime = options.runtime;
-      saveConfig(config);
-      console.log(`✅ Runtime set to: ${options.runtime}`);
-      if (options.runtime === 'docker') {
-        console.log('\nMake sure Docker is installed and running.');
-        console.log('Build the job image: ./scripts/build-image.sh');
-      } else {
-        console.log('\nLocal process mode — no Docker required.');
-        console.log('Jobs will run as child processes on this machine.');
-      }
-      return;
+      changed = true;
     }
 
-    // Default: show config
-    console.log('\nJ41 Dispatcher Configuration:');
-    console.log(`  Runtime: ${config.runtime}`);
-    console.log(`  Config:  ${require('./config').CONFIG_PATH}`);
+    if (options.maxConcurrent) {
+      const n = parseInt(options.maxConcurrent);
+      if (n < 1 || n > 1000) {
+        console.error('❌ --max-concurrent must be 1-1000');
+        process.exit(1);
+      }
+      config.maxConcurrent = n;
+      changed = true;
+    }
+
+    if (options.jobTimeout) {
+      const m = parseInt(options.jobTimeout);
+      if (m < 1 || m > 1440) {
+        console.error('❌ --job-timeout must be 1-1440 minutes');
+        process.exit(1);
+      }
+      config.jobTimeoutMin = m;
+      changed = true;
+    }
+
+    if (options.extensionAutoApprove !== undefined) {
+      config.extensionAutoApprove = options.extensionAutoApprove === 'true';
+      changed = true;
+    }
+
+    if (options.extensionMaxCpu) {
+      const pct = parseInt(options.extensionMaxCpu);
+      if (pct < 10 || pct > 100) {
+        console.error('❌ --extension-max-cpu must be 10-100');
+        process.exit(1);
+      }
+      config.extensionMaxCpuPercent = pct;
+      changed = true;
+    }
+
+    if (options.extensionMinFreeMb) {
+      const mb = parseInt(options.extensionMinFreeMb);
+      if (mb < 64 || mb > 65536) {
+        console.error('❌ --extension-min-free-mb must be 64-65536');
+        process.exit(1);
+      }
+      config.extensionMinFreeMB = mb;
+      changed = true;
+    }
+
+    if (changed) {
+      saveConfig(config);
+      console.log('✅ Configuration updated');
+    }
+
+    // Show config
+    const os = require('os');
+    console.log('\n╔══════════════════════════════════════════╗');
+    console.log('║     Dispatcher Configuration             ║');
+    console.log('╚══════════════════════════════════════════╝\n');
+    console.log(`  Runtime:          ${config.runtime}`);
+    console.log(`  Max concurrent:   ${config.maxConcurrent || 9}`);
+    console.log(`  Job timeout:      ${config.jobTimeoutMin || 60} min`);
+    console.log(`  Config file:      ${require('./config').CONFIG_PATH}`);
+    console.log('');
+    console.log('  Extension auto-approve:');
+    console.log(`    Enabled:        ${config.extensionAutoApprove !== false}`);
+    console.log(`    Max CPU load:   ${config.extensionMaxCpuPercent || 80}%`);
+    console.log(`    Min free RAM:   ${config.extensionMinFreeMB || 512} MB`);
+    console.log('');
+    console.log('  System:');
+    console.log(`    CPUs:           ${os.cpus().length}`);
+    console.log(`    Total RAM:      ${Math.round(os.totalmem() / 1024 / 1024)} MB`);
+    console.log(`    Free RAM:       ${Math.round(os.freemem() / 1024 / 1024)} MB`);
+    console.log(`    Load avg:       ${os.loadavg().map(l => l.toFixed(2)).join(', ')}`);
     console.log('');
   });
 
@@ -1805,7 +1879,37 @@ program
       seen: loadSeenJobs(), // completed/claimed jobs with timestamps (Map<jobId, timestamp>)
       retries: new Map(), // jobId -> retry count
       agentSessions: new Map(), // agentId -> { agent: J41Agent, authedAt: number }
+      capabilities: new Map(), // agentId -> { workspace: bool, services: [] }
     };
+
+    // ── Load on-chain capabilities for VDXF policy enforcement ──
+    console.log('→ Loading on-chain agent capabilities...\n');
+    const { decodeContentMultimap } = require('@j41/sovagent-sdk/dist/onboarding/vdxf.js');
+    for (const agentInfo of readyAgents) {
+      try {
+        const agent = await getAgentSession(state, agentInfo);
+        const idRaw = await agent.client.getIdentityRaw();
+        const id = idRaw.data?.identity || idRaw.identity;
+        if (id?.contentmultimap) {
+          const decoded = decodeContentMultimap(id.contentmultimap);
+          const hasWorkspace = !!decoded.profile?.workspaceCapability;
+          const services = decoded.services || [];
+          state.capabilities.set(agentInfo.id, {
+            workspace: hasWorkspace,
+            services: services.map(s => ({ name: s.name, type: s.type })),
+            profile: decoded.profile,
+          });
+          console.log(`  ${agentInfo.id}: workspace=${hasWorkspace}, services=${services.length}`);
+        } else {
+          state.capabilities.set(agentInfo.id, { workspace: false, services: [], profile: null });
+          console.log(`  ${agentInfo.id}: no VDXF data on-chain`);
+        }
+      } catch (e) {
+        state.capabilities.set(agentInfo.id, { workspace: false, services: [], profile: null });
+        console.log(`  ${agentInfo.id}: capability fetch failed (${e.message})`);
+      }
+    }
+    console.log('');
     
     // Guard all interval callbacks against unhandled rejections
     // (async setInterval callbacks that throw will crash Node v20+)
@@ -1962,7 +2066,97 @@ program
     // Initial poll (catch-up for anything missed while offline)
     await pollForJobs(state);
 
+    // ── Start control plane ──
+    const { startControlServer, stopControlServer } = require('./control');
+    const controlServer = startControlServer(state, {
+      onShutdown: (source) => gracefulShutdown(`control-plane (${source})`),
+      getAgentSession,
+    });
+
     console.log('\n✅ Dispatcher running. Press Ctrl+C to stop.\n');
+
+    // ── Graceful shutdown handler ──
+    let shuttingDown = false;
+    const SHUTDOWN_TIMEOUT_MS = 30000; // 30s max for graceful shutdown
+
+    async function gracefulShutdown(signal) {
+      if (shuttingDown) return; // prevent double-fire
+      shuttingDown = true;
+      console.log(`\n🛑 ${signal} received — graceful shutdown starting...`);
+      console.log(`   Active jobs: ${state.active.size}, timeout: ${SHUTDOWN_TIMEOUT_MS / 1000}s\n`);
+
+      // 1. Stop accepting new jobs (clear intervals by exiting the keep-alive)
+      //    The intervals are orphaned when we exit, which is fine
+
+      // 2. Send shutdown IPC to all active job-agent processes
+      const shutdownPromises = [];
+      for (const [jobId, active] of state.active) {
+        if (active.process && !active.process.killed) {
+          console.log(`   → Sending shutdown to job ${jobId.substring(0, 8)} (PID ${active.pid})`);
+          try {
+            active.process.send({ type: 'shutdown', jobId });
+          } catch (e) {
+            console.log(`   ⚠️  IPC send failed for ${jobId.substring(0, 8)}: ${e.message}`);
+          }
+
+          // Wait for the process to exit
+          shutdownPromises.push(
+            new Promise((resolve) => {
+              const timeout = setTimeout(() => {
+                console.log(`   ⏰ Job ${jobId.substring(0, 8)} didn't exit in time — sending SIGTERM`);
+                try { active.process.kill('SIGTERM'); } catch {}
+                // Force kill after 5 more seconds
+                setTimeout(() => {
+                  try { if (!active.process.killed) active.process.kill('SIGKILL'); } catch {}
+                  resolve();
+                }, 5000);
+              }, SHUTDOWN_TIMEOUT_MS - 5000); // leave 5s buffer for SIGTERM->SIGKILL
+
+              active.process.on('exit', (code) => {
+                clearTimeout(timeout);
+                console.log(`   ✅ Job ${jobId.substring(0, 8)} exited (code ${code})`);
+                resolve();
+              });
+            })
+          );
+        }
+      }
+
+      // Wait for all job-agents to exit (or timeout)
+      if (shutdownPromises.length > 0) {
+        console.log(`\n   Waiting for ${shutdownPromises.length} job(s) to finish...`);
+        await Promise.all(shutdownPromises);
+      }
+
+      // 3. Mark agents as inactive on platform (best-effort)
+      console.log('\n   Marking agents offline on platform...');
+      const { randomUUID } = require('crypto');
+      for (const agentInfo of state.agents) {
+        try {
+          const agent = await getAgentSession(state, agentInfo);
+          const { signMessage } = require('@j41/sovagent-sdk/dist/identity/signer.js');
+          const timestamp = Date.now();
+          const nonce = randomUUID();
+          const message = `status:inactive:${timestamp}`;
+          const signature = signMessage(agentInfo.wif, message, 'verustest');
+          await agent.client.setAgentStatus(agentInfo.iAddress || agentInfo.identity, 'inactive', signature, timestamp, nonce);
+          console.log(`   ✅ ${agentInfo.id}: marked offline`);
+        } catch (e) {
+          console.log(`   ⚠️  ${agentInfo.id}: failed to mark offline (${e.message})`);
+        }
+      }
+
+      // 4. Clean up state
+      state.active.clear();
+      persistActiveJobs(state.active);
+      stopControlServer(controlServer);
+
+      console.log('\n✅ Graceful shutdown complete.\n');
+      process.exit(0);
+    }
+
+    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
     // Keep alive
     await new Promise(() => {});
@@ -2186,6 +2380,69 @@ async function getAgentSession(state, agentInfo) {
   return agent;
 }
 
+/**
+ * VDXF Policy Check: verify agent has workspace.capability on-chain before
+ * forwarding workspace_ready to job-agent. Returns true if allowed.
+ */
+function checkWorkspaceCapability(state, agentId) {
+  const caps = state.capabilities.get(agentId);
+  if (!caps) {
+    console.warn(`[VDXF-POLICY] ${agentId}: no capability data — blocking workspace`);
+    return false;
+  }
+  if (!caps.workspace) {
+    console.warn(`[VDXF-POLICY] ${agentId}: workspace.capability NOT set on-chain — blocking workspace`);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Auto-approve or reject extension requests based on system capacity.
+ * Approve if: queue empty + slots open + system has headroom.
+ * Reject with reason otherwise.
+ */
+async function handleExtensionRequest(state, jobId, extensionId, agentInfo) {
+  const os = require('os');
+  const cfg = loadConfig();
+
+  if (cfg.extensionAutoApprove === false) {
+    console.log(`[Extension] Auto-approve disabled — ignoring ${extensionId.substring(0, 8)}`);
+    return;
+  }
+
+  const maxCpuPct = cfg.extensionMaxCpuPercent || 80;
+  const minFreeMB = cfg.extensionMinFreeMB || 512;
+
+  const queueEmpty = state.queue.length === 0;
+  const slotsOpen = state.active.size < MAX_AGENTS;
+  const loadAvg1m = os.loadavg()[0];
+  const cpuCount = os.cpus().length;
+  const cpuOk = loadAvg1m < cpuCount * (maxCpuPct / 100);
+  const freeMem = os.freemem();
+  const memOk = freeMem > minFreeMB * 1024 * 1024;
+
+  const canApprove = queueEmpty && slotsOpen && cpuOk && memOk;
+
+  try {
+    const agent = await getAgentSession(state, agentInfo);
+    if (canApprove) {
+      await agent.client.approveExtension(jobId, extensionId);
+      console.log(`[Extension] Auto-approved ${extensionId.substring(0, 8)} for job ${jobId.substring(0, 8)} (queue=0, slots=${MAX_AGENTS - state.active.size}, load=${loadAvg1m.toFixed(1)}/${cpuCount}, mem=${Math.round(freeMem / 1024 / 1024)}MB)`);
+    } else {
+      const reasons = [];
+      if (!queueEmpty) reasons.push(`queue=${state.queue.length}`);
+      if (!slotsOpen) reasons.push('no slots');
+      if (!cpuOk) reasons.push(`load=${loadAvg1m.toFixed(1)}/${cpuCount}`);
+      if (!memOk) reasons.push(`mem=${Math.round(freeMem / 1024 / 1024)}MB`);
+      await agent.client.rejectExtension(jobId, extensionId);
+      console.log(`[Extension] Rejected ${extensionId.substring(0, 8)} for job ${jobId.substring(0, 8)} — ${reasons.join(', ')}`);
+    }
+  } catch (e) {
+    console.error(`[Extension] Failed to handle ${extensionId.substring(0, 8)}: ${e.message}`);
+  }
+}
+
 // Poll for new jobs — check ALL agents, not just available ones
 // (an agent with an active job can still have new jobs queued for it)
 async function pollForJobs(state) {
@@ -2338,17 +2595,13 @@ async function pollForJobs(state) {
     if (activeInfo.paused) continue; // Don't check paused jobs
     try {
       const agentSession = await getAgentSession(state, activeInfo.agentInfo);
-      const extensions = await agentSession.client.request('GET', `/v1/jobs/${jobId}/extensions`);
-      const pending = extensions?.data?.filter(e => e.status === 'pending');
+      const extensions = await agentSession.client.getExtensions(jobId);
+      const pending = (extensions || []).filter(e => e.status === 'pending');
       if (pending?.length > 0) {
         for (const ext of pending) {
-          const lastNotified = state._lastExtensionCheck.get(ext.id);
-          if (lastNotified) continue; // Already notified for this extension
+          if (state._lastExtensionCheck.has(ext.id)) continue;
           state._lastExtensionCheck.set(ext.id, Date.now());
-          if (activeInfo.process?.send) {
-            activeInfo.process.send({ type: 'extension_request', jobId, data: { extensionId: ext.id, amount: ext.amount, reason: ext.reason } });
-            console.log(`[Poll] Extension request ${ext.id.substring(0, 8)} → job-agent ${jobId.substring(0, 8)}`);
-          }
+          await handleExtensionRequest(state, jobId, ext.id, activeInfo.agentInfo);
         }
       }
     } catch {
@@ -2379,6 +2632,10 @@ async function pollForJobs(state) {
     for (const [pendingJobId, wsData] of state._pendingWorkspace) {
       const activeInfo = state.active.get(pendingJobId);
       if (activeInfo?.process?.send) {
+        if (!checkWorkspaceCapability(state, activeInfo.agentId)) {
+          state._pendingWorkspace.delete(pendingJobId);
+          continue;
+        }
         activeInfo.process.send({
           type: 'workspace_ready',
           jobId: pendingJobId,
@@ -2397,6 +2654,10 @@ async function pollForJobs(state) {
   for (const [activeJobId, activeInfo] of state.active) {
     if (activeInfo.workspaceNotified) continue;
     if (!activeInfo.process?.send) continue;
+    if (!checkWorkspaceCapability(state, activeInfo.agentId)) {
+      activeInfo.workspaceNotified = true; // Don't check again
+      continue;
+    }
     try {
       const agentSession = await getAgentSession(state, activeInfo.agentInfo);
       const wsStatus = await agentSession.client.getWorkspaceStatus(activeJobId);
@@ -2582,6 +2843,10 @@ async function handleWebhookEvent(state, agentId, payload) {
     case 'workspace.ready': {
       const activeInfo = state.active.get(jobId);
       if (activeInfo?.process?.send) {
+        if (!checkWorkspaceCapability(state, activeInfo.agentId)) {
+          console.log(`[Webhook] Workspace ready — BLOCKED by VDXF policy for ${activeInfo.agentId}`);
+          break;
+        }
         activeInfo.process.send({
           type: 'workspace_ready',
           jobId: jobId,
@@ -2630,8 +2895,8 @@ async function handleWebhookEvent(state, agentId, payload) {
     case 'job.extension_request': {
       console.log(`[Webhook] Extension requested for job ${jobId?.substring(0, 8)}`);
       const extensionJob = state.active.get(jobId);
-      if (extensionJob?.process?.send) {
-        extensionJob.process.send({ type: 'extension_request', jobId, data: data });
+      if (extensionJob && data?.extensionId) {
+        await handleExtensionRequest(state, jobId, data.extensionId, extensionJob.agentInfo);
       }
       break;
     }
@@ -3274,6 +3539,83 @@ program
       console.log('✅ Dispute response submitted:');
       console.log(JSON.stringify(result, null, 2));
       agent.stop();
+    } catch (e) {
+      console.error(`❌ ${e.message}`);
+      process.exit(1);
+    }
+  });
+
+// ── Control Plane Client ──
+program
+  .command('ctl <command>')
+  .description('Send command to running dispatcher (status, jobs, agents, shutdown, canary)')
+  .option('--agent <id>', 'Agent ID (for canary command)')
+  .option('--json', 'Raw JSON output')
+  .action(async (command, options) => {
+    const { sendCommand } = require('./control');
+
+    try {
+      const cmd = { action: command };
+      if (options.agent) cmd.agentId = options.agent;
+
+      const result = await sendCommand(cmd);
+
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      // Pretty-print based on command
+      switch (command) {
+        case 'status':
+          console.log('\n╔══════════════════════════════════════════╗');
+          console.log('║     Dispatcher Status (Live)             ║');
+          console.log('╚══════════════════════════════════════════╝\n');
+          console.log(`  Uptime:     ${result.uptime}`);
+          console.log(`  Agents:     ${result.agents?.available || 0} available / ${result.agents?.total || 0} total`);
+          console.log(`  Active:     ${result.active} job(s)`);
+          console.log(`  Queue:      ${result.queue} pending`);
+          console.log(`  Seen:       ${result.seen} (lifetime)`);
+          console.log('');
+          break;
+
+        case 'jobs':
+          if (!result.active || result.active.length === 0) {
+            console.log('\nNo active jobs.\n');
+          } else {
+            console.log(`\nActive jobs (${result.active.length}):\n`);
+            for (const j of result.active) {
+              console.log(`  ${j.jobId.substring(0, 8)}  agent=${j.agentId}  PID=${j.pid}  running=${j.runningFor}${j.paused ? '  PAUSED' : ''}${j.workspace ? '  WORKSPACE' : ''}`);
+            }
+            console.log('');
+          }
+          break;
+
+        case 'agents':
+          console.log(`\nAgents (${result.agents?.length || 0}):\n`);
+          for (const a of (result.agents || [])) {
+            const statusIcon = a.status === 'available' ? '🟢' : '🔴';
+            const wsIcon = a.workspace ? ' [WS]' : '';
+            console.log(`  ${statusIcon} ${a.id}  ${a.identity}  ${a.status}${wsIcon}  svc=${a.services}${a.currentJob ? `  job=${a.currentJob}` : ''}`);
+          }
+          console.log('');
+          break;
+
+        case 'shutdown':
+          console.log(result.ok ? '\n✅ Shutdown initiated.\n' : `\n❌ ${result.error}\n`);
+          break;
+
+        case 'canary':
+          if (result.error) {
+            console.log(`\n❌ ${result.agentId || ''}: ${result.error}\n`);
+          } else {
+            console.log(`\n${result.agentId}: ${JSON.stringify(result.canary, null, 2)}\n`);
+          }
+          break;
+
+        default:
+          console.log(JSON.stringify(result, null, 2));
+      }
     } catch (e) {
       console.error(`❌ ${e.message}`);
       process.exit(1);
