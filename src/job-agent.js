@@ -519,11 +519,23 @@ async function connectWorkspace(jobId, permissions, mode) {
       _executor.setWorkspaceTools(_workspaceTools, handleWorkspaceToolCall);
     }
 
+    // Inject exclusion list into blocked files and executor prompt
+    const excluded = _agent.workspace.excludedFiles;
+    if (excluded.length > 0) {
+      for (const f of excluded) _blockedFiles.add(f);
+      console.log(`[WORKSPACE] Excluded files from SovGuard: ${excluded.join(', ')}`);
+      // Append to executor system prompt so LLM knows upfront
+      if (_executor && _executor.systemPrompt) {
+        _executor.systemPrompt += `\n\nEXCLUDED FILES (blocked by buyer's SovGuard — do NOT attempt to read these):\n${excluded.map(f => '- ' + f).join('\n')}`;
+      }
+    }
+
     // Auto-scan project root so the agent has context immediately
     try {
       const rootFiles = await _agent.workspace.listDirectory('.');
       const fileList = Array.isArray(rootFiles) ? rootFiles.map(f => f.name || f).join(', ') : JSON.stringify(rootFiles);
-      _agent.sendChatMessage(jobId, `I now have access to your project files. Here's your project structure:\n\n${fileList}\n\nWhat would you like me to work on?`);
+      const excludeNote = excluded.length > 0 ? `\n\nExcluded by SovGuard: ${excluded.join(', ')}` : '';
+      _agent.sendChatMessage(jobId, `I now have access to your project files. Here's your project structure:\n\n${fileList}${excludeNote}\n\nWhat would you like me to work on?`);
       console.log(`[WORKSPACE] Auto-scanned root: ${typeof rootFiles === 'object' ? (Array.isArray(rootFiles) ? rootFiles.length + ' items' : 'ok') : 'ok'}`);
     } catch (scanErr) {
       console.warn(`[WORKSPACE] Auto-scan failed: ${scanErr.message}`);
