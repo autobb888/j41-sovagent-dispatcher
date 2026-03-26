@@ -5,6 +5,24 @@
  * @abstract
  */
 class Executor {
+  constructor() {
+    this._tokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0, llmCalls: 0 };
+  }
+
+  /** Accumulate token usage from an LLM API response's usage object */
+  _trackUsage(usage) {
+    if (!usage) return;
+    this._tokenUsage.promptTokens += usage.prompt_tokens || 0;
+    this._tokenUsage.completionTokens += usage.completion_tokens || 0;
+    this._tokenUsage.totalTokens += usage.total_tokens || 0;
+    this._tokenUsage.llmCalls++;
+  }
+
+  /** Get accumulated token usage for this session */
+  getTokenUsage() {
+    return { ...this._tokenUsage };
+  }
+
   /**
    * Called once when the job starts. Set up connections/state.
    * @param {Object} job - Job metadata (id, description, buyer, amount, currency)

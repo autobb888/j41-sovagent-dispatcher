@@ -18,7 +18,7 @@ const AGENT_ID = process.env.J41_AGENT_ID;
 const IDENTITY = process.env.J41_IDENTITY;
 const JOB_ID = process.env.J41_JOB_ID;
 const TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS || '3600000');
-const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '600000'); // idle → pause (not deliver)
+const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '480000'); // idle → pause (8 min, before backend's 10-min auto-deliver)
 
 const KEYS_FILE = process.env.J41_KEYS_FILE || '/app/keys.json';
 const SOUL_FILE = process.env.J41_SOUL_FILE || '/app/SOUL.md';
@@ -252,17 +252,14 @@ async function main() {
         case 'reconnect':
           console.log(`[IPC] reconnect requested for job ${msg.jobId}`);
           _paused = false;
+          _idleMessageSent = false;
           _lastActivityAt = Date.now();
           try {
-            if (_agent?.chat?.isConnected === false || !_agent?.chat?.isConnected) {
-              await _agent.authenticate();
-              await _agent.chat.connect();
-              _agent.chat.joinJob(msg.jobId);
-              _agent.sendChatMessage(msg.jobId, 'I\'m back online. How can I help?');
-              console.log(`[IPC] Reconnected chat for job ${msg.jobId}`);
-            } else {
-              _agent.sendChatMessage(msg.jobId, 'I\'m still connected. What do you need?');
-            }
+            await _agent.authenticate();
+            await _agent.connectChat();
+            _agent.joinJobChat(msg.jobId);
+            _agent.sendChatMessage(msg.jobId, 'I\'m back online. How can I help?');
+            console.log(`[IPC] Reconnected chat for job ${msg.jobId}`);
           } catch (err) {
             console.error(`[IPC] Reconnect failed: ${err.message}`);
           }
@@ -290,6 +287,13 @@ async function main() {
   try {
     result = await processJob(job, agent, soulPrompt, executor, (resolve) => { setSessionEndResolve(resolve); });
     console.log('\n✅ Work completed\n');
+
+    // Log token usage summary
+    if (_executor?.getTokenUsage) {
+      const usage = _executor.getTokenUsage();
+      console.log(`[TOKENS] Session: ${usage.llmCalls} calls, ${usage.promptTokens} in, ${usage.completionTokens} out, ${usage.totalTokens} total`);
+      if (process.send) process.send({ type: 'token_usage', jobId: JOB_ID, usage });
+    }
   } catch (e) {
     console.error('\n❌ Job failed:', e.message);
     await executor.cleanup().catch(() => {});
@@ -463,19 +467,29 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   }
 
   // Idle timer — check periodically if we should pause (not auto-deliver)
+  _idleMessageSent = false;
   const idleCheck = setInterval(async () => {
     const idleMs = Date.now() - _lastActivityAt;
-    console.log(`[CHAT] Heartbeat — idle ${Math.round(idleMs / 1000)}s, messages: ${messageCount}, timeout: ${IDLE_TIMEOUT_MS / 1000}s, paused: ${_paused}`);
     if (idleMs >= IDLE_TIMEOUT_MS && !sessionEnded && !_paused) {
-      console.log(`[CHAT] Idle for ${Math.round(idleMs / 1000)}s — requesting pause`);
-      agent.sendChatMessage(job.id, 'Session going idle — I\'ll be here when you\'re ready to continue.');
+      if (!_idleMessageSent) {
+        _idleMessageSent = true;
+        console.log(`[CHAT] Idle for ${Math.round(idleMs / 1000)}s — requesting pause`);
+        try {
+          agent.sendChatMessage(job.id, 'Session going idle — I\'ll be here when you\'re ready to continue.');
+        } catch {}
+      }
       try {
         await agent.client.pauseJob(job.id);
-        _paused = true; // Only set after API confirms
-        // Signal dispatcher to throttle container and free slot
+        _paused = true;
         if (process.send) process.send({ type: 'job_idle', jobId: job.id });
+        console.log(`[CHAT] Paused successfully`);
       } catch (err) {
-        console.error(`[CHAT] Pause failed: ${err.message}`);
+        // If pause fails (job already delivered/completed by backend), end session
+        if (err.message?.includes('cannot be paused') || err.message?.includes('Only in-progress')) {
+          console.log(`[CHAT] Pause rejected (${err.message}) — ending session`);
+          _paused = true; // Stop retrying
+          if (resolveSession) resolveSession('backend-ended');
+        }
       }
     }
   }, 10000);
@@ -488,8 +502,11 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   return await executor.finalize();
 }
 
+let _workspaceConnecting = false;
+let _idleMessageSent = false;
 async function connectWorkspace(jobId, permissions, mode) {
-  if (_workspaceConnected) return;
+  if (_workspaceConnected || _workspaceConnecting) return;
+  _workspaceConnecting = true;
   _workspaceMode = mode || 'supervised';
   try {
     console.log(`[WORKSPACE] Connecting for job ${jobId?.substring(0, 8)} (mode=${_workspaceMode})...`);
@@ -502,23 +519,43 @@ async function connectWorkspace(jobId, permissions, mode) {
       _executor.setWorkspaceTools(_workspaceTools, handleWorkspaceToolCall);
     }
 
-    _agent.sendChatMessage(jobId, 'I now have access to your project files. Let me know what you need.');
+    // Auto-scan project root so the agent has context immediately
+    try {
+      const rootFiles = await _agent.workspace.listDirectory('.');
+      const fileList = Array.isArray(rootFiles) ? rootFiles.map(f => f.name || f).join(', ') : JSON.stringify(rootFiles);
+      _agent.sendChatMessage(jobId, `I now have access to your project files. Here's your project structure:\n\n${fileList}\n\nWhat would you like me to work on?`);
+      console.log(`[WORKSPACE] Auto-scanned root: ${typeof rootFiles === 'object' ? (Array.isArray(rootFiles) ? rootFiles.length + ' items' : 'ok') : 'ok'}`);
+    } catch (scanErr) {
+      console.warn(`[WORKSPACE] Auto-scan failed: ${scanErr.message}`);
+      _agent.sendChatMessage(jobId, 'I now have access to your project files. Let me know what you need.');
+    }
+
+    let _wsDisconnectNotified = false;
     _agent.workspace.onStatusChanged((status, data) => {
       console.log(`[WORKSPACE] Status changed: ${status}`);
       if (status === 'aborted' || status === 'completed' || status === 'disconnected') {
         disconnectWorkspace();
+        if (!_wsDisconnectNotified) {
+          _wsDisconnectNotified = true;
+          try { _agent.sendChatMessage(JOB_ID, 'Workspace disconnected. I can still help via chat.'); } catch {}
+        }
       }
     });
     _agent.workspace.onDisconnected((reason) => {
       console.warn(`[WORKSPACE] Disconnected: ${reason}`);
-      _workspaceConnected = false;
-      _workspaceTools = [];
-      if (_executor && typeof _executor.clearWorkspaceTools === 'function') {
-        _executor.clearWorkspaceTools();
+      if (reason === 'io server disconnect' || reason === 'io client disconnect') {
+        disconnectWorkspace();
+        if (!_wsDisconnectNotified) {
+          _wsDisconnectNotified = true;
+          try { _agent.sendChatMessage(JOB_ID, 'Workspace disconnected. I can still help via chat.'); } catch {}
+        }
+      } else {
+        console.log(`[WORKSPACE] Transient disconnect (${reason}) — waiting for auto-reconnect`);
       }
     });
     console.log(`[WORKSPACE] Connected — ${_workspaceTools.length} tool(s) available`);
   } catch (err) {
+    _workspaceConnecting = false;
     console.error(`[WORKSPACE] Failed to connect: ${err.message}`);
     _agent.sendChatMessage(jobId, `Unable to connect to workspace: ${err.message}`);
   }
@@ -549,8 +586,18 @@ function disconnectWorkspace() {
   console.log('[WORKSPACE] Disconnected');
 }
 
+const _blockedFiles = new Set(); // tracks files that were blocked or not found
+
 async function handleWorkspaceToolCall(toolName, args) {
   if (!_workspaceConnected) return 'Workspace is not connected';
+
+  // Workspace activity counts as activity — prevents idle timeout during buyer review
+  _lastActivityAt = Date.now();
+
+  // Reject repeat attempts on known-blocked files
+  if ((toolName === 'workspace_read_file' || toolName === 'workspace_write_file') && _blockedFiles.has(args.path)) {
+    return `BLOCKED: "${args.path}" was already denied (excluded by SovGuard or not found). Do NOT retry this file. Work with other files instead.`;
+  }
 
   // M11: Validate path arg for write operations (defense in depth — SDK also validates)
   if (args.path) {
@@ -563,15 +610,28 @@ async function handleWorkspaceToolCall(toolName, args) {
     switch (toolName) {
       case 'workspace_list_directory':
         return JSON.stringify(await _agent.workspace.listDirectory(args.path || '.'));
-      case 'workspace_read_file':
-        return await _agent.workspace.readFile(args.path);
+      case 'workspace_read_file': {
+        const result = await _agent.workspace.readFile(args.path);
+        // Detect blocked/not-found responses and remember them
+        if (typeof result === 'string' && (result.includes('excluded') || result.includes('not found') || result.includes('blocked') || result.includes('denied'))) {
+          _blockedFiles.add(args.path);
+          return `BLOCKED: "${args.path}" is not accessible (${result}). Do NOT retry this file.`;
+        }
+        return result;
+      }
       case 'workspace_write_file':
         return await _agent.workspace.writeFile(args.path, args.content);
       default:
         return `Unknown workspace tool: ${toolName}`;
     }
   } catch (err) {
-    return `Workspace error: ${err.message}`;
+    const msg = err.message || '';
+    // Track files that error out so the LLM doesn't retry
+    if (args.path && (msg.includes('excluded') || msg.includes('not found') || msg.includes('blocked') || msg.includes('No such file'))) {
+      _blockedFiles.add(args.path);
+      return `BLOCKED: "${args.path}" is not accessible (${msg}). Do NOT retry this file. Use workspace_list_directory to see available files.`;
+    }
+    return `Workspace error: ${msg}`;
   }
 }
 

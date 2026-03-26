@@ -224,6 +224,11 @@ function buildFullProfile(options) {
     if (options.sessionAllowedFileTypes) profile.session.allowedFileTypes = options.sessionAllowedFileTypes;
   }
 
+  // LLM models declaration
+  if (options.models) {
+    profile.models = Array.isArray(options.models) ? options.models : options.models.split(',').map(m => m.trim());
+  }
+
   return profile;
 }
 
@@ -742,6 +747,7 @@ program
   .option('--profile-tags <tags>', 'Comma-separated tags', (v) => v.split(','))
   .option('--profile-website <url>', 'Agent website URL')
   .option('--profile-avatar <url>', 'Agent avatar URL')
+  .option('--models <models>', 'Comma-separated LLM model names (e.g. "kimi-k2.5,claude-sonnet-4.6")')
   .option('--profile-category <cat>', 'Agent category')
   .option('--session-duration <min>', 'Max session duration in minutes', parseInt)
   .option('--session-token-limit <n>', 'Max tokens per session', parseInt)
@@ -899,6 +905,7 @@ program
   .option('--profile-tags <tags>', 'Comma-separated tags', (v) => v.split(','))
   .option('--profile-website <url>', 'Agent website URL')
   .option('--profile-avatar <url>', 'Agent avatar URL')
+  .option('--models <models>', 'Comma-separated LLM model names (e.g. "kimi-k2.5,claude-sonnet-4.6")')
   .option('--profile-category <cat>', 'Agent category')
   .option('--service-name <name>', 'Service name for marketplace listing')
   .option('--service-description <desc>', 'Service description')
@@ -1625,6 +1632,7 @@ program
   .option('--profile-tags <tags>', 'Comma-separated tags', (v) => v.split(','))
   .option('--profile-website <url>', 'Agent website URL')
   .option('--profile-avatar <url>', 'Agent avatar URL')
+  .option('--models <models>', 'Comma-separated LLM model names (e.g. "kimi-k2.5,claude-sonnet-4.6")')
   .option('--profile-owner <owner>', 'Owner VerusID')
   .option('--profile-capabilities <json>', 'Capabilities as JSON array', parseJsonArray)
   .option('--profile-endpoints <json>', 'Endpoints as JSON array', parseJsonArray)
@@ -1893,13 +1901,17 @@ program
         if (id?.contentmultimap) {
           const decoded = decodeContentMultimap(id.contentmultimap);
           const hasWorkspace = !!decoded.profile?.workspaceCapability;
+          // Also check raw CMM for workspace parent key (handles raw hex format from updateidentity)
+          const { PARENT_KEYS: PK } = require('@j41/sovagent-sdk/dist/onboarding/vdxf.js');
+          const hasWorkspaceKey = !!id.contentmultimap[PK.workspace];
           const services = decoded.services || [];
           state.capabilities.set(agentInfo.id, {
             workspace: hasWorkspace,
+            hasWorkspaceKey,
             services: services.map(s => ({ name: s.name, type: s.type })),
             profile: decoded.profile,
           });
-          console.log(`  ${agentInfo.id}: workspace=${hasWorkspace}, services=${services.length}`);
+          console.log(`  ${agentInfo.id}: workspace=${hasWorkspace || hasWorkspaceKey}, services=${services.length}`);
         } else {
           state.capabilities.set(agentInfo.id, { workspace: false, services: [], profile: null });
           console.log(`  ${agentInfo.id}: no VDXF data on-chain`);
@@ -2390,7 +2402,8 @@ function checkWorkspaceCapability(state, agentId) {
     console.warn(`[VDXF-POLICY] ${agentId}: no capability data — blocking workspace`);
     return false;
   }
-  if (!caps.workspace) {
+  // Check decoded profile OR raw contentmultimap for workspace parent key
+  if (!caps.workspace && !caps.hasWorkspaceKey) {
     console.warn(`[VDXF-POLICY] ${agentId}: workspace.capability NOT set on-chain — blocking workspace`);
     return false;
   }
@@ -2533,6 +2546,9 @@ async function pollForJobs(state) {
         }
 
         console.log(`📥 New job: ${job.id} (${job.amount} ${job.currency})`);
+
+        // Mark seen BEFORE starting to prevent duplicate spawns from concurrent polls
+        state.seen.set(job.id, Date.now());
 
         if (state.active.size >= MAX_AGENTS) {
           console.log(`   → Queueing (max capacity)`);
@@ -3333,6 +3349,13 @@ async function startJobLocal(state, job, agentInfo) {
           }
           console.log(`[IDLE] Job ${msg.jobId.substring(0, 8)} paused — agent slot freed`);
           persistActiveJobs(state.active);
+        }
+      }
+      if (msg?.type === 'token_usage') {
+        const info = state.active.get(msg.jobId);
+        if (info) {
+          info.tokenUsage = msg.usage;
+          console.log(`[TOKENS] Job ${msg.jobId.substring(0, 8)}: ${msg.usage.llmCalls} calls, ${msg.usage.promptTokens} in, ${msg.usage.completionTokens} out, ${msg.usage.totalTokens} total`);
         }
       }
     });

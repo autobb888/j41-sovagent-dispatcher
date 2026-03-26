@@ -112,6 +112,7 @@ async function handleCommand(cmd, state, handlers, startedAt) {
           runningFor: `${Math.floor((Date.now() - active.startedAt) / 60000)}m`,
           paused: active.paused || false,
           workspace: active.workspaceNotified || false,
+          tokens: active.tokenUsage || null,
         });
       }
       return { active: jobs, queue: state.queue.length };

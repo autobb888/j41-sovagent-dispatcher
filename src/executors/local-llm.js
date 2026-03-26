@@ -68,7 +68,9 @@ class LocalLLMExecutor extends Executor {
         if (this.workspaceTools.length > 0 && this.workspaceHandler) {
           response = await this._agentLoop();
         } else {
-          response = await callLLM(this.systemPrompt, this.conversationLog);
+          const result = await callLLM(this.systemPrompt, this.conversationLog);
+          this._trackUsage(result.usage);
+          response = result.content;
         }
       } finally {
         this.llmBusy = false;
@@ -93,7 +95,7 @@ class LocalLLMExecutor extends Executor {
     this.workspaceTools = tools;
     this.workspaceHandler = handler;
     if (tools.length > 0 && this.job) {
-      this.systemPrompt += '\n\nYou have access to the buyer\'s project files via workspace tools. Use them when the buyer asks you to read, write, or explore their code. Available tools: workspace_list_directory, workspace_read_file, workspace_write_file.';
+      this.systemPrompt += '\n\nYou have access to the buyer\'s project files via workspace tools. Available tools: workspace_list_directory, workspace_read_file, workspace_write_file.\n\nIMPORTANT RULES:\n- ONLY read files that appear in directory listings. Never guess filenames.\n- If a file read returns BLOCKED or error, do NOT retry that file. Move on to other files.\n- Use workspace_list_directory first to discover what files exist before reading them.\n- Some files are excluded by SovGuard security scanning (e.g. .env, shell scripts) — respect this.';
     }
   }
 
@@ -107,6 +109,7 @@ class LocalLLMExecutor extends Executor {
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       const llmResponse = await callLLMWithTools(this.systemPrompt, messages, this.workspaceTools);
+      this._trackUsage(llmResponse._usage);
 
       if (!llmResponse.tool_calls || llmResponse.tool_calls.length === 0) {
         return llmResponse.content || 'I could not generate a response.';
@@ -128,6 +131,10 @@ class LocalLLMExecutor extends Executor {
         }
 
         console.log(`[WORKSPACE] Tool call: ${toolName}`);
+        if (!this.workspaceHandler) {
+          messages.push({ role: 'tool', tool_call_id: toolCall.id, content: 'Workspace disconnected — tool no longer available.' });
+          continue;
+        }
         const toolResult = await this.workspaceHandler(toolName, args);
 
         messages.push({
@@ -182,10 +189,13 @@ async function callLLM(systemPrompt, messages) {
 
     const data = await res.json();
     const msg = data.choices?.[0]?.message;
-    return msg?.content || msg?.reasoning_content || 'I could not generate a response.';
+    return {
+      content: msg?.content || msg?.reasoning_content || 'I could not generate a response.',
+      usage: data.usage || null,
+    };
   } catch (e) {
     console.error(`[LLM] Kimi call failed: ${e.message}`);
-    return 'I experienced a temporary issue. Please try sending your message again.';
+    return { content: 'I experienced a temporary issue. Please try sending your message again.', usage: null };
   }
 }
 
@@ -237,10 +247,12 @@ async function callLLMWithTools(systemPrompt, messages, tools) {
     }
 
     const data = await res.json();
-    return data.choices?.[0]?.message || { content: 'No response generated.' };
+    const msg = data.choices?.[0]?.message || { content: 'No response generated.' };
+    msg._usage = data.usage || null;
+    return msg;
   } catch (e) {
     console.error(`[LLM] Kimi call failed: ${e.message}`);
-    return { content: 'I experienced a temporary issue. Please try again.' };
+    return { content: 'I experienced a temporary issue. Please try again.', _usage: null };
   }
 }
 
