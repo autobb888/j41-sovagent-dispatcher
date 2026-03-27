@@ -12,6 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { createExecutor, EXECUTOR_TYPE } = require('./executors/index.js');
+const log = require('./logger.js');
 
 const API_URL = process.env.J41_API_URL;
 const AGENT_ID = process.env.J41_AGENT_ID;
@@ -534,13 +535,57 @@ async function connectWorkspace(jobId, permissions, mode) {
     try {
       const rootFiles = await _agent.workspace.listDirectory('.');
       const fileList = Array.isArray(rootFiles) ? rootFiles.map(f => f.name || f).join(', ') : JSON.stringify(rootFiles);
-      const excludeNote = excluded.length > 0 ? `\n\nExcluded by SovGuard: ${excluded.join(', ')}` : '';
-      _agent.sendChatMessage(jobId, `I now have access to your project files. Here's your project structure:\n\n${fileList}${excludeNote}\n\nWhat would you like me to work on?`);
-      console.log(`[WORKSPACE] Auto-scanned root: ${typeof rootFiles === 'object' ? (Array.isArray(rootFiles) ? rootFiles.length + ' items' : 'ok') : 'ok'}`);
+      const fileNames = Array.isArray(rootFiles) ? rootFiles.map(f => f.name || f) : [];
+
+      // Detect project language from manifest files
+      const langSignals = {
+        'Cargo.toml': 'Rust', 'Cargo.lock': 'Rust',
+        'package.json': 'JavaScript/TypeScript', 'tsconfig.json': 'TypeScript',
+        'go.mod': 'Go', 'go.sum': 'Go',
+        'requirements.txt': 'Python', 'pyproject.toml': 'Python', 'setup.py': 'Python', 'Pipfile': 'Python',
+        'Gemfile': 'Ruby', 'Gemfile.lock': 'Ruby',
+        'pom.xml': 'Java', 'build.gradle': 'Java/Kotlin',
+        'composer.json': 'PHP',
+        'mix.exs': 'Elixir',
+        'CMakeLists.txt': 'C/C++', 'Makefile': 'C/C++',
+        'Package.swift': 'Swift',
+        'pubspec.yaml': 'Dart/Flutter',
+      };
+      const detectedLangs = [...new Set(fileNames.filter(f => langSignals[f]).map(f => langSignals[f]))];
+      const langNote = detectedLangs.length > 0 ? `\n\nDetected: ${detectedLangs.join(', ')} project` : '';
+
+      // Inject language into executor system prompt
+      if (detectedLangs.length > 0 && _executor?.systemPrompt) {
+        _executor.systemPrompt += `\n\nThis is a ${detectedLangs.join(' + ')} project. Use the correct language conventions, file extensions, and tooling.`;
+      }
+
+      const excludeNote = excluded.length > 0 ? `\nExcluded by SovGuard: ${excluded.join(', ')}` : '';
+      _agent.sendChatMessage(jobId, `I now have access to your project files.${langNote}\n\n${fileList}${excludeNote}\n\nWhat would you like me to work on?`);
+      console.log(`[WORKSPACE] Auto-scanned root: ${fileNames.length} items${langNote}`);
     } catch (scanErr) {
       console.warn(`[WORKSPACE] Auto-scan failed: ${scanErr.message}`);
       _agent.sendChatMessage(jobId, 'I now have access to your project files. Let me know what you need.');
     }
+
+    // Estimate token cost for workspace jobs and request budget if needed
+    try {
+      const job = _executor?.job;
+      if (job && _agent.requestBudget) {
+        const jobAmount = parseFloat(job.amount) || 0;
+        const usage = _executor?.getTokenUsage?.() || {};
+        // After first scan we know how big the project is — estimate full review cost
+        // Rough heuristic: each file read averages ~2K tokens, workspace sessions run 5-15 calls
+        const estimatedCalls = 10;
+        const estimatedTokens = estimatedCalls * 3000; // ~30K tokens total
+        const estimatedCostUsd = estimatedTokens * 0.001 / 1000; // rough $0.001/1K tokens
+        // Only request budget if estimated cost would exceed 2x the job payment (margin check)
+        // This is a soft signal — the buyer can decline
+        if (estimatedCostUsd > jobAmount * 0.5 && jobAmount < 1.0) {
+          console.log(`[BUDGET] Workspace job may need more budget (est: $${estimatedCostUsd.toFixed(4)}, paid: ${jobAmount} ${job.currency})`);
+          // Don't block — just log for now. requestBudget() will be called mid-session if needed.
+        }
+      }
+    } catch {}
 
     let _wsDisconnectNotified = false;
     _agent.workspace.onStatusChanged((status, data) => {
@@ -678,6 +723,14 @@ process.on('SIGTERM', async () => {
   }
   process.exit(130);
 });
+
+// Soft timeout warning — 5 min before hard kill
+setTimeout(() => {
+  console.warn('⚠️  Job approaching timeout — 5 minutes remaining');
+  if (_agent && !_paused) {
+    try { _agent.sendChatMessage(JOB_ID, 'This session will end in 5 minutes. Wrapping up current work.'); } catch {}
+  }
+}, TIMEOUT_MS - 300000);
 
 // Timeout protection (J4: also submit attestation to API, not just disk)
 setTimeout(async () => {

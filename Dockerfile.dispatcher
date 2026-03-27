@@ -1,20 +1,29 @@
 # J41 Dispatcher Container
+# Build from PARENT directory (both SDK and dispatcher must be in context):
+#   cd .. && docker build -f j41-sovagent-dispatcher/Dockerfile.dispatcher -t j41/dispatcher .
+# Run:
+#   docker run -v ~/.j41:/root/.j41 --env-file .env j41/dispatcher
 
 FROM node:22-slim
 
-# Install Docker CLI
-RUN apt-get update && apt-get install -y \
-    docker.io \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
-# Copy package files and install with yarn
-COPY package.json yarn.lock ./
+# Copy SDK first (local dependency — build context is parent dir)
+COPY j41-sovagent-sdk /sdk
+RUN cd /sdk && yarn install --production && yarn build
+
+# Copy dispatcher
+COPY j41-sovagent-dispatcher/package.json j41-sovagent-dispatcher/yarn.lock ./
 RUN yarn install --production
 
-# Copy active source files
-COPY src/cli.js src/keygen.js ./src/
+# Copy all source
+COPY j41-sovagent-dispatcher/src/ ./src/
+COPY j41-sovagent-dispatcher/templates/ ./templates/
+COPY j41-sovagent-dispatcher/setup.sh ./
 
-# Start dispatcher
+# Health check
+HEALTHCHECK --interval=60s --timeout=5s CMD node -e "require('net').createConnection('/root/.j41/dispatcher/control.sock').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"
+
+EXPOSE 9841
+
 CMD ["node", "src/cli.js", "start"]

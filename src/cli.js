@@ -661,6 +661,79 @@ program
 
 // Init command — create N agent identities
 program
+  .command('quickstart')
+  .description('Guided first-run setup — creates agent, picks template, configures LLM')
+  .action(async () => {
+    ensureDirs();
+    const readline = require('readline');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const ask = (q, def) => new Promise(resolve => {
+      const prompt = def != null ? `${q} [${def}]: ` : `${q}: `;
+      rl.question(prompt, answer => resolve(answer.trim() || (def != null ? String(def) : '')));
+    });
+
+    console.log('\n╔══════════════════════════════════════════╗');
+    console.log('║     J41 Dispatcher — Quick Start         ║');
+    console.log('╚══════════════════════════════════════════╝\n');
+
+    // 1. Identity name
+    const name = await ask('Choose a name for your agent (lowercase, no spaces)', '');
+    if (!name) { console.error('❌ Name required'); rl.close(); process.exit(1); }
+
+    // 2. Template
+    const tplDir = path.join(__dirname, '..', 'templates');
+    const templates = fs.readdirSync(tplDir).filter(d => fs.existsSync(path.join(tplDir, d, 'config.json')));
+    console.log(`\nAvailable templates: ${templates.join(', ')}`);
+    const template = await ask('Choose a template', 'general-assistant');
+
+    // 3. LLM provider
+    console.log('\nPopular LLM providers: openai, claude, groq, deepseek, ollama');
+    const provider = await ask('LLM provider', 'openai');
+
+    // 4. API key
+    let apiKey = '';
+    if (provider !== 'ollama' && provider !== 'lmstudio' && provider !== 'vllm') {
+      apiKey = await ask(`API key for ${provider}`, '');
+      if (!apiKey) console.log('  (You can set it later via environment variable)');
+    }
+
+    // 5. Runtime
+    const runtime = await ask('Runtime mode (local or docker)', 'local');
+
+    rl.close();
+
+    console.log('\n─── Configuration ───');
+    console.log(`  Agent:    ${name}.agentplatform@`);
+    console.log(`  Template: ${template}`);
+    console.log(`  LLM:      ${provider}`);
+    console.log(`  Runtime:  ${runtime}`);
+    console.log('');
+
+    // Save config
+    const config = loadConfig();
+    config.runtime = runtime;
+    saveConfig(config);
+
+    // Write env hints
+    const envHints = [`J41_LLM_PROVIDER=${provider}`];
+    if (apiKey) {
+      const { LLM_PRESETS } = require('./executors/local-llm.js');
+      const preset = LLM_PRESETS[provider];
+      if (preset?.envKey) envHints.push(`${preset.envKey}=${apiKey}`);
+    }
+
+    console.log('Next steps:\n');
+    console.log(`  1. Export your LLM config:`);
+    for (const hint of envHints) console.log(`     export ${hint}`);
+    console.log(`\n  2. Set up your agent:`);
+    console.log(`     node src/cli.js setup agent-1 ${name} --template ${template}`);
+    console.log(`\n  3. Start the dispatcher:`);
+    console.log(`     node src/cli.js start`);
+    console.log('');
+  });
+
+// Init command — create N agent identities
+program
   .command('init')
   .description('Initialize dispatcher with N agent identities')
   .option('-n, --agents <number>', 'Number of agents to create', '9')
@@ -1624,6 +1697,7 @@ program
 program
   .command('setup <agent-id> <identity-name>')
   .description('One-command setup: init keys + register on-chain + finalize with profile & service')
+  .option('--template <name>', 'Use a template (code-review, general-assistant, data-analyst)')
   .option('--profile-name <name>', 'Profile display name')
   .option('--profile-type <type>', 'Profile type (autonomous|assisted|hybrid|tool)', 'autonomous')
   .option('--profile-description <desc>', 'Profile description')
@@ -1655,6 +1729,41 @@ program
   .option('-i, --interactive', 'Interactive mode — walk through all fields')
   .action(async (agentId, identityName, options) => {
     ensureDirs();
+
+    // Load template if specified
+    if (options.template) {
+      const tplDir = path.join(__dirname, '..', 'templates', options.template);
+      const tplConfigPath = path.join(tplDir, 'config.json');
+      if (!fs.existsSync(tplConfigPath)) {
+        const available = fs.readdirSync(path.join(__dirname, '..', 'templates')).filter(d => fs.existsSync(path.join(__dirname, '..', 'templates', d, 'config.json')));
+        console.error(`❌ Template "${options.template}" not found. Available: ${available.join(', ')}`);
+        process.exit(1);
+      }
+      const tpl = JSON.parse(fs.readFileSync(tplConfigPath, 'utf8'));
+      console.log(`📋 Using template: ${options.template}\n`);
+
+      // Merge template into options (CLI flags override template)
+      if (tpl.profile) {
+        if (!options.profileName) options.profileName = tpl.profile.name;
+        if (!options.profileType) options.profileType = tpl.profile.type;
+        if (!options.profileDescription) options.profileDescription = tpl.profile.description;
+        if (!options.profileCategory && tpl.profile.profile?.category) options.profileCategory = tpl.profile.profile.category;
+        if (!options.profileTags && tpl.profile.profile?.tags) options.profileTags = tpl.profile.profile.tags;
+        if (!options.profileProtocols && tpl.profile.network?.protocols) options.profileProtocols = tpl.profile.network.protocols;
+        if (!options.models && tpl.profile.models) options.models = tpl.profile.models;
+      }
+      if (tpl.service) {
+        if (!options.serviceName) options.serviceName = tpl.service.name;
+        if (!options.serviceDescription) options.serviceDescription = tpl.service.description;
+        if (!options.servicePrice) options.servicePrice = tpl.service.price;
+        if (!options.serviceCurrency) options.serviceCurrency = tpl.service.currency;
+        if (!options.serviceCategory) options.serviceCategory = tpl.service.category;
+        if (!options.serviceTurnaround) options.serviceTurnaround = tpl.service.turnaround;
+        if (!options.servicePaymentTerms) options.servicePaymentTerms = tpl.service.paymentTerms;
+      }
+      // Copy SOUL.md if template has one and agent doesn't yet
+      options._templateSoulPath = path.join(tplDir, 'SOUL.md');
+    }
 
     // Interactive mode: prompt for all fields before proceeding
     if (options.interactive) {
@@ -1690,8 +1799,11 @@ program
       console.log(`  ✓ Keys generated (${keys.address})`);
     }
 
-    // Write SOUL.md if provided
-    if (options.soul && fs.existsSync(options.soul)) {
+    // Write SOUL.md — template > --soul flag > default
+    if (options._templateSoulPath && fs.existsSync(options._templateSoulPath) && !fs.existsSync(path.join(agentDir, 'SOUL.md'))) {
+      fs.copyFileSync(options._templateSoulPath, path.join(agentDir, 'SOUL.md'));
+      console.log(`  ✓ SOUL.md from template`);
+    } else if (options.soul && fs.existsSync(options.soul)) {
       fs.copyFileSync(options.soul, path.join(agentDir, 'SOUL.md'));
       console.log(`  ✓ SOUL.md copied from ${options.soul}`);
     } else if (!fs.existsSync(path.join(agentDir, 'SOUL.md'))) {
@@ -1815,6 +1927,40 @@ program
     }
     console.log(`\n  Next: node src/cli.js start`);
     console.log(`  Verify: node src/cli.js inspect ${agentId}`);
+  });
+
+// List available LLM providers (works without dispatcher running)
+program
+  .command('providers')
+  .description('List available LLM providers and executor types')
+  .action(() => {
+    const { LLM_PRESETS, LLM_CONFIG } = require('./executors/local-llm.js');
+    const { EXECUTOR_ALIASES } = require('./executors/index.js');
+
+    console.log('\n╔══════════════════════════════════════════╗');
+    console.log('║     LLM Providers & Executors            ║');
+    console.log('╚══════════════════════════════════════════╝\n');
+
+    console.log('LLM Providers (set J41_LLM_PROVIDER):\n');
+    for (const [name, preset] of Object.entries(LLM_PRESETS)) {
+      if (name === 'custom') continue;
+      const current = LLM_CONFIG.provider === name ? ' ← current' : '';
+      console.log(`  ${name.padEnd(14)} ${(preset.model || '(configure)').padEnd(40)} ${preset.envKey || '(no key)'}${current}`);
+    }
+
+    console.log('\nExecutor Types (set J41_EXECUTOR):\n');
+    console.log('  local-llm    Direct LLM API (default)');
+    console.log('  webhook      REST POST endpoint');
+    console.log('  langserve    LangChain Runnables');
+    console.log('  langgraph    LangGraph Platform');
+    console.log('  a2a          Google Agent-to-Agent');
+    console.log('  mcp          MCP server + LLM');
+
+    console.log('\nFramework Aliases (route to webhook executor):\n');
+    for (const [alias, target] of Object.entries(EXECUTOR_ALIASES)) {
+      console.log(`  ${alias.padEnd(14)} → ${target}`);
+    }
+    console.log('');
   });
 
 // Start command — run the dispatcher (listen for jobs)
@@ -3056,6 +3202,11 @@ function getExecutorEnvVars(agentInfo) {
   if (config.mcpCommand) envVars.push(`J41_MCP_COMMAND=${config.mcpCommand}`);
   if (config.mcpUrl) envVars.push(`J41_MCP_URL=${config.mcpUrl}`);
   if (config.mcpMaxRounds) envVars.push(`J41_MCP_MAX_ROUNDS=${config.mcpMaxRounds}`);
+  // Per-agent LLM config (overrides global J41_LLM_* env vars)
+  if (config.llmProvider) envVars.push(`J41_LLM_PROVIDER=${config.llmProvider}`);
+  if (config.llmModel) envVars.push(`J41_LLM_MODEL=${config.llmModel}`);
+  if (config.llmBaseUrl) envVars.push(`J41_LLM_BASE_URL=${config.llmBaseUrl}`);
+  if (config.llmApiKey) envVars.push(`J41_LLM_API_KEY=${config.llmApiKey}`);
 
   return envVars;
 }
@@ -3286,7 +3437,15 @@ async function startJobLocal(state, job, agentInfo) {
 
   // Optional LLM config — only pass through if set in parent
   const OPTIONAL_PASSTHROUGH = [
+    // LLM provider (new generic)
+    'J41_LLM_PROVIDER', 'J41_LLM_BASE_URL', 'J41_LLM_API_KEY', 'J41_LLM_MODEL',
+    // Legacy Kimi env vars (backwards compatible)
     'KIMI_API_KEY', 'KIMI_BASE_URL', 'KIMI_MODEL',
+    // Provider-specific API keys (for presets)
+    'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GROQ_API_KEY', 'DEEPSEEK_API_KEY', 'MISTRAL_API_KEY',
+    'GOOGLE_API_KEY', 'XAI_API_KEY', 'COHERE_API_KEY', 'PERPLEXITY_API_KEY',
+    'TOGETHER_API_KEY', 'FIREWORKS_API_KEY', 'NVIDIA_API_KEY', 'AZURE_OPENAI_API_KEY', 'OPENROUTER_API_KEY',
+    // Other
     'IDLE_TIMEOUT_MS', 'J41_MCP_COMMAND', 'J41_MCP_URL',
     'J41_EXECUTOR_AUTH', 'J41_EXECUTOR_TIMEOUT', 'J41_MCP_MAX_ROUNDS',
     'J41_EXECUTOR', 'MAX_CONVERSATION_LOG',
@@ -3571,7 +3730,7 @@ program
 // ── Control Plane Client ──
 program
   .command('ctl <command>')
-  .description('Send command to running dispatcher (status, jobs, agents, shutdown, canary)')
+  .description('Send command to running dispatcher: status, jobs, agents, resources, earnings, history, providers, shutdown, canary')
   .option('--agent <id>', 'Agent ID (for canary command)')
   .option('--json', 'Raw JSON output')
   .action(async (command, options) => {
@@ -3634,6 +3793,63 @@ program
           } else {
             console.log(`\n${result.agentId}: ${JSON.stringify(result.canary, null, 2)}\n`);
           }
+          break;
+
+        case 'resources':
+          console.log('\n╔══════════════════════════════════════════╗');
+          console.log('║     System Resources                     ║');
+          console.log('╚══════════════════════════════════════════╝\n');
+          if (result.cpu) {
+            console.log(`  CPU:  ${result.cpu.cores} cores (${result.cpu.model.substring(0, 40)})`);
+            console.log(`        Load: ${result.cpu.load1m} / ${result.cpu.load5m} / ${result.cpu.load15m}  (${result.cpu.usagePercent}%)`);
+          }
+          if (result.memory) {
+            console.log(`  RAM:  ${result.memory.usedMB}MB / ${result.memory.totalMB}MB  (${result.memory.usagePercent}% used, ${result.memory.freeMB}MB free)`);
+          }
+          if (result.capacity) {
+            console.log(`  Slots: ${result.capacity.active}/${result.capacity.maxSlots} active, ${result.capacity.available} available`);
+            console.log(`  Headroom: ${result.capacity.headroom}`);
+          }
+          if (result.jobs?.length > 0) {
+            console.log('\n  Job processes:');
+            for (const j of result.jobs) {
+              console.log(`    ${j.jobId}  PID=${j.pid}  ${j.memMB != null ? j.memMB + 'MB' : '?'}  ${j.agentId}`);
+            }
+          }
+          console.log('');
+          break;
+
+        case 'history':
+          console.log(`\nRecent jobs (${(result.jobs || []).length}):\n`);
+          for (const j of (result.jobs || [])) {
+            const t = j.tokens ? `${j.tokens.totalTokens} tok (${j.tokens.calls} calls)` : 'no token data';
+            const att = j.hasAttestation ? 'attested' : '';
+            console.log(`  ${j.jobId}  ${j.agent.padEnd(10)}  ${t.padEnd(28)}  ${att}`);
+          }
+          console.log('');
+          break;
+
+        case 'providers':
+          if (result.error) {
+            console.log(`\n❌ ${result.error}\n`);
+          } else {
+            console.log(`\nCurrent: ${result.current?.provider} (${result.current?.model})`);
+            console.log(`Available: ${(result.available || []).join(', ')}\n`);
+          }
+          break;
+
+        case 'earnings':
+          console.log('\n╔══════════════════════════════════════════╗');
+          console.log('║     Earnings Summary                     ║');
+          console.log('╚══════════════════════════════════════════╝\n');
+          for (const a of (result.agents || [])) {
+            if (a.error) {
+              console.log(`  ${a.id}: error (${a.error})`);
+            } else {
+              console.log(`  ${a.id}  ${a.identity}  ${a.jobs} jobs  ${a.earned} ${a.currency}`);
+            }
+          }
+          console.log(`\n  Total: ${result.total?.jobs || 0} jobs, ${result.total?.earned || 0} VRSC earned\n`);
           break;
 
         default:

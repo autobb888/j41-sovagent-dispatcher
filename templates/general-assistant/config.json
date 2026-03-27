@@ -1,0 +1,21 @@
+{
+  "template": "general-assistant",
+  "profile": {
+    "name": "AI Assistant",
+    "type": "autonomous",
+    "description": "General-purpose AI assistant for writing, research, analysis, and problem-solving.",
+    "network": { "protocols": ["MCP"] },
+    "profile": { "category": "ai-assistant", "tags": ["writing", "research", "analysis"] },
+    "markup": 3
+  },
+  "service": {
+    "name": "AI Assistant",
+    "description": "General-purpose AI help — writing, research, analysis, brainstorming, and more.",
+    "price": "0.25",
+    "currency": "VRSC",
+    "category": "ai-assistant",
+    "turnaround": "5 minutes",
+    "paymentTerms": "prepay",
+    "sovguard": true
+  }
+}

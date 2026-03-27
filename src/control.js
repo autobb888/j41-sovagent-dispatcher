@@ -72,6 +72,50 @@ function startControlServer(state, handlers) {
     console.error(`[Control] Server error: ${err.message}`);
   });
 
+  // HTTP health check on port 9842 (for Docker/k8s/monitoring)
+  const http = require('http');
+  const healthPort = parseInt(process.env.J41_HEALTH_PORT || '9842');
+  const healthServer = http.createServer((req, res) => {
+    if (req.url === '/health' || req.url === '/') {
+      const uptimeMs = Date.now() - startedAt;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'ok',
+        uptime: uptimeMs,
+        agents: state.agents.length,
+        active: state.active.size,
+        queue: state.queue.length,
+        available: state.available.length,
+      }));
+    } else if (req.url === '/metrics') {
+      // Prometheus-style metrics
+      const uptimeMs = Date.now() - startedAt;
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end([
+        `# HELP j41_uptime_seconds Dispatcher uptime in seconds`,
+        `j41_uptime_seconds ${Math.floor(uptimeMs / 1000)}`,
+        `# HELP j41_agents_total Total registered agents`,
+        `j41_agents_total ${state.agents.length}`,
+        `# HELP j41_jobs_active Currently active jobs`,
+        `j41_jobs_active ${state.active.size}`,
+        `# HELP j41_jobs_queue Queued jobs waiting for slots`,
+        `j41_jobs_queue ${state.queue.length}`,
+        `# HELP j41_agents_available Available agent slots`,
+        `j41_agents_available ${state.available.length}`,
+        `# HELP j41_jobs_seen_total Total jobs seen (lifetime)`,
+        `j41_jobs_seen_total ${state.seen.size}`,
+        '',
+      ].join('\n'));
+    } else {
+      res.writeHead(404);
+      res.end('Not found');
+    }
+  });
+  healthServer.listen(healthPort, '127.0.0.1', () => {
+    console.log(`[Health] http://127.0.0.1:${healthPort}/health`);
+  });
+  healthServer.on('error', () => {}); // non-fatal if port is busy
+
   return server;
 }
 
@@ -157,10 +201,124 @@ async function handleCommand(cmd, state, handlers, startedAt) {
       }
     }
 
+    case 'earnings': {
+      const earnings = { agents: [], total: { jobs: 0, earned: 0, tokenCost: 0 } };
+      for (const agentInfo of state.agents) {
+        try {
+          const agent = await handlers.getAgentSession(state, agentInfo);
+          const completed = await agent.client.getMyJobs({ status: 'completed', role: 'seller' });
+          const delivered = await agent.client.getMyJobs({ status: 'delivered', role: 'seller' });
+          const jobs = [...(completed.data || []), ...(delivered.data || [])];
+          let earned = 0;
+          for (const j of jobs) earned += parseFloat(j.amount) || 0;
+          earnings.agents.push({
+            id: agentInfo.id,
+            identity: agentInfo.identity,
+            jobs: jobs.length,
+            earned: Math.round(earned * 1000) / 1000,
+            currency: jobs[0]?.currency || 'VRSC',
+          });
+          earnings.total.jobs += jobs.length;
+          earnings.total.earned += earned;
+        } catch (e) {
+          earnings.agents.push({ id: agentInfo.id, error: e.message });
+        }
+      }
+      earnings.total.earned = Math.round(earnings.total.earned * 1000) / 1000;
+      return earnings;
+    }
+
+    case 'resources': {
+      const cpus = os.cpus();
+      const loadAvg = os.loadavg();
+      const totalMem = os.totalmem();
+      const freeMem = os.freemem();
+      const usedMem = totalMem - freeMem;
+
+      // Per-job process memory (if available)
+      const jobProcesses = [];
+      for (const [jobId, active] of state.active) {
+        if (active.pid) {
+          try {
+            const stat = fs.readFileSync(`/proc/${active.pid}/status`, 'utf8');
+            const vmRss = stat.match(/VmRSS:\s+(\d+)/);
+            jobProcesses.push({
+              jobId: jobId.substring(0, 8),
+              pid: active.pid,
+              memMB: vmRss ? Math.round(parseInt(vmRss[1]) / 1024) : null,
+              agentId: active.agentId,
+            });
+          } catch {
+            jobProcesses.push({ jobId: jobId.substring(0, 8), pid: active.pid, memMB: null, agentId: active.agentId });
+          }
+        }
+      }
+
+      return {
+        cpu: {
+          cores: cpus.length,
+          model: cpus[0]?.model || 'unknown',
+          load1m: Math.round(loadAvg[0] * 100) / 100,
+          load5m: Math.round(loadAvg[1] * 100) / 100,
+          load15m: Math.round(loadAvg[2] * 100) / 100,
+          usagePercent: Math.round((loadAvg[0] / cpus.length) * 100),
+        },
+        memory: {
+          totalMB: Math.round(totalMem / 1024 / 1024),
+          usedMB: Math.round(usedMem / 1024 / 1024),
+          freeMB: Math.round(freeMem / 1024 / 1024),
+          usagePercent: Math.round((usedMem / totalMem) * 100),
+        },
+        jobs: jobProcesses,
+        capacity: {
+          maxSlots: state.agents.length,
+          active: state.active.size,
+          available: state.available.length,
+          headroom: `${Math.round((1 - loadAvg[0] / cpus.length) * 100)}% CPU, ${Math.round(freeMem / 1024 / 1024)}MB RAM free`,
+        },
+      };
+    }
+
+    case 'history': {
+      // Recent completed jobs from disk
+      const JOBS_DIR = path.join(os.homedir(), '.j41', 'dispatcher', 'jobs');
+      const jobs = [];
+      try {
+        const dirs = fs.readdirSync(JOBS_DIR).sort().reverse().slice(0, cmd.limit || 20);
+        for (const dir of dirs) {
+          const logPath = path.join(JOBS_DIR, dir, 'output.log');
+          if (!fs.existsSync(logPath)) continue;
+          const log = fs.readFileSync(logPath, 'utf8');
+          const tokenMatch = log.match(/\[TOKENS\] Session: (\d+) calls, (\d+) in, (\d+) out, (\d+) total/);
+          const agentMatch = log.match(/Job started — agent: (agent-\d+)/);
+          jobs.push({
+            jobId: dir.substring(0, 8),
+            agent: agentMatch?.[1] || 'unknown',
+            tokens: tokenMatch ? { calls: +tokenMatch[1], promptTokens: +tokenMatch[2], completionTokens: +tokenMatch[3], totalTokens: +tokenMatch[4] } : null,
+            hasAttestation: fs.existsSync(path.join(JOBS_DIR, dir, 'deletion-attestation.json')),
+          });
+        }
+      } catch {}
+      return { jobs };
+    }
+
+    case 'providers': {
+      // List available LLM providers and current config
+      try {
+        const { LLM_PRESETS, LLM_CONFIG } = require('./executors/local-llm.js');
+        return {
+          current: { provider: LLM_CONFIG?.provider, model: LLM_CONFIG?.model, baseUrl: LLM_CONFIG?.baseUrl },
+          available: Object.keys(LLM_PRESETS || {}),
+        };
+      } catch {
+        return { error: 'Could not load LLM presets' };
+      }
+    }
+
     default:
       return {
         error: `Unknown command: ${action}`,
-        available: ['status', 'jobs', 'agents', 'shutdown', 'canary'],
+        available: ['status', 'jobs', 'agents', 'resources', 'earnings', 'history', 'providers', 'shutdown', 'canary'],
       };
   }
 }

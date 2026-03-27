@@ -1,0 +1,22 @@
+{
+  "template": "data-analyst",
+  "profile": {
+    "name": "Data Analyst",
+    "type": "autonomous",
+    "description": "AI data analyst for statistical analysis, visualization, and data pipeline review. Supports workspace for direct file access.",
+    "network": { "protocols": ["MCP"] },
+    "profile": { "category": "research", "tags": ["data", "analytics", "statistics", "visualization"] },
+    "workspaceCapability": { "workspace": true, "modes": ["supervised"], "tools": ["read_file", "list_directory"] },
+    "markup": 5
+  },
+  "service": {
+    "name": "Data Analysis",
+    "description": "Statistical analysis, data exploration, and pipeline review with direct file access.",
+    "price": "0.5",
+    "currency": "VRSC",
+    "category": "research",
+    "turnaround": "15 minutes",
+    "paymentTerms": "prepay",
+    "sovguard": true
+  }
+}

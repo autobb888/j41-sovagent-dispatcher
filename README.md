@@ -18,16 +18,25 @@ Multi-agent orchestration system that manages a pool of pre-registered AI agents
 ## Quick Start
 
 ```bash
-# One-shot setup -- installs Node.js, yarn, detects Docker
+# Clone and install
 git clone https://github.com/autobb888/j41-dispatcher.git
 cd j41-dispatcher
 ./setup.sh
 
-# Set up a single agent end-to-end (interactive prompts for SOUL.md, etc.)
-node src/cli.js setup agent-1 myagent --interactive
+# Guided first-run (picks template, LLM provider, runtime)
+node src/cli.js quickstart
 
-# Start the dispatcher in poll mode
+# Or do it manually with a template:
+export J41_LLM_PROVIDER=openai OPENAI_API_KEY=sk-...
+node src/cli.js setup agent-1 myagent --template code-review
+
+# Start the dispatcher
 node src/cli.js start
+
+# Monitor from another terminal
+node src/cli.js ctl status
+node src/cli.js ctl agents
+node src/cli.js ctl earnings
 ```
 
 `setup.sh` handles everything: installs Node.js and yarn if missing, runs `yarn install`, detects whether Docker is available, and prompts you to choose a runtime mode (`docker` or `local`). No manual dependency management needed.
@@ -54,11 +63,18 @@ node src/cli.js start
 | `ctl agents` | List agents with workspace capability and service count |
 | `ctl shutdown` | Trigger graceful shutdown from another terminal |
 | `ctl canary --agent <id>` | Check canary leak status for an agent |
+| `ctl earnings` | Per-agent earnings summary (jobs + VRSC) |
+| `ctl providers` | Current LLM config + available presets |
+| `ctl history` | Recent completed jobs with token usage |
+| `quickstart` | Guided first-run setup (template, LLM, runtime) |
+| `providers` | List all 22 LLM providers and 12 executor types |
 | `set-authorities <agent-id>` | Set revoke/recover authorities for an agent identity |
 | `check-authorities` | Check authority configuration across all agents |
 | `respond-dispute <jobId>` | Respond to a buyer dispute (refund/rework/rejected) |
 
 All commands are run via `node src/cli.js <command>`. Use `--json` with `ctl` commands for machine-readable output.
+
+Health endpoint: `http://127.0.0.1:9842/health` (JSON) and `/metrics` (Prometheus format) — available whenever the dispatcher is running.
 
 ## Job Lifecycle
 
@@ -157,16 +173,52 @@ node src/cli.js config --runtime local
 
 No image build step required -- the dispatcher forks `job-agent.js` directly.
 
+### LLM Providers (22 presets)
+
+Set `J41_LLM_PROVIDER` or configure `J41_LLM_BASE_URL` + `J41_LLM_API_KEY` + `J41_LLM_MODEL` for any OpenAI-compatible API.
+
+| Provider | Preset | Default Model |
+|---|---|---|
+| OpenAI | `openai` | gpt-4.1 |
+| Anthropic | `claude` | claude-sonnet-4-6 |
+| Google | `gemini` | gemini-2.5-pro |
+| xAI | `grok` | grok-4.20 |
+| Mistral | `mistral` | mistral-large-latest |
+| DeepSeek | `deepseek` | deepseek-chat |
+| Groq | `groq` | llama-3.3-70b-versatile |
+| Together | `together` | Llama-3.3-70B-Instruct-Turbo |
+| Fireworks | `fireworks` | llama-v3p3-70b-instruct |
+| NVIDIA NIM | `nvidia` | llama-3.1-nemotron-70b |
+| Kimi | `kimi` / `kimi-nvidia` | kimi-k2.5 |
+| OpenRouter | `openrouter` | claude-sonnet-4.6 |
+| Cohere | `cohere` | command-a-03-2025 |
+| Perplexity | `perplexity` | sonar-pro |
+| Ollama | `ollama` | llama3.3 (local) |
+| LM Studio | `lmstudio` | local-model |
+| vLLM | `vllm` | local-model |
+
 ### Executor Types
 
 | Type | Description | Use Case |
 |---|---|---|
-| `local-llm` | Direct LLM API calls | Simple Q&A agents |
-| `webhook` | POST to REST endpoint | n8n, custom backends |
-| `langserve` | LangChain Runnables | Stateless chains |
-| `langgraph` | LangGraph Platform | Stateful agents |
+| `local-llm` | Any OpenAI-compatible LLM (22 providers) | Default — direct chat agents |
+| `webhook` | POST to REST endpoint | n8n, CrewAI, AutoGen, Dify, Flowise, Haystack |
+| `langserve` | LangChain Runnables via /invoke | Stateless chains |
+| `langgraph` | LangGraph Platform threads | Stateful agents |
 | `a2a` | Google A2A protocol | Inter-agent communication |
-| `mcp` | Model Context Protocol | Tool-using agents |
+| `mcp` | MCP server + LLM agent loop | Tool-using agents |
+
+Framework aliases: `crewai`, `autogen`, `dify`, `flowise`, `haystack`, `n8n` all route to the `webhook` executor.
+
+### Agent Templates
+
+```bash
+node src/cli.js setup agent-1 myagent --template code-review
+node src/cli.js setup agent-2 myagent2 --template general-assistant
+node src/cli.js setup agent-3 myagent3 --template data-analyst
+```
+
+Templates include SOUL.md, profile config, service listing, and recommended pricing.
 
 ## Dispute Resolution
 
@@ -236,8 +288,12 @@ The dispatcher exposes a Unix domain socket at `~/.j41/dispatcher/control.sock` 
 ```bash
 # From another terminal while dispatcher is running:
 node src/cli.js ctl status          # uptime, active jobs, queue, agents
-node src/cli.js ctl jobs            # active jobs with PID, duration
-node src/cli.js ctl agents          # agent list with workspace capability
+node src/cli.js ctl jobs            # active jobs with PID, duration, tokens
+node src/cli.js ctl agents          # agent list with workspace + services
+node src/cli.js ctl resources       # CPU, RAM, per-job memory, capacity headroom
+node src/cli.js ctl earnings        # per-agent VRSC earnings
+node src/cli.js ctl history         # recent completed jobs with token usage
+node src/cli.js ctl providers       # current LLM + available presets
 node src/cli.js ctl shutdown        # graceful shutdown
 node src/cli.js ctl canary --agent agent-2  # check canary status
 node src/cli.js ctl status --json   # machine-readable output

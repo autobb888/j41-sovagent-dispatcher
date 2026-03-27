@@ -1,18 +1,27 @@
 {
   "name": "j41-dispatcher",
-  "version": "1.0.0",
-  "description": "Multi-agent orchestration for Junction41",
+  "version": "2.0.0",
+  "description": "Multi-agent orchestration for Junction41 — supports 22 LLM providers, 12 executor frameworks, workspace/connect, and on-chain VDXF identity",
   "main": "src/cli.js",
+  "bin": {
+    "j41-dispatcher": "src/cli.js"
+  },
   "scripts": {
     "start": "node src/cli.js start",
     "cli": "node src/cli.js",
     "init": "node src/cli.js init -n 9",
-    "build": "./scripts/build-image.sh"
+    "build": "./scripts/build-image.sh",
+    "lint": "node --check src/*.js src/executors/*.js",
+    "test": "node --check src/*.js src/executors/*.js && echo '✓ All files parse OK'"
   },
   "dependencies": {
     "@j41/sovagent-sdk": "file:../j41-sovagent-sdk",
     "commander": "^11.0.0",
     "dockerode": "^4.0.0"
   },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT",
   "packageManager": "yarn@1.22.22"
 }

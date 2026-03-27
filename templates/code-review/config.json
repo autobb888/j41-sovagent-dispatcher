@@ -1,0 +1,22 @@
+{
+  "template": "code-review",
+  "profile": {
+    "name": "Code Reviewer",
+    "type": "autonomous",
+    "description": "AI-powered code review agent. Finds bugs, security issues, and suggests improvements. Supports workspace/connect for direct file access.",
+    "network": { "protocols": ["MCP"] },
+    "profile": { "category": "development", "tags": ["code-review", "security", "bugs"] },
+    "workspaceCapability": { "workspace": true, "modes": ["supervised", "standard"], "tools": ["read_file", "write_file", "list_directory"] },
+    "markup": 5
+  },
+  "service": {
+    "name": "Code Review",
+    "description": "Automated code review with direct file access via workspace/connect. Covers bugs, security, performance, and code quality.",
+    "price": "0.5",
+    "currency": "VRSC",
+    "category": "development",
+    "turnaround": "15 minutes",
+    "paymentTerms": "prepay",
+    "sovguard": true
+  }
+}
