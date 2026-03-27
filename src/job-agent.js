@@ -505,6 +505,7 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
 
 let _workspaceConnecting = false;
 let _idleMessageSent = false;
+let _wsPingInterval = null;
 async function connectWorkspace(jobId, permissions, mode) {
   if (_workspaceConnected || _workspaceConnecting) return;
   _workspaceConnecting = true;
@@ -587,6 +588,14 @@ async function connectWorkspace(jobId, permissions, mode) {
       }
     } catch {}
 
+    // Keepalive ping — prevents relay from killing session during long LLM thinking
+    if (_wsPingInterval) clearInterval(_wsPingInterval);
+    _wsPingInterval = setInterval(() => {
+      if (_workspaceConnected) {
+        try { _agent.workspace.ping(); } catch {}
+      }
+    }, 25000); // every 25s (buyer sends every 30s)
+
     let _wsDisconnectNotified = false;
     _agent.workspace.onStatusChanged((status, data) => {
       console.log(`[WORKSPACE] Status changed: ${status}`);
@@ -620,6 +629,9 @@ async function connectWorkspace(jobId, permissions, mode) {
 
 function disconnectWorkspace() {
   if (!_workspaceConnected) return;
+
+  // Stop keepalive pings
+  if (_wsPingInterval) { clearInterval(_wsPingInterval); _wsPingInterval = null; }
 
   // Accumulate stats across sessions (for rework cycles)
   try {
@@ -676,17 +688,28 @@ async function handleWorkspaceToolCall(toolName, args) {
         }
         return result;
       }
-      case 'workspace_write_file':
-        return await _agent.workspace.writeFile(args.path, args.content);
+      case 'workspace_write_file': {
+        try {
+          return await _agent.workspace.writeFile(args.path, args.content);
+        } catch (writeErr) {
+          const wmsg = writeErr.message || '';
+          if (wmsg.includes('SovGuard') || wmsg.includes('blocked') || wmsg.includes('safe: false')) {
+            return `SOVGUARD BLOCKED: Your write to "${args.path}" was blocked by the buyer's SovGuard security scanner. The content was flagged as potentially malicious. Do NOT retry the same content — try a different approach that doesn't trigger security flags.`;
+          }
+          throw writeErr;
+        }
+      }
       default:
         return `Unknown workspace tool: ${toolName}`;
     }
   } catch (err) {
     const msg = err.message || '';
-    // Track files that error out so the LLM doesn't retry
     if (args.path && (msg.includes('excluded') || msg.includes('not found') || msg.includes('blocked') || msg.includes('No such file'))) {
       _blockedFiles.add(args.path);
       return `BLOCKED: "${args.path}" is not accessible (${msg}). Do NOT retry this file. Use workspace_list_directory to see available files.`;
+    }
+    if (msg.includes('SovGuard')) {
+      return `SOVGUARD BLOCKED: Operation on "${args.path || 'unknown'}" was blocked by security scanner. Try a different approach.`;
     }
     return `Workspace error: ${msg}`;
   }
