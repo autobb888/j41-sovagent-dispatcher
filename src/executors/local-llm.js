@@ -7,6 +7,7 @@
 
 const crypto = require('crypto');
 const { Executor } = require('./base.js');
+const log = require('../logger.js');
 
 // ── LLM Provider Presets ──
 const LLM_PRESETS = {
@@ -264,7 +265,7 @@ async function callLLM(systemPrompt, messages) {
 
     if (!res.ok) {
       const err = await res.text();
-      console.error(`[LLM] Kimi API error ${res.status}: ${err.substring(0, 200)}`);
+      log.error('LLM API error', { status: res.status, error: err.substring(0, 200) });
       return 'I encountered an issue generating a response. Let me try to help directly — could you rephrase your question?';
     }
 
@@ -275,7 +276,7 @@ async function callLLM(systemPrompt, messages) {
       usage: data.usage || null,
     };
   } catch (e) {
-    console.error(`[LLM] Kimi call failed: ${e.message}`);
+    log.error('LLM call failed', { error: e.message });
     return { content: 'I experienced a temporary issue. Please try sending your message again.', usage: null };
   }
 }
@@ -319,7 +320,7 @@ async function callLLMWithTools(systemPrompt, messages, tools) {
 
     if (!res.ok) {
       const err = await res.text();
-      console.error(`[LLM] Kimi API error ${res.status}: ${err.substring(0, 200)}`);
+      log.error('LLM API error', { status: res.status, error: err.substring(0, 200) });
       return { content: 'I encountered an issue processing your request. Please try again.' };
     }
 
@@ -328,7 +329,7 @@ async function callLLMWithTools(systemPrompt, messages, tools) {
     msg._usage = data.usage || null;
     return msg;
   } catch (e) {
-    console.error(`[LLM] Kimi call failed: ${e.message}`);
+    log.error('LLM call failed', { error: e.message });
     return { content: 'I experienced a temporary issue. Please try again.', _usage: null };
   }
 }

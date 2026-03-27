@@ -151,7 +151,7 @@ async function main() {
 
   // Establish authenticated API session via SDK login
   await withRetry(() => agent.authenticate(), 'authenticate');
-  console.log('✅ Agent logged in\n');
+  log.info('Agent authenticated', { agentId: AGENT_ID, identity: IDENTITY });
 
   const creationTime = new Date().toISOString();
 
@@ -166,13 +166,13 @@ async function main() {
   }
 
   if (fullJob.status === 'accepted' || fullJob.status === 'in_progress') {
-    console.log('✅ Job already accepted (by dispatcher)\n');
+    log.info('Job already accepted', { jobId: JOB_ID, status: fullJob.status });
   } else {
     const timestamp = Math.floor(Date.now() / 1000);
     const acceptMsg = `J41-ACCEPT|Job:${fullJob.jobHash}|Buyer:${fullJob.buyerVerusId}|Amt:${fullJob.amount} ${fullJob.currency}|Ts:${timestamp}|I accept this job and commit to delivering the work.`;
     const acceptSig = signMessage(keys.wif, acceptMsg, 'verustest');
     await withRetry(() => agent.client.acceptJob(job.id, acceptSig, timestamp), 'acceptJob');
-    console.log('✅ Job accepted\n');
+    log.info('Job accepted', { jobId: JOB_ID, buyer: fullJob.buyerVerusId, amount: fullJob.amount, currency: fullJob.currency });
   }
 
   // Connect to chat (guarded — job is already accepted, must not crash without delivery)
@@ -287,16 +287,16 @@ async function main() {
   let result;
   try {
     result = await processJob(job, agent, soulPrompt, executor, (resolve) => { setSessionEndResolve(resolve); });
-    console.log('\n✅ Work completed\n');
+    log.info('Work completed', { jobId: JOB_ID });
 
     // Log token usage summary
     if (_executor?.getTokenUsage) {
       const usage = _executor.getTokenUsage();
-      console.log(`[TOKENS] Session: ${usage.llmCalls} calls, ${usage.promptTokens} in, ${usage.completionTokens} out, ${usage.totalTokens} total`);
+      log.info('Token usage', { jobId: JOB_ID, ...usage });
       if (process.send) process.send({ type: 'token_usage', jobId: JOB_ID, usage });
     }
   } catch (e) {
-    console.error('\n❌ Job failed:', e.message);
+    log.error('Job failed', { jobId: JOB_ID, error: e.message });
     await executor.cleanup().catch(() => {});
     result = { error: e.message, content: 'Job failed: ' + e.message };
   }
@@ -304,7 +304,7 @@ async function main() {
   // ─────────────────────────────────────────
   // STEP 3: DELIVER RESULT
   // ─────────────────────────────────────────
-  console.log('→ Delivering result...');
+  log.info('Delivering result', { jobId: JOB_ID });
   const deliverTimestamp = Math.floor(Date.now() / 1000);
   const deliverHash = result.hash || 'failed';
   const deliverMessage = `J41-DELIVER|Job:${fullJob.jobHash}|Delivery:${deliverHash}|Ts:${deliverTimestamp}|I have delivered the work for this job.`;
@@ -315,7 +315,7 @@ async function main() {
     'deliverJob',
     { maxAttempts: 5, baseDelayMs: 2000 }
   );
-  console.log('✅ Job delivered\n');
+  log.info('Job delivered', { jobId: JOB_ID, hash: deliverHash });
 
   // Signal workspace done to buyer
   if (_workspaceConnected) {
@@ -474,7 +474,7 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
     if (idleMs >= IDLE_TIMEOUT_MS && !sessionEnded && !_paused) {
       if (!_idleMessageSent) {
         _idleMessageSent = true;
-        console.log(`[CHAT] Idle for ${Math.round(idleMs / 1000)}s — requesting pause`);
+        log.info('Session idle, requesting pause', { jobId: job.id, idleSec: Math.round(idleMs / 1000) });
         try {
           agent.sendChatMessage(job.id, 'Session going idle — I\'ll be here when you\'re ready to continue.');
         } catch {}
@@ -483,11 +483,11 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
         await agent.client.pauseJob(job.id);
         _paused = true;
         if (process.send) process.send({ type: 'job_idle', jobId: job.id });
-        console.log(`[CHAT] Paused successfully`);
+        log.info('Session paused', { jobId: job.id });
       } catch (err) {
         // If pause fails (job already delivered/completed by backend), end session
         if (err.message?.includes('cannot be paused') || err.message?.includes('Only in-progress')) {
-          console.log(`[CHAT] Pause rejected (${err.message}) — ending session`);
+          log.warn('Pause rejected, ending session', { jobId: job.id, error: err.message });
           _paused = true; // Stop retrying
           if (resolveSession) resolveSession('backend-ended');
         }
@@ -510,7 +510,7 @@ async function connectWorkspace(jobId, permissions, mode) {
   _workspaceConnecting = true;
   _workspaceMode = mode || 'supervised';
   try {
-    console.log(`[WORKSPACE] Connecting for job ${jobId?.substring(0, 8)} (mode=${_workspaceMode})...`);
+    log.info('Workspace connecting', { jobId: jobId?.substring(0, 8), mode: _workspaceMode });
     await _agent.workspace.connect(jobId);
     _workspaceConnected = true;
     _workspaceTools = _agent.workspace.getAvailableTools();
@@ -694,7 +694,7 @@ async function handleWorkspaceToolCall(toolName, args) {
 
 // J1: Graceful shutdown on SIGTERM — submit attestation before exit
 process.on('SIGTERM', async () => {
-  console.log('🛑 SIGTERM received — shutting down gracefully');
+  log.warn('SIGTERM received, shutting down', { jobId: JOB_ID });
   try {
     // Clean up executor
     if (_executor) await _executor.cleanup().catch(() => {});
@@ -910,7 +910,7 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
  * Final cleanup: attestation, file deletion, identity update, exit.
  */
 async function performCleanup(agent, keys, fullJob, postDeliveryResult) {
-  console.log('→ Performing final cleanup...');
+  log.info('Performing final cleanup', { jobId: JOB_ID });
 
   const attestTimestamp = Math.floor(Date.now() / 1000);
 
@@ -933,7 +933,7 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult) {
     );
 
     const result = await agent.client.submitDeletionAttestation(JOB_ID, attestSig, attestTs);
-    console.log(`✅ Deletion attestation submitted (verified: ${result.signatureVerified})`);
+    log.info('Deletion attestation submitted', { jobId: JOB_ID, verified: result.signatureVerified });
   } catch (e) {
     console.log('⚠️  Could not submit attestation:', e.message);
   }
@@ -1006,7 +1006,7 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult) {
         network: 'verustest',
       });
       const txResult = await agent.client.broadcast(rawhex);
-      console.log(`✅ On-chain identity updated: ${txResult.txid || txResult}`);
+      log.info('On-chain identity updated', { jobId: JOB_ID, txid: txResult.txid || txResult });
     } else {
       console.log('⚠️  No UTXOs available — skipping on-chain update');
     }

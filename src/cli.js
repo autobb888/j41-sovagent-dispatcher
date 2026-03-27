@@ -12,6 +12,7 @@ const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
 const { getRuntime, persistActiveJobs, loadActiveJobs, saveConfig, loadConfig } = require('./config');
+const log = require('./logger');
 
 const RUNTIME = getRuntime();
 
@@ -2240,7 +2241,7 @@ program
     async function gracefulShutdown(signal) {
       if (shuttingDown) return; // prevent double-fire
       shuttingDown = true;
-      console.log(`\n🛑 ${signal} received — graceful shutdown starting...`);
+      log.warn('Graceful shutdown starting', { signal, activeJobs: state.active.size });
       console.log(`   Active jobs: ${state.active.size}, timeout: ${SHUTDOWN_TIMEOUT_MS / 1000}s\n`);
 
       // 1. Stop accepting new jobs (clear intervals by exiting the keep-alive)
@@ -3537,7 +3538,7 @@ async function startJobLocal(state, job, agentInfo) {
     state.available = state.available.filter(a => a.id !== agentInfo.id);
     persistActiveJobs(state.active);
 
-    console.log(`✅ Local process started for job ${job.id} (PID ${child.pid})`);
+    log.info('Job process started', { jobId: job.id, pid: child.pid, agentId: agentInfo.id });
 
     // Timeout
     setTimeout(async () => {
