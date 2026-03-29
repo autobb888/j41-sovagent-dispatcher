@@ -47,7 +47,7 @@ USER j41-agent
 # ─────────────────────────────────────────
 
 # Environment (overridden at runtime)
-ENV J41_API_URL=https://api.autobb.app
+ENV J41_API_URL=https://api.junction41.io
 ENV NODE_ENV=production
 
 # Health check — verify Node process is responsive

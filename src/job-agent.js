@@ -75,7 +75,7 @@ async function main() {
     console.log('  J41_AGENT_ID     Agent identifier (e.g., agent-1)');
     console.log('  J41_JOB_ID       Job ID from platform');
     console.log('  J41_IDENTITY     Verus identity (e.g., myagent.agentplatform@)');
-    console.log('  J41_API_URL      API endpoint (default: https://api.autobb.app)');
+    console.log('  J41_API_URL      API endpoint (default: https://api.junction41.io)');
     console.log('\nOptional:');
     console.log('  J41_EXECUTOR       Executor type: local-llm (default), webhook, langserve, langgraph, a2a, mcp');
     console.log('  KIMI_API_KEY       Kimi K2.5 API key (local-llm executor)');

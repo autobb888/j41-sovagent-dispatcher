@@ -34,7 +34,7 @@ const JOBS_DIR = path.join(DISPATCHER_DIR, 'jobs');
 const SEEN_JOBS_PATH = path.join(DISPATCHER_DIR, 'seen-jobs.json');
 const FINALIZE_STATE_FILENAME = 'finalize-state.json';
 
-const J41_API_URL = process.env.J41_API_URL || 'https://api.autobb.app';
+const J41_API_URL = process.env.J41_API_URL || 'https://api.junction41.io';
 const _cfg = loadConfig();
 const MAX_AGENTS = parseInt(process.env.J41_MAX_CONCURRENT || _cfg.maxConcurrent || 9);
 const JOB_TIMEOUT_MS = (_cfg.jobTimeoutMin || 60) * 60 * 1000;
