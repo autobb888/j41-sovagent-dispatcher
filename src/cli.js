@@ -3374,6 +3374,21 @@ async function handleWebhookEvent(state, agentId, payload) {
       break;
     }
 
+    case 'job.extension_approved': {
+      console.log(`[Webhook] ✅ Extension approved for job ${jobId?.substring(0, 8)}`);
+      const extJob = state.active.get(jobId);
+      if (extJob?.process?.send) {
+        extJob.process.send({ type: 'budget_increased', data: { additionalTokens: data?.estimatedTokens || 5000 } });
+      }
+      break;
+    }
+
+    case 'job.extension_rejected': {
+      console.log(`[Webhook] ❌ Extension rejected for job ${jobId?.substring(0, 8)}`);
+      // Job-agent continues with remaining budget
+      break;
+    }
+
     default:
       // Log unhandled events for debugging
       break;
@@ -3764,6 +3779,18 @@ async function startJobLocal(state, job, agentInfo) {
           console.log(`[IDLE] Job ${msg.jobId.substring(0, 8)} paused — agent slot freed`);
           persistActiveJobs(state.active);
         }
+      }
+      if (msg?.type === 'extension_needed') {
+        console.log(`[Extension] Job ${msg.jobId?.substring(0, 8)} requesting extension: $${msg.amount} for ~${msg.estimatedTokens} tokens`);
+        (async () => {
+          try {
+            const agent = await getAgentSession(state, agentInfo);
+            await agent.client.requestExtension(msg.jobId, msg.amount, msg.reason);
+            console.log(`[Extension] Submitted to platform for buyer approval`);
+          } catch (e) {
+            console.error(`[Extension] Failed to submit: ${e.message}`);
+          }
+        })();
       }
       if (msg?.type === 'token_usage') {
         const info = state.active.get(msg.jobId);

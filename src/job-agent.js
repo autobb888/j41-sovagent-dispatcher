@@ -828,9 +828,35 @@ setTimeout(async () => {
  * state are still alive from the original processJob() call.
  */
 async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndResolve, reworkContext, tokenBudget) {
-  // Set token budget on executor
+  // Set token budget on executor with warning callback for extension requests
   if (tokenBudget && tokenBudget > 0) {
-    executor.setBudget(tokenBudget);
+    executor.setBudget(tokenBudget, 80, (usage, budget) => {
+      console.log(`⚠️  Token budget at ${Math.round((usage.totalTokens / budget) * 100)}% — requesting extension`);
+      const additionalTokens = Math.max(budget - usage.totalTokens, Math.floor(budget * 0.5));
+
+      if (process.send) {
+        try {
+          const { calculateListedPrice } = require('@j41/sovagent-sdk/dist/pricing/calculator.js');
+          const model = process.env.J41_LLM_MODEL || 'claude-sonnet-4';
+          const halfTokens = Math.floor(additionalTokens / 2);
+          const pricing = calculateListedPrice({
+            model,
+            inputTokens: halfTokens,
+            outputTokens: halfTokens,
+            markupPercent: _agentMarkup || 15,
+          });
+          process.send({
+            type: 'extension_needed',
+            jobId: job.id,
+            amount: pricing.listedPrice,
+            reason: `Token budget at ${Math.round((usage.totalTokens / budget) * 100)}% — need ${additionalTokens} more tokens`,
+            estimatedTokens: additionalTokens,
+          });
+        } catch (e) {
+          console.error('Failed to calculate extension price:', e.message);
+        }
+      }
+    });
     console.log(`  Token budget for rework: ${tokenBudget} tokens`);
   }
 
@@ -965,6 +991,13 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
           console.log('[POST-DELIVERY] Dispatcher shutdown — exiting post-delivery wait');
           _shuttingDown = true;
           safeResolve({ reason: 'dispatcher-shutdown' });
+          break;
+        }
+
+        case 'budget_increased': {
+          const additional = msg.data?.additionalTokens || 0;
+          console.log(`💰 Budget increased by ${additional} tokens`);
+          executor.increaseBudget(additional);
           break;
         }
 
