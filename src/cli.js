@@ -318,6 +318,24 @@ async function interactiveProfileSetup(keys, soulContent) {
   const trustlevel = await ask('  Trust level (basic|verified|audited)', 'verified');
   const disputeresolution = await ask('  Dispute resolution (platform|arbitration|mutual)', 'platform');
 
+  // Dispute policy (VDXF)
+  console.log('\n── Dispute Policy (published on-chain) ──');
+  const defaultAction = await ask('  Default action on dispute (rework/refund/reject)', 'rework');
+  const maxRefundPercent = parseInt(await ask('  Max refund percent (0-100)', '100'), 10);
+  const maxReworkCycles = parseInt(await ask('  Max rework cycles', '2'), 10);
+  const reworkBudgetPercent = parseInt(await ask('  Rework budget per cycle (% of job cost)', '30'), 10);
+  const escalateAfter = await ask('  Escalate after (max_rework/2nd_dispute/never)', 'max_rework');
+  const systemCrashRefund = parseInt(await ask('  System crash refund % (0-100)', '100'), 10);
+
+  const disputePolicy = {
+    defaultAction,
+    maxRefundPercent: Math.min(Math.max(maxRefundPercent, 0), 100),
+    maxReworkCycles: Math.max(maxReworkCycles, 0),
+    reworkBudgetPercent: Math.min(Math.max(reworkBudgetPercent, 0), 100),
+    escalateAfter,
+    systemCrashRefund: Math.min(Math.max(systemCrashRefund, 0), 100),
+  };
+
   // ── Workspace ──
   console.log('\n── Workspace ──');
   const wsEnabled = (await ask('  Enable workspace file access? (y/N)', 'N')).toLowerCase();
@@ -364,6 +382,38 @@ async function interactiveProfileSetup(keys, soulContent) {
     addService = (await ask('  Add another service? (y/N)', 'N')).toLowerCase();
   }
 
+  // Service pricing calculation
+  if (models.length > 0 && services.length > 0) {
+    console.log('\n── Service Cost Estimation ──');
+    for (const svc of services) {
+      const svcModel = await ask(`  Model for "${svc.name}" (${models.join('/')})`, models[0]);
+      const inputTokens = parseInt(await ask('  Estimated input tokens per job', '8000'), 10);
+      const outputTokens = parseInt(await ask('  Estimated output tokens per job', '2000'), 10);
+      const apiCallsCount = parseInt(await ask('  API calls per job (0 if none)', '0'), 10);
+
+      try {
+        const { calculateListedPrice } = require('@j41/sovagent-sdk/dist/pricing/calculator.js');
+        const result = calculateListedPrice({
+          model: svcModel,
+          inputTokens,
+          outputTokens,
+          markupPercent: markup || 15,
+        });
+        console.log(`  Raw cost: $${result.rawCost} → Listed: $${result.listedPrice} (${markup}% markup)`);
+        svc.costBreakdown = {
+          model: svcModel,
+          estimatedInputTokens: inputTokens,
+          estimatedOutputTokens: outputTokens,
+          rawCost: result.rawCost,
+          apiCalls: apiCallsCount,
+          markup: markup || 15,
+        };
+      } catch (e) {
+        console.log(`  ⚠️  Could not calculate price: ${e.message}`);
+      }
+    }
+  }
+
   rl.close();
 
   const profile = {
@@ -385,7 +435,7 @@ async function interactiveProfileSetup(keys, soulContent) {
     ...(workspaceCapability ? { workspaceCapability } : {}),
   };
 
-  return { profile, services };
+  return { profile, services, disputePolicy };
 }
 
 /**
@@ -555,7 +605,7 @@ async function interactiveOnboarding(identityName) {
   };
 }
 
-function createFinalizeHooks(agentId, identityName, profile, services = []) {
+function createFinalizeHooks(agentId, identityName, profile, services = [], disputePolicy) {
   const agentDir = path.join(AGENTS_DIR, agentId);
   const keys = loadAgentKeys(agentId) || {};
   const primaryaddresses = Array.isArray(keys.primaryaddresses)
@@ -637,7 +687,7 @@ function createFinalizeHooks(agentId, identityName, profile, services = []) {
       await agent.authenticate();
 
       // Build VDXF contentmultimap from profile
-      const vdxfAdditions = buildAgentContentMultimap(profile, services);
+      const vdxfAdditions = buildAgentContentMultimap(profile, services, disputePolicy);
 
       // Get current identity data and UTXOs from platform
       const identityRawResp = await agent.client.getIdentityRaw();
@@ -1022,6 +1072,7 @@ program
 
       let profileData;
       let serviceData = [];
+      let disputePolicyData;
 
       if (options.profileName) {
         // Headless mode — use CLI flags
@@ -1032,6 +1083,7 @@ program
         const result = await interactiveProfileSetup(keys, soul);
         profileData = result.profile;
         serviceData = result.services;
+        disputePolicyData = result.disputePolicy;
       }
 
       console.log(`\n→ Registering agent profile on J41 platform...`);
@@ -1081,7 +1133,7 @@ program
           mode: options.interactive ? 'interactive' : 'headless',
           profile,
           services,
-          hooks: createFinalizeHooks(agentId, keys.identity, profile, services),
+          hooks: createFinalizeHooks(agentId, keys.identity, profile, services, disputePolicyData),
         });
 
         console.log(`✅ Finalize stage: ${finalizeResult.stage}`);
@@ -2008,6 +2060,7 @@ program
 
     let profileData;
     let services = [];
+    let disputePolicyData;
     const soulPath = path.join(agentDir, 'SOUL.md');
     const soul = fs.existsSync(soulPath) ? fs.readFileSync(soulPath, 'utf-8').trim() : '';
 
@@ -2016,6 +2069,7 @@ program
       const result = await interactiveProfileSetup(keys, soul);
       profileData = result.profile;
       services = result.services;
+      disputePolicyData = result.disputePolicy;
     } else {
       // Headless mode — use CLI flags
       profileData = buildFullProfile(options);
@@ -2055,7 +2109,7 @@ program
         mode: 'headless',
         profile: profile || profileData,
         services,
-        hooks: createFinalizeHooks(agentId, keys.identity, profile || profileData, services),
+        hooks: createFinalizeHooks(agentId, keys.identity, profile || profileData, services, disputePolicyData),
       });
       console.log(`  ✓ Finalize: ${finalizeResult.stage}`);
     } catch (e) {
@@ -4352,7 +4406,7 @@ async function mainMenu() {
 
     // Save profile to agent dir for reference
     const profilePath = path.join(AGENTS_DIR, agent.id, 'profile.json');
-    fs.writeFileSync(profilePath, JSON.stringify({ profile: result.profile, services: result.services }, null, 2));
+    fs.writeFileSync(profilePath, JSON.stringify({ profile: result.profile, services: result.services, disputePolicy: result.disputePolicy }, null, 2));
     console.log(`\n  Profile saved to ${profilePath}`);
     console.log('  Use "Publish VDXF Update" to write on-chain.\n');
 
@@ -4452,7 +4506,7 @@ async function mainMenu() {
       return;
     }
 
-    const { profile, services } = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
+    const { profile, services, disputePolicy } = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
 
     try {
       const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
@@ -4467,7 +4521,7 @@ async function mainMenu() {
 
       if (!utxos.length) { console.log('\n  No UTXOs — fund the agent first.\n'); return; }
 
-      const newCmm = buildAgentContentMultimap(profile, services || []);
+      const newCmm = buildAgentContentMultimap(profile, services || [], disputePolicy);
       const rawhex = buildIdentityUpdateTx({
         wif: keys.wif, identityData, utxos, vdxfAdditions: newCmm,
         network: J41_NETWORK, clearContentmultimap: true,
