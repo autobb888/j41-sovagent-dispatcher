@@ -819,6 +819,35 @@ setTimeout(async () => {
 }, TIMEOUT_MS);
 
 /**
+ * Resume an existing job session for rework. Instead of processJob() which
+ * creates a new chat session from scratch, this continues the existing
+ * conversation with the buyer's rework instructions as the next message.
+ *
+ * Uses executor.handleMessage() — the same method used for processing buyer
+ * chat messages during normal operation. The executor and its LLM conversation
+ * state are still alive from the original processJob() call.
+ */
+async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndResolve, reworkContext, tokenBudget) {
+  // Set token budget on executor
+  if (tokenBudget && tokenBudget > 0) {
+    executor.setBudget(tokenBudget);
+    console.log(`  Token budget for rework: ${tokenBudget} tokens`);
+  }
+
+  // Inject the rework context as the next user message via handleMessage()
+  console.log(`  Rework instruction: "${reworkContext.substring(0, 100)}${reworkContext.length > 100 ? '...' : ''}"`);
+
+  // handleMessage() is the existing Executor method that processes buyer messages.
+  // The executor keeps its conversation history from the original job.
+  const response = await executor.handleMessage(reworkContext, { jobId: job.id, senderVerusId: 'system' });
+
+  // Finalize to get the deliverable
+  const result = await executor.finalize();
+
+  return result;
+}
+
+/**
  * Post-delivery wait loop. Listens for IPC messages from dispatcher
  * for job completion, disputes, and rework events.
  */
@@ -940,7 +969,9 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
         }
 
         case 'dispute.rework_accepted': {
-          console.log('🔄 Rework accepted — re-entering chat session...');
+          console.log('🔄 Rework accepted — continuing chat session...');
+          _reworkCount++;
+
           if (agent.handler?.onReworkRequested) {
             try {
               const freshJob = await agent.client.getJob(job.id);
@@ -949,9 +980,37 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
               console.error('Handler error:', e.message);
             }
           }
-          // Re-enter chat and re-deliver
+
+          // Guard: max rework cycles exceeded
+          if (_disputePolicy && _reworkCount > _disputePolicy.maxReworkCycles) {
+            console.log(`⚠️  Rework cycle ${_reworkCount} exceeds max ${_disputePolicy.maxReworkCycles} — ignoring`);
+            break;
+          }
+
           try {
-            const reworkResult = await processJob(job, agent, soulPrompt, executor, registerSessionEndResolve);
+            // Get buyer's rejection reason as rework instructions
+            let reworkContext = 'Please rework the delivery.';
+            try {
+              const dispute = await agent.client.getDispute(job.id);
+              if (dispute?.reason) reworkContext = dispute.reason;
+            } catch (e) {
+              console.log('⚠️  Could not fetch dispute reason:', e.message);
+            }
+
+            // Calculate rework token budget
+            let tokenBudget = null;
+            if (_disputePolicy && fullJob.amount) {
+              const budgetUsd = (_disputePolicy.reworkBudgetPercent / 100) * fullJob.amount;
+              try {
+                const { budgetToTokens } = require('@j41/sovagent-sdk/dist/pricing/calculator.js');
+                const model = process.env.J41_LLM_MODEL || 'claude-sonnet-4';
+                tokenBudget = budgetToTokens(model, budgetUsd);
+              } catch (e) {
+                console.log('⚠️  Could not calculate token budget:', e.message);
+              }
+            }
+
+            const reworkResult = await resumeJob(job, agent, soulPrompt, executor, registerSessionEndResolve, reworkContext, tokenBudget);
             console.log('✅ Rework completed — re-delivering...');
 
             const ts = Math.floor(Date.now() / 1000);
@@ -964,7 +1023,6 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
               { maxAttempts: 5, baseDelayMs: 2000 }
             );
             console.log('✅ Rework delivered — new review window started\n');
-            // Reset safety timer for new review window
             resetSafetyTimer();
           } catch (e) {
             console.error('❌ Rework failed:', e.message);
