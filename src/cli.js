@@ -31,7 +31,12 @@ let secureSetup;
 try {
   secureSetup = require('@j41/secure-setup');
 } catch {
-  // Not installed yet — first-run will handle it
+  try {
+    // Local dev: try direct path
+    secureSetup = require('../j41-secure-setup/lib/index.js');
+  } catch {
+    // Not available — first-run will skip
+  }
 }
 
 const J41_DIR = path.join(os.homedir(), '.j41');
@@ -2267,6 +2272,59 @@ program
       capabilities: new Map(), // agentId -> { workspace: bool, services: [] }
       _devUnsafe, // security: allows local mode when true
     };
+
+    // ── Task 18: First-run security setup ──────────────────────
+    const initMarker = path.join(os.homedir(), '.j41', 'dispatcher-security-initialized');
+    if (!fs.existsSync(initMarker)) {
+      console.log('');
+      console.log('  ╔══════════════════════════════════════════════════╗');
+      console.log('  ║  J41 Dispatcher Security Setup (first run)      ║');
+      console.log('  ╚══════════════════════════════════════════════════╝');
+      console.log('');
+      if (secureSetup) {
+        try {
+          await secureSetup.setup('dispatcher');
+          console.log('  ✓ Security setup complete');
+        } catch (e) {
+          console.error(`  Security setup failed: ${e.message}`);
+          console.error('  Run manually: yarn dlx @j41/secure-setup --dispatcher');
+          // Continue — quick-check will catch issues
+        }
+      } else {
+        console.warn('  @j41/secure-setup not installed. Install it:');
+        console.warn('    yarn add @j41/secure-setup');
+        console.warn('  Or run manually:');
+        console.warn('    yarn dlx @j41/secure-setup --dispatcher');
+      }
+      console.log('');
+    }
+
+    // ── Task 19: Startup security quick-check ──────────────────
+    if (secureSetup) {
+      try {
+        const checkResult = secureSetup.quickCheck('dispatcher');
+        if (!checkResult.passed) {
+          console.error('');
+          console.error('  ══════════════════════════════════════════════════');
+          console.error('  SECURITY CHECK FAILED — dispatcher will not start');
+          console.error('  ══════════════════════════════════════════════════');
+          for (const issue of checkResult.issues) {
+            console.error(`  - ${issue}`);
+          }
+          console.error('');
+          console.error('  Fix: yarn dlx @j41/secure-setup --dispatcher --fix');
+          console.error('');
+          if (!state._devUnsafe) {
+            process.exit(1);
+          }
+          console.warn('  Continuing anyway (--dev-unsafe mode)...');
+        } else {
+          console.log(`  Security: ${checkResult.score}/10 (${checkResult.mode})`);
+        }
+      } catch (e) {
+        console.warn(`  Security quick-check unavailable: ${e.message}`);
+      }
+    }
 
     // ── Load on-chain capabilities for VDXF policy enforcement ──
     console.log('→ Loading on-chain agent capabilities...\n');
