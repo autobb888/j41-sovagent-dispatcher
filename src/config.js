@@ -48,6 +48,12 @@ function persistActiveJobs(activeMap) {
       agentId: active.agentId,
       pid: active.pid || null,
       startedAt: active.startedAt,
+      // Crash recovery fields
+      jobAmount: active.jobAmount || null,
+      buyerPayAddress: active.buyerPayAddress || null,
+      currency: active.currency || null,
+      agentInfoId: active.agentInfoId || null,
+      reworkCount: active.reworkCount || 0,
     };
   }
   try {
