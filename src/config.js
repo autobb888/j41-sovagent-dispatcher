@@ -18,6 +18,7 @@ const DEFAULTS = {
   extensionAutoApprove: true,
   extensionMaxCpuPercent: 80,   // reject if load avg > this % of cores
   extensionMinFreeMB: 512,      // reject if free RAM below this
+  drainTimeoutMin: null,  // default: 2 * jobTimeoutMin, null = auto-calculate
 };
 
 function loadConfig() {

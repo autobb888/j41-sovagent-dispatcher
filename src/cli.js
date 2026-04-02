@@ -2472,93 +2472,72 @@ program
 
     // ── Graceful shutdown handler ──
     let shuttingDown = false;
-    const SHUTDOWN_TIMEOUT_MS = 30000; // 30s max for graceful shutdown
 
     async function gracefulShutdown(signal) {
-      if (shuttingDown) return; // prevent double-fire
+      if (shuttingDown) {
+        // Second signal during drain — emergency exit
+        console.log('\n⚠️  Second signal received — emergency exit. Remaining jobs will be refunded on next startup.');
+        process.exit(1);
+      }
       shuttingDown = true;
-      log.warn('Graceful shutdown starting', { signal, activeJobs: state.active.size });
-      console.log(`   Active jobs: ${state.active.size}, timeout: ${SHUTDOWN_TIMEOUT_MS / 1000}s\n`);
+      log.warn('Graceful shutdown starting (drain mode)', { signal, activeJobs: state.active.size });
+      console.log(`\n🔄 Draining: ${state.active.size} active job(s). Waiting for containers to finish...`);
+      console.log('   Press Ctrl+C again for emergency exit.\n');
 
-      // 1. Stop accepting new jobs (clear intervals by exiting the keep-alive)
-      //    The intervals are orphaned when we exit, which is fine
-
-      // 2. Send shutdown IPC to all active job-agent processes
-      const shutdownPromises = [];
-      for (const [jobId, active] of state.active) {
-        if (active.process && !active.process.killed) {
-          console.log(`   → Sending shutdown to job ${jobId.substring(0, 8)} (PID ${active.pid})`);
-          try {
-            active.process.send({ type: 'shutdown', jobId });
-          } catch (e) {
-            console.log(`   ⚠️  IPC send failed for ${jobId.substring(0, 8)}: ${e.message}`);
-          }
-
-          // Wait for the process to exit
-          shutdownPromises.push(
-            new Promise((resolve) => {
-              const timeout = setTimeout(() => {
-                console.log(`   ⏰ Job ${jobId.substring(0, 8)} didn't exit in time — sending SIGTERM`);
-                try { active.process.kill('SIGTERM'); } catch {}
-                // Force kill after 5 more seconds
-                setTimeout(() => {
-                  try { if (!active.process.killed) active.process.kill('SIGKILL'); } catch {}
-                  resolve();
-                }, 5000);
-              }, SHUTDOWN_TIMEOUT_MS - 5000); // leave 5s buffer for SIGTERM->SIGKILL
-
-              active.process.on('exit', (code) => {
-                clearTimeout(timeout);
-                console.log(`   ✅ Job ${jobId.substring(0, 8)} exited (code ${code})`);
-                resolve();
-              });
-            })
-          );
-        }
-      }
-
-      // Wait for all job-agents to exit (or timeout)
-      if (shutdownPromises.length > 0) {
-        console.log(`\n   Waiting for ${shutdownPromises.length} job(s) to finish...`);
-        await Promise.all(shutdownPromises);
-      }
-
-      // 3. Mark agents as inactive — both platform API and on-chain VDXF
-      console.log('\n   Marking agents offline...');
-      const { randomUUID } = require('crypto');
+      // 1. Set agents offline (stop accepting new jobs)
       for (const agentInfo of state.agents) {
         try {
           const agent = await getAgentSession(state, agentInfo);
-
-          // Platform API status (instant)
           const { signMessage } = require('@j41/sovagent-sdk/dist/identity/signer.js');
           const verusId = agentInfo.iAddress || agentInfo.identity;
           const timestamp = Math.floor(Date.now() / 1000);
+          const { randomUUID } = require('crypto');
           const nonce = randomUUID();
           const message = `J41-STATUS|Agent:${verusId}|Status:inactive|Ts:${timestamp}|Nonce:${nonce}`;
           const signature = signMessage(agentInfo.wif, message, J41_NETWORK);
           await agent.client.setAgentStatus(verusId, 'inactive', signature, timestamp, nonce);
-          console.log(`   ✅ ${agentInfo.id}: platform status → inactive`);
-
-          // On-chain VDXF status (broadcast TX, confirms later)
-          try {
-            await agent.setOnChainStatus('inactive');
-            console.log(`   ✅ ${agentInfo.id}: on-chain status → inactive`);
-          } catch (chainErr) {
-            console.log(`   ⚠️  ${agentInfo.id}: on-chain status failed (${chainErr.message.slice(0, 50)})`);
-          }
+          console.log(`   ✅ ${agentInfo.id}: status → inactive`);
+          try { await agent.setOnChainStatus('inactive'); } catch {}
         } catch (e) {
-          console.log(`   ⚠️  ${agentInfo.id}: failed to mark offline (${e.message})`);
+          console.log(`   ⚠️  ${agentInfo.id}: failed to mark offline`);
         }
       }
 
-      // 4. Clean up state
-      state.active.clear();
-      persistActiveJobs(state.active);
-      stopControlServer(controlServer);
+      // 2. Calculate drain timeout
+      const cfg = loadConfig();
+      const drainTimeoutMs = (cfg.drainTimeoutMin || (cfg.jobTimeoutMin || 60) * 2) * 60 * 1000;
 
-      console.log('\n✅ Graceful shutdown complete.\n');
-      process.exit(0);
+      // 3. If no active jobs, exit immediately
+      if (state.active.size === 0) {
+        console.log('\n✅ No active jobs. Shutting down.\n');
+        persistActiveJobs(state.active);
+        stopControlServer(controlServer);
+        process.exit(0);
+      }
+
+      // 4. Monitor until all containers finish or timeout
+      const drainStart = Date.now();
+      const drainInterval = setInterval(() => {
+        const elapsed = Math.round((Date.now() - drainStart) / 1000);
+        console.log(`   Draining: ${state.active.size} job(s) remaining (${elapsed}s elapsed)`);
+
+        if (state.active.size === 0) {
+          clearInterval(drainInterval);
+          console.log('\n✅ All jobs finished. Shutting down.\n');
+          state.active.clear();
+          persistActiveJobs(state.active);
+          stopControlServer(controlServer);
+          process.exit(0);
+        }
+
+        if (Date.now() - drainStart > drainTimeoutMs) {
+          clearInterval(drainInterval);
+          console.log(`\n⚠️  Drain timeout (${Math.round(drainTimeoutMs / 60000)}min) — remaining ${state.active.size} job(s) will be refunded on next startup.`);
+          // Don't clear active-jobs.json — crash recovery will handle refunds
+          stopControlServer(controlServer);
+          process.exit(1);
+        }
+      }, 10000);
     }
 
     process.on('SIGINT', () => gracefulShutdown('SIGINT'));
