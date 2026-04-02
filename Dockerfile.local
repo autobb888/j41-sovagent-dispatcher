@@ -1,0 +1,23 @@
+# J41 Job Agent — local build with pre-installed SDK
+FROM node:22-slim
+
+WORKDIR /app
+
+# Copy pre-built node_modules from host (SDK + all deps already installed)
+COPY node_modules ./node_modules
+
+# Copy executor source + runtime
+COPY src/executors ./executors
+COPY src/job-agent.js ./
+COPY src/sign-attestation.js ./
+COPY src/logger.js ./
+
+# Security
+RUN groupadd -r j41-agent && useradd -r -g j41-agent j41-agent
+RUN chown -R j41-agent:j41-agent /app
+USER j41-agent
+
+ENV J41_API_URL=https://api.junction41.io
+ENV NODE_ENV=production
+
+ENTRYPOINT ["node", "job-agent.js"]

@@ -35,6 +35,7 @@ const SEEN_JOBS_PATH = path.join(DISPATCHER_DIR, 'seen-jobs.json');
 const FINALIZE_STATE_FILENAME = 'finalize-state.json';
 
 const J41_API_URL = process.env.J41_API_URL || 'https://api.junction41.io';
+const J41_NETWORK = process.env.J41_NETWORK || 'verustest';
 const _cfg = loadConfig();
 const MAX_AGENTS = parseInt(process.env.J41_MAX_CONCURRENT || _cfg.maxConcurrent || 9);
 const JOB_TIMEOUT_MS = (_cfg.jobTimeoutMin || 60) * 60 * 1000;
@@ -192,7 +193,7 @@ function buildFullProfile(options) {
     name: options.profileName,
     type: options.profileType || 'autonomous',
     description: options.profileDescription,
-    owner: options.profileOwner,
+    payAddress: options.payAddress,
     network: {
       capabilities: options.profileCapabilities || [],
       endpoints: options.profileEndpoints || [],
@@ -230,7 +231,161 @@ function buildFullProfile(options) {
     profile.models = Array.isArray(options.models) ? options.models : options.models.split(',').map(m => m.trim());
   }
 
+  // Markup
+  if (options.markup != null) {
+    const m = parseInt(options.markup, 10);
+    if (m >= 1 && m <= 50) profile.markup = m;
+  }
+
+  // Workspace capability
+  if (options.workspace) {
+    profile.workspaceCapability = {
+      workspace: true,
+      modes: options.workspaceModes
+        ? options.workspaceModes.split(',').map(m => m.trim())
+        : ['supervised', 'standard'],
+      tools: options.workspaceTools
+        ? options.workspaceTools.split(',').map(t => t.trim())
+        : ['read_file', 'write_file', 'list_directory'],
+    };
+  }
+
   return profile;
+}
+
+// ── Interactive profile setup ──────────────────────────────────────
+
+/**
+ * Interactive walkthrough that prompts for every VDXF field.
+ * Returns { profile, services } ready for buildAgentContentMultimap.
+ */
+async function interactiveProfileSetup(keys, soulContent) {
+  const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout });
+  const ask = (q, def) => new Promise(resolve => {
+    const prompt = def != null ? `${q} [${def}]: ` : `${q}: `;
+    rl.question(prompt, answer => resolve(answer.trim() || (def != null ? String(def) : '')));
+  });
+
+  // Extract defaults from SOUL.md
+  const soulName = (soulContent.match(/^#\s+(.+?)(?:\s*—.*)?$/m) || [])[1] || keys.identity;
+  const soulDesc = (soulContent.match(/^(?!#)(?!\s*$)(.+)$/m) || [])[1] || '';
+
+  console.log('\n╔══════════════════════════════════════════════════╗');
+  console.log('║  Agent Profile Setup — 25-key VDXF flat format   ║');
+  console.log('╚══════════════════════════════════════════════════╝\n');
+
+  // ── Core fields ──
+  console.log('── Core Agent Fields ──');
+  const name = await ask('  Display name', soulName);
+  const type = await ask('  Type (autonomous|assisted|hybrid|tool)', 'autonomous');
+  const description = await ask('  Description', soulDesc);
+  const payAddress = await ask('  Payment address (i-addr or R-addr)', keys.iAddress);
+
+  // ── Network ──
+  console.log('\n── Network ──');
+  const capsRaw = await ask('  Capabilities (comma-separated)', 'research,writing,analysis');
+  const capabilities = capsRaw ? capsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+  const epsRaw = await ask('  Endpoints (comma-separated URLs)', 'https://api.junction41.io/v1');
+  const endpoints = epsRaw ? epsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+  const protosRaw = await ask('  Protocols (comma-separated: MCP,REST,A2A,WebSocket)', 'MCP,REST');
+  const protocols = protosRaw ? protosRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+
+  // ── Profile ──
+  console.log('\n── Profile Metadata ──');
+  const category = await ask('  Category', 'general');
+  const tagsRaw = await ask('  Tags (comma-separated)', 'ai,autonomous');
+  const tags = tagsRaw ? tagsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+  const website = await ask('  Website URL (optional)');
+  const avatar = await ask('  Avatar URL (optional)');
+
+  // ── Models & Pricing ──
+  console.log('\n── Models & Pricing ──');
+  const modelsRaw = await ask('  LLM models (comma-separated)', 'claude-opus-4-6');
+  const models = modelsRaw ? modelsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+  const markupRaw = await ask('  Markup multiplier (1-50)', '1');
+  const markup = Math.max(1, Math.min(50, parseInt(markupRaw, 10) || 1));
+
+  // ── Session Limits ──
+  console.log('\n── Session Limits ──');
+  const duration = parseInt(await ask('  Max duration in seconds', '7200'), 10) || 7200;
+  const tokenLimit = parseInt(await ask('  Token limit per session', '200000'), 10) || 200000;
+  const messageLimit = parseInt(await ask('  Message limit per session', '100'), 10) || 100;
+  const maxFileSize = parseInt(await ask('  Max file size in bytes', '10485760'), 10) || 10485760;
+
+  // ── Platform Config ──
+  console.log('\n── Platform Config ──');
+  const datapolicy = await ask('  Data policy (ephemeral|session|persistent)', 'ephemeral');
+  const trustlevel = await ask('  Trust level (basic|verified|audited)', 'verified');
+  const disputeresolution = await ask('  Dispute resolution (platform|arbitration|mutual)', 'platform');
+
+  // ── Workspace ──
+  console.log('\n── Workspace ──');
+  const wsEnabled = (await ask('  Enable workspace file access? (y/N)', 'N')).toLowerCase();
+  let workspaceCapability;
+  if (wsEnabled === 'y' || wsEnabled === 'yes') {
+    const modesRaw = await ask('  Workspace modes (comma-separated: supervised,standard)', 'supervised,standard');
+    const toolsRaw = await ask('  Workspace tools', 'read_file,write_file,list_directory');
+    workspaceCapability = {
+      workspace: true,
+      modes: modesRaw.split(',').map(s => s.trim()),
+      tools: toolsRaw.split(',').map(s => s.trim()),
+    };
+  }
+
+  // ── Service ──
+  console.log('\n── Service Definition ──');
+  const services = [];
+  let addService = (await ask('  Add a service? (Y/n)', 'Y')).toLowerCase();
+  while (addService !== 'n' && addService !== 'no') {
+    const svcName = await ask('    Service name');
+    if (!svcName) break;
+    const svcDesc = await ask('    Description');
+    const svcCategory = await ask('    Category', category);
+    const svcPrice = parseFloat(await ask('    Price (in VRSC)', '0.5')) || 0.5;
+    const svcCurrency = await ask('    Currency', 'VRSCTEST');
+    const svcTurnaround = await ask('    Turnaround time', '1h');
+    const svcTerms = await ask('    Payment terms (prepay|postpay|split)', 'prepay');
+    const svcSovguard = (await ask('    Require SovGuard? (Y/n)', 'Y')).toLowerCase() !== 'n';
+    const svcWindow = parseInt(await ask('    Dispute resolution window (hours)', '72'), 10) || 72;
+
+    services.push({
+      name: svcName,
+      description: svcDesc || undefined,
+      category: svcCategory || undefined,
+      price: svcPrice,
+      currency: svcCurrency,
+      turnaround: svcTurnaround,
+      paymentTerms: svcTerms,
+      sovguard: svcSovguard,
+      resolutionWindow: svcWindow,
+      refundPolicy: { policy: 'fixed', percent: 100 },
+    });
+
+    addService = (await ask('  Add another service? (y/N)', 'N')).toLowerCase();
+  }
+
+  rl.close();
+
+  const profile = {
+    name,
+    type,
+    description,
+    payAddress,
+    network: { capabilities, endpoints, protocols },
+    profile: {
+      category,
+      tags,
+      ...(website ? { website } : {}),
+      ...(avatar ? { avatar } : {}),
+    },
+    models,
+    markup,
+    session: { duration, tokenLimit, messageLimit, maxFileSize },
+    platformConfig: { datapolicy, trustlevel, disputeresolution },
+    ...(workspaceCapability ? { workspaceCapability } : {}),
+  };
+
+  return { profile, services };
 }
 
 /**
@@ -437,17 +592,13 @@ function createFinalizeHooks(agentId, identityName, profile, services = []) {
               resolutionWindow: svc.resolutionWindow,
               refundPolicy: svc.refundPolicy,
             }))),
-            network: JSON.stringify({
-              capabilities: profile.network?.capabilities || [],
-              endpoints: profile.network?.endpoints || [],
-              protocols: profile.network?.protocols || [],
-            }),
-            profile: JSON.stringify({
-              tags: profile.profile?.tags || [],
-              website: profile.profile?.website,
-              avatar: profile.profile?.avatar,
-              category: profile.profile?.category,
-            }),
+            networkCapabilities: JSON.stringify(profile.network?.capabilities || []),
+            networkEndpoints: JSON.stringify(profile.network?.endpoints || []),
+            networkProtocols: JSON.stringify(profile.network?.protocols || []),
+            profileTags: JSON.stringify(profile.profile?.tags || []),
+            profileWebsite: profile.profile?.website || '',
+            profileAvatar: profile.profile?.avatar || '',
+            profileCategory: profile.profile?.category || '',
           }
         : { services: '[]' };
 
@@ -469,7 +620,7 @@ function createFinalizeHooks(agentId, identityName, profile, services = []) {
       }, null, 2));
 
       // Also save the verus CLI command for manual fallback
-      const commandArgs = buildUpdateIdentityCommand(payload, 'verustest');
+      const commandArgs = buildUpdateIdentityCommand(payload, J41_NETWORK);
       const commandStr = commandArgs.map(a => a.includes(' ') || a.includes('{') ? `'${a}'` : a).join(' ');
       fs.writeFileSync(cmdPath, `${commandStr}\n`);
       fs.chmodSync(cmdPath, 0o700);
@@ -508,7 +659,7 @@ function createFinalizeHooks(agentId, identityName, profile, services = []) {
         identityData,
         utxos,
         vdxfAdditions,
-        network: 'verustest',
+        network: J41_NETWORK,
       });
       console.log(`   ↳ Transaction signed (${rawhex.length / 2} bytes)`);
 
@@ -772,11 +923,11 @@ program
       console.log(`  ${agentId}: generating keys...`);
       
       const { generateKeypair } = require('./keygen.js');
-      const keys = generateKeypair('verustest');
+      const keys = generateKeypair(J41_NETWORK);
       
       fs.writeFileSync(
         path.join(agentDir, 'keys.json'),
-        JSON.stringify({ ...keys, network: 'verustest' }, null, 2)
+        JSON.stringify({ ...keys, network: J41_NETWORK }, null, 2)
       );
       fs.chmodSync(path.join(agentDir, 'keys.json'), 0o600);
       
@@ -805,7 +956,7 @@ program
   .option('--profile-name <name>', 'Profile display name for headless finalize')
   .option('--profile-type <type>', 'Profile type (autonomous|assisted|hybrid|tool)', 'autonomous')
   .option('--profile-description <desc>', 'Profile description for headless finalize')
-  .option('--profile-owner <owner>', 'Owner VerusID (e.g., 33test@)')
+  .option('--pay-address <address>', 'Payment address (i-address or R-address)')
   .option('--profile-capabilities <json>', 'Capabilities as JSON array: [{"id":"x","name":"X"}]', parseJsonArray)
   .option('--profile-endpoints <json>', 'Endpoints as JSON array: [{"url":"https://...","protocol":"MCP"}]', parseJsonArray)
   .option('--profile-protocols <protos>', 'Comma-separated protocols (MCP,REST,A2A,WebSocket)', (v) => v.split(','))
@@ -851,7 +1002,7 @@ program
     });
 
     try {
-      const result = await agent.register(identityName, 'verustest');
+      const result = await agent.register(identityName, J41_NETWORK);
 
       // Save identity to keys file
       keys.identity = result.identity;
@@ -865,39 +1016,23 @@ program
       console.log(`   Identity: ${result.identity}`);
       console.log(`   i-Address: ${result.iAddress}`);
 
-      // Always register agent profile on the platform
+      // Build agent profile — interactive walkthrough or flags
       const soulPath = path.join(AGENTS_DIR, agentId, 'SOUL.md');
       const soul = fs.existsSync(soulPath) ? fs.readFileSync(soulPath, 'utf-8').trim() : '';
-      // Extract name from SOUL.md heading (# Name) or fall back to identity name
-      const soulNameMatch = soul.match(/^#\s+(.+)$/m);
-      const defaultName = soulNameMatch ? soulNameMatch[1] : identityName;
-      // Extract description: first non-heading, non-empty line
-      const soulDescMatch = soul.match(/^(?!#)(?!\s*$)(.+)$/m);
-      const defaultDesc = soulDescMatch ? soulDescMatch[1] : 'J41 dispatcher worker agent.';
 
-      const profileData = {
-        name: options.profileName || defaultName,
-        type: options.profileType || 'autonomous',
-        description: options.profileDescription || defaultDesc,
-        network: {
-          capabilities: options.profileCapabilities || [],
-          endpoints: options.profileEndpoints || [],
-          protocols: options.profileProtocols || ['MCP'],
-        },
-        profile: {
-          category: options.profileCategory || 'ai-assistant',
-          tags: options.profileTags || ['dispatcher', 'worker', 'autonomous'],
-          website: options.profileWebsite || undefined,
-          avatar: options.profileAvatar || undefined,
-        },
-        platformConfig: {
-          datapolicy: options.dataPolicy || 'ephemeral',
-          trustlevel: options.trustLevel || 'basic',
-          disputeresolution: options.disputeResolution || 'platform',
-        },
-        canary: false,
-      };
-      if (options.profileOwner) profileData.owner = options.profileOwner;
+      let profileData;
+      let serviceData = [];
+
+      if (options.profileName) {
+        // Headless mode — use CLI flags
+        profileData = buildFullProfile(options);
+        serviceData = buildServiceFromOptions(options, profileData.description);
+      } else {
+        // Interactive walkthrough — prompt for every VDXF field
+        const result = await interactiveProfileSetup(keys, soul);
+        profileData = result.profile;
+        serviceData = result.services;
+      }
 
       console.log(`\n→ Registering agent profile on J41 platform...`);
       try {
@@ -910,6 +1045,18 @@ program
         });
         const regResult = await profileAgent.registerWithJ41(profileData);
         console.log(`✅ Agent profile registered! (agentId: ${regResult.agentId})`);
+
+        // Register services
+        if (serviceData.length > 0) {
+          for (const svc of serviceData) {
+            try {
+              await profileAgent.registerService(svc);
+              console.log(`✅ Service registered: ${svc.name}`);
+            } catch (svcErr) {
+              console.error(`⚠️  Service "${svc.name}" registration failed: ${svcErr.message}`);
+            }
+          }
+        }
       } catch (profileErr) {
         console.error(`⚠️  Profile registration failed: ${profileErr.message}`);
         console.error(`   You can retry later with: node src/cli.js finalize ${agentId}`);
@@ -972,7 +1119,7 @@ program
   .option('--profile-name <name>', 'Profile display name for headless finalize')
   .option('--profile-type <type>', 'Profile type (autonomous|assisted|hybrid|tool)', 'autonomous')
   .option('--profile-description <desc>', 'Profile description for headless finalize')
-  .option('--profile-owner <owner>', 'Owner VerusID (e.g., 33test@)')
+  .option('--pay-address <address>', 'Payment address (i-address or R-address)')
   .option('--profile-capabilities <json>', 'Capabilities as JSON array: [{"id":"x","name":"X"}]', parseJsonArray)
   .option('--profile-endpoints <json>', 'Endpoints as JSON array: [{"url":"https://...","protocol":"MCP"}]', parseJsonArray)
   .option('--profile-protocols <protos>', 'Comma-separated protocols (MCP,REST,A2A,WebSocket)', (v) => v.split(','))
@@ -1466,7 +1613,7 @@ program
     result.local.address = keys.address;
     result.local.identity = keys.identity || null;
     result.local.iAddress = keys.iAddress || null;
-    result.local.network = keys.network || 'verustest';
+    result.local.network = keys.network || J41_NETWORK;
     result.local.registrationStatus = keys.registrationStatus || (keys.identity ? 'registered' : 'unregistered');
 
     const finalizePath = path.join(agentDir, FINALIZE_STATE_FILENAME);
@@ -1708,7 +1855,7 @@ program
   .option('--profile-website <url>', 'Agent website URL')
   .option('--profile-avatar <url>', 'Agent avatar URL')
   .option('--models <models>', 'Comma-separated LLM model names (e.g. "kimi-k2.5,claude-sonnet-4.6")')
-  .option('--profile-owner <owner>', 'Owner VerusID')
+  .option('--pay-address <address>', 'Payment address (i-address or R-address)')
   .option('--profile-capabilities <json>', 'Capabilities as JSON array', parseJsonArray)
   .option('--profile-endpoints <json>', 'Endpoints as JSON array', parseJsonArray)
   .option('--service-name <name>', 'Service name for marketplace')
@@ -1793,8 +1940,8 @@ program
     } else {
       fs.mkdirSync(agentDir, { recursive: true });
       const { generateKeypair } = require('./keygen.js');
-      keys = generateKeypair('verustest');
-      keys.network = 'verustest';
+      keys = generateKeypair(J41_NETWORK);
+      keys.network = J41_NETWORK;
       fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2));
       fs.chmodSync(path.join(agentDir, 'keys.json'), 0o600);
       console.log(`  ✓ Keys generated (${keys.address})`);
@@ -1827,7 +1974,7 @@ program
 
       try {
         console.log(`  → Registering ${identityName}.agentplatform@ (this may take several minutes)...`);
-        const regResult = await agent.register(identityName, 'verustest');
+        const regResult = await agent.register(identityName, J41_NETWORK);
         keys.identity = regResult.identity;
         keys.iAddress = regResult.iAddress;
         delete keys.registrationStatus;
@@ -1859,41 +2006,41 @@ program
       iAddress: keys.iAddress,
     });
 
-    const profileData = {
-      name: options.profileName || identityName,
-      type: options.profileType || 'autonomous',
-      description: options.profileDescription || 'J41 dispatcher worker agent.',
-      network: {
-        capabilities: options.profileCapabilities || [],
-        endpoints: options.profileEndpoints || [],
-        protocols: options.profileProtocols || ['MCP'],
-      },
-      profile: {
-        category: options.profileCategory || 'ai-assistant',
-        tags: options.profileTags || ['dispatcher', 'worker'],
-        website: options.profileWebsite || undefined,
-        avatar: options.profileAvatar || undefined,
-      },
-      platformConfig: {
-        datapolicy: options.dataPolicy || 'ephemeral',
-        trustlevel: options.trustLevel || 'basic',
-        disputeresolution: options.disputeResolution || 'platform',
-      },
-      canary: false,
-    };
-    if (options.profileOwner) profileData.owner = options.profileOwner;
+    let profileData;
+    let services = [];
+    const soulPath = path.join(agentDir, 'SOUL.md');
+    const soul = fs.existsSync(soulPath) ? fs.readFileSync(soulPath, 'utf-8').trim() : '';
+
+    if (options.interactive || !options.profileName) {
+      // Interactive walkthrough — prompt for every VDXF field
+      const result = await interactiveProfileSetup(keys, soul);
+      profileData = result.profile;
+      services = result.services;
+    } else {
+      // Headless mode — use CLI flags
+      profileData = buildFullProfile(options);
+      services = buildServiceFromOptions(options, profileData.description);
+    }
 
     try {
       const regResult = await profileAgent.registerWithJ41(profileData);
       console.log(`  ✓ Profile registered (${regResult.agentId || 'ok'})`);
+
+      for (const svc of services) {
+        try {
+          await profileAgent.registerService(svc);
+          console.log(`  ✓ Service registered: ${svc.name}`);
+        } catch (svcErr) {
+          console.error(`  ⚠️  Service "${svc.name}": ${svcErr.message}`);
+        }
+      }
     } catch (e) {
       console.error(`  ⚠️  Profile: ${e.message}`);
     }
 
-    // ── Step 4: Finalize (VDXF + service) ──
+    // ── Step 4: Finalize (VDXF on-chain + service registration) ──
     console.log('\nStep 4/4: Finalize (VDXF on-chain + service registration)');
-    const profile = buildFullProfile(options);
-    const services = buildServiceFromOptions(options, options.profileDescription || profileData.description);
+    const profile = profileData;
 
     // Remove stale finalize state so it runs fresh
     const finalizeStatePath = path.join(agentDir, FINALIZE_STATE_FILENAME);
@@ -2048,9 +2195,9 @@ program
         if (id?.contentmultimap) {
           const decoded = decodeContentMultimap(id.contentmultimap);
           const hasWorkspace = !!decoded.profile?.workspaceCapability;
-          // Also check raw CMM for workspace parent key (handles raw hex format from updateidentity)
-          const { PARENT_KEYS: PK } = require('@j41/sovagent-sdk/dist/onboarding/vdxf.js');
-          const hasWorkspaceKey = !!id.contentmultimap[PK.workspace];
+          // Also check raw CMM for workspace key (flat format or legacy parent key)
+          const { VDXF_KEYS: VK, PARENT_KEYS: PK } = require('@j41/sovagent-sdk/dist/onboarding/vdxf.js');
+          const hasWorkspaceKey = !!id.contentmultimap[VK.workspace.capability] || !!id.contentmultimap[PK.workspace];
           const services = decoded.services || [];
           state.capabilities.set(agentInfo.id, {
             workspace: hasWorkspace,
@@ -2069,7 +2216,32 @@ program
       }
     }
     console.log('');
-    
+
+    // Cache dispute policy and markup per agent from VDXF
+    if (!state.disputePolicy) state.disputePolicy = new Map();
+    if (!state.agentMarkup) state.agentMarkup = new Map();
+    for (const agentInfo of readyAgents) {
+      try {
+        const agent = await getAgentSession(state, agentInfo);
+        const identity = await agent.client.getMyIdentity();
+        if (identity?.contentmultimap) {
+          const decoded = decodeContentMultimap(identity.contentmultimap);
+          if (decoded.disputePolicy) {
+            state.disputePolicy.set(agentInfo.id, decoded.disputePolicy);
+            console.log(`  ✅ ${agentInfo.id}: dispute policy loaded (default=${decoded.disputePolicy.defaultAction})`);
+          } else {
+            console.log(`  ⚠️  ${agentInfo.id}: no dispute policy on-chain — disputes will log only`);
+          }
+          if (decoded.profile?.markup != null) {
+            state.agentMarkup.set(agentInfo.id, decoded.profile.markup);
+          }
+        }
+      } catch (e) {
+        console.log(`  ⚠️  ${agentInfo.id}: failed to load dispute policy (${e.message.slice(0, 60)})`);
+      }
+    }
+    console.log('');
+
     // Guard all interval callbacks against unhandled rejections
     // (async setInterval callbacks that throw will crash Node v20+)
     const safeInterval = (fn, ms, label) => {
@@ -2207,6 +2379,55 @@ program
       safeInterval(() => checkPendingReviews(state), 60000, 'Reviews');
     }
 
+    // ── Profile sync — detect on-chain changes and re-register with platform ──
+    const _profileHashes = new Map(); // agentId -> last known contentmultimap hash
+    safeInterval(async () => {
+      const { decodeContentMultimap } = require('@j41/sovagent-sdk/dist/onboarding/vdxf.js');
+      for (const agentInfo of state.agents) {
+        try {
+          const agent = await getAgentSession(state, agentInfo);
+          const idRaw = await agent.client.getIdentityRaw();
+          const cmm = idRaw.data?.identity?.contentmultimap || idRaw.identity?.contentmultimap;
+          if (!cmm) continue;
+
+          // Hash the contentmultimap to detect changes
+          const hash = require('crypto').createHash('sha256').update(JSON.stringify(cmm)).digest('hex').slice(0, 16);
+          const prev = _profileHashes.get(agentInfo.id);
+
+          if (!prev) {
+            // First run — just record
+            _profileHashes.set(agentInfo.id, hash);
+            continue;
+          }
+
+          if (hash !== prev) {
+            console.log(`[ProfileSync] ${agentInfo.id}: on-chain profile changed (${prev} → ${hash}) — re-syncing with platform`);
+            _profileHashes.set(agentInfo.id, hash);
+
+            // Decode and push to platform
+            const decoded = decodeContentMultimap(cmm);
+            const profile = decoded.profile || {};
+            await agent.client.updateAgent(agentInfo.iAddress || agentInfo.identity, {
+              displayName: profile.name,
+              type: profile.type,
+              description: profile.description,
+              payAddress: profile.payAddress,
+              profileCategory: profile.profile?.category,
+              profileTags: profile.profile?.tags,
+              models: profile.models,
+              markup: profile.markup,
+            });
+            console.log(`[ProfileSync] ✅ ${agentInfo.id}: platform profile updated`);
+          }
+        } catch (e) {
+          // Non-fatal — will retry next cycle
+          if (!e.message?.includes('not registered')) {
+            state.agentSessions.delete(agentInfo.id);
+          }
+        }
+      }
+    }, 300000, 'ProfileSync'); // Every 5 minutes
+
     // ── Common intervals (both modes) ──
     // Check for completed jobs
     safeInterval(() => cleanupCompletedJobs(state), 10000, 'Cleanup');
@@ -2231,6 +2452,18 @@ program
       onShutdown: (source) => gracefulShutdown(`control-plane (${source})`),
       getAgentSession,
     });
+
+    // ── Set agents active on-chain ──
+    console.log('\n→ Setting agents active on-chain...');
+    for (const agentInfo of readyAgents) {
+      try {
+        const agent = await getAgentSession(state, agentInfo);
+        await agent.setOnChainStatus('active');
+        console.log(`  ✅ ${agentInfo.id}: on-chain status → active`);
+      } catch (e) {
+        console.log(`  ⚠️  ${agentInfo.id}: on-chain status update failed (${e.message.slice(0, 60)})`);
+      }
+    }
 
     console.log('\n✅ Dispatcher running. Press Ctrl+C to stop.\n');
 
@@ -2287,19 +2520,30 @@ program
         await Promise.all(shutdownPromises);
       }
 
-      // 3. Mark agents as inactive on platform (best-effort)
-      console.log('\n   Marking agents offline on platform...');
+      // 3. Mark agents as inactive — both platform API and on-chain VDXF
+      console.log('\n   Marking agents offline...');
       const { randomUUID } = require('crypto');
       for (const agentInfo of state.agents) {
         try {
           const agent = await getAgentSession(state, agentInfo);
+
+          // Platform API status (instant)
           const { signMessage } = require('@j41/sovagent-sdk/dist/identity/signer.js');
-          const timestamp = Date.now();
+          const verusId = agentInfo.iAddress || agentInfo.identity;
+          const timestamp = Math.floor(Date.now() / 1000);
           const nonce = randomUUID();
-          const message = `status:inactive:${timestamp}`;
-          const signature = signMessage(agentInfo.wif, message, 'verustest');
-          await agent.client.setAgentStatus(agentInfo.iAddress || agentInfo.identity, 'inactive', signature, timestamp, nonce);
-          console.log(`   ✅ ${agentInfo.id}: marked offline`);
+          const message = `J41-STATUS|Agent:${verusId}|Status:inactive|Ts:${timestamp}|Nonce:${nonce}`;
+          const signature = signMessage(agentInfo.wif, message, J41_NETWORK);
+          await agent.client.setAgentStatus(verusId, 'inactive', signature, timestamp, nonce);
+          console.log(`   ✅ ${agentInfo.id}: platform status → inactive`);
+
+          // On-chain VDXF status (broadcast TX, confirms later)
+          try {
+            await agent.setOnChainStatus('inactive');
+            console.log(`   ✅ ${agentInfo.id}: on-chain status → inactive`);
+          } catch (chainErr) {
+            console.log(`   ⚠️  ${agentInfo.id}: on-chain status failed (${chainErr.message.slice(0, 50)})`);
+          }
         } catch (e) {
           console.log(`   ⚠️  ${agentInfo.id}: failed to mark offline (${e.message})`);
         }
@@ -2655,9 +2899,9 @@ async function pollForJobs(state) {
             const fullJob = await agent.client.getJob(job.id);
             if (fullJob?.jobHash && fullJob?.buyerVerusId) {
               const timestamp = Math.floor(Date.now() / 1000);
-              const acceptSig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), 'verustest');
-              await agent.client.acceptJob(job.id, acceptSig, timestamp);
-              console.log(`✅ Job ${job.id} accepted (signed) — awaiting buyer payment`);
+              const acceptSig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
+              await agent.client.acceptJob(job.id, acceptSig, timestamp, agentInfo.address);
+              console.log(`✅ Job ${job.id} accepted (signed, pay→${agentInfo.address.slice(0, 8)}...) — awaiting buyer payment`);
               state.pendingPayment.set(job.id, { accepted: true, agentInfo });
             }
           } catch (acceptErr) {
@@ -2878,9 +3122,9 @@ async function handleWebhookEvent(state, agentId, payload) {
         const fullJob = await agent.client.getJob(jobId);
         if (fullJob?.jobHash && fullJob?.buyerVerusId) {
           const timestamp = Math.floor(Date.now() / 1000);
-          const sig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), 'verustest');
-          await agent.client.acceptJob(jobId, sig, timestamp);
-          console.log(`[Webhook] ✅ Job ${jobId.substring(0, 8)} accepted`);
+          const sig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
+          await agent.client.acceptJob(jobId, sig, timestamp, agentInfo.address);
+          console.log(`[Webhook] ✅ Job ${jobId.substring(0, 8)} accepted (pay→${agentInfo.address.slice(0, 8)}...)`);
         }
       } catch (e) {
         if (!e.message?.includes('already')) console.error(`[Webhook] Accept failed: ${e.message}`);
@@ -2918,7 +3162,7 @@ async function handleWebhookEvent(state, agentId, payload) {
         const agent = await getAgentSession(state, agentInfo);
         // Check inbox for the review
         const inbox = await agent.client.getInbox('pending', 10);
-        const reviews = (inbox.data || []).filter(i => i.type === 'review' || i.type === 'job_completed');
+        const reviews = (inbox.data || []).filter(i => i.type === 'review' || i.rating != null);
         for (const review of reviews) {
           try {
             await agent.acceptReview(review.id);
@@ -3119,9 +3363,9 @@ async function handleWebhookEvent(state, agentId, payload) {
         const fullJob = await agent.client.getJob(bountyJobId);
         if (fullJob?.jobHash && fullJob?.buyerVerusId) {
           const timestamp = Math.floor(Date.now() / 1000);
-          const sig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), 'verustest');
-          await agent.client.acceptJob(bountyJobId, sig, timestamp);
-          console.log(`[Webhook] ✅ Bounty job ${bountyJobId.substring(0, 8)} accepted`);
+          const sig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
+          await agent.client.acceptJob(bountyJobId, sig, timestamp, agentInfo.address);
+          console.log(`[Webhook] ✅ Bounty job ${bountyJobId.substring(0, 8)} accepted (pay→${agentInfo.address.slice(0, 8)}...)`);
           state.seen.set(bountyJobId, Date.now());
         }
       } catch (e) {
@@ -3148,7 +3392,7 @@ async function checkPendingReviews(state) {
       // Check inbox for pending review/completion items only
       const inbox = await agent.client.getInbox('pending', 20);
       const pending = (inbox?.data || []).filter(
-        item => item.type === 'job_completed' || item.type === 'review'
+        item => item.type === 'review'
       );
       if (pending.length === 0) continue;
 
@@ -3241,7 +3485,7 @@ async function startJobContainer(state, job, agentInfo) {
   const tmpKeysPath = path.join(jobDir, 'keys.json');
   fs.copyFileSync(keysPath, tmpKeysPath);
   try {
-    fs.chmodSync(tmpKeysPath, 0o640);
+    fs.chmodSync(tmpKeysPath, 0o644);
   } catch {
     // best effort on systems that don't support chmod
   }
@@ -3254,16 +3498,19 @@ async function startJobContainer(state, job, agentInfo) {
       Image: 'j41/job-agent:latest',  // PRE-BAKED IMAGE
       Env: [
         `J41_API_URL=${J41_API_URL}`,
+        `J41_NETWORK=${J41_NETWORK}`,
         `J41_AGENT_ID=${agentInfo.id}`,
         `J41_IDENTITY=${agentInfo.identity}`,
         `J41_JOB_ID=${job.id}`,
         `JOB_TIMEOUT_MS=${JOB_TIMEOUT_MS}`,
-        // LLM config (pass through from dispatcher env)
-        ...(process.env.KIMI_API_KEY    ? [`KIMI_API_KEY=${process.env.KIMI_API_KEY}`]       : []),
-        ...(process.env.KIMI_BASE_URL   ? [`KIMI_BASE_URL=${process.env.KIMI_BASE_URL}`]     : []),
-        ...(process.env.KIMI_MODEL      ? [`KIMI_MODEL=${process.env.KIMI_MODEL}`]            : []),
-        ...(process.env.IDLE_TIMEOUT_MS ? [`IDLE_TIMEOUT_MS=${process.env.IDLE_TIMEOUT_MS}`]  : []),
-        // M7: Per-agent executor config (from agent-config.json or keys.json)
+        // LLM config (pass through from dispatcher env — new generic + legacy)
+        ...['J41_LLM_PROVIDER','J41_LLM_BASE_URL','J41_LLM_API_KEY','J41_LLM_MODEL',
+            'KIMI_API_KEY','KIMI_BASE_URL','KIMI_MODEL',
+            'ANTHROPIC_API_KEY','OPENAI_API_KEY','GROQ_API_KEY','DEEPSEEK_API_KEY',
+            'MISTRAL_API_KEY','GOOGLE_API_KEY','XAI_API_KEY','OPENROUTER_API_KEY',
+            'IDLE_TIMEOUT_MS','J41_EXECUTOR','MAX_CONVERSATION_LOG',
+        ].filter(k => process.env[k]).map(k => `${k}=${process.env[k]}`),
+        // Per-agent executor config (from agent-config.json or keys.json)
         ...getExecutorEnvVars(agentInfo),
       ],
       HostConfig: {
@@ -3304,6 +3551,11 @@ async function startJobContainer(state, job, agentInfo) {
       agentInfo,
       workspaceNotified: false,
       workspaceChecked: false,
+      jobAmount: job.amount || 0,
+      buyerPayAddress: job.buyerPayAddress || job.buyer?.payAddress || null,
+      currency: job.currency || 'VRSC',
+      agentInfoId: agentInfo.id,
+      reworkCount: 0,
     });
 
     // Mark as seen immediately to avoid duplicate pickup loops while status remains requested
@@ -3312,7 +3564,8 @@ async function startJobContainer(state, job, agentInfo) {
     
     // Remove from available pool
     state.available = state.available.filter(a => a.id !== agentInfo.id);
-    
+    persistActiveJobs(state.active);
+
     console.log(`✅ Container started for job ${job.id}`);
 
     // Stream container logs to dispatcher stdout for debugging
@@ -3424,6 +3677,7 @@ async function startJobLocal(state, job, agentInfo) {
 
   // Platform config — required for job-agent
   env.J41_API_URL = J41_API_URL;
+  env.J41_NETWORK = J41_NETWORK;
   env.J41_AGENT_ID = agentInfo.id;
   env.J41_IDENTITY = agentInfo.identity;
   env.J41_JOB_ID = job.id;
@@ -3520,6 +3774,15 @@ async function startJobLocal(state, job, agentInfo) {
       }
     });
 
+    // Send dispute policy + markup via IPC (complex objects, not suitable for env)
+    if (child.connected) {
+      child.send({
+        type: 'dispute_policy',
+        disputePolicy: state.disputePolicy?.get(agentInfo.id) || null,
+        agentMarkup: state.agentMarkup?.get(agentInfo.id) || 15,
+      });
+    }
+
     state.active.set(job.id, {
       agentId: agentInfo.id,
       process: child,
@@ -3531,6 +3794,11 @@ async function startJobLocal(state, job, agentInfo) {
       paused: false,
       pausedAt: null,
       pauseTTL: job.lifecycle?.pauseTTL || 60,
+      jobAmount: job.amount || 0,
+      buyerPayAddress: job.buyerPayAddress || job.buyer?.payAddress || null,
+      currency: job.currency || 'VRSC',
+      agentInfoId: agentInfo.id,
+      reworkCount: 0,
     });
 
     state.seen.set(job.id, Date.now());
@@ -3862,4 +4130,300 @@ program
     }
   });
 
-program.parse();
+// ── Interactive TUI Menu (no-args default) ──────────────────────────
+
+async function mainMenu() {
+  const readline = require('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const ask = (q) => new Promise(resolve => rl.question(q, answer => resolve(answer.trim())));
+
+  const clear = () => process.stdout.write('\x1B[2J\x1B[0f');
+
+  async function showMain() {
+    console.log('');
+    console.log('╔══════════════════════════════════════════╗');
+    console.log('║           J41 Dispatcher                  ║');
+    console.log('╚══════════════════════════════════════════╝');
+    console.log('');
+    console.log('  1. Run Agents');
+    console.log('  2. Setup Agents');
+    console.log('  3. System Settings');
+    console.log('  q. Quit');
+    console.log('');
+    const choice = await ask('  Select: ');
+
+    switch (choice) {
+      case '1': rl.close(); program.parse(['node', 'cli.js', 'start']); return;
+      case '2': await showAgentList(); break;
+      case '3': await showSystemSettings(); break;
+      case 'q': case 'Q': rl.close(); process.exit(0);
+      default: await showMain();
+    }
+  }
+
+  async function showAgentList() {
+    console.log('');
+    console.log('── Agent Setup ──');
+    console.log('');
+
+    ensureDirs();
+    const agents = [];
+    if (fs.existsSync(AGENTS_DIR)) {
+      const dirs = fs.readdirSync(AGENTS_DIR).filter(d => fs.existsSync(path.join(AGENTS_DIR, d, 'keys.json'))).sort();
+      for (const dir of dirs) {
+        const keys = JSON.parse(fs.readFileSync(path.join(AGENTS_DIR, dir, 'keys.json'), 'utf8'));
+        agents.push({ id: dir, identity: keys.identity || '(not registered)', iAddress: keys.iAddress || '-', address: keys.address });
+      }
+    }
+
+    if (agents.length === 0) {
+      console.log('  No agents found.\n');
+    } else {
+      for (let i = 0; i < agents.length; i++) {
+        const a = agents[i];
+        const status = a.identity && a.identity !== '(not registered)' ? a.identity : `(unregistered — ${a.address.slice(0, 12)}...)`;
+        console.log(`  ${i + 1}. ${a.id.padEnd(12)} ${status}`);
+      }
+    }
+    console.log(`  +. Create new agent`);
+    console.log(`  b. Back`);
+    console.log('');
+    const choice = await ask('  Select: ');
+
+    if (choice === 'b' || choice === 'B') { await showMain(); return; }
+    if (choice === '+') { await createNewAgent(); await showAgentList(); return; }
+
+    const idx = parseInt(choice, 10) - 1;
+    if (idx >= 0 && idx < agents.length) {
+      await showAgentDetail(agents[idx]);
+    }
+    await showAgentList();
+  }
+
+  async function showAgentDetail(agent) {
+    console.log('');
+    console.log(`── ${agent.id}: ${agent.identity} ──`);
+    console.log(`   i-Address: ${agent.iAddress}`);
+    console.log('');
+    console.log('  1. Edit Profile (25-key VDXF walkthrough)');
+    console.log('  2. View Current On-Chain Profile');
+    console.log('  3. Register Identity On-Chain');
+    console.log('  4. Publish VDXF Update');
+    console.log('  b. Back');
+    console.log('');
+    const choice = await ask('  Select: ');
+
+    switch (choice) {
+      case '1': await editAgentProfile(agent); break;
+      case '2': await viewAgentProfile(agent); break;
+      case '3': await registerAgentIdentity(agent); break;
+      case '4': await publishVdxfUpdate(agent); break;
+      case 'b': case 'B': return;
+    }
+  }
+
+  async function editAgentProfile(agent) {
+    const keysPath = path.join(AGENTS_DIR, agent.id, 'keys.json');
+    const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+    const soulPath = path.join(AGENTS_DIR, agent.id, 'SOUL.md');
+    const soul = fs.existsSync(soulPath) ? fs.readFileSync(soulPath, 'utf-8').trim() : '';
+
+    // Close current rl so interactiveProfileSetup can create its own
+    rl.close();
+    const result = await interactiveProfileSetup(keys, soul);
+
+    // Save profile to agent dir for reference
+    const profilePath = path.join(AGENTS_DIR, agent.id, 'profile.json');
+    fs.writeFileSync(profilePath, JSON.stringify({ profile: result.profile, services: result.services }, null, 2));
+    console.log(`\n  Profile saved to ${profilePath}`);
+    console.log('  Use "Publish VDXF Update" to write on-chain.\n');
+
+    // Re-create rl for menu
+    const readline2 = require('readline');
+    const rl2 = readline2.createInterface({ input: process.stdin, output: process.stdout });
+    // Can't easily re-enter menu after rl close; just exit
+    console.log('  (Returning to shell — run j41-dispatcher again to continue)');
+    rl2.close();
+    process.exit(0);
+  }
+
+  async function viewAgentProfile(agent) {
+    const keysPath = path.join(AGENTS_DIR, agent.id, 'keys.json');
+    const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+
+    if (!keys.identity || !keys.iAddress) {
+      console.log('\n  Agent not registered on-chain yet.\n');
+      return;
+    }
+
+    try {
+      const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
+      const { VDXF_KEYS, PARENT_KEYS, decodeContentMultimap } = require('@j41/sovagent-sdk/dist/onboarding/vdxf.js');
+
+      const a = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif, identityName: keys.identity, iAddress: keys.iAddress });
+      await a.login();
+      const { data } = await a.client.getIdentityRaw();
+      const cmm = data.identity?.contentmultimap || {};
+
+      // Build reverse map
+      const keyNames = {};
+      for (const [group, gkeys] of Object.entries(VDXF_KEYS)) {
+        for (const [field, iAddr] of Object.entries(gkeys)) { keyNames[iAddr] = group + '.' + field; }
+      }
+      for (const [group, iAddr] of Object.entries(PARENT_KEYS)) { keyNames[iAddr] = 'LEGACY:' + group; }
+
+      console.log(`\n  On-chain: ${Object.keys(cmm).length} keys\n`);
+      for (const [iAddr, values] of Object.entries(cmm)) {
+        const name = keyNames[iAddr] || '??? ' + iAddr;
+        let val = '(complex)';
+        if (Array.isArray(values) && values.length > 0) {
+          const dd = values[values.length - 1];
+          const inner = dd?.['i4GC1YGEVD21afWudGoFJVdnfjJ5XWnCQv'];
+          if (inner?.objectdata?.message) { val = inner.objectdata.message; if (val.length > 60) val = val.slice(0, 57) + '...'; }
+        }
+        console.log(`  ${name.padEnd(28)} = ${val}`);
+      }
+
+      const decoded = decodeContentMultimap(cmm);
+      if (decoded.services.length) {
+        console.log(`\n  Services: ${decoded.services.map(s => s.name).join(', ')}`);
+      }
+      console.log('');
+    } catch (e) {
+      console.error(`\n  Error: ${e.message}\n`);
+    }
+  }
+
+  async function registerAgentIdentity(agent) {
+    const keysPath = path.join(AGENTS_DIR, agent.id, 'keys.json');
+    const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+
+    if (keys.identity && keys.iAddress) {
+      console.log(`\n  Already registered: ${keys.identity} (${keys.iAddress})\n`);
+      return;
+    }
+
+    const name = await ask('  Identity name (without .agentplatform@): ');
+    if (!name) return;
+
+    console.log(`  Registering ${name}.agentplatform@... (this may take several minutes)`);
+    try {
+      const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
+      const a = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif });
+      const result = await a.register(name, J41_NETWORK);
+      keys.identity = result.identity;
+      keys.iAddress = result.iAddress;
+      fs.writeFileSync(keysPath, JSON.stringify(keys, null, 2));
+      console.log(`  Done: ${result.identity} (${result.iAddress})\n`);
+    } catch (e) {
+      console.error(`  Failed: ${e.message}\n`);
+    }
+  }
+
+  async function publishVdxfUpdate(agent) {
+    const keysPath = path.join(AGENTS_DIR, agent.id, 'keys.json');
+    const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+    const profilePath = path.join(AGENTS_DIR, agent.id, 'profile.json');
+
+    if (!keys.identity || !keys.iAddress) {
+      console.log('\n  Agent not registered on-chain yet.\n');
+      return;
+    }
+    if (!fs.existsSync(profilePath)) {
+      console.log('\n  No saved profile. Run "Edit Profile" first.\n');
+      return;
+    }
+
+    const { profile, services } = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
+
+    try {
+      const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
+      const { buildAgentContentMultimap } = require('@j41/sovagent-sdk/dist/onboarding/vdxf.js');
+      const { buildIdentityUpdateTx } = require('@j41/sovagent-sdk/dist/identity/update.js');
+
+      const a = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif, identityName: keys.identity, iAddress: keys.iAddress });
+      await a.login();
+      const { data: identityData } = await a.client.getIdentityRaw();
+      const utxoResp = await a.client.getUtxos();
+      const utxos = utxoResp.utxos || utxoResp;
+
+      if (!utxos.length) { console.log('\n  No UTXOs — fund the agent first.\n'); return; }
+
+      const newCmm = buildAgentContentMultimap(profile, services || []);
+      const rawhex = buildIdentityUpdateTx({
+        wif: keys.wif, identityData, utxos, vdxfAdditions: newCmm,
+        network: J41_NETWORK, clearContentmultimap: true,
+      });
+
+      const result = await a.client.broadcast(rawhex);
+      console.log(`\n  Published: ${result.txid || result}`);
+      console.log(`  ${Object.keys(newCmm).length} flat VDXF keys written. Wait ~60s for confirmation.\n`);
+    } catch (e) {
+      console.error(`\n  Failed: ${e.message}\n`);
+    }
+  }
+
+  async function createNewAgent() {
+    const id = await ask('  New agent ID (e.g. agent-6): ');
+    if (!id) return;
+
+    const agentDir = path.join(AGENTS_DIR, id);
+    if (fs.existsSync(path.join(agentDir, 'keys.json'))) {
+      console.log(`  ${id} already exists.\n`);
+      return;
+    }
+
+    fs.mkdirSync(agentDir, { recursive: true });
+    const { generateKeypair } = require('./keygen.js');
+    const keys = generateKeypair(J41_NETWORK);
+    keys.network = J41_NETWORK;
+    fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2));
+    fs.chmodSync(path.join(agentDir, 'keys.json'), 0o600);
+    fs.writeFileSync(path.join(agentDir, 'SOUL.md'), `# ${id}\n\nA helpful AI assistant on the J41 platform.`);
+    console.log(`\n  Created ${id} (${keys.address})`);
+    console.log(`  Fund this address with VRSCTEST, then register the identity.\n`);
+  }
+
+  async function showSystemSettings() {
+    const cfg = loadConfig();
+    console.log('');
+    console.log('── System Settings ──');
+    console.log('');
+    console.log(`  API URL:           ${J41_API_URL}`);
+    console.log(`  Runtime:           ${cfg.runtime || 'local'}`);
+    console.log(`  Max Concurrent:    ${cfg.maxConcurrent || 9}`);
+    console.log(`  Job Timeout:       ${cfg.jobTimeoutMin || 60} min`);
+    console.log(`  Network:           verustest`);
+    console.log(`  Auto-Approve Ext:  ${cfg.extensionAutoApprove !== false ? 'yes' : 'no'}`);
+    console.log(`  Ext Max CPU:       ${cfg.extensionMaxCpuPercent || 80}%`);
+    console.log(`  Ext Min Free RAM:  ${cfg.extensionMinFreeMB || 512} MB`);
+    console.log('');
+    console.log('  1. Edit settings');
+    console.log('  b. Back');
+    console.log('');
+    const choice = await ask('  Select: ');
+
+    if (choice === '1') {
+      const runtime = await ask(`  Runtime (local|docker) [${cfg.runtime || 'local'}]: `) || cfg.runtime || 'local';
+      const maxConcurrent = parseInt(await ask(`  Max concurrent agents [${cfg.maxConcurrent || 9}]: `)) || cfg.maxConcurrent || 9;
+      const jobTimeoutMin = parseInt(await ask(`  Job timeout minutes [${cfg.jobTimeoutMin || 60}]: `)) || cfg.jobTimeoutMin || 60;
+      const extensionAutoApprove = (await ask(`  Auto-approve extensions? (y/n) [${cfg.extensionAutoApprove !== false ? 'y' : 'n'}]: `) || (cfg.extensionAutoApprove !== false ? 'y' : 'n')).toLowerCase() !== 'n';
+
+      const newCfg = { ...cfg, runtime, maxConcurrent, jobTimeoutMin, extensionAutoApprove };
+      saveConfig(newCfg);
+      console.log('\n  Settings saved.\n');
+    }
+    await showMain();
+  }
+
+  await showMain();
+}
+
+// ── Entry point ──
+
+if (process.argv.length <= 2) {
+  // No command — launch interactive menu
+  mainMenu().catch(e => { console.error(e); process.exit(1); });
+} else {
+  program.parse();
+}

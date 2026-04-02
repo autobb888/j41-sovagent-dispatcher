@@ -21,6 +21,7 @@ const JOB_ID = process.env.J41_JOB_ID;
 const TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS || '3600000');
 const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '480000'); // idle → pause (8 min, before backend's 10-min auto-deliver)
 
+const J41_NETWORK = process.env.J41_NETWORK || 'verustest';
 const KEYS_FILE = process.env.J41_KEYS_FILE || '/app/keys.json';
 const SOUL_FILE = process.env.J41_SOUL_FILE || '/app/SOUL.md';
 const JOB_DIR = process.env.J41_JOB_DIR || '/app/job';
@@ -63,6 +64,9 @@ let _workspaceStats = null;
 let _workspaceMode = 'supervised';
 let _shuttingDown = false;
 let _sessionEndResolve = null; // global ref so shutdown IPC can resolve the session
+let _disputePolicy = null;
+let _agentMarkup = 15;
+let _reworkCount = 0;
 
 async function main() {
   // Check for required environment variables
@@ -170,7 +174,7 @@ async function main() {
   } else {
     const timestamp = Math.floor(Date.now() / 1000);
     const acceptMsg = `J41-ACCEPT|Job:${fullJob.jobHash}|Buyer:${fullJob.buyerVerusId}|Amt:${fullJob.amount} ${fullJob.currency}|Ts:${timestamp}|I accept this job and commit to delivering the work.`;
-    const acceptSig = signMessage(keys.wif, acceptMsg, 'verustest');
+    const acceptSig = signMessage(keys.wif, acceptMsg, J41_NETWORK);
     await withRetry(() => agent.client.acceptJob(job.id, acceptSig, timestamp), 'acceptJob');
     log.info('Job accepted', { jobId: JOB_ID, buyer: fullJob.buyerVerusId, amount: fullJob.amount, currency: fullJob.currency });
   }
@@ -184,7 +188,7 @@ async function main() {
     // Deliver a "failed" result so the accepted job isn't left in limbo
     const deliverTimestamp = Math.floor(Date.now() / 1000);
     const deliverMessage = `J41-DELIVER|Job:${fullJob.jobHash}|Delivery:failed|Ts:${deliverTimestamp}|I have delivered the work for this job.`;
-    const deliverSig = signMessage(keys.wif, deliverMessage, 'verustest');
+    const deliverSig = signMessage(keys.wif, deliverMessage, J41_NETWORK);
     await withRetry(
       () => agent.client.deliverJob(job.id, 'failed', deliverSig, deliverTimestamp, 'Chat connection failed — could not process job'),
       'deliverJob-chatfail',
@@ -276,6 +280,11 @@ async function main() {
           _agent?.sendChatMessage(msg.jobId, 'Service is shutting down. Delivering current work now.');
           if (sessionEndResolve) sessionEndResolve('dispatcher-shutdown');
           break;
+        case 'dispute_policy':
+          _disputePolicy = msg.disputePolicy || null;
+          _agentMarkup = msg.agentMarkup || 15;
+          if (_disputePolicy) console.log(`[IPC] Dispute policy received (default=${_disputePolicy.defaultAction})`);
+          break;
         default:
           // Queue for post-delivery handler
           ipcQueue.push(msg);
@@ -308,7 +317,7 @@ async function main() {
   const deliverTimestamp = Math.floor(Date.now() / 1000);
   const deliverHash = result.hash || 'failed';
   const deliverMessage = `J41-DELIVER|Job:${fullJob.jobHash}|Delivery:${deliverHash}|Ts:${deliverTimestamp}|I have delivered the work for this job.`;
-  const deliverSig = signMessage(keys.wif, deliverMessage, 'verustest');
+  const deliverSig = signMessage(keys.wif, deliverMessage, J41_NETWORK);
 
   await withRetry(
     () => agent.client.deliverJob(job.id, deliverHash, deliverSig, deliverTimestamp, result.content.substring(0, 200)),
@@ -728,7 +737,7 @@ process.on('SIGTERM', async () => {
     try {
       if (_agent) {
         const { message: attestMessage } = await _agent.client.getDeletionAttestationMessage(JOB_ID, attestTimestamp);
-        const attestSig = signMessage(keys.wif, attestMessage, 'verustest');
+        const attestSig = signMessage(keys.wif, attestMessage, J41_NETWORK);
         fs.writeFileSync(
           path.join(JOB_DIR, 'deletion-attestation-sigterm.json'),
           JSON.stringify({ jobId: JOB_ID, message: attestMessage, signature: attestSig, timestamp: attestTimestamp }, null, 2)
@@ -776,7 +785,7 @@ setTimeout(async () => {
       if (!_agent) await agent.authenticate();
       const { message: attestMessage } = await agent.client.getDeletionAttestationMessage(JOB_ID, attestTimestamp);
       const { signMessage: signMsg } = require('@j41/sovagent-sdk/dist/identity/signer.js');
-      const attestSig = signMsg(keys.wif, attestMessage, 'verustest');
+      const attestSig = signMsg(keys.wif, attestMessage, J41_NETWORK);
 
       fs.writeFileSync(
         path.join(JOB_DIR, 'deletion-attestation-timeout.json'),
@@ -796,7 +805,7 @@ setTimeout(async () => {
         deletionMethod: 'timeout',
       };
       const { signMessage: signMsg } = require('@j41/sovagent-sdk/dist/identity/signer.js');
-      deletionAttestation.signature = signMsg(keys.wif, JSON.stringify(deletionAttestation), 'verustest');
+      deletionAttestation.signature = signMsg(keys.wif, JSON.stringify(deletionAttestation), J41_NETWORK);
       fs.writeFileSync(
         path.join(JOB_DIR, 'deletion-attestation-timeout.json'),
         JSON.stringify(deletionAttestation, null, 2)
@@ -850,6 +859,8 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
 
         case 'dispute.filed': {
           console.log(`⚠️  Dispute filed: ${msg.data?.reason || 'no reason'}`);
+
+          // Call handler hook first (escape hatch)
           if (agent.handler?.onJobDisputed) {
             try {
               const freshJob = await agent.client.getJob(job.id);
@@ -858,6 +869,53 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
               console.error('Handler error:', e.message);
             }
           }
+
+          // VDXF policy auto-response (if no handler handled it)
+          if (_disputePolicy) {
+            try {
+              const policy = _disputePolicy;
+              let action = policy.defaultAction || 'rework';
+              let refundPercent = 0;
+              let reworkCost = 0;
+
+              // Check rework cycle limit
+              if (action === 'rework' && _reworkCount >= policy.maxReworkCycles) {
+                if (policy.escalateAfter === 'max_rework') {
+                  console.log(`⚠️  Max rework cycles (${policy.maxReworkCycles}) reached — deferring to platform arbitration`);
+                  break;
+                }
+                action = 'refund';
+              }
+
+              if (action === 'refund') {
+                refundPercent = Math.min(policy.maxRefundPercent || 100, 100);
+              } else if (action === 'rework') {
+                reworkCost = (policy.reworkBudgetPercent || 30) / 100 * (fullJob.amount || 0);
+              }
+
+              const ts = Math.floor(Date.now() / 1000);
+              const { buildDisputeRespondMessage } = require('@j41/sovagent-sdk/dist/signing/messages.js');
+              const respondMsg = buildDisputeRespondMessage({ jobHash: fullJob.jobHash, action, timestamp: ts });
+              const sig = signMessage(keys.wif, respondMsg, J41_NETWORK);
+
+              await withRetry(
+                () => agent.client.respondToDispute(job.id, {
+                  action,
+                  message: `Auto per VDXF policy: ${action}`,
+                  timestamp: ts,
+                  signature: sig,
+                  ...(action === 'refund' ? { refundPercent } : {}),
+                  ...(action === 'rework' ? { reworkCost } : {}),
+                }),
+                'respondToDispute (auto)',
+                { maxAttempts: 3, baseDelayMs: 2000 }
+              );
+              console.log(`✅ Auto-responded to dispute: ${action}`);
+            } catch (e) {
+              console.error('❌ Auto-dispute response failed:', e.message);
+            }
+          }
+
           // Stay alive — wait for resolution
           break;
         }
@@ -899,7 +957,7 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
             const ts = Math.floor(Date.now() / 1000);
             const hash = reworkResult.hash || 'rework';
             const deliverMsg = buildDeliverMessage({ jobHash: fullJob.jobHash, deliveryHash: hash, timestamp: ts });
-            const sig = signMessage(keys.wif, deliverMsg, 'verustest');
+            const sig = signMessage(keys.wif, deliverMsg, J41_NETWORK);
             await withRetry(
               () => agent.client.deliverJob(job.id, hash, sig, ts, reworkResult.content?.substring(0, 200)),
               'deliverJob (rework)',
@@ -942,7 +1000,7 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult) {
     const { message: attestMessage, timestamp: attestTs } =
       await agent.client.getDeletionAttestationMessage(JOB_ID, attestTimestamp);
     const { signMessage } = require('@j41/sovagent-sdk/dist/identity/signer.js');
-    const attestSig = signMessage(keys.wif, attestMessage, 'verustest');
+    const attestSig = signMessage(keys.wif, attestMessage, J41_NETWORK);
 
     fs.writeFileSync(
       path.join(JOB_DIR, 'deletion-attestation.json'),
@@ -1026,7 +1084,7 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult) {
         identityData,
         utxos,
         vdxfAdditions: additions,
-        network: 'verustest',
+        network: J41_NETWORK,
       });
       const txResult = await agent.client.broadcast(rawhex);
       log.info('On-chain identity updated', { jobId: JOB_ID, txid: txResult.txid || txResult });
