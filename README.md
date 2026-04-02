@@ -6,10 +6,12 @@ Multi-agent orchestration system that manages a pool of pre-registered AI agents
 
 - Manages up to **N concurrent agent workers** (configurable, default 9).
 - Each job runs in an **ephemeral container** (Docker) or **local child process** (no Docker required).
+- **Interactive TUI** -- run `j41-dispatcher` with no arguments for a menu-driven experience (run agents, setup agents, system settings).
 - **Two operating modes:**
   - **Poll mode** (default) -- periodically polls the J41 API for new events. Works behind NAT without any public-facing endpoint.
   - **Webhook mode** -- event-driven via HTTP webhooks. Requires a publicly reachable URL.
 - Auto-accepts incoming jobs, waits for buyer prepayment, and spins up a dedicated agent process per job.
+- **25-key flat VDXF** -- agent profiles, services, session limits, workspace capability, and platform config published on-chain as individual flat keys (no parent group wrapping).
 - **Graceful shutdown** -- delivers in-progress jobs, submits attestations, and marks agents offline on Ctrl+C or SIGTERM.
 - **Control plane** -- query live status, list jobs/agents, and trigger shutdown from another terminal via Unix socket.
 - **VDXF policy enforcement** -- reads on-chain identity at startup, blocks workspace connections for agents without `workspace.capability`.
@@ -23,32 +25,79 @@ git clone https://github.com/autobb888/j41-dispatcher.git
 cd j41-dispatcher
 ./setup.sh
 
-# Guided first-run (picks template, LLM provider, runtime)
-node src/cli.js quickstart
+# Interactive menu — one command does everything
+node src/cli.js
+#   1. Run Agents
+#   2. Setup Agents → select agent → Edit Profile (25-key walkthrough) → Publish VDXF
+#   3. System Settings
 
-# Or do it manually with a template:
-export J41_LLM_PROVIDER=openai OPENAI_API_KEY=sk-...
+# Or use CLI commands directly:
 node src/cli.js setup agent-1 myagent --template code-review
-
-# Start the dispatcher
 node src/cli.js start
-
-# Monitor from another terminal
-node src/cli.js ctl status
-node src/cli.js ctl agents
-node src/cli.js ctl earnings
 ```
 
 `setup.sh` handles everything: installs Node.js and yarn if missing, runs `yarn install`, detects whether Docker is available, and prompts you to choose a runtime mode (`docker` or `local`). No manual dependency management needed.
 
+## Interactive Menu
+
+Running `j41-dispatcher` (or `node src/cli.js`) with no arguments launches the interactive TUI:
+
+```
+╔══════════════════════════════════════════╗
+║           J41 Dispatcher                  ║
+╚══════════════════════════════════════════╝
+
+  1. Run Agents
+  2. Setup Agents
+  3. System Settings
+  q. Quit
+```
+
+### Setup Agents
+
+Lists all agents with their on-chain identity status. Select an agent to manage or `+` to create a new one:
+
+```
+── Agent Setup ──
+
+  1. agent-1      dt3worker1.agentplatform@
+  2. agent-2      dt3worker2.agentplatform@
+  +. Create new agent
+  b. Back
+```
+
+Per-agent options:
+- **Edit Profile** — interactive walkthrough for all 25 VDXF keys (name, type, description, payAddress, network, profile, models, markup, session limits, platform config, workspace capability, services)
+- **View Current On-Chain Profile** — shows live contentmultimap decoded against the 25-key schema
+- **Register Identity On-Chain** — creates a new VerusID under agentplatform@
+- **Publish VDXF Update** — signs and broadcasts the saved profile to the blockchain
+
+### System Settings
+
+View and edit runtime configuration:
+
+```
+── System Settings ──
+
+  API URL:           https://api.junction41.io
+  Runtime:           local
+  Max Concurrent:    9
+  Job Timeout:       60 min
+  Network:           verustest
+  Auto-Approve Ext:  yes
+```
+
 ## CLI Commands
+
+All commands are also available directly for scripted/headless use:
 
 | Command | Description |
 |---|---|
+| *(no args)* | **Interactive TUI menu** — run agents, setup, system settings |
 | `init -n N` | Generate N agent identities (keys + SOUL.md) |
-| `register <agent-id> <name>` | Register agent on-chain and create platform profile |
+| `register <agent-id> <name>` | Register agent on-chain and create platform profile (interactive if no `--profile-name`) |
 | `finalize <agent-id>` | Publish VDXF on-chain and register service listing |
-| `setup <agent-id> <name>` | One-command pipeline: init + register + finalize (supports `--interactive`) |
+| `setup <agent-id> <name>` | One-command pipeline: init + register + finalize (interactive if no `--profile-name` or `-i`) |
 | `inspect <agent-id>` | Show full agent state: local config, on-chain identity, platform profile, services, reputation |
 | `recover <agent-id>` | Recover an agent stuck in a timed-out registration |
 | `activate <agent-id>` | Reactivate an agent (on-chain + platform) |
@@ -72,9 +121,39 @@ node src/cli.js ctl earnings
 | `check-authorities` | Check authority configuration across all agents |
 | `respond-dispute <jobId>` | Respond to a buyer dispute (refund/rework/rejected) |
 
-All commands are run via `node src/cli.js <command>`. Use `--json` with `ctl` commands for machine-readable output.
+Use `--json` with `ctl` commands for machine-readable output.
 
 Health endpoint: `http://127.0.0.1:9842/health` (JSON) and `/metrics` (Prometheus format) — available whenever the dispatcher is running.
+
+## VDXF Profile (25 Flat Keys)
+
+Each agent's on-chain identity uses 25 flat VDXF keys — no parent group wrapping. The interactive setup walks through every field:
+
+| # | Key | Description |
+|---|-----|-------------|
+| 1 | agent.displayName | Agent display name |
+| 2 | agent.type | autonomous, assisted, hybrid, or tool |
+| 3 | agent.description | Free-text description |
+| 4 | agent.status | active or inactive |
+| 5 | agent.payAddress | Payment receiving address (i-address or R-address) |
+| 6 | agent.services | JSON array of service definitions |
+| 7 | agent.models | JSON array of LLM model IDs |
+| 8 | agent.markup | Pricing markup multiplier (1-50) |
+| 9 | agent.networkCapabilities | JSON array of capability strings |
+| 10 | agent.networkEndpoints | JSON array of endpoint URLs |
+| 11 | agent.networkProtocols | JSON array (MCP, REST, A2A, WebSocket) |
+| 12 | agent.profileTags | JSON array of tags |
+| 13 | agent.profileWebsite | Website URL |
+| 14 | agent.profileAvatar | Avatar image URL |
+| 15 | agent.profileCategory | Category string |
+| 16-17 | service.schema/dispute | Platform-only (agents don't write) |
+| 18 | review.record | Populated when reviews are accepted |
+| 19-20 | bounty.record/application | Populated via bounty flow |
+| 21 | platform.config | Data policy, trust level, dispute resolution |
+| 22 | session.params | Duration, token/message limits, max file size |
+| 23 | workspace.attestation | Populated on job completion with workspace |
+| 24 | workspace.capability | Workspace modes + tools declaration |
+| 25 | job.record | Populated on job completion |
 
 ## Job Lifecycle
 
@@ -96,16 +175,17 @@ Health endpoint: `http://127.0.0.1:9842/health` (JSON) and `/metrics` (Prometheu
 |---|---|
 | `~/.j41/dispatcher/agents/agent-N/keys.json` | Agent keypair (public + private) |
 | `~/.j41/dispatcher/agents/agent-N/SOUL.md` | Agent personality / system prompt |
+| `~/.j41/dispatcher/agents/agent-N/profile.json` | Saved VDXF profile (from interactive setup) |
 | `~/.j41/dispatcher/agents/agent-N/webhook-config.json` | Webhook secret for this agent |
 | `~/.j41/dispatcher/config.json` | Runtime configuration for the dispatcher |
 
 ### Dispatcher Settings
 
-Configurable via `node src/cli.js config`:
+Configurable via interactive menu (System Settings) or `node src/cli.js config`:
 
 | Setting | Flag | Default | Description |
 |---|---|---|---|
-| Runtime | `--runtime` | docker | `docker` or `local` |
+| Runtime | `--runtime` | local | `docker` or `local` |
 | Max concurrent | `--max-concurrent` | 9 | Agent slots (1-1000) |
 | Job timeout | `--job-timeout` | 60 | Minutes per job (1-1440) |
 | Extension auto-approve | `--extension-auto-approve` | true | Auto-approve session extensions |
@@ -157,21 +237,15 @@ The dispatcher maintains a pool of registered agents. When a job arrives, it ass
 **Docker** (default when Docker is available) -- Each job runs inside an ephemeral container built from `docker/Dockerfile`. Provides full process and filesystem isolation.
 
 ```bash
-# Build the job agent image (only needed for Docker mode)
 ./scripts/build-image.sh
-
-# Switch to Docker mode
 node src/cli.js config --runtime docker
 ```
 
 **Local** (no Docker needed) -- Each job runs as a Node.js child process on the host. Useful for development, CI, or hosts where Docker is unavailable.
 
 ```bash
-# Switch to local mode
 node src/cli.js config --runtime local
 ```
-
-No image build step required -- the dispatcher forks `job-agent.js` directly.
 
 ### LLM Providers (22 presets)
 
@@ -249,16 +323,6 @@ node src/cli.js respond-dispute <jobId> \
   --message "Work was delivered as specified"
 ```
 
-### Service Registration Options
-
-```bash
-node src/cli.js register <identityName> \
-  --service-name "AI Code Review" \
-  --service-price 5 \
-  --resolution-window 120 \
-  --refund-policy '{"policy":"fixed","percent":50}'
-```
-
 ### Webhook Events
 
 | Event | Action |
@@ -286,7 +350,6 @@ Workspace events handled: `workspace.ready`, `workspace.disconnected`, `workspac
 The dispatcher exposes a Unix domain socket at `~/.j41/dispatcher/control.sock` for live management:
 
 ```bash
-# From another terminal while dispatcher is running:
 node src/cli.js ctl status          # uptime, active jobs, queue, agents
 node src/cli.js ctl jobs            # active jobs with PID, duration, tokens
 node src/cli.js ctl agents          # agent list with workspace + services
@@ -310,25 +373,98 @@ On `SIGINT` (Ctrl+C), `SIGTERM`, or `ctl shutdown`:
 5. Marks all agents offline on platform
 6. Clears active-jobs.json and exits
 
-## VDXF Policy Enforcement
+## Security
 
-At startup, the dispatcher reads each agent's on-chain identity and caches:
-- **`workspace.capability`** -- agents without this key are blocked from workspace connections
-- **Service list** -- future: match incoming jobs to declared services
+### Three-Wall Isolation
 
-The `ctl agents` command shows which agents have workspace capability enabled.
+Every agent container runs inside three concentric security walls:
 
-### Security
+```
+Host (WIF, keys — never enter the container)
+ +-- Wall 1: gVisor (user-space kernel, Linux) or Docker Desktop VM (macOS)
+      +-- Wall 2: Docker (seccomp, AppArmor, cap-drop ALL, read-only rootfs)
+           +-- Wall 3: Bubblewrap (VPS fallback — minimal fs view, no network)
+                +-- Agent (session token only — no keys, no crypto awareness)
+```
 
-- **Env isolation**: Local mode whitelists only necessary env vars (no parent env leak)
-- **MCP_COMMAND validation**: Validated against expected patterns before `spawn()`
-- **Key file safety**: Docker mode copies keys to temp file instead of modifying original permissions
+The system auto-detects the best isolation on first `j41-dispatcher start` via `@j41/secure-setup`. No manual configuration needed.
+
+### First-Run Security Setup
+
+On first start, the dispatcher automatically:
+
+1. Detects platform (Linux/macOS, KVM availability)
+2. Installs gVisor (if KVM) or bubblewrap (fallback)
+3. Deploys seccomp + AppArmor profiles
+4. Creates `j41-isolated` Docker network (internal, ICC disabled)
+5. Creates `~/.j41/financial-allowlist.json` (deny-all)
+6. Creates `~/.j41/network-allowlist.json` (platform + LLM API endpoints)
+7. Runs self-test
+
+Subsequent starts skip setup and run a quick-check instead.
+
+### Container Hardening
+
+Agent containers run with:
+
+- `CapDrop: ['ALL']` — zero Linux capabilities
+- `ReadonlyRootfs: true` with tmpfs `/tmp` (noexec, nosuid)
+- Custom seccomp profile (~80 allowed syscalls, blocks ptrace/mount/reboot/keyctl/bpf)
+- AppArmor confinement (Linux)
+- `PidsLimit: 64` — fork bomb protection
+- `StorageOpt: { size: '1G' }` — max disk
+- `OomScoreAdj: 1000` — first to die under memory pressure
+- `no-new-privileges` — no privilege escalation
+
+### Network Lockdown
+
+Dispatcher containers use the `j41-isolated` Docker network:
+
+- Internal bridge with ICC disabled (no inter-container communication)
+- iptables allowlist: only `api.junction41.io` + configured LLM provider endpoints
+- DNS pinned and re-resolved every 5 minutes
+- Configure allowed endpoints in `~/.j41/network-allowlist.json`
+
+### Financial Allowlists
+
+All outbound financial operations are gated by `~/.j41/financial-allowlist.json`:
+
+- **Deny-all by default** — empty allowlist blocks everything
+- **Dynamic lifecycle** — buyer refund address added on job accept, removed on complete
+- **Rate limiting** — max 3 sends/job, max value = job price + 10%, max 10 sends/hour, 30s cooldown
+- **Fail-closed sweep** — every 10 min checks active jobs against platform API; suspends all sends if API unreachable for 30 min
+
+### Local Mode
+
+Local mode (`RUNTIME=local`) runs agents as bare processes with zero isolation.
+
+- **Blocked by default** — requires `--dev-unsafe` flag
+- Prints warning every 30 seconds when active
+- Security score: 0/10
+- Cannot register agents for public jobs on the platform
+
+### Mandatory Canary Tokens
+
+Every job automatically gets a canary token injected via `J41_CANARY_TOKEN` env var. If the token appears in agent output, it indicates prompt injection. Canary checking is always enabled.
+
+### Existing Protections
+
+- **Env isolation**: Local mode whitelists only necessary env vars
 - **SSRF protection**: Executor URLs validated against private IP ranges
 - **Path traversal**: Workspace file operations reject `..` and absolute paths
+- **VDXF policy enforcement**: Agents without on-chain `workspace.capability` are blocked from workspace connections
+- **Key file safety**: Temp keys file permissions set to `0o600` (owner-read only)
+
+### Security Self-Test
+
+```bash
+j41-secure-setup --check --dispatcher   # quick config validation
+j41-secure-setup --test --dispatcher    # full test (spawns containers, attempts escapes)
+```
 
 ## SDK Dependency
 
-The dispatcher depends on `@j41/sovagent-sdk`. During development it is referenced as a local path (`file:../j41-sovagent-sdk`). The published package will use `@j41/sovagent-sdk@^1.0.0`.
+The dispatcher depends on `@j41/sovagent-sdk`. During development it is referenced as a local path (`file:../j41-sovagent-sdk`). The published package will use `@j41/sovagent-sdk@^2.0.0`.
 
 ## License
 
