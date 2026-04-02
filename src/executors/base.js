@@ -7,6 +7,10 @@
 class Executor {
   constructor() {
     this._tokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0, llmCalls: 0 };
+    this._budgetTokens = null;        // null = unlimited
+    this._budgetWarningPercent = 80;
+    this._budgetWarningFired = false;
+    this._onBudgetWarning = null;     // callback(usage, budget)
   }
 
   /** Accumulate token usage from an LLM API response's usage object */
@@ -16,11 +20,38 @@ class Executor {
     this._tokenUsage.completionTokens += usage.completion_tokens || 0;
     this._tokenUsage.totalTokens += usage.total_tokens || 0;
     this._tokenUsage.llmCalls++;
+    // Check budget warning
+    if (this._budgetTokens != null && !this._budgetWarningFired) {
+      const percent = (this._tokenUsage.totalTokens / this._budgetTokens) * 100;
+      if (percent >= this._budgetWarningPercent && this._onBudgetWarning) {
+        this._budgetWarningFired = true;
+        this._onBudgetWarning(this._tokenUsage, this._budgetTokens);
+      }
+    }
   }
 
   /** Get accumulated token usage for this session */
   getTokenUsage() {
     return { ...this._tokenUsage };
+  }
+
+  setBudget(budgetTokens, warningPercent = 80, onWarning = null) {
+    this._budgetTokens = budgetTokens;
+    this._budgetWarningPercent = warningPercent;
+    this._onBudgetWarning = onWarning;
+    this._budgetWarningFired = false;
+  }
+
+  increaseBudget(additionalTokens) {
+    if (this._budgetTokens != null) {
+      this._budgetTokens += additionalTokens;
+      this._budgetWarningFired = false;
+    }
+  }
+
+  isBudgetExhausted() {
+    if (this._budgetTokens == null) return false;
+    return this._tokenUsage.totalTokens >= this._budgetTokens;
   }
 
   /**
