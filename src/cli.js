@@ -55,6 +55,178 @@ const JOB_TIMEOUT_MS = (_cfg.jobTimeoutMin || 60) * 60 * 1000;
 const MAX_RETRIES = 2;
 const SEEN_JOBS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
+// ── Financial Allowlist (Plan C) ──
+const ALLOWLIST_PATH = path.join(os.homedir(), '.j41', 'financial-allowlist.json');
+
+function loadFinancialAllowlist() {
+  try {
+    if (!fs.existsSync(ALLOWLIST_PATH)) {
+      // Create deny-all default
+      const dir = path.dirname(ALLOWLIST_PATH);
+      fs.mkdirSync(dir, { recursive: true });
+      const empty = { permanent: [], operator: [], active_jobs: [] };
+      fs.writeFileSync(ALLOWLIST_PATH, JSON.stringify(empty, null, 2));
+      return empty;
+    }
+    return JSON.parse(fs.readFileSync(ALLOWLIST_PATH, 'utf8'));
+  } catch (err) {
+    console.error(`[allowlist] Failed to load ${ALLOWLIST_PATH}: ${err.message} — deny-all mode`);
+    return { permanent: [], operator: [], active_jobs: [] };
+  }
+}
+
+function isAddressInAllowlist(allowlist, address) {
+  const all = [
+    ...allowlist.permanent.map(e => e.address),
+    ...allowlist.operator.map(e => e.address),
+    ...allowlist.active_jobs.map(e => e.address),
+  ];
+  return all.includes(address);
+}
+
+function addActiveJobToAllowlist(jobId, buyerAddress) {
+  try {
+    const list = loadFinancialAllowlist();
+    if (list.active_jobs.some(e => e.jobId === jobId)) return;
+    list.active_jobs.push({
+      address: buyerAddress,
+      jobId,
+      added: new Date().toISOString(),
+    });
+    fs.writeFileSync(ALLOWLIST_PATH, JSON.stringify(list, null, 2));
+    console.log(`[allowlist] Added buyer address ${buyerAddress} for job ${jobId}`);
+  } catch (err) {
+    console.error(`[allowlist] Failed to add job address: ${err.message}`);
+  }
+}
+
+function removeActiveJobFromAllowlist(jobId) {
+  try {
+    const list = loadFinancialAllowlist();
+    list.active_jobs = list.active_jobs.filter(e => e.jobId !== jobId);
+    fs.writeFileSync(ALLOWLIST_PATH, JSON.stringify(list, null, 2));
+    console.log(`[allowlist] Removed buyer address for job ${jobId}`);
+  } catch (err) {
+    console.error(`[allowlist] Failed to remove job address: ${err.message}`);
+  }
+}
+
+// Dispatcher-side rate limiting (in-memory, resets on restart)
+const dispatcherSendHistory = { global: [], perJob: new Map() };
+const DISPATCHER_RATE_LIMITS = {
+  maxSendsPerJob: 3,
+  maxSendsPerHour: 10,
+  cooldownMs: 30_000,
+};
+let dispatcherFinancialSuspended = false;
+
+function checkDispatcherRateLimit(jobId, amount, jobPrice) {
+  if (dispatcherFinancialSuspended) {
+    return { allowed: false, reason: 'Financial operations suspended (API outage)' };
+  }
+  const now = Date.now();
+  const jobHistory = dispatcherSendHistory.perJob.get(jobId) || [];
+
+  if (jobHistory.length >= DISPATCHER_RATE_LIMITS.maxSendsPerJob) {
+    return { allowed: false, reason: `Max sends per job (${DISPATCHER_RATE_LIMITS.maxSendsPerJob})` };
+  }
+
+  const maxValue = jobPrice * 1.1;
+  const totalSent = jobHistory.reduce((s, r) => s + r.amount, 0);
+  if (totalSent + amount > maxValue) {
+    return { allowed: false, reason: 'Total value exceeds job price + 10%' };
+  }
+
+  const oneHourAgo = now - 3_600_000;
+  const recentGlobal = dispatcherSendHistory.global.filter(r => r.timestamp > oneHourAgo);
+  if (recentGlobal.length >= DISPATCHER_RATE_LIMITS.maxSendsPerHour) {
+    return { allowed: false, reason: `Hourly global limit (${DISPATCHER_RATE_LIMITS.maxSendsPerHour})` };
+  }
+
+  if (jobHistory.length > 0) {
+    const last = jobHistory[jobHistory.length - 1];
+    if (now - last.timestamp < DISPATCHER_RATE_LIMITS.cooldownMs) {
+      return { allowed: false, reason: 'Cooldown active' };
+    }
+  }
+
+  return { allowed: true };
+}
+
+function recordDispatcherSend(jobId, amount) {
+  const record = { timestamp: Date.now(), amount };
+  if (!dispatcherSendHistory.perJob.has(jobId)) {
+    dispatcherSendHistory.perJob.set(jobId, []);
+  }
+  dispatcherSendHistory.perJob.get(jobId).push(record);
+  dispatcherSendHistory.global.push(record);
+}
+
+// ── Dispatcher-side allowlist sweep timer ──
+let dispatcherApiOutageSince = null;
+const DISPATCHER_SWEEP_INTERVAL = 10 * 60 * 1000; // 10 minutes
+
+function startDispatcherSweep(state) {
+  const timer = setInterval(async () => {
+    try {
+      const list = loadFinancialAllowlist();
+      if (list.active_jobs.length === 0) {
+        if (dispatcherApiOutageSince) {
+          dispatcherApiOutageSince = null;
+          dispatcherFinancialSuspended = false;
+        }
+        return;
+      }
+
+      let apiReachable = false;
+
+      for (const entry of [...list.active_jobs]) {
+        // Find an authenticated agent session to check the API
+        const agentInfo = state.agents?.[0];
+        if (!agentInfo) continue;
+
+        try {
+          const session = await getAgentSession(state, agentInfo);
+          const job = await session.client.getJob(entry.jobId);
+          apiReachable = true;
+
+          const activeStatuses = ['requested', 'accepted', 'in_progress', 'delivered', 'rework'];
+          if (!activeStatuses.includes(job.status)) {
+            removeActiveJobFromAllowlist(entry.jobId);
+            dispatcherSendHistory.perJob.delete(entry.jobId);
+            console.log(`[allowlist-sweep] Removed stale job ${entry.jobId} (${job.status})`);
+          }
+        } catch (err) {
+          console.error(`[allowlist-sweep] API check failed for ${entry.jobId}: ${err.message}`);
+        }
+      }
+
+      if (apiReachable) {
+        if (dispatcherApiOutageSince) {
+          console.log('[allowlist-sweep] API restored — resuming financial operations');
+          dispatcherApiOutageSince = null;
+          dispatcherFinancialSuspended = false;
+        }
+      } else {
+        const now = Date.now();
+        if (!dispatcherApiOutageSince) dispatcherApiOutageSince = now;
+        if (now - dispatcherApiOutageSince >= 30 * 60 * 1000) {
+          if (!dispatcherFinancialSuspended) {
+            dispatcherFinancialSuspended = true;
+            console.error('[allowlist-sweep] API outage >30min — ALL financial ops suspended');
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`[allowlist-sweep] Unhandled error: ${err.message}`);
+    }
+  }, DISPATCHER_SWEEP_INTERVAL);
+
+  timer.unref();
+  console.log(`[allowlist] Dispatcher sweep timer started (every ${DISPATCHER_SWEEP_INTERVAL / 60_000} min)`);
+  return timer;
+}
+
 /**
  * Validate that a URL is safe to use as an executor endpoint.
  * Rejects non-https schemes and private/internal IP ranges.
@@ -2578,6 +2750,9 @@ program
     }, 300000, 'ProfileSync'); // Every 5 minutes
 
     // ── Common intervals (both modes) ──
+    // Start financial allowlist sweep timer
+    startDispatcherSweep(state);
+
     // Check for completed jobs
     safeInterval(() => cleanupCompletedJobs(state), 10000, 'Cleanup');
 
@@ -2996,24 +3171,30 @@ async function handleCrashRecovery(state) {
       const buyerAddress = orphan.buyerPayAddress || currentJob.buyerPayAddress;
 
       if (refundAmount > 0 && buyerAddress) {
-        console.log(`    💸 Issuing ${refundPercent}% refund: ${refundAmount} ${orphan.currency || 'VRSC'} to ${buyerAddress}`);
-        try {
-          const txid = await agent.sendCurrency(buyerAddress, refundAmount);
-          console.log(`    ✅ Refund TX: ${txid}`);
-
+        // ── Allowlist check before refund ──
+        const allowlist = loadFinancialAllowlist();
+        if (!isAddressInAllowlist(allowlist, buyerAddress)) {
+          console.error(`    ❌ BLOCKED: Refund address ${buyerAddress} not in allowlist — skipping refund`);
+        } else {
+          console.log(`    💸 Issuing ${refundPercent}% refund: ${refundAmount} ${orphan.currency || 'VRSC'} to ${buyerAddress}`);
           try {
-            await agent.client.submitRefundTxid(jobId, txid);
-          } catch (e) {
-            console.log(`    ⚠️  Could not record refund on platform: ${e.message}`);
-          }
+            const txid = await agent.sendCurrency(buyerAddress, refundAmount);
+            console.log(`    ✅ Refund TX: ${txid}`);
 
-          try {
-            await agent.client.sendChatMessage(jobId, `System failure — ${refundPercent}% refund issued. TX: ${txid}`);
+            try {
+              await agent.client.submitRefundTxid(jobId, txid);
+            } catch (e) {
+              console.log(`    ⚠️  Could not record refund on platform: ${e.message}`);
+            }
+
+            try {
+              await agent.client.sendChatMessage(jobId, `System failure — ${refundPercent}% refund issued. TX: ${txid}`);
+            } catch (e) {
+              console.log(`    ⚠️  Could not notify buyer: ${e.message}`);
+            }
           } catch (e) {
-            console.log(`    ⚠️  Could not notify buyer: ${e.message}`);
+            console.error(`    ❌ Refund TX failed: ${e.message}`);
           }
-        } catch (e) {
-          console.error(`    ❌ Refund TX failed: ${e.message}`);
         }
       } else {
         console.log(`    ⚠️  Cannot issue refund — missing amount (${jobAmount}) or address (${buyerAddress})`);
@@ -3153,6 +3334,13 @@ async function pollForJobs(state) {
               const acceptSig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
               await agent.client.acceptJob(job.id, acceptSig, timestamp, agentInfo.address);
               console.log(`✅ Job ${job.id} accepted (signed, pay→${agentInfo.address.slice(0, 8)}...) — awaiting buyer payment`);
+
+              // ── Allowlist lifecycle: add buyer refund address ──
+              const buyerPayAddr = fullJob.buyerPayAddress || fullJob.buyer?.payAddress;
+              if (buyerPayAddr) {
+                addActiveJobToAllowlist(job.id, buyerPayAddr);
+              }
+
               state.pendingPayment.set(job.id, { accepted: true, agentInfo });
             }
           } catch (acceptErr) {
@@ -3376,6 +3564,12 @@ async function handleWebhookEvent(state, agentId, payload) {
           const sig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
           await agent.client.acceptJob(jobId, sig, timestamp, agentInfo.address);
           console.log(`[Webhook] ✅ Job ${jobId.substring(0, 8)} accepted (pay→${agentInfo.address.slice(0, 8)}...)`);
+
+          // ── Allowlist lifecycle: add buyer refund address ──
+          const buyerPayAddr = fullJob.buyerPayAddress || fullJob.buyer?.payAddress;
+          if (buyerPayAddr) {
+            addActiveJobToAllowlist(jobId, buyerPayAddr);
+          }
         }
       } catch (e) {
         if (!e.message?.includes('already')) console.error(`[Webhook] Accept failed: ${e.message}`);
@@ -3617,6 +3811,13 @@ async function handleWebhookEvent(state, agentId, payload) {
           const sig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
           await agent.client.acceptJob(bountyJobId, sig, timestamp, agentInfo.address);
           console.log(`[Webhook] ✅ Bounty job ${bountyJobId.substring(0, 8)} accepted (pay→${agentInfo.address.slice(0, 8)}...)`);
+
+          // ── Allowlist lifecycle: add buyer refund address ──
+          const bountyBuyerAddr = fullJob.buyerPayAddress || fullJob.buyer?.payAddress;
+          if (bountyBuyerAddr) {
+            addActiveJobToAllowlist(bountyJobId, bountyBuyerAddr);
+          }
+
           state.seen.set(bountyJobId, Date.now());
         }
       } catch (e) {
@@ -3993,6 +4194,10 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   }
   state.active.delete(jobId);
 
+  // ── Allowlist lifecycle: remove buyer address ──
+  removeActiveJobFromAllowlist(jobId);
+  dispatcherSendHistory.perJob.delete(jobId);
+
   if (!skipReturnAgent) {
     console.log(`✅ Job ${jobId} complete, agent returned to pool`);
   }
@@ -4243,6 +4448,10 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
   }
   state.active.delete(jobId);
   persistActiveJobs(state.active);
+
+  // ── Allowlist lifecycle: remove buyer address ──
+  removeActiveJobFromAllowlist(jobId);
+  dispatcherSendHistory.perJob.delete(jobId);
 
   if (!skipReturnAgent) {
     console.log(`✅ Job ${jobId} complete, agent returned to pool`);
