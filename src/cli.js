@@ -907,7 +907,7 @@ program
     }
 
     // 5. Runtime
-    const runtime = await ask('Runtime mode (local or docker)', 'local');
+    const runtime = await ask('Runtime mode (docker or local)', 'docker');
 
     rl.close();
 
@@ -2178,6 +2178,7 @@ program
   .description('Start the dispatcher (listens for jobs, manages pool)')
   .option('--webhook-url <url>', 'Public URL for receiving webhook events (enables webhook mode)')
   .option('--webhook-port <port>', 'Port for webhook HTTP server (default: 9841)', '9841')
+  .option('--dev-unsafe', 'Allow local mode (ZERO isolation — development only)')
   .action(async (options) => {
     ensureDirs();
 
@@ -2192,6 +2193,19 @@ program
     console.log('║     Ephemeral Job Containers             ║');
     console.log('║     with Privacy Attestation             ║');
     console.log('╚══════════════════════════════════════════╝\n');
+    // Store --dev-unsafe flag in state for local mode gate
+    const _devUnsafe = !!options.devUnsafe;
+
+    // Local mode warning timer
+    if (RUNTIME === 'local' && _devUnsafe) {
+      console.warn('');
+      console.warn('  *** WARNING: Running in LOCAL mode — ZERO isolation. NOT safe for real jobs. ***');
+      console.warn('');
+      setInterval(() => {
+        console.warn('  *** WARNING: Running in LOCAL mode — ZERO isolation. NOT safe for real jobs. ***');
+      }, 30_000);
+    }
+
     console.log(`Runtime: ${RUNTIME} mode`);
     console.log(`Registered agents: ${agents.length}`);
     console.log(`Max concurrent: ${MAX_AGENTS}`);
@@ -2243,6 +2257,7 @@ program
       retries: new Map(), // jobId -> retry count
       agentSessions: new Map(), // agentId -> { agent: J41Agent, authedAt: number }
       capabilities: new Map(), // agentId -> { workspace: bool, services: [] }
+      _devUnsafe, // security: allows local mode when true
     };
 
     // ── Load on-chain capabilities for VDXF policy enforcement ──
@@ -3670,7 +3685,7 @@ async function startJobContainer(state, job, agentInfo) {
   const tmpKeysPath = path.join(jobDir, 'keys.json');
   fs.copyFileSync(keysPath, tmpKeysPath);
   try {
-    fs.chmodSync(tmpKeysPath, 0o644);
+    fs.chmodSync(tmpKeysPath, 0o600);
   } catch {
     // best effort on systems that don't support chmod
   }
@@ -3838,6 +3853,22 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
 // ─────────────────────────────────────────
 
 async function startJobLocal(state, job, agentInfo) {
+  // Security gate: block local mode unless --dev-unsafe was passed
+  if (!state._devUnsafe) {
+    console.error('');
+    console.error('  ============================================================');
+    console.error('  BLOCKED: Local mode runs agents with ZERO isolation.');
+    console.error('  The agent process has full access to this machine.');
+    console.error('');
+    console.error('  To use local mode for development ONLY:');
+    console.error('    node src/cli.js start --dev-unsafe');
+    console.error('');
+    console.error('  For production: switch to docker runtime:');
+    console.error('    node src/cli.js config --runtime docker');
+    console.error('  ============================================================');
+    console.error('');
+    throw new Error('Local mode blocked — use --dev-unsafe for development');
+  }
   const jobDir = path.join(JOBS_DIR, job.id);
   fs.mkdirSync(jobDir, { recursive: true });
 
