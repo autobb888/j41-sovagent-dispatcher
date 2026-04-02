@@ -2443,6 +2443,9 @@ program
       console.error(`[Dispatcher] Unhandled rejection (non-fatal):`, reason?.message || reason);
     });
 
+    // Crash recovery — process orphaned jobs before accepting new ones
+    await handleCrashRecovery(state);
+
     // Initial poll (catch-up for anything missed while offline)
     await pollForJobs(state);
 
@@ -2799,6 +2802,115 @@ function checkWorkspaceCapability(state, agentId) {
     return false;
   }
   return true;
+}
+
+/**
+ * Handle crash recovery: detect orphaned jobs from active-jobs.json,
+ * issue refunds for interrupted jobs, clean up Docker containers.
+ */
+async function handleCrashRecovery(state) {
+  const orphanedJobs = loadActiveJobs();
+  const jobIds = Object.keys(orphanedJobs);
+  if (jobIds.length === 0) return;
+
+  console.log(`\n⚠️  Crash recovery: found ${jobIds.length} orphaned job(s)`);
+
+  for (const jobId of jobIds) {
+    const orphan = orphanedJobs[jobId];
+    console.log(`  Processing ${jobId.substring(0, 8)}...`);
+
+    try {
+      // Find the agent session
+      const agentInfo = state.agents.find(a => a.id === orphan.agentInfoId);
+      if (!agentInfo) {
+        console.log(`    ⚠️  Agent ${orphan.agentInfoId} not found — skipping`);
+        continue;
+      }
+
+      const agent = await getAgentSession(state, agentInfo);
+
+      // Query platform for current job state
+      let currentJob;
+      try {
+        currentJob = await agent.client.getJob(jobId);
+      } catch (e) {
+        console.log(`    ⚠️  Could not fetch job status: ${e.message}`);
+        if (orphan.jobAmount && orphan.buyerPayAddress) {
+          console.log(`    Using persisted data for refund`);
+          currentJob = { status: 'in_progress', amount: orphan.jobAmount };
+        } else {
+          continue;
+        }
+      }
+
+      const finishedStatuses = ['completed', 'resolved', 'resolved_rejected', 'cancelled'];
+      if (finishedStatuses.includes(currentJob.status)) {
+        console.log(`    ✅ Job already ${currentJob.status} — cleaning up`);
+        continue;
+      }
+
+      // Job was interrupted — issue refund
+      const policy = state.disputePolicy?.get(agentInfo.id);
+      const refundPercent = policy?.systemCrashRefund ?? 100;
+      const jobAmount = orphan.jobAmount || currentJob.amount || 0;
+      const refundAmount = jobAmount * (refundPercent / 100);
+      const buyerAddress = orphan.buyerPayAddress || currentJob.buyerPayAddress;
+
+      if (refundAmount > 0 && buyerAddress) {
+        console.log(`    💸 Issuing ${refundPercent}% refund: ${refundAmount} ${orphan.currency || 'VRSC'} to ${buyerAddress}`);
+        try {
+          const txid = await agent.sendCurrency(buyerAddress, refundAmount);
+          console.log(`    ✅ Refund TX: ${txid}`);
+
+          try {
+            await agent.client.submitRefundTxid(jobId, txid);
+          } catch (e) {
+            console.log(`    ⚠️  Could not record refund on platform: ${e.message}`);
+          }
+
+          try {
+            await agent.client.sendChatMessage(jobId, `System failure — ${refundPercent}% refund issued. TX: ${txid}`);
+          } catch (e) {
+            console.log(`    ⚠️  Could not notify buyer: ${e.message}`);
+          }
+        } catch (e) {
+          console.error(`    ❌ Refund TX failed: ${e.message}`);
+        }
+      } else {
+        console.log(`    ⚠️  Cannot issue refund — missing amount (${jobAmount}) or address (${buyerAddress})`);
+      }
+
+      // Kill orphaned Docker containers
+      if (RUNTIME === 'docker') {
+        try {
+          const Docker = require('dockerode');
+          const docker = new Docker();
+          const containers = await docker.listContainers({
+            all: true,
+            filters: { label: [`j41.job.id=${jobId}`] },
+          });
+          for (const containerInfo of containers) {
+            try {
+              const container = docker.getContainer(containerInfo.Id);
+              await container.stop().catch(() => {});
+              await container.remove().catch(() => {});
+              console.log(`    🗑️  Removed container ${containerInfo.Id.substring(0, 12)}`);
+            } catch (e) {
+              console.log(`    ⚠️  Container cleanup failed: ${e.message}`);
+            }
+          }
+        } catch (e) {
+          console.log(`    ⚠️  Docker cleanup failed: ${e.message}`);
+        }
+      }
+    } catch (e) {
+      console.error(`  ❌ Recovery failed for ${jobId.substring(0, 8)}: ${e.message}`);
+    }
+  }
+
+  // Clear orphaned jobs file
+  persistActiveJobs(new Map());
+  console.log(`✅ Crash recovery complete\n`);
 }
 
 /**
