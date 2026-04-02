@@ -2480,8 +2480,8 @@ program
           console.error('  ══════════════════════════════════════════════════');
           console.error('  SECURITY CHECK FAILED — dispatcher will not start');
           console.error('  ══════════════════════════════════════════════════');
-          for (const issue of checkResult.issues) {
-            console.error(`  - ${issue}`);
+          for (const issue of (checkResult.checks || []).filter(c => c.status === 'fail')) {
+            console.error(`  - ${issue.name}: ${issue.detail}`);
           }
           console.error('');
           console.error('  Fix: yarn dlx @j41/secure-setup --dispatcher --fix');
