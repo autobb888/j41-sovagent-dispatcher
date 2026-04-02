@@ -716,6 +716,13 @@ function createFinalizeHooks(agentId, identityName, profile, services = [], disp
       // Broadcast via platform API
       const txResult = await agent.client.broadcast(rawhex);
       console.log(`   ✅ Identity updated on-chain: ${txResult.txid || txResult}`);
+      // Trigger backend to re-index immediately
+      try {
+        await agent.client.refreshAgent(keys.iAddress || identityName);
+        console.log('   ✅ Backend refreshed — marketplace updated');
+      } catch (e) {
+        console.log(`   ⚠️  Backend refresh failed: ${e.message.slice(0, 60)}`);
+      }
     },
     verifyVdxf: async () => {
       console.log('   ↳ Verification deferred to index stage');
@@ -2472,6 +2479,13 @@ program
               markup: profile.markup,
             });
             console.log(`[ProfileSync] ✅ ${agentInfo.id}: platform profile updated`);
+            // Trigger backend re-index for VDXF changes
+            try {
+              await agent.client.refreshAgent(agentInfo.iAddress || agentInfo.identity);
+              console.log(`[ProfileSync] ✅ ${agentInfo.id}: backend refreshed`);
+            } catch (e) {
+              console.log(`[ProfileSync] ⚠️  ${agentInfo.id}: backend refresh failed`);
+            }
           }
         } catch (e) {
           // Non-fatal — will retry next cycle
@@ -2517,6 +2531,13 @@ program
         const agent = await getAgentSession(state, agentInfo);
         await agent.setOnChainStatus('active');
         console.log(`  ✅ ${agentInfo.id}: on-chain status → active`);
+        // Trigger backend re-index so marketplace reflects active status immediately
+        try {
+          await agent.client.refreshAgent(agentInfo.iAddress || agentInfo.identity);
+          console.log(`  ✅ ${agentInfo.id}: backend refreshed`);
+        } catch (e) {
+          console.log(`  ⚠️  ${agentInfo.id}: backend refresh failed (${e.message.slice(0, 60)})`);
+        }
       } catch (e) {
         console.log(`  ⚠️  ${agentInfo.id}: on-chain status update failed (${e.message.slice(0, 60)})`);
       }
@@ -2552,6 +2573,10 @@ program
           await agent.client.setAgentStatus(verusId, 'inactive', signature, timestamp, nonce);
           console.log(`   ✅ ${agentInfo.id}: status → inactive`);
           try { await agent.setOnChainStatus('inactive'); } catch {}
+          // Trigger backend re-index so marketplace shows offline immediately
+          try {
+            await agent.client.refreshAgent(agentInfo.iAddress || agentInfo.identity);
+          } catch {}
         } catch (e) {
           console.log(`   ⚠️  ${agentInfo.id}: failed to mark offline`);
         }
@@ -4530,6 +4555,13 @@ async function mainMenu() {
       const result = await a.client.broadcast(rawhex);
       console.log(`\n  Published: ${result.txid || result}`);
       console.log(`  ${Object.keys(newCmm).length} flat VDXF keys written. Wait ~60s for confirmation.\n`);
+      // Trigger backend to re-index immediately
+      try {
+        await a.client.refreshAgent(keys.iAddress || keys.identity);
+        console.log('  ✅ Backend refreshed — marketplace updated\n');
+      } catch (e) {
+        console.log(`  ⚠️  Backend refresh failed: ${e.message.slice(0, 60)}\n`);
+      }
     } catch (e) {
       console.error(`\n  Failed: ${e.message}\n`);
     }
