@@ -26,6 +26,14 @@ if (RUNTIME === 'docker') {
   }
 }
 
+// Security profile detection (from @j41/secure-setup)
+let secureSetup;
+try {
+  secureSetup = require('@j41/secure-setup');
+} catch {
+  // Not installed yet — first-run will handle it
+}
+
 const J41_DIR = path.join(os.homedir(), '.j41');
 const DISPATCHER_DIR = path.join(J41_DIR, 'dispatcher');
 const AGENTS_DIR = path.join(DISPATCHER_DIR, 'agents');
@@ -3656,6 +3664,83 @@ function getExecutorEnvVars(agentInfo) {
   return envVars;
 }
 
+// --- Dispatcher container security helpers (Plan B) ---
+
+function buildDispatcherSecurityOpt() {
+  const opts = ['no-new-privileges:true'];
+
+  // Seccomp profile — deployed by @j41/secure-setup
+  const seccompPath = process.platform === 'linux'
+    ? '/etc/j41/seccomp-agent.json'
+    : path.join(os.homedir(), '.j41', 'seccomp-agent.json');
+
+  if (fs.existsSync(seccompPath)) {
+    opts.push(`seccomp=${seccompPath}`);
+  }
+
+  // AppArmor — Linux only
+  if (process.platform === 'linux') {
+    try {
+      const profiles = fs.readFileSync('/sys/kernel/security/apparmor/profiles', 'utf8');
+      if (profiles.includes('j41-agent-profile')) {
+        opts.push('apparmor=j41-agent-profile');
+      }
+    } catch {
+      // AppArmor not available — skip
+    }
+  }
+
+  return opts;
+}
+
+function getDispatcherNetworkMode() {
+  // Use j41-isolated network if it exists, otherwise default bridge
+  try {
+    require('child_process').execSync('docker network inspect j41-isolated', { stdio: 'ignore', timeout: 5000 });
+    return 'j41-isolated';
+  } catch {
+    return 'bridge';
+  }
+}
+
+function getDispatcherBwrapConfig() {
+  // If gVisor is NOT the runtime and bwrap IS installed, use bwrap entrypoint
+  if (!secureSetup) return {};
+
+  try {
+    const isolation = secureSetup.detectIsolation();
+    if (isolation.mode === 'bwrap') {
+      const entrypointPath = path.join(
+        require.resolve('@j41/secure-setup').replace(/lib\/index\.js$/, ''),
+        'scripts', 'entrypoint-agent.sh'
+      );
+      if (fs.existsSync(entrypointPath)) {
+        return {
+          CapAdd: ['SYS_ADMIN'],
+          CapDrop: [], // Override: bwrap needs SYS_ADMIN for unshare
+          Entrypoint: ['/bin/sh', entrypointPath],
+        };
+      }
+    }
+  } catch {
+    // Detection failed — skip bwrap
+  }
+
+  return {};
+}
+
+function isGvisorAvailable() {
+  try {
+    const rt = require('child_process').execSync(
+      'docker info --format "{{.DefaultRuntime}}"',
+      { encoding: 'utf8', timeout: 5000 }
+    ).trim();
+    return rt === 'runsc';
+  } catch {
+    return false;
+  }
+}
+
 // Start a job container
 async function startJobContainer(state, job, agentInfo) {
   if (!docker) {
@@ -3676,7 +3761,11 @@ async function startJobContainer(state, job, agentInfo) {
   fs.writeFileSync(path.join(jobDir, 'buyer.txt'), job.buyerVerusId);
   fs.writeFileSync(path.join(jobDir, 'amount.txt'), String(job.amount));
   fs.writeFileSync(path.join(jobDir, 'currency.txt'), job.currency);
-  
+
+  // Mandatory canary token (Plan B: every job gets one)
+  const canaryToken = require('crypto').randomBytes(32).toString('hex');
+  fs.writeFileSync(path.join(jobDir, 'canary.token'), canaryToken, { mode: 0o600 });
+
   const agentDir = path.join(AGENTS_DIR, agentInfo.id);
   const keysPath = path.join(agentDir, 'keys.json');
 
@@ -3703,6 +3792,7 @@ async function startJobContainer(state, job, agentInfo) {
         `J41_IDENTITY=${agentInfo.identity}`,
         `J41_JOB_ID=${job.id}`,
         `JOB_TIMEOUT_MS=${JOB_TIMEOUT_MS}`,
+        `J41_CANARY_TOKEN=${canaryToken}`,
         // LLM config (pass through from dispatcher env — new generic + legacy)
         ...['J41_LLM_PROVIDER','J41_LLM_BASE_URL','J41_LLM_API_KEY','J41_LLM_MODEL',
             'KIMI_API_KEY','KIMI_BASE_URL','KIMI_MODEL',
@@ -3720,19 +3810,21 @@ async function startJobContainer(state, job, agentInfo) {
           `${tmpKeysPath}:/app/keys.json:ro`,
           `${path.join(agentDir, 'SOUL.md')}:/app/SOUL.md:ro`,
         ],
-        AutoRemove: !keepContainers, // Keep container for debugging when J41_KEEP_CONTAINERS=1
-        Memory: 2 * 1024 * 1024 * 1024, // 2GB limit
+        AutoRemove: !keepContainers,
+        Memory: 2 * 1024 * 1024 * 1024, // 2GB
         CpuQuota: 100000, // 1 CPU core
-        // Security: No new privileges
-        SecurityOpt: ['no-new-privileges:true'],
-        // Read-only root filesystem
         ReadonlyRootfs: true,
-        // tmpfs for /tmp so processes can write temp files on readonly rootfs (X6)
         Tmpfs: { '/tmp': 'rw,noexec,nosuid,size=64m' },
-        // Limit process count to prevent fork bombs (X7)
         PidsLimit: 64,
-        // Drop all capabilities
         CapDrop: ['ALL'],
+        // --- Security hardening (Plan B) ---
+        SecurityOpt: buildDispatcherSecurityOpt(),
+        NetworkMode: getDispatcherNetworkMode(),
+        StorageOpt: { size: '1G' },
+        OomScoreAdj: 1000,
+        // gVisor runtime (if configured as Docker default)
+        ...(isGvisorAvailable() ? { Runtime: 'runsc' } : {}),
+        ...(getDispatcherBwrapConfig()),
       },
       Labels: {
         'j41.job.id': job.id,
@@ -3878,6 +3970,10 @@ async function startJobLocal(state, job, agentInfo) {
   fs.writeFileSync(path.join(jobDir, 'amount.txt'), String(job.amount));
   fs.writeFileSync(path.join(jobDir, 'currency.txt'), job.currency);
 
+  // Mandatory canary token (Plan B: every job gets one)
+  const canaryToken = require('crypto').randomBytes(32).toString('hex');
+  fs.writeFileSync(path.join(jobDir, 'canary.token'), canaryToken, { mode: 0o600 });
+
   const agentDir = path.join(AGENTS_DIR, agentInfo.id);
   const keysPath = path.join(agentDir, 'keys.json');
 
@@ -3901,6 +3997,7 @@ async function startJobLocal(state, job, agentInfo) {
   env.J41_KEYS_FILE = keysPath;
   env.J41_SOUL_FILE = path.join(agentDir, 'SOUL.md');
   env.J41_JOB_DIR = jobDir;
+  env.J41_CANARY_TOKEN = canaryToken;
 
   // Session lifecycle config from service (passed via job API response)
   if (job.lifecycle?.idleTimeout) env.IDLE_TIMEOUT_MS = String(job.lifecycle.idleTimeout * 60000);
