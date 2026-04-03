@@ -6,6 +6,15 @@
  * Max 9 concurrent. Queue if at capacity.
  */
 
+// Auto-load .env from project root (before anything reads process.env)
+const _envPath = require('path').resolve(__dirname, '..', '.env');
+if (require('fs').existsSync(_envPath)) {
+  for (const line of require('fs').readFileSync(_envPath, 'utf8').split('\n')) {
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+  }
+}
+
 const { Command } = require('commander');
 const fs = require('fs');
 const path = require('path');
@@ -3380,14 +3389,16 @@ async function pollForJobs(state) {
         // ── Step 2: Check if ready to start ──
         // in_progress = platform confirmed payment and moved the job forward
         // accepted + payment.verified = payment confirmed
+        // accepted + payment.status === 'confirmed'/'completed' = payment confirmed
         // accepted + no payment object = platform doesn't enforce payment (let it through)
         const isPaid = job.status === 'in_progress' ||
           (job.payment && job.payment.verified === true) ||
+          (job.payment && (job.payment.status === 'confirmed' || job.payment.status === 'completed')) ||
           (!job.payment); // platform doesn't populate payment → don't block
 
         if (!isPaid) {
           if (!state.pendingPayment.has(job.id)) {
-            console.log(`⏳ Job ${job.id} (${job.amount} ${job.currency}) — awaiting payment`);
+            console.log(`⏳ Job ${job.id} (${job.amount} ${job.currency}) — awaiting payment (status: ${job.status}, payment: ${JSON.stringify(job.payment || 'none').slice(0, 120)})`);
             state.pendingPayment.set(job.id, { accepted: true, agentInfo });
           }
           continue;
@@ -4024,6 +4035,26 @@ function isGvisorAvailable() {
   }
 }
 
+let _storageOptSupported = null;
+function supportsStorageOpt() {
+  if (_storageOptSupported !== null) return _storageOptSupported;
+  try {
+    const driver = require('child_process').execSync(
+      'docker info --format "{{.Driver}}"',
+      { encoding: 'utf8', timeout: 5000 }
+    ).trim();
+    if (driver !== 'overlay2') { _storageOptSupported = false; return false; }
+    require('child_process').execSync(
+      `mount | grep pquota`,
+      { encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }
+    );
+    _storageOptSupported = true;
+  } catch {
+    _storageOptSupported = false;
+  }
+  return _storageOptSupported;
+}
+
 // Start a job container
 async function startJobContainer(state, job, agentInfo) {
   if (!docker) {
@@ -4057,7 +4088,7 @@ async function startJobContainer(state, job, agentInfo) {
   const tmpKeysPath = path.join(jobDir, 'keys.json');
   fs.copyFileSync(keysPath, tmpKeysPath);
   try {
-    fs.chmodSync(tmpKeysPath, 0o600);
+    fs.chmodSync(tmpKeysPath, 0o644); // container process needs read access; mount is :ro
   } catch {
     // best effort on systems that don't support chmod
   }
@@ -4100,10 +4131,11 @@ async function startJobContainer(state, job, agentInfo) {
         Tmpfs: { '/tmp': 'rw,noexec,nosuid,size=64m' },
         PidsLimit: 64,
         CapDrop: ['ALL'],
+        Dns: ['8.8.8.8', '1.1.1.1'], // j41-isolated network can't use host systemd-resolved
         // --- Security hardening (Plan B) ---
         SecurityOpt: buildDispatcherSecurityOpt(),
         NetworkMode: getDispatcherNetworkMode(),
-        StorageOpt: { size: '1G' },
+        ...(supportsStorageOpt() ? { StorageOpt: { size: '1G' } } : {}),
         OomScoreAdj: 1000,
         // gVisor runtime (if configured as Docker default)
         ...(isGvisorAvailable() ? { Runtime: 'runsc' } : {}),
