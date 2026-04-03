@@ -2695,11 +2695,20 @@ program
       }
       if (wsConnected > 0) console.log(`WebSocket: ${wsConnected} agent(s) connected`);
 
-      // Poll for jobs
-      safeInterval(() => pollForJobs(state), 60000, 'Poll');
+      // Poll interval scales with agent count — 60s base, +500ms per agent stagger
+      // 5 agents:  60s cycle (2.5s stagger total)
+      // 50 agents: 60s cycle (25s stagger, fits within interval)
+      // 100 agents: 90s cycle (50s stagger, needs wider interval)
+      const agentCount = state.agents.length;
+      const pollInterval = Math.max(60000, agentCount * 1000);
+      const reviewInterval = Math.max(60000, agentCount * 1000);
+      console.log(`  Poll interval: ${Math.round(pollInterval / 1000)}s (${agentCount} agent${agentCount !== 1 ? 's' : ''})`);
 
-      // Check for pending reviews every 60s
-      safeInterval(() => checkPendingReviews(state), 60000, 'Reviews');
+      // Poll for jobs
+      safeInterval(() => pollForJobs(state), pollInterval, 'Poll');
+
+      // Check for pending reviews
+      safeInterval(() => checkPendingReviews(state), reviewInterval, 'Reviews');
     }
 
     // ── Profile sync — detect on-chain changes and re-register with platform ──
@@ -2791,7 +2800,10 @@ program
 
     // ── Set agents active on-chain + platform ──
     console.log('\n→ Setting agents active...');
-    for (const agentInfo of readyAgents) {
+    for (let i = 0; i < readyAgents.length; i++) {
+      const agentInfo = readyAgents[i];
+      // Stagger activation — 1s between agents to avoid rate limits at scale
+      if (i > 0) await new Promise(r => setTimeout(r, 1000));
       try {
         const agent = await getAgentSession(state, agentInfo);
         const result = await agent.activate({ onChain: true });
@@ -3315,7 +3327,10 @@ function queueInsertByPriority(queue, job) {
 // Poll for new jobs — check ALL agents, not just available ones
 // (an agent with an active job can still have new jobs queued for it)
 async function pollForJobs(state) {
-  for (const agentInfo of [...state.agents]) {
+  for (let i = 0; i < state.agents.length; i++) {
+    const agentInfo = state.agents[i];
+    // Stagger API calls — 500ms between agents to avoid rate limits at scale
+    if (i > 0) await new Promise(r => setTimeout(r, 500));
     try {
       console.log(`[Poll] Checking ${agentInfo.id} (${agentInfo.identity || agentInfo.address})`);
 
@@ -3885,8 +3900,10 @@ async function handleWebhookEvent(state, agentId, payload) {
 // Check for pending reviews and process them (runs from dispatcher, not container)
 async function checkPendingReviews(state) {
   // Check all registered agents (not just available ones — reviews arrive after job is done)
-  for (const agentInfo of state.agents) {
+  for (let i = 0; i < state.agents.length; i++) {
+    const agentInfo = state.agents[i];
     if (!agentInfo.identity || !agentInfo.wif || !agentInfo.iAddress) continue;
+    if (i > 0) await new Promise(r => setTimeout(r, 500));
 
     try {
       const agent = await getAgentSession(state, agentInfo);

@@ -483,33 +483,50 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   // polls the platform API directly for workspace status.  In local (fork) mode
   // the dispatcher forwards workspace_ready via process.send(), so the poller is
   // not needed (but is harmless — connectWorkspace() is idempotent).
-  const WORKSPACE_POLL_INTERVAL = 10000; // 10s
-  const WORKSPACE_POLL_MAX = 5 * 60 * 1000; // stop after 5 min if no workspace appears
+  //
+  // Adaptive backoff: 10s → 20s → 30s (caps at 30s) to reduce API load at scale.
+  // Stops after 5 min if no workspace appears.
+  const WS_POLL_INITIAL = 10000;
+  const WS_POLL_MAX_INTERVAL = 30000;
+  const WS_POLL_TTL = 5 * 60 * 1000;
   let _wsPollerStopped = false;
+  let _wsPollInterval = WS_POLL_INITIAL;
+  let _wsPollTimer = null;
 
-  const wsPoller = setInterval(async () => {
-    if (_workspaceConnected || _workspaceConnecting || _wsPollerStopped || _paused || _shuttingDown) return;
-    try {
-      const wsStatus = await agent.client.getWorkspaceStatus(job.id);
-      if (wsStatus && (wsStatus.status === 'active' || wsStatus.status === 'pending')) {
-        _wsPollerStopped = true;
-        console.log(`[WORKSPACE] Detected workspace ${wsStatus.status} via poll`);
-        await connectWorkspace(
-          job.id,
-          wsStatus.permissions || { read: true, write: true },
-          wsStatus.mode || 'supervised',
-        );
+  function scheduleWsPoll() {
+    if (_wsPollerStopped) return;
+    _wsPollTimer = setTimeout(async () => {
+      if (_workspaceConnected || _workspaceConnecting || _wsPollerStopped || _paused || _shuttingDown) {
+        scheduleWsPoll();
+        return;
       }
-    } catch {
-      // No workspace session exists or API error — expected for non-workspace jobs, keep polling
-    }
-  }, WORKSPACE_POLL_INTERVAL);
+      try {
+        const wsStatus = await agent.client.getWorkspaceStatus(job.id);
+        if (wsStatus && (wsStatus.status === 'active' || wsStatus.status === 'pending')) {
+          _wsPollerStopped = true;
+          console.log(`[WORKSPACE] Detected workspace ${wsStatus.status} via poll`);
+          await connectWorkspace(
+            job.id,
+            wsStatus.permissions || { read: true, write: true },
+            wsStatus.mode || 'supervised',
+          );
+          return;
+        }
+      } catch {
+        // No workspace session or API error — expected for non-workspace jobs
+      }
+      // Back off: 10s → 20s → 30s
+      _wsPollInterval = Math.min(_wsPollInterval + WS_POLL_INITIAL, WS_POLL_MAX_INTERVAL);
+      scheduleWsPoll();
+    }, _wsPollInterval);
+  }
+  scheduleWsPoll();
 
-  // Stop polling after 5 minutes — if buyer hasn't connected by then, they probably won't
+  // Stop polling after 5 minutes
   const wsPollerTimeout = setTimeout(() => {
     _wsPollerStopped = true;
-    clearInterval(wsPoller);
-  }, WORKSPACE_POLL_MAX);
+    if (_wsPollTimer) clearTimeout(_wsPollTimer);
+  }, WS_POLL_TTL);
 
   // Idle timer — check periodically if we should pause (not auto-deliver)
   _idleMessageSent = false;
@@ -542,7 +559,8 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   // Wait for session end or idle timeout
   await sessionPromise;
   clearInterval(idleCheck);
-  clearInterval(wsPoller);
+  _wsPollerStopped = true;
+  if (_wsPollTimer) clearTimeout(_wsPollTimer);
   clearTimeout(wsPollerTimeout);
 
   // Finalize executor — get deliverable
