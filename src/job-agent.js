@@ -476,6 +476,39 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
     }
   }
 
+  // ── Workspace poller (Docker mode) ──
+  // In Docker mode there is no IPC channel from the dispatcher, so the job-agent
+  // polls the platform API directly for workspace status.  In local (fork) mode
+  // the dispatcher forwards workspace_ready via process.send(), so the poller is
+  // not needed (but is harmless — connectWorkspace() is idempotent).
+  const WORKSPACE_POLL_INTERVAL = 10000; // 10s
+  const WORKSPACE_POLL_MAX = 5 * 60 * 1000; // stop after 5 min if no workspace appears
+  let _wsPollerStopped = false;
+
+  const wsPoller = setInterval(async () => {
+    if (_workspaceConnected || _workspaceConnecting || _wsPollerStopped || _paused || _shuttingDown) return;
+    try {
+      const wsStatus = await agent.client.getWorkspaceStatus(job.id);
+      if (wsStatus && (wsStatus.status === 'active' || wsStatus.status === 'pending')) {
+        _wsPollerStopped = true;
+        console.log(`[WORKSPACE] Detected workspace ${wsStatus.status} via poll`);
+        await connectWorkspace(
+          job.id,
+          wsStatus.permissions || { read: true, write: true },
+          wsStatus.mode || 'supervised',
+        );
+      }
+    } catch {
+      // No workspace session exists or API error — expected for non-workspace jobs, keep polling
+    }
+  }, WORKSPACE_POLL_INTERVAL);
+
+  // Stop polling after 5 minutes — if buyer hasn't connected by then, they probably won't
+  const wsPollerTimeout = setTimeout(() => {
+    _wsPollerStopped = true;
+    clearInterval(wsPoller);
+  }, WORKSPACE_POLL_MAX);
+
   // Idle timer — check periodically if we should pause (not auto-deliver)
   _idleMessageSent = false;
   const idleCheck = setInterval(async () => {
@@ -507,6 +540,8 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   // Wait for session end or idle timeout
   await sessionPromise;
   clearInterval(idleCheck);
+  clearInterval(wsPoller);
+  clearTimeout(wsPollerTimeout);
 
   // Finalize executor — get deliverable
   return await executor.finalize();

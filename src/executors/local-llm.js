@@ -272,7 +272,7 @@ async function callLLM(systemPrompt, messages) {
     const data = await res.json();
     const msg = data.choices?.[0]?.message;
     return {
-      content: msg?.content || msg?.reasoning_content || 'I could not generate a response.',
+      content: msg?.content || msg?.reasoning_content || msg?.reasoning || 'I could not generate a response.',
       usage: data.usage || null,
     };
   } catch (e) {
@@ -326,6 +326,10 @@ async function callLLMWithTools(systemPrompt, messages, tools) {
 
     const data = await res.json();
     const msg = data.choices?.[0]?.message || { content: 'No response generated.' };
+    // Kimi K2.5 via NVIDIA returns content=null with text in reasoning field
+    if (!msg.content && (msg.reasoning_content || msg.reasoning)) {
+      msg.content = msg.reasoning_content || msg.reasoning;
+    }
     msg._usage = data.usage || null;
     return msg;
   } catch (e) {
