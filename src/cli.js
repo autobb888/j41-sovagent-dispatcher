@@ -2780,13 +2780,13 @@ program
       getAgentSession,
     });
 
-    // ── Set agents active on-chain ──
-    console.log('\n→ Setting agents active on-chain...');
+    // ── Set agents active on-chain + platform ──
+    console.log('\n→ Setting agents active...');
     for (const agentInfo of readyAgents) {
       try {
         const agent = await getAgentSession(state, agentInfo);
-        await agent.setOnChainStatus('active');
-        console.log(`  ✅ ${agentInfo.id}: on-chain status → active`);
+        const result = await agent.activate({ onChain: true });
+        console.log(`  ✅ ${agentInfo.id}: active (on-chain txid: ${result.onChainTxid || 'skipped'})`);
         // Trigger backend re-index so marketplace reflects active status immediately
         try {
           await agent.client.refreshAgent(agentInfo.iAddress || agentInfo.identity);
@@ -2795,7 +2795,7 @@ program
           console.log(`  ⚠️  ${agentInfo.id}: backend refresh failed (${e.message.slice(0, 60)})`);
         }
       } catch (e) {
-        console.log(`  ⚠️  ${agentInfo.id}: on-chain status update failed (${e.message.slice(0, 60)})`);
+        console.log(`  ⚠️  ${agentInfo.id}: activation failed (${e.message.slice(0, 60)})`);
       }
     }
 
@@ -3279,6 +3279,30 @@ async function handleExtensionRequest(state, jobId, extensionId, agentInfo) {
   }
 }
 
+/**
+ * Insert a job into the priority queue. Sorted by:
+ *  1. Amount descending (higher-paying jobs first)
+ *  2. createdAt ascending (older jobs first, as tiebreaker)
+ * Falls back to FIFO if amount/createdAt are missing.
+ */
+function queueInsertByPriority(queue, job) {
+  const amt = parseFloat(job.amount) || 0;
+  const ts = job.createdAt ? new Date(job.createdAt).getTime() : Date.now();
+
+  // Find insertion index: first position where the new job has higher priority
+  let idx = queue.length; // default: append at end
+  for (let i = 0; i < queue.length; i++) {
+    const qAmt = parseFloat(queue[i].amount) || 0;
+    const qTs = queue[i].createdAt ? new Date(queue[i].createdAt).getTime() : Date.now();
+
+    if (amt > qAmt || (amt === qAmt && ts < qTs)) {
+      idx = i;
+      break;
+    }
+  }
+  queue.splice(idx, 0, job);
+}
+
 // Poll for new jobs — check ALL agents, not just available ones
 // (an agent with an active job can still have new jobs queued for it)
 async function pollForJobs(state) {
@@ -3381,8 +3405,8 @@ async function pollForJobs(state) {
         state.seen.set(job.id, Date.now());
 
         if (state.active.size >= MAX_AGENTS) {
-          console.log(`   → Queueing (max capacity)`);
-          state.queue.push({ ...job, assignedAgent: agentInfo });
+          console.log(`   → Queueing (max capacity, ${job.amount || '?'} ${job.currency || 'VRSC'})`);
+          queueInsertByPriority(state.queue, { ...job, assignedAgent: agentInfo });
         } else {
           console.log(`   → Starting job with ${agentInfo.id} (${RUNTIME})`);
           await startJob(state, job, agentInfo);
@@ -3583,8 +3607,8 @@ async function handleWebhookEvent(state, agentId, payload) {
         const agent = await getAgentSession(state, agentInfo);
         const job = await agent.client.getJob(jobId);
         if (state.active.size >= MAX_AGENTS) {
-          state.queue.push({ ...job, assignedAgent: agentInfo });
-          console.log(`[Webhook] Job ${jobId.substring(0, 8)} queued (max capacity)`);
+          queueInsertByPriority(state.queue, { ...job, assignedAgent: agentInfo });
+          console.log(`[Webhook] Job ${jobId.substring(0, 8)} queued (priority, ${job.amount || '?'} ${job.currency || 'VRSC'})`);
         } else {
           console.log(`[Webhook] Starting job ${jobId.substring(0, 8)} with ${agentInfo.id}`);
           await startJob(state, job, agentInfo);
