@@ -3439,9 +3439,16 @@ async function pollForJobs(state) {
         }
       }
     } catch (e) {
-      // Invalidate session on auth/request errors so next poll re-authenticates
-      state.agentSessions.delete(agentInfo.id);
-      console.error(`[Poll] Error for ${agentInfo.id}:`, e.message);
+      // Surface SovGuard/platform quota limits — don't silently retry
+      if (e.statusCode === 429 && (e.upgrade_url || e.plan || (e.message && e.message.includes('upgrade')))) {
+        console.error(`\n⛔ [Poll] ${agentInfo.id}: ${e.message}`);
+        if (e.upgrade_url) console.error(`   Upgrade your plan: ${e.upgrade_url}`);
+        // Don't invalidate session — this is a quota issue, not auth
+      } else {
+        // Invalidate session on auth/request errors so next poll re-authenticates
+        state.agentSessions.delete(agentInfo.id);
+        console.error(`[Poll] Error for ${agentInfo.id}:`, e.message);
+      }
     }
   }
 
@@ -3662,6 +3669,10 @@ async function handleWebhookEvent(state, agentId, payload) {
           try {
             await agent.acceptReview(review.id);
             console.log(`[Webhook] ✅ Review ${review.id.substring(0, 8)} processed for ${agentInfo.id}`);
+            // Trigger backend re-index so review is visible on marketplace immediately
+            try {
+              await agent.client.refreshAgent(agentInfo.iAddress || agentInfo.identity);
+            } catch {}
           } catch (e) {
             console.error(`[Webhook] Review failed: ${e.message}`);
           }
@@ -3888,6 +3899,23 @@ async function handleWebhookEvent(state, agentId, payload) {
     case 'job.extension_rejected': {
       console.log(`[Webhook] ❌ Extension rejected for job ${jobId?.substring(0, 8)}`);
       // Job-agent continues with remaining budget
+      break;
+    }
+
+    // ── SovGuard limit webhooks ──
+    case 'limit.warning': {
+      const usage = event.data?.usage || '?';
+      const limit = event.data?.limit || '?';
+      const plan = event.data?.plan || '?';
+      const threshold = event.data?.threshold || 0.8;
+      console.warn(`\n⚠️  [SovGuard] Usage warning: ${usage}/${limit} tokens (${Math.round(threshold * 100)}%) — plan: ${plan}`);
+      if (event.data?.upgrade_url) console.warn(`   Upgrade: ${event.data.upgrade_url}`);
+      break;
+    }
+    case 'limit.reached': {
+      const plan = event.data?.plan || '?';
+      console.error(`\n⛔ [SovGuard] Token limit reached — plan: ${plan}. Scans will be rejected.`);
+      if (event.data?.upgrade_url) console.error(`   Upgrade: ${event.data.upgrade_url}`);
       break;
     }
 
