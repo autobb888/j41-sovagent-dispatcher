@@ -50,7 +50,7 @@ const FINALIZE_STATE_FILENAME = 'finalize-state.json';
 const J41_API_URL = process.env.J41_API_URL || 'https://api.junction41.io';
 const J41_NETWORK = process.env.J41_NETWORK || 'verustest';
 const _cfg = loadConfig();
-const MAX_AGENTS = parseInt(process.env.J41_MAX_CONCURRENT || _cfg.maxConcurrent || 9);
+const MAX_AGENTS = process.env.J41_MAX_CONCURRENT ? parseInt(process.env.J41_MAX_CONCURRENT) : (_cfg.maxConcurrent ? parseInt(_cfg.maxConcurrent) : Infinity);
 const JOB_TIMEOUT_MS = (_cfg.jobTimeoutMin || 60) * 60 * 1000;
 const MAX_RETRIES = 2;
 const SEEN_JOBS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -983,7 +983,7 @@ program
     if (options.maxConcurrent) {
       const n = parseInt(options.maxConcurrent);
       if (n < 1 || n > 1000) {
-        console.error('❌ --max-concurrent must be 1-1000');
+        console.error('❌ --max-concurrent must be a positive number');
         process.exit(1);
       }
       config.maxConcurrent = n;
@@ -1036,7 +1036,7 @@ program
     console.log('║     Dispatcher Configuration             ║');
     console.log('╚══════════════════════════════════════════╝\n');
     console.log(`  Runtime:          ${config.runtime}`);
-    console.log(`  Max concurrent:   ${config.maxConcurrent || 9}`);
+    console.log(`  Max concurrent:   ${config.maxConcurrent || 'unlimited'}`);
     console.log(`  Job timeout:      ${config.jobTimeoutMin || 60} min`);
     console.log(`  Config file:      ${require('./config').CONFIG_PATH}`);
     console.log('');
@@ -2393,7 +2393,7 @@ program
 
     console.log(`Runtime: ${RUNTIME} mode`);
     console.log(`Registered agents: ${agents.length}`);
-    console.log(`Max concurrent: ${MAX_AGENTS}`);
+    console.log(`Max concurrent: ${MAX_AGENTS === Infinity ? 'unlimited' : MAX_AGENTS}`);
     console.log(`Job timeout: ${JOB_TIMEOUT_MS / 60000} min`);
     if (RUNTIME === 'docker') {
       console.log(`Keep containers: ${process.env.J41_KEEP_CONTAINERS === '1' ? 'ON (debug)' : 'OFF'}`);
@@ -4990,7 +4990,7 @@ async function mainMenu() {
     console.log('');
     console.log(`  API URL:           ${J41_API_URL}`);
     console.log(`  Runtime:           ${cfg.runtime || 'local'}`);
-    console.log(`  Max Concurrent:    ${cfg.maxConcurrent || 9}`);
+    console.log(`  Max Concurrent:    ${cfg.maxConcurrent || 'unlimited'}`);
     console.log(`  Job Timeout:       ${cfg.jobTimeoutMin || 60} min`);
     console.log(`  Network:           verustest`);
     console.log(`  Auto-Approve Ext:  ${cfg.extensionAutoApprove !== false ? 'yes' : 'no'}`);
@@ -5004,7 +5004,8 @@ async function mainMenu() {
 
     if (choice === '1') {
       const runtime = await ask(`  Runtime (local|docker) [${cfg.runtime || 'local'}]: `) || cfg.runtime || 'local';
-      const maxConcurrent = parseInt(await ask(`  Max concurrent agents [${cfg.maxConcurrent || 9}]: `)) || cfg.maxConcurrent || 9;
+      const maxConcurrentInput = await ask(`  Max concurrent agents [${cfg.maxConcurrent || 'unlimited'}]: `);
+      const maxConcurrent = maxConcurrentInput ? parseInt(maxConcurrentInput) : cfg.maxConcurrent;
       const jobTimeoutMin = parseInt(await ask(`  Job timeout minutes [${cfg.jobTimeoutMin || 60}]: `)) || cfg.jobTimeoutMin || 60;
       const extensionAutoApprove = (await ask(`  Auto-approve extensions? (y/n) [${cfg.extensionAutoApprove !== false ? 'y' : 'n'}]: `) || (cfg.extensionAutoApprove !== false ? 'y' : 'n')).toLowerCase() !== 'n';
 
