@@ -2474,7 +2474,7 @@ program
     // ── Task 19: Startup security quick-check ──────────────────
     if (secureSetup) {
       try {
-        const checkResult = secureSetup.quickCheck('dispatcher');
+        const checkResult = await secureSetup.quickCheck('dispatcher');
         if (!checkResult.passed) {
           console.error('');
           console.error('  ══════════════════════════════════════════════════');
