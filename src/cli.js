@@ -4095,9 +4095,17 @@ async function startJobContainer(state, job, agentInfo) {
 
   try {
     const keepContainers = process.env.J41_KEEP_CONTAINERS === '1';
+    const containerName = `j41-job-${job.id}`;
+
+    // Remove stale container with same name (leftover from crash/restart)
+    try {
+      const old = docker.getContainer(containerName);
+      await old.remove({ force: true });
+      console.log(`  ♻️  Removed stale container ${containerName}`);
+    } catch {}
 
     const container = await docker.createContainer({
-      name: `j41-job-${job.id}`,
+      name: containerName,
       Image: 'j41/job-agent:latest',  // PRE-BAKED IMAGE
       Env: [
         `J41_API_URL=${J41_API_URL}`,

@@ -186,11 +186,13 @@ async function main() {
   } catch (chatErr) {
     console.error('❌ Chat connection failed after job acceptance:', chatErr.message);
     // Deliver a "failed" result so the accepted job isn't left in limbo
+    const failContent = `Chat connection failed: ${chatErr.message}`;
+    const failHash = require('crypto').createHash('sha256').update(failContent).digest('hex');
     const deliverTimestamp = Math.floor(Date.now() / 1000);
-    const deliverMessage = `J41-DELIVER|Job:${fullJob.jobHash}|Delivery:failed|Ts:${deliverTimestamp}|I have delivered the work for this job.`;
+    const deliverMessage = `J41-DELIVER|Job:${fullJob.jobHash}|Delivery:${failHash}|Ts:${deliverTimestamp}|I have delivered the work for this job.`;
     const deliverSig = signMessage(keys.wif, deliverMessage, J41_NETWORK);
     await withRetry(
-      () => agent.client.deliverJob(job.id, 'failed', deliverSig, deliverTimestamp, 'Chat connection failed — could not process job'),
+      () => agent.client.deliverJob(job.id, failHash, deliverSig, deliverTimestamp, failContent),
       'deliverJob-chatfail',
       { maxAttempts: 5, baseDelayMs: 2000 }
     );
