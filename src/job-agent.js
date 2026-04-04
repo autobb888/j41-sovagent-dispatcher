@@ -432,8 +432,9 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
     console.log(`[FILES] Could not check for files: ${e.message}`);
   }
 
-  // Initialize executor (sends greeting, sets up state)
-  await executor.init(job, agent, soulPrompt);
+  // Initialize executor (sends greeting on first connect, skips on reconnect)
+  const isReconnect = fullJob.status === 'in_progress';
+  await executor.init(job, agent, soulPrompt, { isReconnect });
 
   // Handle incoming messages — delegate to executor (J4: serialized via queue)
   agent.onChatMessage((jobId, msg) => {

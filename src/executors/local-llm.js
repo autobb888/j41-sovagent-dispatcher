@@ -75,7 +75,7 @@ class LocalLLMExecutor extends Executor {
     this.workspaceHandler = null;
   }
 
-  async init(job, agent, soulPrompt) {
+  async init(job, agent, soulPrompt, options = {}) {
     this.job = job;
     this.agent = agent;
     this.soulPrompt = soulPrompt;
@@ -92,6 +92,12 @@ class LocalLLMExecutor extends Executor {
       'You are in a live chat session. Respond helpfully and concisely.',
       'When you believe the work is complete, say so clearly.',
     ].join('\n');
+
+    // Skip greeting on reconnect — buyer already got a greeting from a previous container
+    if (options.isReconnect) {
+      console.log(`[CHAT] Skipping greeting (reconnect — job already in_progress)`);
+      return;
+    }
 
     // Send greeting — use LLM if available, template fallback
     let greeting;
