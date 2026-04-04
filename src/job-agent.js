@@ -43,10 +43,17 @@ async function withRetry(fn, label, { maxAttempts = 3, baseDelayMs = 1000 } = {}
     try {
       return await fn();
     } catch (e) {
+      // Non-retryable 429: monthly token/quota limit (has upgrade_url or plan field)
+      if (e.statusCode === 429 && (e.upgrade_url || e.plan || (e.message && e.message.includes('upgrade')))) {
+        console.error(`\n⛔ ${label}: SovGuard limit reached — ${e.message}`);
+        if (e.upgrade_url) console.error(`   Upgrade: ${e.upgrade_url}`);
+        throw e; // Don't retry — operator needs to upgrade
+      }
       const isLast = attempt === maxAttempts;
       console.error(`[RETRY] ${label} attempt ${attempt}/${maxAttempts} failed: ${e.message}`);
       if (isLast) throw e;
-      const delay = baseDelayMs * Math.pow(2, attempt - 1);
+      // Longer backoff for rate-limit 429s
+      const delay = (e.statusCode === 429 ? baseDelayMs * 3 : baseDelayMs) * Math.pow(2, attempt - 1);
       await new Promise(r => setTimeout(r, delay));
     }
   }
