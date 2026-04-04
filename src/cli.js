@@ -2382,6 +2382,26 @@ program
       process.exit(1);
     }
     
+    // ── PID file: ensure only one dispatcher runs at a time ──
+    // Kills previous dispatcher process only — Docker containers stay alive
+    // and get adopted by the new instance via polling.
+    const PID_FILE = path.join(DISPATCHER_DIR, 'dispatcher.pid');
+    try {
+      if (fs.existsSync(PID_FILE)) {
+        const oldPid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim());
+        if (oldPid && oldPid !== process.pid) {
+          try {
+            process.kill(oldPid, 0); // check if alive (throws if dead)
+            process.kill(oldPid, 'SIGTERM');
+            console.log(`  Stopped previous dispatcher (PID ${oldPid})`);
+            await new Promise(r => setTimeout(r, 1000));
+          } catch {}
+        }
+      }
+    } catch {}
+    fs.writeFileSync(PID_FILE, String(process.pid));
+    process.on('exit', () => { try { fs.unlinkSync(PID_FILE); } catch {} });
+
     console.log('╔══════════════════════════════════════════╗');
     console.log('║     J41 Dispatcher                       ║');
     console.log('║     Ephemeral Job Containers             ║');
