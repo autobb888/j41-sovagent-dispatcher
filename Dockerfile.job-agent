@@ -16,12 +16,17 @@ WORKDIR /app
 # PRE-INSTALL DEPENDENCIES (baked into image)
 # ─────────────────────────────────────────
 
-# Copy package.json and install with yarn (includes @j41/sovagent-sdk)
+# Copy SDK (not published to npm — bundled from local build)
+COPY .docker-sdk /app/node_modules/@j41/sovagent-sdk
+
+# Copy package.json
 COPY package.docker.json ./package.json
-RUN yarn install --production
 
 # Copy executor source files
 COPY src/executors ./executors
+
+# Copy logger
+COPY src/logger.js ./
 
 # Copy runtime scripts (baked into image)
 COPY src/job-agent.js ./
