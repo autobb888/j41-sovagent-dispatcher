@@ -208,9 +208,8 @@ async function main() {
     process.exit(1);
   }
 
-  // Explicitly join this job's chat room
-  agent.joinJobChat(job.id);
-  console.log(`[CHAT] Joined job room: ${job.id}`);
+  // Note: connectChat() auto-joins all active job rooms including this one.
+  // Explicit joinJobChat removed to prevent double room join → duplicate messages.
 
   // Debug: log ALL chat events to help diagnose message delivery
   agent.on('chat:message', (msg) => {

@@ -199,6 +199,8 @@ class LocalLLMExecutor extends Executor {
 
   async _agentLoop() {
     const messages = [...this.conversationLog];
+    let totalToolCalls = 0;
+    const MAX_TOTAL_CALLS = 15;
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       const llmResponse = await callLLMWithTools(this.systemPrompt, messages, this.workspaceTools);
@@ -215,6 +217,12 @@ class LocalLLMExecutor extends Executor {
       });
 
       for (const toolCall of llmResponse.tool_calls) {
+        totalToolCalls++;
+        if (totalToolCalls > MAX_TOTAL_CALLS) {
+          messages.push({ role: 'tool', tool_call_id: toolCall.id, content: 'Tool call limit reached — summarize your findings and respond to the user now.' });
+          continue;
+        }
+
         const toolName = toolCall.function.name;
         let args;
         try {
@@ -223,7 +231,7 @@ class LocalLLMExecutor extends Executor {
           args = {};
         }
 
-        console.log(`[WORKSPACE] Tool call: ${toolName}`);
+        console.log(`[WORKSPACE] Tool call: ${toolName}(${JSON.stringify(args).substring(0, 60)})`);
         if (!this.workspaceHandler) {
           messages.push({ role: 'tool', tool_call_id: toolCall.id, content: 'Workspace disconnected — tool no longer available.' });
           continue;
@@ -236,9 +244,16 @@ class LocalLLMExecutor extends Executor {
           content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
         });
       }
+
+      // If we hit the total call limit, force one more LLM round to get a text response
+      if (totalToolCalls >= MAX_TOTAL_CALLS) {
+        const finalResponse = await callLLMWithTools(this.systemPrompt, messages, []);
+        this._trackUsage(finalResponse._usage);
+        return finalResponse.content || 'I explored the project structure. What would you like me to focus on?';
+      }
     }
 
-    return 'I reached the maximum number of tool-calling rounds. Please try rephrasing your request.';
+    return 'I reached the maximum number of tool-calling rounds. Here is what I found so far — please ask a more specific question.';
   }
 }
 
