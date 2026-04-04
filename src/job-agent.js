@@ -321,6 +321,7 @@ async function main() {
 
   let result;
   try {
+    job.status = fullJob.status; // pass current status so processJob knows if this is a reconnect
     result = await processJob(job, agent, soulPrompt, executor, (resolve) => { setSessionEndResolve(resolve); });
     log.info('Work completed', { jobId: JOB_ID });
 
@@ -433,7 +434,7 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   }
 
   // Initialize executor (sends greeting on first connect, skips on reconnect)
-  const isReconnect = fullJob.status === 'in_progress';
+  const isReconnect = job.status === 'in_progress';
   await executor.init(job, agent, soulPrompt, { isReconnect });
 
   // Handle incoming messages — delegate to executor (J4: serialized via queue)
