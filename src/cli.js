@@ -2708,7 +2708,7 @@ program
       safeInterval(() => pollForJobs(state), pollInterval, 'Poll');
 
       // Check for pending reviews
-      safeInterval(() => checkPendingReviews(state), reviewInterval, 'Reviews');
+      safeInterval(() => checkPendingInbox(state), reviewInterval, 'Inbox');
     }
 
     // ── Profile sync — detect on-chain changes and re-register with platform ──
@@ -3483,17 +3483,22 @@ async function pollForJobs(state) {
       const currentJob = await agentSession.client.getJob(jobId);
       const lastStatus = state._lastSentStatus.get(jobId);
       if (currentJob.status === lastStatus) continue; // Already sent this status
-      if (currentJob.status === 'completed' && activeInfo.process?.send) {
-        activeInfo.process.send({ type: 'job.completed', data: { jobId } });
+      if (currentJob.status === 'completed') {
+        sendToJobAgent(activeInfo, { type: 'job.completed', data: { jobId } });
         state._lastSentStatus.set(jobId, currentJob.status);
-      } else if (currentJob.status === 'disputed' && activeInfo.process?.send) {
-        activeInfo.process.send({ type: 'dispute.filed', data: { jobId, reason: currentJob.dispute?.reason } });
+      } else if (currentJob.status === 'disputed') {
+        sendToJobAgent(activeInfo, { type: 'dispute.filed', data: { jobId, reason: currentJob.dispute?.reason } });
         state._lastSentStatus.set(jobId, currentJob.status);
-      } else if ((currentJob.status === 'resolved' || currentJob.status === 'resolved_rejected') && activeInfo.process?.send) {
-        activeInfo.process.send({ type: 'dispute.resolved', data: { jobId, action: currentJob.dispute?.action } });
+      } else if (currentJob.status === 'resolved' || currentJob.status === 'resolved_rejected') {
+        sendToJobAgent(activeInfo, { type: 'dispute.resolved', data: { jobId, action: currentJob.dispute?.action } });
         state._lastSentStatus.set(jobId, currentJob.status);
-      } else if (currentJob.status === 'rework' && activeInfo.process?.send) {
-        activeInfo.process.send({ type: 'dispute.rework_accepted', data: { jobId } });
+      } else if (currentJob.status === 'rework') {
+        sendToJobAgent(activeInfo, { type: 'dispute.rework_accepted', data: { jobId } });
+        state._lastSentStatus.set(jobId, currentJob.status);
+      } else if (currentJob.status === 'delivered' && lastStatus !== 'delivered') {
+        // Auto-deliver detected via poll (pause_ttl_expired)
+        console.log(`[Poll] Job ${jobId.substring(0, 8)} auto-delivered`);
+        sendToJobAgent(activeInfo, { type: 'end_session_request', jobId });
         state._lastSentStatus.set(jobId, currentJob.status);
       }
 
@@ -3504,9 +3509,7 @@ async function pollForJobs(state) {
         activeInfo.pausedAt = null;
         activeInfo.resumedAt = Date.now();
         state.available = state.available.filter(a => a.id !== activeInfo.agentInfo?.id);
-        if (activeInfo.process?.send) {
-          activeInfo.process.send({ type: 'reconnect', jobId });
-        }
+        sendToJobAgent(activeInfo, { type: 'reconnect', jobId });
         state._lastSentStatus.set(jobId, currentJob.status);
       }
     } catch (e) {
@@ -3865,13 +3868,35 @@ async function handleWebhookEvent(state, agentId, payload) {
     }
 
     case 'job.paused': {
-      // Platform confirmed pause — update local state if not already done via IPC
+      const pauseReason = data?.auto ? ` (auto: ${data.reason || 'idle'})` : '';
+      console.log(`[Webhook] Job ${jobId?.substring(0, 8)} paused${pauseReason}`);
       const pauseInfo = state.active.get(jobId);
       if (pauseInfo && !pauseInfo.paused) {
         pauseInfo.paused = true;
         pauseInfo.pausedAt = Date.now();
+        pauseInfo.pauseCount = (pauseInfo.pauseCount || 0) + 1;
         state.available.push(pauseInfo.agentInfo);
-        console.log(`[Webhook] Job ${jobId?.substring(0, 8)} paused — slot freed`);
+        // For free-lifecycle agents, auto-extend to resume
+        if (data?.auto && pauseInfo.reactivationFee === 0) {
+          try {
+            const agentSession = await getAgentSession(state, pauseInfo.agentInfo);
+            await agentSession.client.requestExtension(jobId, { amount: 0, currency: pauseInfo.currency || 'VRSC', reason: 'Auto-resume (free lifecycle)' });
+            console.log(`[Webhook] Auto-extended paused job ${jobId?.substring(0, 8)} (free lifecycle)`);
+          } catch (extErr) {
+            console.warn(`[Webhook] Auto-extend failed: ${extErr.message}`);
+          }
+        }
+      }
+      break;
+    }
+
+    case 'job.delivered': {
+      const deliverReason = data?.auto ? ` (auto: ${data.reason || 'pause_ttl'})` : '';
+      console.log(`[Webhook] Job ${jobId?.substring(0, 8)} delivered${deliverReason}`);
+      const deliverInfo = state.active.get(jobId);
+      if (deliverInfo) {
+        // Tell container to clean up workspace and finalize
+        sendToJobAgent(deliverInfo, { type: 'end_session_request', jobId });
       }
       break;
     }
@@ -3942,9 +3967,8 @@ async function handleWebhookEvent(state, agentId, payload) {
   }
 }
 
-// Check for pending reviews and process them (runs from dispatcher, not container)
-async function checkPendingReviews(state) {
-  // Check all registered agents (not just available ones — reviews arrive after job is done)
+// Check for pending inbox items (reviews + job records) and process them
+async function checkPendingInbox(state) {
   for (let i = 0; i < state.agents.length; i++) {
     const agentInfo = state.agents[i];
     if (!agentInfo.identity || !agentInfo.wif || !agentInfo.iAddress) continue;
@@ -3952,30 +3976,33 @@ async function checkPendingReviews(state) {
 
     try {
       const agent = await getAgentSession(state, agentInfo);
-
-      // Check inbox for pending review/completion items only
       const inbox = await agent.client.getInbox('pending', 20);
       const pending = (inbox?.data || []).filter(
-        item => item.type === 'review'
+        item => item.type === 'review' || item.type === 'job_record'
       );
       if (pending.length === 0) continue;
 
-      console.log(`[Reviews] ${agentInfo.id}: ${pending.length} pending review(s)`);
+      console.log(`[Inbox] ${agentInfo.id}: ${pending.length} pending item(s)`);
 
       for (const item of pending) {
         try {
-          console.log(`[Reviews] Processing ${item.type} ${item.id}`);
-          await agent.acceptReview(item.id);
-          console.log(`[Reviews] ✅ Review accepted and identity updated for ${agentInfo.id}`);
+          if (item.type === 'review') {
+            console.log(`[Inbox] Processing review ${item.id}`);
+            await agent.acceptReview(item.id);
+            console.log(`[Inbox] ✅ Review accepted for ${agentInfo.id}`);
+          } else if (item.type === 'job_record') {
+            console.log(`[Inbox] Processing job record ${item.id}`);
+            await agent.acceptJobRecord(item.id);
+            console.log(`[Inbox] ✅ Job record written on-chain for ${agentInfo.id}`);
+          }
         } catch (e) {
-          console.error(`[Reviews] ❌ Failed to process ${item.id}:`, e.message);
+          console.error(`[Inbox] ❌ Failed to process ${item.type} ${item.id}:`, e.message);
         }
       }
     } catch (e) {
-      // Invalidate session on error so next cycle re-authenticates
       state.agentSessions.delete(agentInfo.id);
       if (!e.message.includes('not registered')) {
-        console.error(`[Reviews] Error checking ${agentInfo.id}:`, e.message);
+        console.error(`[Inbox] Error checking ${agentInfo.id}:`, e.message);
       }
     }
   }
@@ -4233,6 +4260,8 @@ async function startJobContainer(state, job, agentInfo) {
       currency: job.currency || 'VRSC',
       agentInfoId: agentInfo.id,
       reworkCount: 0,
+      reactivationFee: job.lifecycle?.reactivationFee ?? null,
+      pauseCount: 0,
     });
 
     // Mark as seen immediately to avoid duplicate pickup loops while status remains requested
