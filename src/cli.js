@@ -4189,6 +4189,7 @@ async function startJobContainer(state, job, agentInfo) {
     // Remove stale container with same name (leftover from crash/restart)
     try {
       const old = docker.getContainer(containerName);
+      await old.inspect(); // throws if container doesn't exist
       await old.remove({ force: true });
       console.log(`  ♻️  Removed stale container ${containerName}`);
     } catch {}
