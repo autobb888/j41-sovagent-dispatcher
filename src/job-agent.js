@@ -243,12 +243,12 @@ async function main() {
   const executor = createExecutor();
   _executor = executor;
 
-  // H6: Single consolidated IPC handler — replaces two separate listeners
+  // H6: Single consolidated IPC handler — works in both local (process.send) and Docker (/tmp/ipc-msg.json) modes
   const ipcQueue = [];
-  if (process.send) {
-    process.on('message', async (msg) => {
-      if (!msg || !msg.type) return;
-      switch (msg.type) {
+
+  async function handleIpcMessage(msg) {
+    if (!msg || !msg.type) return;
+    switch (msg.type) {
         case 'workspace_ready':
           await connectWorkspace(msg.jobId, msg.permissions, msg.mode);
           break;
@@ -298,9 +298,27 @@ async function main() {
           // Queue for post-delivery handler
           ipcQueue.push(msg);
           break;
-      }
-    });
+    }
   }
+
+  // Local mode — direct IPC via process.send
+  if (process.send) {
+    process.on('message', handleIpcMessage);
+  }
+
+  // Docker mode — poll /tmp/ipc-msg.json for messages from dispatcher
+  const IPC_FILE = '/tmp/ipc-msg.json';
+  const _ipcPoller = setInterval(async () => {
+    try {
+      if (!fs.existsSync(IPC_FILE)) return;
+      const raw = fs.readFileSync(IPC_FILE, 'utf8').trim();
+      fs.unlinkSync(IPC_FILE); // consume immediately
+      if (!raw) return;
+      const msg = JSON.parse(raw);
+      console.log(`[IPC-FILE] Received: ${msg.type}`);
+      await handleIpcMessage(msg);
+    } catch {}
+  }, 2000);
 
   let result;
   try {
@@ -566,6 +584,7 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   // Wait for session end or idle timeout
   await sessionPromise;
   clearInterval(idleCheck);
+  clearInterval(_ipcPoller);
   _wsPollerStopped = true;
   if (_wsPollTimer) clearTimeout(_wsPollTimer);
   clearTimeout(wsPollerTimeout);

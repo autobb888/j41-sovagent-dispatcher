@@ -3122,6 +3122,28 @@ async function getAgentSession(state, agentInfo) {
 }
 
 /**
+ * Send an IPC-style message to a running job-agent.
+ * Local mode: process.send()  |  Docker mode: writes to /tmp/ipc-msg.json inside container
+ */
+function sendToJobAgent(activeInfo, msg) {
+  if (activeInfo.process?.send) {
+    activeInfo.process.send(msg);
+    return true;
+  }
+  if (activeInfo.container) {
+    try {
+      const msgJson = JSON.stringify(msg);
+      require('child_process').execSync(
+        `docker exec ${activeInfo.container.id} sh -c 'echo '"'"'${msgJson.replace(/'/g, "'\\''")}'"'"' > /tmp/ipc-msg.json'`,
+        { timeout: 5000, stdio: 'ignore' }
+      );
+      return true;
+    } catch { return false; }
+  }
+  return false;
+}
+
+/**
  * VDXF Policy Check: verify agent has workspace.capability on-chain before
  * forwarding workspace_ready to job-agent. Returns true if allowed.
  */
@@ -3817,9 +3839,8 @@ async function handleWebhookEvent(state, agentId, payload) {
     case 'job.reconnect': {
       console.log(`[Webhook] Reconnect requested for job ${jobId?.substring(0, 8)}`);
       const reconnectJob = state.active.get(jobId);
-      if (reconnectJob?.process?.send) {
-        reconnectJob.process.send({ type: 'reconnect', jobId });
-        console.log(`[Webhook] Sent reconnect IPC to job-agent ${jobId?.substring(0, 8)}`);
+      if (reconnectJob && sendToJobAgent(reconnectJob, { type: 'reconnect', jobId })) {
+        console.log(`[Webhook] Sent reconnect to job-agent ${jobId?.substring(0, 8)}`);
       } else {
         // Job-agent not active — try to re-pick it up on next poll
         if (jobId) {
@@ -3836,13 +3857,9 @@ async function handleWebhookEvent(state, agentId, payload) {
       if (resumeInfo) {
         resumeInfo.paused = false;
         resumeInfo.pausedAt = null;
-        resumeInfo.resumedAt = Date.now(); // Sentinel: prevents late job_idle IPC from re-pausing
-        // Reclaim slot — remove from available pool
+        resumeInfo.resumedAt = Date.now();
         state.available = state.available.filter(a => a.id !== resumeInfo.agentInfo?.id);
-        // Tell job-agent to resume
-        if (resumeInfo.process?.send) {
-          resumeInfo.process.send({ type: 'reconnect', jobId });
-        }
+        sendToJobAgent(resumeInfo, { type: 'reconnect', jobId });
       }
       break;
     }
