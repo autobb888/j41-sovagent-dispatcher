@@ -93,8 +93,22 @@ class LocalLLMExecutor extends Executor {
       'When you believe the work is complete, say so clearly.',
     ].join('\n');
 
-    // Send greeting
-    const greeting = `Hello! I'm your Verus agent. I've accepted your job: "${job.description.substring(0, 100)}". How can I help you?`;
+    // Send greeting — use LLM if available, template fallback
+    let greeting;
+    if (LLM_CONFIG.apiKey) {
+      try {
+        const greetResult = await callLLM(this.systemPrompt, [
+          { role: 'user', content: `[SYSTEM: The buyer just connected. Introduce yourself briefly and ask how you can help with this job. Keep it under 2 sentences.]` },
+        ]);
+        this._trackUsage(greetResult.usage);
+        greeting = greetResult.content;
+      } catch {
+        greeting = null;
+      }
+    }
+    if (!greeting) {
+      greeting = `Hello! I'm your Verus agent. I've accepted your job: "${job.description.substring(0, 100)}". How can I help you?`;
+    }
     agent.sendChatMessage(job.id, greeting);
     this.conversationLog.push({ role: 'assistant', content: greeting });
     console.log(`[CHAT] Sent greeting`);
@@ -330,12 +344,43 @@ async function callLLMWithTools(systemPrompt, messages, tools) {
     if (!msg.content && (msg.reasoning_content || msg.reasoning)) {
       msg.content = msg.reasoning_content || msg.reasoning;
     }
+    // Kimi K2.5 emits tool calls as raw markup in content instead of tool_calls array
+    // Parse <|tool_calls_section_begin|> ... <|tool_calls_section_end|> into proper tool_calls
+    if (msg.content && msg.content.includes('<|tool_calls_section_begin|>') && (!msg.tool_calls || msg.tool_calls.length === 0)) {
+      const parsed = parseInlineToolCalls(msg.content);
+      if (parsed.length > 0) {
+        msg.tool_calls = parsed;
+        // Strip tool call markup from content, keep any text before it
+        msg.content = msg.content.replace(/<\|tool_calls_section_begin\|>[\s\S]*?<\|tool_calls_section_end\|>/, '').trim() || null;
+      }
+    }
     msg._usage = data.usage || null;
     return msg;
   } catch (e) {
     log.error('LLM call failed', { error: e.message });
     return { content: 'I experienced a temporary issue. Please try again.', _usage: null };
   }
+}
+
+/**
+ * Parse Kimi K2.5 inline tool call markup into OpenAI-compatible tool_calls array.
+ * Format: <|tool_call_begin|> functions.name:id <|tool_call_argument_begin|> {json} <|tool_call_end|>
+ */
+function parseInlineToolCalls(content) {
+  const calls = [];
+  const regex = /<\|tool_call_begin\|>\s*functions\.(\w+):(\S+)\s*<\|tool_call_argument_begin\|>\s*(\{[\s\S]*?\})\s*<\|tool_call_end\|>/g;
+  let match;
+  while ((match = regex.exec(content)) !== null) {
+    calls.push({
+      id: `call_${match[2] || calls.length}`,
+      type: 'function',
+      function: {
+        name: match[1],
+        arguments: match[3],
+      },
+    });
+  }
+  return calls;
 }
 
 // ─────────────────────────────────────────
