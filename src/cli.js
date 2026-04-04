@@ -4223,6 +4223,8 @@ async function startJobContainer(state, job, agentInfo) {
           `${tmpKeysPath}:/app/keys.json:ro`,
           `${path.join(agentDir, 'SOUL.md')}:/app/SOUL.md:ro`,
         ],
+        // Run as host UID so bind-mounted job dir is writable
+        User: `${process.getuid()}:${process.getgid()}`,
         AutoRemove: !keepContainers,
         Memory: 2 * 1024 * 1024 * 1024, // 2GB
         CpuQuota: 100000, // 1 CPU core
