@@ -509,49 +509,43 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   // the dispatcher forwards workspace_ready via process.send(), so the poller is
   // not needed (but is harmless — connectWorkspace() is idempotent).
   //
-  // Adaptive backoff: 10s → 20s → 30s (caps at 30s) to reduce API load at scale.
-  // Stops after 5 min if no workspace appears.
-  const WS_POLL_INITIAL = 10000;
-  const WS_POLL_MAX_INTERVAL = 30000;
-  const WS_POLL_TTL = 5 * 60 * 1000;
+  // Polls for workspace status throughout the job lifetime.
+  // When detected, attempts to connect. If connection fails (buyer not ready yet),
+  // resets and keeps polling. Only stops when successfully connected or job ends.
+  const WS_POLL_INTERVAL = 15000; // 15s between checks
   let _wsPollerStopped = false;
-  let _wsPollInterval = WS_POLL_INITIAL;
   let _wsPollTimer = null;
 
   function scheduleWsPoll() {
     if (_wsPollerStopped) return;
     _wsPollTimer = setTimeout(async () => {
-      if (_workspaceConnected || _workspaceConnecting || _wsPollerStopped || _paused || _shuttingDown) {
+      if (_workspaceConnected || _wsPollerStopped || _shuttingDown) return;
+      // Skip while connecting or paused, but keep scheduling
+      if (_workspaceConnecting || _paused) {
         scheduleWsPoll();
         return;
       }
       try {
         const wsStatus = await agent.client.getWorkspaceStatus(job.id);
         if (wsStatus && (wsStatus.status === 'active' || wsStatus.status === 'pending')) {
-          _wsPollerStopped = true;
           console.log(`[WORKSPACE] Detected workspace ${wsStatus.status} via poll`);
           await connectWorkspace(
             job.id,
             wsStatus.permissions || { read: true, write: true },
             wsStatus.mode || 'supervised',
           );
-          return;
+          // If connectWorkspace succeeded, _workspaceConnected is true and we stop
+          if (_workspaceConnected) return;
+          // If it failed (timeout), keep polling — buyer may connect later
+          console.log(`[WORKSPACE] Connection attempt failed — will retry`);
         }
       } catch {
-        // No workspace session or API error — expected for non-workspace jobs
+        // No workspace session or API error — keep polling
       }
-      // Back off: 10s → 20s → 30s
-      _wsPollInterval = Math.min(_wsPollInterval + WS_POLL_INITIAL, WS_POLL_MAX_INTERVAL);
       scheduleWsPoll();
-    }, _wsPollInterval);
+    }, WS_POLL_INTERVAL);
   }
   scheduleWsPoll();
-
-  // Stop polling after 5 minutes
-  const wsPollerTimeout = setTimeout(() => {
-    _wsPollerStopped = true;
-    if (_wsPollTimer) clearTimeout(_wsPollTimer);
-  }, WS_POLL_TTL);
 
   // Idle timer — check periodically if we should pause (not auto-deliver)
   _idleMessageSent = false;
@@ -587,7 +581,6 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   clearInterval(_ipcPoller);
   _wsPollerStopped = true;
   if (_wsPollTimer) clearTimeout(_wsPollTimer);
-  clearTimeout(wsPollerTimeout);
 
   // Finalize executor — get deliverable
   return await executor.finalize();
@@ -713,7 +706,10 @@ async function connectWorkspace(jobId, permissions, mode) {
   } catch (err) {
     _workspaceConnecting = false;
     console.error(`[WORKSPACE] Failed to connect: ${err.message}`);
-    _agent.sendChatMessage(jobId, `Unable to connect to workspace: ${err.message}`);
+    // Don't message buyer on timeout — poller will retry automatically
+    if (!err.message?.includes('Timeout')) {
+      _agent.sendChatMessage(jobId, `Unable to connect to workspace: ${err.message}`);
+    }
   }
 }
 
