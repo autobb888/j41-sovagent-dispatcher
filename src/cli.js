@@ -3451,6 +3451,7 @@ async function pollForJobs(state) {
 
         // Mark seen BEFORE starting to prevent duplicate spawns from concurrent polls
         state.seen.set(job.id, Date.now());
+        saveSeenJobs(state.seen);
 
         if (state.active.size >= MAX_AGENTS) {
           console.log(`   → Queueing (max capacity, ${job.amount || '?'} ${job.currency || 'VRSC'})`);
