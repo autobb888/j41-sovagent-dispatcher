@@ -1,0 +1,525 @@
+#!/usr/bin/env node
+/**
+ * J41 Dispatcher — Interactive Dashboard
+ * Arrow-key TUI for managing agents, viewing VDXF data, configuring LLM, etc.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+const J41_DIR = path.join(os.homedir(), '.j41');
+const DISPATCHER_DIR = path.join(J41_DIR, 'dispatcher');
+const AGENTS_DIR = path.join(DISPATCHER_DIR, 'agents');
+const CONFIG_FILE = path.join(DISPATCHER_DIR, 'config.json');
+const ENV_FILE = path.join(__dirname, '..', '.env');
+
+// ── VDXF key → human name mapping ──
+const VDXF_KEY_NAMES = {
+  'iKkdwxhdupLgf7v2qn4JGBQHntsBb17kjW': 'agent.displayName',
+  'iNxeLSDFARVQezfEt4i8CBZjTSRpFTPAyP': 'agent.type',
+  'iQr3yKEn2DXaG4GQGVAVYivC3jwcvScfzk': 'agent.description',
+  'iLy373iaKafmRCY43ahty4m8aLQx32y8Fh': 'agent.status',
+  'iRxxUvbDXJT5wVpnx7oc9nkYALCoDh6aTD': 'agent.payAddress',
+  'i8Wk7fcbsBWtcf965Z3WvDUjahF1aTH1tu': 'agent.services',
+  'iQJUQmdFSmM49cvLJfKLZnuRYsjXSmTTHY': 'agent.models',
+  'iBLx3rga8DewiN6gyQyC5avFin8fnnojnS': 'agent.markup',
+  'iF7174LxgcAnu3qZ7iJzSyJYthDJXBzQNw': 'agent.networkCapabilities',
+  'i5VzGsiFmJYuRr7b8aUyHzAS8vd9DC4puS': 'agent.networkEndpoints',
+  'iSAVTXMb9TyWWuDDnWopFhgZpjm21WPigv': 'agent.networkProtocols',
+  'iKM57qfzmgM1sxBgR3XBQa2XCRURZ2YVo2': 'agent.profileTags',
+  'i7HY93tqfqCkpyKYiNtcDbioAgF8gRL9TQ': 'agent.profileWebsite',
+  'iALo91Z75iXZxMvymvQMRwo7GAeHv5veKc': 'agent.profileAvatar',
+  'iD3quozCGbzJyZ29uvRCeecr12np2dMsvN': 'agent.profileCategory',
+  'iFxerhcrMr2e5eWyvHiXuWHXj2dnhEZF8p': 'agent.disputePolicy',
+  'iLbUN8TFvMZR9uaZYY1qBmL99bJE2uYdad': 'review.record',
+  'i6PC1B9vgVf8bLtHcdsNunLtr6ibtnL7ZC': 'bounty.record',
+  'iE8Z7gZmAs4NU8AqEJzV9MWHUCoUBQqfum': 'bounty.application',
+  'iMs3n1aCWQh5rmkXCNLRi8WqbzZrq3F7Ye': 'platform.config',
+  'iHjLTt9P8Jb1uCYSpVpwXFbwzbPYWW4n8p': 'session.params',
+  'i8xp9AgvueoAHyYXbxNACMgRQfEXF82V5D': 'workspace.attestation',
+  'iMxAXRfTWUkKBmLGEZtEJbKj58kDi1GjZ9': 'workspace.capability',
+  'iPsXc7vcBzAxyjFYfPAs9PUtMLh1EJPHSn': 'job.record',
+};
+
+// ── Helpers ──
+
+function loadConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { return {}; }
+}
+
+function loadEnv() {
+  const env = {};
+  try {
+    for (const line of fs.readFileSync(ENV_FILE, 'utf8').split('\n')) {
+      const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+      if (m) env[m[1]] = m[2];
+    }
+  } catch {}
+  return env;
+}
+
+function getAgents() {
+  try {
+    return fs.readdirSync(AGENTS_DIR)
+      .filter(d => fs.existsSync(path.join(AGENTS_DIR, d, 'keys.json')))
+      .map(id => {
+        const keys = JSON.parse(fs.readFileSync(path.join(AGENTS_DIR, id, 'keys.json'), 'utf8'));
+        const soul = fs.existsSync(path.join(AGENTS_DIR, id, 'SOUL.md'))
+          ? fs.readFileSync(path.join(AGENTS_DIR, id, 'SOUL.md'), 'utf8').substring(0, 100)
+          : '(none)';
+        return { id, ...keys, soulPreview: soul };
+      });
+  } catch { return []; }
+}
+
+function getDispatcherStatus() {
+  const pidFile = path.join(DISPATCHER_DIR, 'dispatcher.pid');
+  if (!fs.existsSync(pidFile)) return { running: false };
+  const pid = parseInt(fs.readFileSync(pidFile, 'utf8').trim());
+  try { process.kill(pid, 0); return { running: true, pid }; } catch { return { running: false, stalePid: pid }; }
+}
+
+function extractVdxfValue(entry) {
+  if (typeof entry === 'string') {
+    // Hex-encoded (like review records)
+    try { return Buffer.from(entry, 'hex').toString('utf8'); } catch { return entry; }
+  }
+  if (entry && typeof entry === 'object') {
+    // Nested DD format
+    const inner = Object.values(entry)[0];
+    if (inner?.objectdata?.message) return inner.objectdata.message;
+    if (inner?.objectdata) return JSON.stringify(inner.objectdata);
+  }
+  return JSON.stringify(entry);
+}
+
+// ── Screens ──
+
+async function mainMenu(inquirer) {
+  const agents = getAgents();
+  const status = getDispatcherStatus();
+  const config = loadConfig();
+  const env = loadEnv();
+
+  console.clear();
+  console.log('╔══════════════════════════════════════════════════╗');
+  console.log('║  J41 Dispatcher — Setup & Management             ║');
+  console.log('╚══════════════════════════════════════════════════╝');
+  console.log(`\n  Agents: ${agents.length} registered`);
+  console.log(`  Dispatcher: ${status.running ? `running (PID ${status.pid})` : 'stopped'}`);
+  console.log(`  Runtime: ${config.runtime || 'docker'}`);
+  console.log(`  LLM: ${env.J41_LLM_PROVIDER || '(not configured)'}`);
+  console.log('');
+
+  const { choice } = await inquirer.prompt([{
+    type: 'list',
+    name: 'choice',
+    message: 'What would you like to do?',
+    choices: [
+      { name: `[1] View Agents (${agents.length} registered)`, value: 'agents' },
+      { name: '[2] Add New Agent', value: 'add' },
+      { name: '[3] Configure LLM Provider', value: 'llm' },
+      { name: '[4] Configure Services', value: 'services' },
+      { name: '[5] Security Setup', value: 'security' },
+      { name: `[6] Start Dispatcher ${status.running ? '(already running)' : ''}`, value: 'start' },
+      { name: '[7] Status & Logs', value: 'status' },
+      new inquirer.Separator(),
+      { name: '    Quit', value: 'quit' },
+    ],
+  }]);
+
+  return choice;
+}
+
+async function agentListScreen(inquirer) {
+  const agents = getAgents();
+  if (agents.length === 0) {
+    console.log('\n  No agents registered. Use "Add New Agent" to create one.\n');
+    await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+    return;
+  }
+
+  const { agentId } = await inquirer.prompt([{
+    type: 'list',
+    name: 'agentId',
+    message: 'Select an agent:',
+    choices: [
+      ...agents.map(a => ({
+        name: `  ${a.id.padEnd(10)} ${(a.identity || '').padEnd(30)} ${a.network || ''}`,
+        value: a.id,
+      })),
+      new inquirer.Separator(),
+      { name: '  ← Back', value: '__back' },
+    ],
+  }]);
+
+  if (agentId === '__back') return;
+  await agentDetailScreen(inquirer, agentId);
+}
+
+async function agentDetailScreen(inquirer, agentId) {
+  const agentDir = path.join(AGENTS_DIR, agentId);
+  const keys = JSON.parse(fs.readFileSync(path.join(agentDir, 'keys.json'), 'utf8'));
+
+  console.clear();
+  console.log(`\n  ═══ ${keys.identity || agentId} ═══\n`);
+  console.log(`  ID:        ${agentId}`);
+  console.log(`  Identity:  ${keys.identity || '(not set)'}`);
+  console.log(`  i-Address: ${keys.iAddress || '(not set)'}`);
+  console.log(`  R-Address: ${keys.address}`);
+  console.log(`  Network:   ${keys.network || 'verustest'}`);
+  console.log(`  Pubkey:    ${keys.pubkey?.substring(0, 20)}...`);
+
+  // Check SOUL.md
+  const soulPath = path.join(agentDir, 'SOUL.md');
+  if (fs.existsSync(soulPath)) {
+    const soul = fs.readFileSync(soulPath, 'utf8');
+    console.log(`  SOUL.md:   ${soul.substring(0, 80).replace(/\n/g, ' ')}...`);
+  }
+
+  const { action } = await inquirer.prompt([{
+    type: 'list',
+    name: 'action',
+    message: 'Agent options:',
+    choices: [
+      { name: '  View VDXF Keys (on-chain data)', value: 'vdxf' },
+      { name: '  View Platform Profile', value: 'platform' },
+      { name: '  View Services', value: 'services' },
+      { name: '  View SOUL.md', value: 'soul' },
+      { name: '  View Jobs', value: 'jobs' },
+      new inquirer.Separator(),
+      { name: '  ← Back to agents', value: '__back' },
+    ],
+  }]);
+
+  switch (action) {
+    case 'vdxf': await vdxfScreen(inquirer, keys); break;
+    case 'platform': await platformScreen(inquirer, keys); break;
+    case 'services': await servicesScreen(inquirer, keys); break;
+    case 'soul': await soulScreen(inquirer, agentDir); break;
+    case 'jobs': await jobsScreen(inquirer, keys); break;
+    case '__back': return;
+  }
+
+  // Loop back to agent detail
+  await agentDetailScreen(inquirer, agentId);
+}
+
+async function vdxfScreen(inquirer, keys) {
+  console.clear();
+  console.log(`\n  ═══ VDXF Keys: ${keys.identity} ═══\n`);
+
+  try {
+    const { J41Agent } = require('@j41/sovagent-sdk');
+    const agent = new J41Agent({
+      apiUrl: process.env.J41_API_URL || loadEnv().J41_API_URL || 'https://api.junction41.io',
+      wif: keys.wif,
+      identityName: keys.identity,
+      iAddress: keys.iAddress,
+    });
+    await agent.authenticate();
+    const { data: rawId } = await agent.client.getIdentityRaw();
+    agent.stop();
+
+    const cmap = rawId.identity?.contentmultimap || {};
+    if (Object.keys(cmap).length === 0) {
+      console.log('  (no VDXF keys found on-chain)\n');
+    } else {
+      for (const [iAddr, entries] of Object.entries(cmap)) {
+        const name = VDXF_KEY_NAMES[iAddr] || iAddr;
+        const values = Array.isArray(entries) ? entries : [entries];
+
+        for (const entry of values) {
+          const val = extractVdxfValue(entry);
+          // Truncate long values
+          const displayVal = val.length > 120 ? val.substring(0, 117) + '...' : val;
+          const nameCol = `  ${name}`.padEnd(32);
+          console.log(`${nameCol} ${displayVal}`);
+        }
+      }
+    }
+    console.log(`\n  Block height: ${rawId.blockHeight || '?'}`);
+    console.log(`  Last TX: ${rawId.txid?.substring(0, 16) || '?'}...`);
+  } catch (e) {
+    console.log(`  Error fetching VDXF data: ${e.message}\n`);
+  }
+
+  console.log('');
+  await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+}
+
+async function platformScreen(inquirer, keys) {
+  console.clear();
+  console.log(`\n  ═══ Platform Profile: ${keys.identity} ═══\n`);
+
+  try {
+    const { J41Agent } = require('@j41/sovagent-sdk');
+    const agent = new J41Agent({
+      apiUrl: process.env.J41_API_URL || loadEnv().J41_API_URL || 'https://api.junction41.io',
+      wif: keys.wif,
+      identityName: keys.identity,
+      iAddress: keys.iAddress,
+    });
+    await agent.authenticate();
+    const detail = await agent.client.request('GET', `/v1/agents/${encodeURIComponent(keys.identity)}`);
+    agent.stop();
+
+    const d = detail.data || detail;
+    console.log(`  Name:           ${d.name || '(none)'}`);
+    console.log(`  Status:         ${d.status || '?'} ${d.online ? '● online' : '○ offline'}`);
+    console.log(`  Type:           ${d.type || '?'}`);
+    console.log(`  Trust Tier:     ${d.trustTier || '?'}`);
+    console.log(`  Reviews:        ${d.chainReviewCount || 0}`);
+    console.log(`  Workspace:      ${d.workspaceCapable ? 'enabled' : 'disabled'}`);
+    console.log(`  Models:         ${(d.models || []).join(', ') || '(none)'}`);
+    console.log(`  Category:       ${d.category || '(none)'}`);
+    console.log(`  Last Seen:      ${d.lastSeenAt || '?'}`);
+    console.log(`  Created:        ${d.createdAt || '?'}`);
+    console.log(`  Description:    ${(d.description || '').substring(0, 100)}`);
+  } catch (e) {
+    console.log(`  Error: ${e.message}\n`);
+  }
+
+  console.log('');
+  await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+}
+
+async function servicesScreen(inquirer, keys) {
+  console.clear();
+  console.log(`\n  ═══ Services: ${keys.identity} ═══\n`);
+
+  try {
+    const { J41Agent } = require('@j41/sovagent-sdk');
+    const agent = new J41Agent({
+      apiUrl: process.env.J41_API_URL || loadEnv().J41_API_URL || 'https://api.junction41.io',
+      wif: keys.wif,
+      identityName: keys.identity,
+      iAddress: keys.iAddress,
+    });
+    await agent.authenticate();
+    const services = await agent.client.request('GET', `/v1/agents/${encodeURIComponent(keys.identity)}/services`);
+    agent.stop();
+
+    const list = services.data || services || [];
+    if (list.length === 0) {
+      console.log('  (no services registered)\n');
+    } else {
+      for (let i = 0; i < list.length; i++) {
+        const s = list[i];
+        console.log(`  [${i + 1}] ${s.name}`);
+        console.log(`      Price: ${s.price} ${s.currency}  |  Status: ${s.status}  |  Category: ${s.category || '?'}`);
+        console.log(`      Turnaround: ${s.turnaround || '?'}  |  SovGuard: ${s.sovguard ? 'yes' : 'no'}  |  Workspace: ${s.workspaceCapable ? 'yes' : 'no'}`);
+        console.log(`      ${(s.description || '').substring(0, 100)}`);
+        console.log('');
+      }
+    }
+  } catch (e) {
+    console.log(`  Error: ${e.message}\n`);
+  }
+
+  await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+}
+
+async function soulScreen(inquirer, agentDir) {
+  console.clear();
+  const soulPath = path.join(agentDir, 'SOUL.md');
+  if (fs.existsSync(soulPath)) {
+    console.log(`\n  ═══ SOUL.md ═══\n`);
+    console.log(fs.readFileSync(soulPath, 'utf8'));
+  } else {
+    console.log('\n  (no SOUL.md found)\n');
+  }
+  console.log('');
+  await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+}
+
+async function jobsScreen(inquirer, keys) {
+  console.clear();
+  console.log(`\n  ═══ Recent Jobs: ${keys.identity} ═══\n`);
+
+  try {
+    const { J41Agent } = require('@j41/sovagent-sdk');
+    const agent = new J41Agent({
+      apiUrl: process.env.J41_API_URL || loadEnv().J41_API_URL || 'https://api.junction41.io',
+      wif: keys.wif,
+      identityName: keys.identity,
+      iAddress: keys.iAddress,
+    });
+    await agent.authenticate();
+    const result = await agent.client.getMyJobs({ role: 'seller' });
+    agent.stop();
+
+    const jobs = (result.data || []).slice(0, 15);
+    if (jobs.length === 0) {
+      console.log('  (no jobs)\n');
+    } else {
+      console.log(`  ${'ID'.padEnd(10)} ${'Status'.padEnd(12)} ${'Amount'.padEnd(12)} ${'Created'.padEnd(22)} Description`);
+      console.log(`  ${'─'.repeat(10)} ${'─'.repeat(12)} ${'─'.repeat(12)} ${'─'.repeat(22)} ${'─'.repeat(30)}`);
+      for (const j of jobs) {
+        const created = j.timestamps?.created ? new Date(j.timestamps.created).toISOString().substring(0, 16) : '?';
+        console.log(`  ${j.id.substring(0, 8).padEnd(10)} ${(j.status || '?').padEnd(12)} ${(j.amount + ' ' + (j.currency || '')).padEnd(12)} ${created.padEnd(22)} ${(j.description || '').substring(0, 40)}`);
+      }
+      console.log(`\n  Total: ${result.data?.length || jobs.length} jobs`);
+    }
+  } catch (e) {
+    console.log(`  Error: ${e.message}\n`);
+  }
+
+  console.log('');
+  await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+}
+
+async function statusScreen(inquirer) {
+  console.clear();
+  console.log(`\n  ═══ Dispatcher Status ═══\n`);
+
+  const status = getDispatcherStatus();
+  const config = loadConfig();
+  const env = loadEnv();
+
+  console.log(`  Running:    ${status.running ? `yes (PID ${status.pid})` : 'no'}`);
+  console.log(`  Runtime:    ${config.runtime || 'docker'}`);
+  console.log(`  LLM:        ${env.J41_LLM_PROVIDER || '(not set)'}`);
+  console.log(`  API:        ${env.J41_API_URL || 'https://api.junction41.io'}`);
+
+  // Check Docker
+  try {
+    const docker = require('child_process').execSync('docker ps --filter name=j41-job --format "{{.Names}} {{.Status}}"', { encoding: 'utf8', timeout: 5000 }).trim();
+    const containers = docker ? docker.split('\n') : [];
+    console.log(`\n  Active containers: ${containers.length}`);
+    for (const c of containers) console.log(`    ${c}`);
+  } catch {
+    console.log(`\n  Docker: not available`);
+  }
+
+  // Check security
+  try {
+    const secureSetup = require('@j41/secure-setup');
+    const isolation = await secureSetup.detectIsolation();
+    console.log(`\n  Security:   ${isolation.score}/10 (${isolation.mode})`);
+  } catch {
+    console.log(`\n  Security:   (secure-setup not available)`);
+  }
+
+  console.log('');
+  await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+}
+
+async function llmScreen(inquirer) {
+  console.clear();
+  console.log(`\n  ═══ LLM Provider Configuration ═══\n`);
+
+  const env = loadEnv();
+  console.log(`  Current: ${env.J41_LLM_PROVIDER || '(not set)'}`);
+  console.log(`  API Key: ${env.KIMI_API_KEY ? '****' + env.KIMI_API_KEY.slice(-8) : '(not set)'}\n`);
+
+  try {
+    const { LLM_PRESETS } = require('./executors/local-llm.js');
+    const providers = Object.keys(LLM_PRESETS);
+
+    const { provider } = await inquirer.prompt([{
+      type: 'list',
+      name: 'provider',
+      message: 'Select LLM provider:',
+      choices: [
+        ...providers.map(p => {
+          const preset = LLM_PRESETS[p];
+          const current = env.J41_LLM_PROVIDER === p ? ' ◄ current' : '';
+          return { name: `  ${p.padEnd(14)} ${(preset.model || '').padEnd(40)} ${preset.envKey || ''}${current}`, value: p };
+        }),
+        new inquirer.Separator(),
+        { name: '  ← Back (no change)', value: '__back' },
+      ],
+    }]);
+
+    if (provider === '__back') return;
+
+    const preset = LLM_PRESETS[provider];
+    let apiKey = env[preset.envKey] || '';
+
+    if (preset.envKey && !apiKey) {
+      const { key } = await inquirer.prompt([{
+        type: 'password',
+        name: 'key',
+        message: `Enter API key for ${provider} (${preset.envKey}):`,
+        mask: '*',
+      }]);
+      apiKey = key;
+    }
+
+    // Write to .env
+    let envContent = '';
+    try { envContent = fs.readFileSync(ENV_FILE, 'utf8'); } catch {}
+    // Update or add provider
+    if (envContent.includes('J41_LLM_PROVIDER=')) {
+      envContent = envContent.replace(/J41_LLM_PROVIDER=.*/, `J41_LLM_PROVIDER=${provider}`);
+    } else {
+      envContent += `\nJ41_LLM_PROVIDER=${provider}`;
+    }
+    // Update or add API key
+    if (preset.envKey && apiKey) {
+      if (envContent.includes(`${preset.envKey}=`)) {
+        envContent = envContent.replace(new RegExp(`${preset.envKey}=.*`), `${preset.envKey}=${apiKey}`);
+      } else {
+        envContent += `\n${preset.envKey}=${apiKey}`;
+      }
+    }
+    fs.writeFileSync(ENV_FILE, envContent.trim() + '\n');
+    console.log(`\n  ✅ Updated .env — provider: ${provider}`);
+    console.log(`  Restart dispatcher to apply.\n`);
+  } catch (e) {
+    console.log(`  Error: ${e.message}\n`);
+  }
+
+  await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+}
+
+// ── Main Loop ──
+
+async function main() {
+  // inquirer v9 is ESM-only, use dynamic import
+  const mod = await import('inquirer');
+  const inquirer = mod.default || mod;
+
+  while (true) {
+    const choice = await mainMenu(inquirer);
+
+    switch (choice) {
+      case 'agents': await agentListScreen(inquirer); break;
+      case 'add':
+        console.log('\n  Run: node src/cli.js setup <agent-id> <identity-name>\n');
+        await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+        break;
+      case 'llm': await llmScreen(inquirer); break;
+      case 'services':
+        console.log('\n  Select an agent from "View Agents" to manage services.\n');
+        await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+        break;
+      case 'security':
+        console.log('\n  Run: npx j41-secure-setup --check\n');
+        await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+        break;
+      case 'start': {
+        const status = getDispatcherStatus();
+        if (status.running) {
+          console.log(`\n  Dispatcher already running (PID ${status.pid})\n`);
+        } else {
+          const { spawn } = require('child_process');
+          const child = spawn('node', ['src/cli.js', 'start'], {
+            detached: true,
+            stdio: ['ignore', fs.openSync('/tmp/dispatcher.log', 'a'), fs.openSync('/tmp/dispatcher.log', 'a')],
+          });
+          child.unref();
+          console.log(`\n  ✅ Dispatcher started (PID ${child.pid})\n  Logs: tail -f /tmp/dispatcher.log\n`);
+        }
+        await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+        break;
+      }
+      case 'status': await statusScreen(inquirer); break;
+      case 'quit': process.exit(0);
+    }
+  }
+}
+
+main().catch(e => { console.error(e); process.exit(1); });

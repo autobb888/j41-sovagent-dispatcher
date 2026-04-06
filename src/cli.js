@@ -5199,8 +5199,8 @@ async function mainMenu() {
 // ── Entry point ──
 
 if (process.argv.length <= 2) {
-  // No command — launch interactive menu
-  mainMenu().catch(e => { console.error(e); process.exit(1); });
+  // No command — launch interactive dashboard
+  require('./dashboard.js');
 } else {
   program.parse();
 }
