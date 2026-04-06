@@ -140,7 +140,9 @@ async function mainMenu(inquirer) {
       { name: '[4] Configure Services', value: 'services' },
       { name: '[5] Security Setup', value: 'security' },
       { name: `[6] Start Dispatcher ${status.running ? '(already running)' : ''}`, value: 'start' },
-      { name: '[7] Status & Logs', value: 'status' },
+      { name: `[7] Stop Dispatcher ${status.running ? '' : '(not running)'}`, value: 'stop' },
+      { name: '[8] View Logs', value: 'logs' },
+      { name: '[9] Status', value: 'status' },
       new inquirer.Separator(),
       { name: '    Quit', value: 'quit' },
     ],
@@ -554,6 +556,44 @@ async function main() {
           console.log(`\n  ✅ Dispatcher started (PID ${child.pid})\n  Logs: tail -f /tmp/dispatcher.log\n`);
         }
         await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+        break;
+      }
+      case 'stop': {
+        const status = getDispatcherStatus();
+        if (!status.running) {
+          console.log('\n  Dispatcher is not running.\n');
+        } else {
+          try {
+            process.kill(status.pid, 'SIGTERM');
+            console.log(`\n  ✅ Sent SIGTERM to dispatcher (PID ${status.pid})`);
+            console.log('  Dispatcher will drain active jobs and shut down gracefully.\n');
+          } catch (e) {
+            console.log(`\n  Failed to stop: ${e.message}\n`);
+          }
+        }
+        await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+        break;
+      }
+      case 'logs': {
+        console.clear();
+        console.log('\n  ═══ Dispatcher Logs ═══\n');
+        console.log('  Streaming /tmp/dispatcher.log — press Ctrl+C to stop\n');
+        const { spawn } = require('child_process');
+        try {
+          const tail = spawn('tail', ['-f', '-n', '40', '/tmp/dispatcher.log'], { stdio: 'inherit' });
+          await new Promise((resolve) => {
+            tail.on('close', resolve);
+            // Also catch SIGINT to return to menu instead of exiting
+            const handler = () => { tail.kill(); resolve(); process.removeListener('SIGINT', handler); };
+            process.on('SIGINT', handler);
+          });
+        } catch (e) {
+          console.log(`  Error: ${e.message}`);
+          if (!fs.existsSync('/tmp/dispatcher.log')) {
+            console.log('  No log file found. Start the dispatcher first.\n');
+          }
+          await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+        }
         break;
       }
       case 'status': await statusScreen(inquirer); break;
