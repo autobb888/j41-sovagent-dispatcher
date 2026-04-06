@@ -169,7 +169,7 @@ async function mainMenu(inquirer) {
   console.log('');
 
   const { choice } = await promptWithEsc(inquirer, [{
-    type: 'list',
+    type: 'list', pageSize: 20,
     name: 'choice',
     message: 'What would you like to do?',
     choices: [
@@ -205,7 +205,7 @@ async function agentListScreen(inquirer) {
   }
 
   const { agentId } = await promptWithEsc(inquirer, [{
-    type: 'list',
+    type: 'list', pageSize: 20,
     name: 'agentId',
     message: 'Select an agent:',
     choices: [
@@ -243,7 +243,7 @@ async function agentDetailScreen(inquirer, agentId) {
   }
 
   const { action } = await promptWithEsc(inquirer, [{
-    type: 'list',
+    type: 'list', pageSize: 20,
     name: 'action',
     message: 'Agent options:',
     choices: [
@@ -506,7 +506,7 @@ async function llmScreen(inquirer) {
     const providers = Object.keys(LLM_PRESETS);
 
     const { provider } = await promptWithEsc(inquirer, [{
-      type: 'list',
+      type: 'list', pageSize: 20,
       name: 'provider',
       message: 'Select LLM provider:',
       choices: [
@@ -644,14 +644,14 @@ async function main() {
       case 'inspect': await withBack(async () => {
         const agents = getAgents();
         if (agents.length === 0) { console.log('\n  No agents.\n'); return; }
-        const { id } = await promptWithEsc(inquirer, [{ type: 'list', name: 'id', message: 'Select agent to inspect:', choices: agents.map(a => ({ name: `  ${a.id.padEnd(10)} ${a.identity}`, value: a.id })) }]);
+        const { id } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'id', message: 'Select agent to inspect:', choices: agents.map(a => ({ name: `  ${a.id.padEnd(10)} ${a.identity}`, value: a.id })) }]);
         const keys = agents.find(a => a.id === id);
         if (keys) await vdxfScreen(inquirer, keys);
       }); break;
       case 'inbox': await withBack(async () => {
         const agents = getAgents();
         if (agents.length === 0) { console.log('\n  No agents.\n'); return; }
-        const { id } = await promptWithEsc(inquirer, [{ type: 'list', name: 'id', message: 'Check inbox for:', choices: agents.map(a => ({ name: `  ${a.id.padEnd(10)} ${a.identity}`, value: a.id })) }]);
+        const { id } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'id', message: 'Check inbox for:', choices: agents.map(a => ({ name: `  ${a.id.padEnd(10)} ${a.identity}`, value: a.id })) }]);
         const keys = agents.find(a => a.id === id);
         if (!keys) return;
         console.clear();
