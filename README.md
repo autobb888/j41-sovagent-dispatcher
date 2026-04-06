@@ -4,18 +4,23 @@ Multi-agent orchestration system that manages a pool of pre-registered AI agents
 
 ## Overview
 
-- Manages up to **N concurrent agent workers** (configurable, default 9).
-- Each job runs in an **ephemeral container** (Docker) or **local child process** (no Docker required).
-- **Interactive TUI** -- run `j41-dispatcher` with no arguments for a menu-driven experience (run agents, setup agents, system settings).
+- Manages **unlimited concurrent agent workers** (configurable via `--max-concurrent`).
+- Each job runs in an **ephemeral Docker container** with security hardening (seccomp, AppArmor, gVisor/bwrap).
+- **Interactive TUI dashboard** -- run `node src/cli.js` with no arguments for a 13-item menu with arrow-key navigation and ESC-to-go-back.
 - **Two operating modes:**
-  - **Poll mode** (default) -- periodically polls the J41 API for new events. Works behind NAT without any public-facing endpoint.
+  - **Poll mode** (default) -- periodically polls the J41 API. Staggered 500ms between agents, dynamic interval scaling for 100+ agents.
   - **Webhook mode** -- event-driven via HTTP webhooks. Requires a publicly reachable URL.
-- Auto-accepts incoming jobs, waits for buyer prepayment, and spins up a dedicated agent process per job.
-- **25-key flat VDXF** -- agent profiles, services, session limits, workspace capability, and platform config published on-chain as individual flat keys (no parent group wrapping).
-- **Graceful shutdown** -- delivers in-progress jobs, submits attestations, and marks agents offline on Ctrl+C or SIGTERM.
-- **Control plane** -- query live status, list jobs/agents, and trigger shutdown from another terminal via Unix socket.
-- **VDXF policy enforcement** -- reads on-chain identity at startup, blocks workspace connections for agents without `workspace.capability`.
-- **Extension auto-approve** -- approves session extensions when queue is empty, slots are open, and CPU/RAM are under configured thresholds.
+- **PID file** -- prevents duplicate dispatcher processes. New instance auto-kills previous.
+- **`.env` auto-loading** -- reads `.env` file at startup, no manual `source` needed.
+- **Workspace auto-connect** -- job-agent polls for workspace status and connects jailbox automatically (no IPC required in Docker mode).
+- **UTXO chaining** -- send multiple payments per block without waiting for confirmations.
+- **Financial allowlists** -- deny-all by default, auto-adds seller addresses on job creation, reloads from disk on every check.
+- **SovGuard 429 handling** -- surfaces upgrade URLs on quota limits, longer backoff on rate limits.
+- **Crash recovery** -- detects orphaned jobs on startup, handles refunds/cleanup.
+- **Graceful drain shutdown** -- delivers in-progress jobs, submits attestations, and marks agents offline on Ctrl+C or SIGTERM.
+- **On-chain job records** -- auto-processes `job_record` and `review` inbox items, writes to identity.
+- **Docker IPC** -- file-based IPC (`/tmp/ipc-msg.json`) for reconnect/pause/resume in Docker containers.
+- **Kimi K2.5 tool call parsing** -- handles `<|tool_calls_section_begin|>` markup from reasoning models.
 
 ## Quick Start
 
@@ -43,49 +48,42 @@ node src/cli.js start
 Running `j41-dispatcher` (or `node src/cli.js`) with no arguments launches the interactive TUI:
 
 ```
-╔══════════════════════════════════════════╗
-║           J41 Dispatcher                  ║
-╚══════════════════════════════════════════╝
+╔══════════════════════════════════════════════════╗
+║  J41 Dispatcher — Setup & Management             ║
+╚══════════════════════════════════════════════════╝
 
-  1. Run Agents
-  2. Setup Agents
-  3. System Settings
-  q. Quit
+  Agents: 5 registered
+  Dispatcher: running (PID 12345)
+  Runtime: docker
+  LLM: kimi-nvidia
+
+  [1]  View Agents (5 registered)
+  [2]  Add New Agent
+  [3]  Configure LLM Provider
+  [4]  Configure Services
+  [5]  Security Setup
+    ── Dispatcher ──
+  [6]  Start Dispatcher
+  [7]  Stop Dispatcher
+  [8]  View Logs
+  [9]  Status & Health
+    ── Tools ──
+  [10] Inspect Agent (on-chain)
+  [11] Check Inbox
+  [12] Earnings Summary
+  [13] Docker Containers
 ```
 
-### Setup Agents
+Arrow keys to navigate, Enter to select, **ESC to go back** from any screen.
 
-Lists all agents with their on-chain identity status. Select an agent to manage or `+` to create a new one:
+### View Agents
 
-```
-── Agent Setup ──
-
-  1. agent-1      dt3worker1.agentplatform@
-  2. agent-2      dt3worker2.agentplatform@
-  +. Create new agent
-  b. Back
-```
-
-Per-agent options:
-- **Edit Profile** — interactive walkthrough for all 25 VDXF keys (name, type, description, payAddress, network, profile, models, markup, session limits, platform config, workspace capability, services)
-- **View Current On-Chain Profile** — shows live contentmultimap decoded against the 25-key schema
-- **Register Identity On-Chain** — creates a new VerusID under agentplatform@
-- **Publish VDXF Update** — signs and broadcasts the saved profile to the blockchain
-
-### System Settings
-
-View and edit runtime configuration:
-
-```
-── System Settings ──
-
-  API URL:           https://api.junction41.io
-  Runtime:           local
-  Max Concurrent:    9
-  Job Timeout:       60 min
-  Network:           verustest
-  Auto-Approve Ext:  yes
-```
+Select an agent to see:
+- **VDXF Keys** — all 24 on-chain keys with values, `(not set)` for empty ones
+- **Platform Profile** — name, status, trust tier, reviews, models, workspace
+- **Services** — price, category, turnaround, SovGuard, workspace capability
+- **SOUL.md** — agent personality / system prompt
+- **Jobs** — recent jobs with status, amount, description
 
 ## CLI Commands
 
@@ -186,7 +184,7 @@ Configurable via interactive menu (System Settings) or `node src/cli.js config`:
 | Setting | Flag | Default | Description |
 |---|---|---|---|
 | Runtime | `--runtime` | local | `docker` or `local` |
-| Max concurrent | `--max-concurrent` | 9 | Agent slots (1-1000) |
+| Max concurrent | `--max-concurrent` | unlimited | Agent slots (operator chooses) |
 | Job timeout | `--job-timeout` | 60 | Minutes per job (1-1440) |
 | Extension auto-approve | `--extension-auto-approve` | true | Auto-approve session extensions |
 | CPU threshold | `--extension-max-cpu` | 80 | Reject extensions if load avg > this % of cores |
@@ -234,17 +232,28 @@ The dispatcher maintains a pool of registered agents. When a job arrives, it ass
 
 ### Runtime Modes
 
-**Docker** (default when Docker is available) -- Each job runs inside an ephemeral container built from `docker/Dockerfile`. Provides full process and filesystem isolation.
+**Docker** (default) -- Each job runs inside an ephemeral container with security hardening:
+- Seccomp + AppArmor profiles via `@j41/secure-setup`
+- gVisor runtime (if KVM available) or bubblewrap fallback
+- `CapDrop: ALL`, `ReadonlyRootfs: true`, `PidsLimit: 64`
+- `j41-isolated` Docker network (ICC disabled)
+- Container runs as host UID (no root-owned files)
+- Security score: 10/10 (gVisor), 8/10 (bwrap), 4/10 (Docker only)
 
 ```bash
-./scripts/build-image.sh
-node src/cli.js config --runtime docker
+# Build the job-agent Docker image (required before first run)
+# Requires .docker-sdk directory with SDK dist + node_modules
+rm -rf .docker-sdk && mkdir -p .docker-sdk/dist
+cp -rL ../j41-sovagent-sdk/dist/* .docker-sdk/dist/
+cp ../j41-sovagent-sdk/package.json .docker-sdk/
+cp -rL ../j41-sovagent-sdk/node_modules .docker-sdk/node_modules
+docker build -f Dockerfile.job-agent -t j41/job-agent:latest .
 ```
 
-**Local** (no Docker needed) -- Each job runs as a Node.js child process on the host. Useful for development, CI, or hosts where Docker is unavailable.
+**Local** (dev only, requires `--dev-unsafe`) -- Each job runs as a Node.js child process on the host. Zero isolation — not safe for production.
 
 ```bash
-node src/cli.js config --runtime local
+node src/cli.js start --dev-unsafe
 ```
 
 ### LLM Providers (22 presets)
