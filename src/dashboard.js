@@ -206,12 +206,49 @@ async function agentDetailScreen(inquirer, agentId) {
   await agentDetailScreen(inquirer, agentId);
 }
 
+// All VDXF keys in display order
+const ALL_VDXF_KEYS = [
+  // Agent keys
+  { iAddr: 'iKkdwxhdupLgf7v2qn4JGBQHntsBb17kjW', name: 'agent.displayName' },
+  { iAddr: 'iNxeLSDFARVQezfEt4i8CBZjTSRpFTPAyP', name: 'agent.type' },
+  { iAddr: 'iQr3yKEn2DXaG4GQGVAVYivC3jwcvScfzk', name: 'agent.description' },
+  { iAddr: 'iLy373iaKafmRCY43ahty4m8aLQx32y8Fh', name: 'agent.status' },
+  { iAddr: 'iRxxUvbDXJT5wVpnx7oc9nkYALCoDh6aTD', name: 'agent.payAddress' },
+  { iAddr: 'iBLx3rga8DewiN6gyQyC5avFin8fnnojnS', name: 'agent.markup' },
+  { iAddr: 'iQJUQmdFSmM49cvLJfKLZnuRYsjXSmTTHY', name: 'agent.models' },
+  { iAddr: 'iD3quozCGbzJyZ29uvRCeecr12np2dMsvN', name: 'agent.profileCategory' },
+  { iAddr: 'iKM57qfzmgM1sxBgR3XBQa2XCRURZ2YVo2', name: 'agent.profileTags' },
+  { iAddr: 'i7HY93tqfqCkpyKYiNtcDbioAgF8gRL9TQ', name: 'agent.profileWebsite' },
+  { iAddr: 'iALo91Z75iXZxMvymvQMRwo7GAeHv5veKc', name: 'agent.profileAvatar' },
+  { iAddr: 'iF7174LxgcAnu3qZ7iJzSyJYthDJXBzQNw', name: 'agent.networkCapabilities' },
+  { iAddr: 'i5VzGsiFmJYuRr7b8aUyHzAS8vd9DC4puS', name: 'agent.networkEndpoints' },
+  { iAddr: 'iSAVTXMb9TyWWuDDnWopFhgZpjm21WPigv', name: 'agent.networkProtocols' },
+  { iAddr: 'iFxerhcrMr2e5eWyvHiXuWHXj2dnhEZF8p', name: 'agent.disputePolicy' },
+  // Service
+  { iAddr: 'i8Wk7fcbsBWtcf965Z3WvDUjahF1aTH1tu', name: 'agent.services' },
+  // Session
+  { iAddr: 'iHjLTt9P8Jb1uCYSpVpwXFbwzbPYWW4n8p', name: 'session.params' },
+  // Platform config
+  { iAddr: 'iMs3n1aCWQh5rmkXCNLRi8WqbzZrq3F7Ye', name: 'platform.config' },
+  // Workspace
+  { iAddr: 'iMxAXRfTWUkKBmLGEZtEJbKj58kDi1GjZ9', name: 'workspace.capability' },
+  { iAddr: 'i8xp9AgvueoAHyYXbxNACMgRQfEXF82V5D', name: 'workspace.attestation' },
+  // Records
+  { iAddr: 'iLbUN8TFvMZR9uaZYY1qBmL99bJE2uYdad', name: 'review.record' },
+  { iAddr: 'iPsXc7vcBzAxyjFYfPAs9PUtMLh1EJPHSn', name: 'job.record' },
+  { iAddr: 'i6PC1B9vgVf8bLtHcdsNunLtr6ibtnL7ZC', name: 'bounty.record' },
+  { iAddr: 'iE8Z7gZmAs4NU8AqEJzV9MWHUCoUBQqfum', name: 'bounty.application' },
+];
+
 async function vdxfScreen(inquirer, keys) {
   console.clear();
   console.log(`\n  ═══ VDXF Keys: ${keys.identity} ═══\n`);
 
   try {
     const { J41Agent } = require('@j41/sovagent-sdk');
+    // Suppress SDK console output
+    const origLog = console.log;
+    console.log = () => {};
     const agent = new J41Agent({
       apiUrl: process.env.J41_API_URL || loadEnv().J41_API_URL || 'https://api.junction41.io',
       wif: keys.wif,
@@ -221,24 +258,41 @@ async function vdxfScreen(inquirer, keys) {
     await agent.authenticate();
     const { data: rawId } = await agent.client.getIdentityRaw();
     agent.stop();
+    console.log = origLog;
 
     const cmap = rawId.identity?.contentmultimap || {};
-    if (Object.keys(cmap).length === 0) {
-      console.log('  (no VDXF keys found on-chain)\n');
-    } else {
-      for (const [iAddr, entries] of Object.entries(cmap)) {
-        const name = VDXF_KEY_NAMES[iAddr] || iAddr;
-        const values = Array.isArray(entries) ? entries : [entries];
 
-        for (const entry of values) {
-          const val = extractVdxfValue(entry);
-          // Truncate long values
-          const displayVal = val.length > 120 ? val.substring(0, 117) + '...' : val;
-          const nameCol = `  ${name}`.padEnd(32);
-          console.log(`${nameCol} ${displayVal}`);
-        }
+    // Show ALL keys, marking empty ones
+    for (const keyDef of ALL_VDXF_KEYS) {
+      const nameCol = `  ${keyDef.name}`.padEnd(32);
+      const entries = cmap[keyDef.iAddr];
+
+      if (!entries) {
+        console.log(`${nameCol} \x1b[2m(not set)\x1b[0m`);
+        continue;
+      }
+
+      const values = Array.isArray(entries) ? entries : [entries];
+      for (let i = 0; i < values.length; i++) {
+        const val = extractVdxfValue(values[i]);
+        const displayVal = val.length > 100 ? val.substring(0, 97) + '...' : val;
+        const label = i === 0 ? nameCol : `  ${''}`.padEnd(32);
+        console.log(`${label} ${displayVal}`);
       }
     }
+
+    // Show any unknown keys not in our mapping
+    const knownAddrs = new Set(ALL_VDXF_KEYS.map(k => k.iAddr));
+    for (const [iAddr, entries] of Object.entries(cmap)) {
+      if (knownAddrs.has(iAddr)) continue;
+      const values = Array.isArray(entries) ? entries : [entries];
+      for (const entry of values) {
+        const val = extractVdxfValue(entry);
+        const displayVal = val.length > 80 ? val.substring(0, 77) + '...' : val;
+        console.log(`  \x1b[33m${iAddr.substring(0, 20)}...\x1b[0m`.padEnd(44) + ` ${displayVal}`);
+      }
+    }
+
     console.log(`\n  Block height: ${rawId.blockHeight || '?'}`);
     console.log(`  Last TX: ${rawId.txid?.substring(0, 16) || '?'}...`);
   } catch (e) {
