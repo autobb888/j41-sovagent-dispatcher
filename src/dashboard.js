@@ -111,6 +111,45 @@ async function createAgent(keys) {
   return agent;
 }
 
+// ── ESC-to-back support ──
+
+const BACK = Symbol('BACK');
+
+/** Wrap inquirer.prompt to support ESC key → throws BACK */
+function promptWithEsc(inquirer, questions) {
+  return new Promise((resolve, reject) => {
+    // Listen for ESC on raw stdin
+    const onKeypress = (chunk) => {
+      if (chunk && chunk[0] === 27 && chunk.length === 1) { // ESC key
+        process.stdin.removeListener('data', onKeypress);
+        reject(BACK);
+      }
+    };
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode?.(false); // inquirer handles raw mode
+    }
+    process.stdin.on('data', onKeypress);
+
+    inquirer.prompt(questions).then((result) => {
+      process.stdin.removeListener('data', onKeypress);
+      resolve(result);
+    }).catch((err) => {
+      process.stdin.removeListener('data', onKeypress);
+      reject(err);
+    });
+  });
+}
+
+/** Run a screen function, catch BACK to return silently */
+async function withBack(fn) {
+  try {
+    await fn();
+  } catch (e) {
+    if (e === BACK) return; // ESC pressed — go back
+    throw e;
+  }
+}
+
 // ── Screens ──
 
 async function mainMenu(inquirer) {
@@ -129,22 +168,28 @@ async function mainMenu(inquirer) {
   console.log(`  LLM: ${env.J41_LLM_PROVIDER || '(not configured)'}`);
   console.log('');
 
-  const { choice } = await inquirer.prompt([{
+  const { choice } = await promptWithEsc(inquirer, [{
     type: 'list',
     name: 'choice',
     message: 'What would you like to do?',
     choices: [
-      { name: `[1] View Agents (${agents.length} registered)`, value: 'agents' },
-      { name: '[2] Add New Agent', value: 'add' },
-      { name: '[3] Configure LLM Provider', value: 'llm' },
-      { name: '[4] Configure Services', value: 'services' },
-      { name: '[5] Security Setup', value: 'security' },
-      { name: `[6] Start Dispatcher ${status.running ? '(already running)' : ''}`, value: 'start' },
-      { name: `[7] Stop Dispatcher ${status.running ? '' : '(not running)'}`, value: 'stop' },
-      { name: '[8] View Logs', value: 'logs' },
-      { name: '[9] Status', value: 'status' },
+      { name: `[1]  View Agents (${agents.length} registered)`, value: 'agents' },
+      { name: '[2]  Add New Agent', value: 'add' },
+      { name: '[3]  Configure LLM Provider', value: 'llm' },
+      { name: '[4]  Configure Services', value: 'services' },
+      { name: '[5]  Security Setup', value: 'security' },
+      new inquirer.Separator('  ── Dispatcher ──'),
+      { name: `[6]  Start Dispatcher ${status.running ? '\x1b[32m(running)\x1b[0m' : ''}`, value: 'start' },
+      { name: `[7]  Stop Dispatcher ${status.running ? '' : '\x1b[2m(not running)\x1b[0m'}`, value: 'stop' },
+      { name: '[8]  View Logs', value: 'logs' },
+      { name: '[9]  Status & Health', value: 'status' },
+      new inquirer.Separator('  ── Tools ──'),
+      { name: '[10] Inspect Agent (on-chain)', value: 'inspect' },
+      { name: '[11] Check Inbox', value: 'inbox' },
+      { name: '[12] Earnings Summary', value: 'earnings' },
+      { name: '[13] Docker Containers', value: 'docker' },
       new inquirer.Separator(),
-      { name: '    Quit', value: 'quit' },
+      { name: '     Quit', value: 'quit' },
     ],
   }]);
 
@@ -155,11 +200,11 @@ async function agentListScreen(inquirer) {
   const agents = getAgents();
   if (agents.length === 0) {
     console.log('\n  No agents registered. Use "Add New Agent" to create one.\n');
-    await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
     return;
   }
 
-  const { agentId } = await inquirer.prompt([{
+  const { agentId } = await promptWithEsc(inquirer, [{
     type: 'list',
     name: 'agentId',
     message: 'Select an agent:',
@@ -197,7 +242,7 @@ async function agentDetailScreen(inquirer, agentId) {
     console.log(`  SOUL.md:   ${soul.substring(0, 80).replace(/\n/g, ' ')}...`);
   }
 
-  const { action } = await inquirer.prompt([{
+  const { action } = await promptWithEsc(inquirer, [{
     type: 'list',
     name: 'action',
     message: 'Agent options:',
@@ -308,7 +353,7 @@ async function vdxfScreen(inquirer, keys) {
   }
 
   console.log('');
-  await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
 async function platformScreen(inquirer, keys) {
@@ -337,7 +382,7 @@ async function platformScreen(inquirer, keys) {
   }
 
   console.log('');
-  await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
 async function servicesScreen(inquirer, keys) {
@@ -367,7 +412,7 @@ async function servicesScreen(inquirer, keys) {
     console.log(`  Error: ${e.message}\n`);
   }
 
-  await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
 async function soulScreen(inquirer, agentDir) {
@@ -380,7 +425,7 @@ async function soulScreen(inquirer, agentDir) {
     console.log('\n  (no SOUL.md found)\n');
   }
   console.log('');
-  await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
 async function jobsScreen(inquirer, keys) {
@@ -409,7 +454,7 @@ async function jobsScreen(inquirer, keys) {
   }
 
   console.log('');
-  await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
 async function statusScreen(inquirer) {
@@ -445,7 +490,7 @@ async function statusScreen(inquirer) {
   }
 
   console.log('');
-  await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
 async function llmScreen(inquirer) {
@@ -460,7 +505,7 @@ async function llmScreen(inquirer) {
     const { LLM_PRESETS } = require('./executors/local-llm.js');
     const providers = Object.keys(LLM_PRESETS);
 
-    const { provider } = await inquirer.prompt([{
+    const { provider } = await promptWithEsc(inquirer, [{
       type: 'list',
       name: 'provider',
       message: 'Select LLM provider:',
@@ -481,7 +526,7 @@ async function llmScreen(inquirer) {
     let apiKey = env[preset.envKey] || '';
 
     if (preset.envKey && !apiKey) {
-      const { key } = await inquirer.prompt([{
+      const { key } = await promptWithEsc(inquirer, [{
         type: 'password',
         name: 'key',
         message: `Enter API key for ${provider} (${preset.envKey}):`,
@@ -514,7 +559,7 @@ async function llmScreen(inquirer) {
     console.log(`  Error: ${e.message}\n`);
   }
 
-  await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
 // ── Main Loop ──
@@ -528,19 +573,19 @@ async function main() {
     const choice = await mainMenu(inquirer);
 
     switch (choice) {
-      case 'agents': await agentListScreen(inquirer); break;
+      case 'agents': await withBack(() => agentListScreen(inquirer)); break;
       case 'add':
         console.log('\n  Run: node src/cli.js setup <agent-id> <identity-name>\n');
-        await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+        await withBack(() => promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]));
         break;
-      case 'llm': await llmScreen(inquirer); break;
+      case 'llm': await withBack(() => llmScreen(inquirer)); break;
       case 'services':
         console.log('\n  Select an agent from "View Agents" to manage services.\n');
-        await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+        await withBack(() => promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]));
         break;
       case 'security':
         console.log('\n  Run: npx j41-secure-setup --check\n');
-        await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+        await withBack(() => promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]));
         break;
       case 'start': {
         const status = getDispatcherStatus();
@@ -555,10 +600,10 @@ async function main() {
           child.unref();
           console.log(`\n  ✅ Dispatcher started (PID ${child.pid})\n  Logs: tail -f /tmp/dispatcher.log\n`);
         }
-        await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+        await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
         break;
       }
-      case 'stop': {
+      case 'stop': await withBack(async () => {
         const status = getDispatcherStatus();
         if (!status.running) {
           console.log('\n  Dispatcher is not running.\n');
@@ -571,9 +616,8 @@ async function main() {
             console.log(`\n  Failed to stop: ${e.message}\n`);
           }
         }
-        await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
-        break;
-      }
+        await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+      }); break;
       case 'logs': {
         console.clear();
         console.log('\n  ═══ Dispatcher Logs ═══\n');
@@ -592,11 +636,73 @@ async function main() {
           if (!fs.existsSync('/tmp/dispatcher.log')) {
             console.log('  No log file found. Start the dispatcher first.\n');
           }
-          await inquirer.prompt([{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+          await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
         }
         break;
       }
-      case 'status': await statusScreen(inquirer); break;
+      case 'status': await withBack(() => statusScreen(inquirer)); break;
+      case 'inspect': await withBack(async () => {
+        const agents = getAgents();
+        if (agents.length === 0) { console.log('\n  No agents.\n'); return; }
+        const { id } = await promptWithEsc(inquirer, [{ type: 'list', name: 'id', message: 'Select agent to inspect:', choices: agents.map(a => ({ name: `  ${a.id.padEnd(10)} ${a.identity}`, value: a.id })) }]);
+        const keys = agents.find(a => a.id === id);
+        if (keys) await vdxfScreen(inquirer, keys);
+      }); break;
+      case 'inbox': await withBack(async () => {
+        const agents = getAgents();
+        if (agents.length === 0) { console.log('\n  No agents.\n'); return; }
+        const { id } = await promptWithEsc(inquirer, [{ type: 'list', name: 'id', message: 'Check inbox for:', choices: agents.map(a => ({ name: `  ${a.id.padEnd(10)} ${a.identity}`, value: a.id })) }]);
+        const keys = agents.find(a => a.id === id);
+        if (!keys) return;
+        console.clear();
+        console.log(`\n  ═══ Inbox: ${keys.identity} ═══\n`);
+        try {
+          const agent = await createAgent(keys);
+          const inbox = await agent.client.getInbox('pending', 20);
+          agent.stop();
+          const items = inbox.data || [];
+          if (items.length === 0) { console.log('  (no pending items)\n'); }
+          else {
+            console.log(`  ${'Type'.padEnd(16)} ${'ID'.padEnd(10)} Status`);
+            console.log(`  ${'─'.repeat(16)} ${'─'.repeat(10)} ${'─'.repeat(10)}`);
+            for (const i of items) console.log(`  ${(i.type || '?').padEnd(16)} ${i.id.substring(0,8).padEnd(10)} ${i.status}`);
+            console.log(`\n  Total: ${items.length} pending`);
+          }
+        } catch(e) { console.log(`  Error: ${e.message}`); }
+        console.log('');
+        await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+      }); break;
+      case 'earnings': await withBack(async () => {
+        console.clear();
+        console.log('\n  ═══ Earnings Summary ═══\n');
+        const agents = getAgents();
+        for (const a of agents) {
+          try {
+            const agent = await createAgent(a);
+            const bal = await agent.client.getBalance();
+            const result = await agent.client.getMyJobs({ role: 'seller' });
+            agent.stop();
+            const completed = (result.data || []).filter(j => j.status === 'completed' || j.status === 'delivered');
+            const total = completed.reduce((s, j) => s + (parseFloat(j.amount) || 0), 0);
+            const balStr = (bal.balances || []).map(b => `${b.amount} ${b.currency}`).join(', ') || '0';
+            console.log(`  ${a.id.padEnd(10)} ${(a.identity || '').padEnd(30)} Balance: ${balStr.padEnd(20)} Jobs: ${completed.length} (${total.toFixed(2)} earned)`);
+          } catch(e) {
+            console.log(`  ${a.id.padEnd(10)} ${(a.identity || '').padEnd(30)} Error: ${e.message.substring(0, 40)}`);
+          }
+        }
+        console.log('');
+        await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+      }); break;
+      case 'docker': await withBack(async () => {
+        console.clear();
+        console.log('\n  ═══ Docker Containers ═══\n');
+        try {
+          const out = require('child_process').execSync('docker ps -a --filter name=j41-job --format "table {{.Names}}\t{{.Status}}\t{{.CreatedAt}}"', { encoding: 'utf8', timeout: 5000 });
+          console.log(out || '  (no j41 containers)\n');
+        } catch(e) { console.log(`  Error: ${e.message}`); }
+        console.log('');
+        await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+      }); break;
       case 'quit': process.exit(0);
     }
   }
