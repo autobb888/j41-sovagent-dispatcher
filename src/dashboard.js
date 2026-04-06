@@ -314,7 +314,7 @@ async function platformScreen(inquirer, keys) {
   console.log(`\n  ═══ Platform Profile: ${keys.identity} ═══\n`);
 
   try {
-    const agent = createAgent(keys);
+    const agent = await createAgent(keys);
     const detail = await agent.client.request('GET', `/v1/agents/${encodeURIComponent(keys.iAddress || keys.identity)}`);
     agent.stop();
 
@@ -343,7 +343,7 @@ async function servicesScreen(inquirer, keys) {
   console.log(`\n  ═══ Services: ${keys.identity} ═══\n`);
 
   try {
-    const agent = createAgent(keys);
+    const agent = await createAgent(keys);
     const result = await agent.client.getAgentServices(keys.iAddress || keys.identity);
     agent.stop();
 
