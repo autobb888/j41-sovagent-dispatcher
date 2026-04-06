@@ -94,6 +94,23 @@ function extractVdxfValue(entry) {
   return JSON.stringify(entry);
 }
 
+// ── Agent factory (suppress SDK logs) ──
+
+async function createAgent(keys) {
+  const { J41Agent } = require('@j41/sovagent-sdk');
+  const origLog = console.log;
+  console.log = () => {};
+  const agent = new J41Agent({
+    apiUrl: process.env.J41_API_URL || loadEnv().J41_API_URL || 'https://api.junction41.io',
+    wif: keys.wif,
+    identityName: keys.identity,
+    iAddress: keys.iAddress,
+  });
+  await agent.authenticate();
+  console.log = origLog;
+  return agent;
+}
+
 // ── Screens ──
 
 async function mainMenu(inquirer) {
@@ -245,20 +262,9 @@ async function vdxfScreen(inquirer, keys) {
   console.log(`\n  ═══ VDXF Keys: ${keys.identity} ═══\n`);
 
   try {
-    const { J41Agent } = require('@j41/sovagent-sdk');
-    // Suppress SDK console output
-    const origLog = console.log;
-    console.log = () => {};
-    const agent = new J41Agent({
-      apiUrl: process.env.J41_API_URL || loadEnv().J41_API_URL || 'https://api.junction41.io',
-      wif: keys.wif,
-      identityName: keys.identity,
-      iAddress: keys.iAddress,
-    });
-    await agent.authenticate();
+    const agent = await createAgent(keys);
     const { data: rawId } = await agent.client.getIdentityRaw();
     agent.stop();
-    console.log = origLog;
 
     const cmap = rawId.identity?.contentmultimap || {};
 
@@ -308,15 +314,8 @@ async function platformScreen(inquirer, keys) {
   console.log(`\n  ═══ Platform Profile: ${keys.identity} ═══\n`);
 
   try {
-    const { J41Agent } = require('@j41/sovagent-sdk');
-    const agent = new J41Agent({
-      apiUrl: process.env.J41_API_URL || loadEnv().J41_API_URL || 'https://api.junction41.io',
-      wif: keys.wif,
-      identityName: keys.identity,
-      iAddress: keys.iAddress,
-    });
-    await agent.authenticate();
-    const detail = await agent.client.request('GET', `/v1/agents/${encodeURIComponent(keys.identity)}`);
+    const agent = createAgent(keys);
+    const detail = await agent.client.request('GET', `/v1/agents/${encodeURIComponent(keys.iAddress || keys.identity)}`);
     agent.stop();
 
     const d = detail.data || detail;
@@ -328,9 +327,9 @@ async function platformScreen(inquirer, keys) {
     console.log(`  Workspace:      ${d.workspaceCapable ? 'enabled' : 'disabled'}`);
     console.log(`  Models:         ${(d.models || []).join(', ') || '(none)'}`);
     console.log(`  Category:       ${d.category || '(none)'}`);
-    console.log(`  Last Seen:      ${d.lastSeenAt || '?'}`);
+    console.log(`  Last Seen:      ${d.lastSeenAt || '(never)'}`);
     console.log(`  Created:        ${d.createdAt || '?'}`);
-    console.log(`  Description:    ${(d.description || '').substring(0, 100)}`);
+    console.log(`  Description:    ${(d.description || '(none)').substring(0, 100)}`);
   } catch (e) {
     console.log(`  Error: ${e.message}\n`);
   }
@@ -344,18 +343,11 @@ async function servicesScreen(inquirer, keys) {
   console.log(`\n  ═══ Services: ${keys.identity} ═══\n`);
 
   try {
-    const { J41Agent } = require('@j41/sovagent-sdk');
-    const agent = new J41Agent({
-      apiUrl: process.env.J41_API_URL || loadEnv().J41_API_URL || 'https://api.junction41.io',
-      wif: keys.wif,
-      identityName: keys.identity,
-      iAddress: keys.iAddress,
-    });
-    await agent.authenticate();
-    const services = await agent.client.request('GET', `/v1/agents/${encodeURIComponent(keys.identity)}/services`);
+    const agent = createAgent(keys);
+    const result = await agent.client.getAgentServices(keys.iAddress || keys.identity);
     agent.stop();
 
-    const list = services.data || services || [];
+    const list = result.data || result || [];
     if (list.length === 0) {
       console.log('  (no services registered)\n');
     } else {
@@ -364,6 +356,7 @@ async function servicesScreen(inquirer, keys) {
         console.log(`  [${i + 1}] ${s.name}`);
         console.log(`      Price: ${s.price} ${s.currency}  |  Status: ${s.status}  |  Category: ${s.category || '?'}`);
         console.log(`      Turnaround: ${s.turnaround || '?'}  |  SovGuard: ${s.sovguard ? 'yes' : 'no'}  |  Workspace: ${s.workspaceCapable ? 'yes' : 'no'}`);
+        console.log(`      ID: ${s.id}`);
         console.log(`      ${(s.description || '').substring(0, 100)}`);
         console.log('');
       }
@@ -393,14 +386,7 @@ async function jobsScreen(inquirer, keys) {
   console.log(`\n  ═══ Recent Jobs: ${keys.identity} ═══\n`);
 
   try {
-    const { J41Agent } = require('@j41/sovagent-sdk');
-    const agent = new J41Agent({
-      apiUrl: process.env.J41_API_URL || loadEnv().J41_API_URL || 'https://api.junction41.io',
-      wif: keys.wif,
-      identityName: keys.identity,
-      iAddress: keys.iAddress,
-    });
-    await agent.authenticate();
+    const agent = await createAgent(keys);
     const result = await agent.client.getMyJobs({ role: 'seller' });
     agent.stop();
 
