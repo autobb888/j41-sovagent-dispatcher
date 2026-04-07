@@ -493,6 +493,114 @@ async function statusScreen(inquirer) {
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
+async function createCustomTemplate(inquirer, tplDir) {
+  console.clear();
+  console.log('\n  ═══ Create Custom Template ═══\n');
+  console.log('  Fill in the profile and service details. This will be saved as a\n  reusable template for future agents.\n');
+
+  // Template name
+  const { tplName } = await promptWithEsc(inquirer, [{ type: 'input', name: 'tplName', message: 'Template name (lowercase, dashes):' }]);
+  if (!tplName) { console.log('\n  ❌ Name required.\n'); return null; }
+  if (fs.existsSync(path.join(tplDir, tplName))) { console.log(`\n  ❌ Template "${tplName}" already exists.\n`); return null; }
+
+  console.log('\n  ── Agent Profile ──\n');
+
+  const { profileName } = await promptWithEsc(inquirer, [{ type: 'input', name: 'profileName', message: 'Display name:', default: 'My Agent' }]);
+  const { profileType } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'profileType', message: 'Agent type:', choices: [
+    { name: '  autonomous — fully automated, no human in the loop', value: 'autonomous' },
+    { name: '  assisted — human-assisted AI', value: 'assisted' },
+    { name: '  hybrid — mix of automated and manual', value: 'hybrid' },
+    { name: '  tool — utility/function agent', value: 'tool' },
+  ]}]);
+  const { profileDesc } = await promptWithEsc(inquirer, [{ type: 'input', name: 'profileDesc', message: 'Description:' }]);
+  const { profileCategory } = await promptWithEsc(inquirer, [{ type: 'input', name: 'profileCategory', message: 'Category:', default: 'development' }]);
+  const { profileTags } = await promptWithEsc(inquirer, [{ type: 'input', name: 'profileTags', message: 'Tags (comma-separated):', default: 'ai,assistant' }]);
+  const { profileMarkup } = await promptWithEsc(inquirer, [{ type: 'input', name: 'profileMarkup', message: 'Markup % (0-50):', default: '0' }]);
+  const { profileModels } = await promptWithEsc(inquirer, [{ type: 'input', name: 'profileModels', message: 'Models (comma-separated):', default: 'moonshotai/kimi-k2.5' }]);
+  const { profileProtocols } = await promptWithEsc(inquirer, [{ type: 'checkbox', pageSize: 20, name: 'profileProtocols', message: 'Protocols:', choices: ['MCP', 'REST', 'A2A', 'WebSocket'], default: ['MCP', 'REST'] }]);
+  const { profileCapabilities } = await promptWithEsc(inquirer, [{ type: 'input', name: 'profileCapabilities', message: 'Capabilities (comma-separated):', default: 'code-review,analysis' }]);
+
+  // Workspace
+  const { workspaceEnabled } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'workspaceEnabled', message: 'Enable workspace (file access)?', default: true }]);
+  let workspaceModes = ['supervised'];
+  if (workspaceEnabled) {
+    const { modes } = await promptWithEsc(inquirer, [{ type: 'checkbox', pageSize: 20, name: 'modes', message: 'Workspace modes:', choices: ['supervised', 'standard'], default: ['supervised'] }]);
+    workspaceModes = modes;
+  }
+
+  // Session params
+  console.log('\n  ── Session Limits ──\n');
+  const { sessDuration } = await promptWithEsc(inquirer, [{ type: 'input', name: 'sessDuration', message: 'Max duration (seconds):', default: '7200' }]);
+  const { sessTokenLimit } = await promptWithEsc(inquirer, [{ type: 'input', name: 'sessTokenLimit', message: 'Token limit:', default: '200000' }]);
+  const { sessMessageLimit } = await promptWithEsc(inquirer, [{ type: 'input', name: 'sessMessageLimit', message: 'Message limit:', default: '100' }]);
+
+  // Service
+  console.log('\n  ── Default Service ──\n');
+  const { svcName } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcName', message: 'Service name:', default: profileName }]);
+  const { svcDesc } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcDesc', message: 'Service description:', default: profileDesc }]);
+  const { svcPrice } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcPrice', message: 'Price:', default: '0.5' }]);
+  const { svcCurrency } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcCurrency', message: 'Currency:', default: 'VRSCTEST' }]);
+  const { svcCategory } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcCategory', message: 'Category:', default: profileCategory }]);
+  const { svcTurnaround } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcTurnaround', message: 'Turnaround:', default: '15 minutes' }]);
+  const { svcPayment } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'svcPayment', message: 'Payment terms:', choices: ['prepay', 'postpay', 'split'], default: 'prepay' }]);
+  const { svcSovguard } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'svcSovguard', message: 'Enable SovGuard?', default: true }]);
+
+  // SOUL.md
+  console.log('\n  ── Agent Personality ──\n');
+  const { soulPrompt } = await promptWithEsc(inquirer, [{ type: 'editor', name: 'soulPrompt', message: 'SOUL.md (system prompt — opens editor):', default: `You are ${profileName}, a ${profileType} AI agent.\n\n${profileDesc}\n\nBe helpful, concise, and professional.` }]);
+
+  // Build config
+  const config = {
+    template: tplName,
+    profile: {
+      name: profileName,
+      type: profileType,
+      description: profileDesc,
+      network: {
+        capabilities: profileCapabilities.split(',').map(s => s.trim()).filter(Boolean),
+        protocols: profileProtocols,
+      },
+      profile: {
+        category: profileCategory,
+        tags: profileTags.split(',').map(s => s.trim()).filter(Boolean),
+      },
+      models: profileModels.split(',').map(s => s.trim()).filter(Boolean),
+      markup: parseInt(profileMarkup) || 0,
+      session: {
+        duration: parseInt(sessDuration) || 7200,
+        tokenLimit: parseInt(sessTokenLimit) || 200000,
+        messageLimit: parseInt(sessMessageLimit) || 100,
+      },
+      workspace: workspaceEnabled ? {
+        enabled: true,
+        modes: workspaceModes,
+        tools: ['read_file', 'write_file', 'list_directory'],
+      } : { enabled: false },
+    },
+    service: {
+      name: svcName,
+      description: svcDesc,
+      price: svcPrice,
+      currency: svcCurrency,
+      category: svcCategory,
+      turnaround: svcTurnaround,
+      paymentTerms: svcPayment,
+      sovguard: svcSovguard,
+    },
+  };
+
+  // Save template
+  const tplPath = path.join(tplDir, tplName);
+  fs.mkdirSync(tplPath, { recursive: true });
+  fs.writeFileSync(path.join(tplPath, 'config.json'), JSON.stringify(config, null, 2));
+  fs.writeFileSync(path.join(tplPath, 'SOUL.md'), soulPrompt);
+
+  console.log(`\n  ✅ Template "${tplName}" saved to templates/${tplName}/`);
+  console.log(`  Files: config.json, SOUL.md\n`);
+
+  return tplName;
+}
+
 async function addAgentScreen(inquirer) {
   console.clear();
   console.log('\n  ═══ Add New Agent ═══\n');
@@ -516,10 +624,22 @@ async function addAgentScreen(inquirer) {
   let templates = [];
   try { templates = fs.readdirSync(tplDir).filter(d => fs.existsSync(path.join(tplDir, d, 'config.json'))); } catch {}
 
-  let template = 'general-assistant';
-  if (templates.length > 0) {
-    const { tpl } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'tpl', message: 'Select template:', choices: templates.map(t => ({ name: `  ${t}`, value: t })) }]);
-    template = tpl;
+  const { tpl } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'tpl', message: 'Select template:', choices: [
+    ...templates.map(t => {
+      try {
+        const cfg = JSON.parse(fs.readFileSync(path.join(tplDir, t, 'config.json'), 'utf8'));
+        return { name: `  ${t.padEnd(22)} ${cfg.profile?.description?.substring(0, 50) || ''}`, value: t };
+      } catch { return { name: `  ${t}`, value: t }; }
+    }),
+    new inquirer.Separator(),
+    { name: '  + Create Custom Template', value: '__custom' },
+  ]}]);
+
+  let template = tpl;
+
+  if (template === '__custom') {
+    template = await createCustomTemplate(inquirer, tplDir);
+    if (!template) return;
   }
 
   console.log(`\n  ─── Creating Agent ───`);
