@@ -493,6 +493,189 @@ async function statusScreen(inquirer) {
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
+async function addAgentScreen(inquirer) {
+  console.clear();
+  console.log('\n  ═══ Add New Agent ═══\n');
+
+  const agents = getAgents();
+  const nextNum = agents.length + 1;
+  const defaultId = `agent-${nextNum}`;
+
+  const { agentId } = await promptWithEsc(inquirer, [{ type: 'input', name: 'agentId', message: 'Agent ID (local identifier):', default: defaultId }]);
+  if (fs.existsSync(path.join(AGENTS_DIR, agentId, 'keys.json'))) {
+    console.log(`\n  ❌ Agent ${agentId} already exists.\n`);
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'Identity name (lowercase, no spaces — becomes <name>.agentplatform@):' }]);
+  if (!name) { console.log('\n  ❌ Name required.\n'); return; }
+
+  // Check available templates
+  const tplDir = path.join(__dirname, '..', 'templates');
+  let templates = [];
+  try { templates = fs.readdirSync(tplDir).filter(d => fs.existsSync(path.join(tplDir, d, 'config.json'))); } catch {}
+
+  let template = 'general-assistant';
+  if (templates.length > 0) {
+    const { tpl } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'tpl', message: 'Select template:', choices: templates.map(t => ({ name: `  ${t}`, value: t })) }]);
+    template = tpl;
+  }
+
+  console.log(`\n  ─── Creating Agent ───`);
+  console.log(`  ID:       ${agentId}`);
+  console.log(`  Identity: ${name}.agentplatform@`);
+  console.log(`  Template: ${template}\n`);
+
+  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Proceed with setup?', default: true }]);
+  if (!confirm) return;
+
+  // Run the setup command
+  const { execSync } = require('child_process');
+  try {
+    console.log('');
+    execSync(`node src/cli.js setup ${agentId} ${name} --template ${template}`, { stdio: 'inherit', timeout: 120000 });
+    console.log('\n  ✅ Agent created successfully.\n');
+  } catch (e) {
+    console.log(`\n  ❌ Setup failed: ${e.message}\n`);
+  }
+
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
+async function configureServicesScreen(inquirer) {
+  const agents = getAgents();
+  if (agents.length === 0) {
+    console.log('\n  No agents registered. Add an agent first.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  const { agentId } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'agentId', message: 'Select agent to manage services:', choices: agents.map(a => ({ name: `  ${a.id.padEnd(10)} ${a.identity}`, value: a.id })) }]);
+  const keys = agents.find(a => a.id === agentId);
+  if (!keys) return;
+
+  console.clear();
+  console.log(`\n  ═══ Services: ${keys.identity} ═══\n`);
+
+  // Show existing services
+  try {
+    const agent = await createAgent(keys);
+    const result = await agent.client.getAgentServices(keys.iAddress || keys.identity);
+    agent.stop();
+    const list = result.data || result || [];
+    if (list.length > 0) {
+      console.log('  Current services:\n');
+      for (const s of list) {
+        console.log(`  • ${s.name} — ${s.price} ${s.currency} (${s.status})`);
+      }
+      console.log('');
+    } else {
+      console.log('  No services registered yet.\n');
+    }
+  } catch (e) {
+    console.log(`  Could not fetch services: ${e.message}\n`);
+  }
+
+  const { action } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'action', message: 'What would you like to do?', choices: [
+    { name: '  Add new service', value: 'add' },
+    { name: '  ← Back', value: '__back' },
+  ]}]);
+
+  if (action === '__back') return;
+
+  // Add service interactively
+  const { svcName } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcName', message: 'Service name:', default: 'Code Review' }]);
+  const { svcDesc } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcDesc', message: 'Description:' }]);
+  const { svcPrice } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcPrice', message: 'Price:', default: '0.5' }]);
+  const { svcCurrency } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcCurrency', message: 'Currency:', default: 'VRSCTEST' }]);
+  const { svcCategory } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcCategory', message: 'Category:', default: 'development' }]);
+  const { svcTurnaround } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcTurnaround', message: 'Turnaround:', default: '15 minutes' }]);
+  const { svcSovguard } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'svcSovguard', message: 'Enable SovGuard?', default: true }]);
+
+  try {
+    const agent = await createAgent(keys);
+    await agent.registerService({
+      name: svcName,
+      description: svcDesc,
+      price: parseFloat(svcPrice),
+      currency: svcCurrency,
+      category: svcCategory,
+      turnaround: svcTurnaround,
+      paymentTerms: 'prepay',
+      sovguard: svcSovguard,
+    });
+    agent.stop();
+    console.log('\n  ✅ Service registered.\n');
+  } catch (e) {
+    console.log(`\n  ❌ Failed: ${e.message}\n`);
+  }
+
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
+async function securityScreen(inquirer) {
+  console.clear();
+  console.log('\n  ═══ Security Setup ═══\n');
+
+  // Check current security status
+  try {
+    const secureSetup = require('@j41/secure-setup');
+    const isolation = await secureSetup.detectIsolation();
+    const platform = await secureSetup.detectPlatform();
+
+    console.log(`  Platform:    ${platform.os} ${platform.arch} ${platform.distro || ''}`);
+    console.log(`  Docker:      ${platform.hasDocker ? 'yes' : 'no'}`);
+    console.log(`  KVM:         ${platform.hasKVM ? 'yes' : 'no'}`);
+    console.log(`  gVisor:      ${isolation.gvisorInstalled ? 'installed' + (isolation.gvisorDefault ? ' (default runtime)' : '') : 'not installed'}`);
+    console.log(`  Bubblewrap:  ${isolation.bwrapInstalled ? 'installed' : 'not installed'}`);
+    console.log(`  Seccomp:     ${isolation.seccompProfilesDeployed ? 'profiles deployed' : 'not deployed'}`);
+    console.log(`  Score:       ${isolation.score}/10 (${isolation.mode})`);
+    console.log('');
+
+    if (isolation.score < 8) {
+      console.log('  ⚠️  Security score below 8 — consider running setup to improve.\n');
+    } else {
+      console.log('  ✅ Security is properly configured.\n');
+    }
+  } catch (e) {
+    console.log(`  @j41/secure-setup not available: ${e.message}`);
+    console.log('  Install: yarn add @j41/secure-setup\n');
+  }
+
+  const { action } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'action', message: 'Options:', choices: [
+    { name: '  Run security setup (install/update profiles)', value: 'setup' },
+    { name: '  Run self-test (container escape attempts)', value: 'test' },
+    { name: '  Check profile integrity', value: 'check' },
+    { name: '  ← Back', value: '__back' },
+  ]}]);
+
+  if (action === '__back') return;
+
+  const { execSync } = require('child_process');
+  try {
+    switch (action) {
+      case 'setup':
+        console.log('\n  Running security setup...\n');
+        execSync('node -e "require(\'@j41/secure-setup\').setup(\'dispatcher\').then(r => console.log(JSON.stringify(r, null, 2)))"', { stdio: 'inherit', timeout: 60000 });
+        break;
+      case 'test':
+        console.log('\n  Running self-test...\n');
+        execSync('node -e "require(\'@j41/secure-setup\').selfTest().then(r => { for (const t of r.tests) console.log((t.passed ? \'  ✅\' : \'  ❌\') + \' \' + t.name + \': \' + t.detail); console.log(\'\\n  Score: \' + r.score + \'/10\'); })"', { stdio: 'inherit', timeout: 60000 });
+        break;
+      case 'check':
+        console.log('\n  Checking profiles...\n');
+        execSync('node -e "require(\'@j41/secure-setup\').quickCheck(\'dispatcher\').then(r => { for (const c of r.checks) console.log((c.status === \'pass\' ? \'  ✅\' : \'  ⚠️ \') + \' \' + c.name + \': \' + c.detail); })"', { stdio: 'inherit', timeout: 30000 });
+        break;
+    }
+  } catch (e) {
+    console.log(`\n  Error: ${e.message}`);
+  }
+
+  console.log('');
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
 async function llmScreen(inquirer) {
   console.clear();
   console.log(`\n  ═══ LLM Provider Configuration ═══\n`);
@@ -574,19 +757,10 @@ async function main() {
 
     switch (choice) {
       case 'agents': await withBack(() => agentListScreen(inquirer)); break;
-      case 'add':
-        console.log('\n  Run: node src/cli.js setup <agent-id> <identity-name>\n');
-        await withBack(() => promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]));
-        break;
+      case 'add': await withBack(() => addAgentScreen(inquirer)); break;
       case 'llm': await withBack(() => llmScreen(inquirer)); break;
-      case 'services':
-        console.log('\n  Select an agent from "View Agents" to manage services.\n');
-        await withBack(() => promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]));
-        break;
-      case 'security':
-        console.log('\n  Run: npx j41-secure-setup --check\n');
-        await withBack(() => promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]));
-        break;
+      case 'services': await withBack(() => configureServicesScreen(inquirer)); break;
+      case 'security': await withBack(() => securityScreen(inquirer)); break;
       case 'start': {
         const status = getDispatcherStatus();
         if (status.running) {
