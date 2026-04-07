@@ -493,6 +493,33 @@ async function statusScreen(inquirer) {
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
+/** Fetch categories from platform and show as a list picker */
+async function pickCategory(inquirer, defaultVal) {
+  let categories = [];
+  try {
+    const tmpAgent = await createAgent(getAgents()[0]);
+    const result = await tmpAgent.client.request('GET', '/v1/services/categories');
+    tmpAgent.stop();
+    categories = Array.isArray(result.data || result) ? (result.data || result) : [];
+  } catch {}
+
+  if (categories.length > 0 && categories[0]?.id) {
+    const catChoices = [];
+    for (const cat of categories) {
+      catChoices.push({ name: `  ${cat.icon || ''} ${cat.name}`, value: cat.id });
+      if (cat.subs?.length > 0) {
+        for (const sub of cat.subs) {
+          catChoices.push({ name: `     └─ ${sub}`, value: `${cat.id}:${sub.toLowerCase().replace(/[^a-z0-9]/g, '-')}` });
+        }
+      }
+    }
+    const { cat } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'cat', message: 'Category:', choices: catChoices }]);
+    return cat;
+  }
+  const { cat } = await promptWithEsc(inquirer, [{ type: 'input', name: 'cat', message: 'Category:', default: defaultVal || 'development' }]);
+  return cat;
+}
+
 async function createCustomTemplate(inquirer, tplDir) {
   console.clear();
   console.log('\n  ═══ Create Custom Template ═══\n');
@@ -513,7 +540,7 @@ async function createCustomTemplate(inquirer, tplDir) {
     { name: '  tool — utility/function agent', value: 'tool' },
   ]}]);
   const { profileDesc } = await promptWithEsc(inquirer, [{ type: 'input', name: 'profileDesc', message: 'Description:' }]);
-  const { profileCategory } = await promptWithEsc(inquirer, [{ type: 'input', name: 'profileCategory', message: 'Category:', default: 'development' }]);
+  const profileCategory = await pickCategory(inquirer, 'development');
   const { profileTags } = await promptWithEsc(inquirer, [{ type: 'input', name: 'profileTags', message: 'Tags (comma-separated):', default: 'ai,assistant' }]);
   const { profileMarkup } = await promptWithEsc(inquirer, [{ type: 'input', name: 'profileMarkup', message: 'Markup % (0-50):', default: '0' }]);
   const { profileModels } = await promptWithEsc(inquirer, [{ type: 'input', name: 'profileModels', message: 'Models (comma-separated):', default: 'moonshotai/kimi-k2.5' }]);
@@ -540,7 +567,7 @@ async function createCustomTemplate(inquirer, tplDir) {
   const { svcDesc } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcDesc', message: 'Service description:', default: profileDesc }]);
   const { svcPrice } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcPrice', message: 'Price:', default: '0.5' }]);
   const { svcCurrency } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcCurrency', message: 'Currency:', default: 'VRSCTEST' }]);
-  const { svcCategory } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcCategory', message: 'Category:', default: profileCategory }]);
+  const svcCategory = await pickCategory(inquirer, profileCategory);
   const { svcTurnaround } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcTurnaround', message: 'Turnaround:', default: '15 minutes' }]);
   const { svcPayment } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'svcPayment', message: 'Payment terms:', choices: ['prepay', 'postpay', 'split'], default: 'prepay' }]);
   const { svcSovguard } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'svcSovguard', message: 'Enable SovGuard?', default: true }]);
@@ -709,7 +736,7 @@ async function configureServicesScreen(inquirer) {
   const { svcDesc } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcDesc', message: 'Description:' }]);
   const { svcPrice } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcPrice', message: 'Price:', default: '0.5' }]);
   const { svcCurrency } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcCurrency', message: 'Currency:', default: 'VRSCTEST' }]);
-  const { svcCategory } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcCategory', message: 'Category:', default: 'development' }]);
+  const svcCategory = await pickCategory(inquirer, 'development');
   const { svcTurnaround } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcTurnaround', message: 'Turnaround:', default: '15 minutes' }]);
   const { svcSovguard } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'svcSovguard', message: 'Enable SovGuard?', default: true }]);
 
