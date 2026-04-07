@@ -493,15 +493,26 @@ async function statusScreen(inquirer) {
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
-/** Fetch categories from platform and show as a list picker */
-async function pickCategory(inquirer, defaultVal) {
-  let categories = [];
+/** Fetch categories from platform — cached per session */
+let _cachedCategories = null;
+async function fetchCategories() {
+  if (_cachedCategories) return _cachedCategories;
   try {
-    const tmpAgent = await createAgent(getAgents()[0]);
-    const result = await tmpAgent.client.request('GET', '/v1/services/categories');
-    tmpAgent.stop();
-    categories = Array.isArray(result.data || result) ? (result.data || result) : [];
-  } catch {}
+    const agents = getAgents();
+    if (agents.length === 0) return [];
+    const agent = await createAgent(agents[0]);
+    const result = await agent.client.request('GET', '/v1/services/categories');
+    agent.stop();
+    _cachedCategories = Array.isArray(result.data || result) ? (result.data || result) : [];
+  } catch {
+    _cachedCategories = [];
+  }
+  return _cachedCategories;
+}
+
+/** Show category picker with subcategories */
+async function pickCategory(inquirer, defaultVal) {
+  const categories = await fetchCategories();
 
   if (categories.length > 0 && categories[0]?.id) {
     const catChoices = [];
@@ -526,9 +537,12 @@ async function createCustomTemplate(inquirer, tplDir) {
   console.log('  Fill in the profile and service details. This will be saved as a\n  reusable template for future agents.\n');
 
   // Template name
-  const { tplName } = await promptWithEsc(inquirer, [{ type: 'input', name: 'tplName', message: 'Template name (lowercase, dashes):' }]);
-  if (!tplName) { console.log('\n  ❌ Name required.\n'); return null; }
+  const { rawTplName } = await promptWithEsc(inquirer, [{ type: 'input', name: 'rawTplName', message: 'Template name (lowercase, dashes):' }]);
+  if (!rawTplName) { console.log('\n  ❌ Name required.\n'); return null; }
+  const tplName = rawTplName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+  if (!tplName) { console.log('\n  ❌ Invalid name.\n'); return null; }
   if (fs.existsSync(path.join(tplDir, tplName))) { console.log(`\n  ❌ Template "${tplName}" already exists.\n`); return null; }
+  if (tplName !== rawTplName) console.log(`  → Normalized to: ${tplName}`);
 
   console.log('\n  ── Agent Profile ──\n');
 
