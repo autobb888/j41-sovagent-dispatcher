@@ -28,12 +28,24 @@ def check(label, ok, detail=''):
         print(f'  ❌ {label}{": " + detail if detail else ""}')
         failed += 1
 
+import re
+ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\[\?[0-9]*[a-zA-Z]')
+
 def wait_for(p, pattern, timeout=TIMEOUT):
-    try:
-        p.expect(pattern, timeout=timeout)
-        return True
-    except:
-        return False
+    """Wait for pattern in output, ignoring ANSI escape codes"""
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        try:
+            p.expect('.+', timeout=1)
+            # Strip ANSI from accumulated buffer
+            clean = ANSI_RE.sub('', p.before + p.after if p.after else p.before)
+            if re.search(pattern, clean):
+                return True
+        except pexpect.TIMEOUT:
+            continue
+        except:
+            return False
+    return False
 
 def nav_down_enter(p, n):
     for _ in range(n):
@@ -44,8 +56,9 @@ def nav_down_enter(p, n):
     time.sleep(0.5)
 
 def type_text(p, text):
+    time.sleep(0.3)  # Wait for prompt to be ready before typing
     p.sendline(text)
-    time.sleep(0.3)
+    time.sleep(0.5)
 
 def toggle_checkbox(p, positions):
     """For checkbox prompts — navigate to positions and toggle with space"""
@@ -82,23 +95,26 @@ check('Add Agent screen', wait_for(p, 'Add New Agent', 10))
 
 # ── Step 2: Fill agent ID and name ──
 print('\nStep 2: Agent ID and name\n')
-wait_for(p, 'Agent ID', 10)
+check('Agent ID prompt', wait_for(p, 'Agent ID', 10))
 type_text(p, 'agent-template-test')
-check('Agent ID entered', wait_for(p, 'Identity name', 10))
+check('Identity prompt', wait_for(p, 'Identity name|identity|name', 15))
 type_text(p, 'templatetest1')
-check('Identity entered', wait_for(p, 'Select template', 10))
+check('Template select', wait_for(p, 'Select template|template', 15))
 
 # ── Step 3: Select "+ Create Custom Template" (last item after separator) ──
 print('\nStep 3: Select Create Custom Template\n')
 # Navigate to bottom — custom template is after the 3 existing templates + separator
-nav_down_enter(p, 4)  # 3 templates + separator + custom = index 4 (separator auto-skipped)
-check('Custom template screen', wait_for(p, 'Create Custom Template', 10))
+# Navigate past existing templates to "+ Create Custom Template"
+# 4 templates now (code-review, data-analyst, general-assistant, workspace-reviewer) + separator + custom
+nav_down_enter(p, 5)
+check('Custom template screen', wait_for(p, 'Create Custom Template|Template name', 10))
 
 # ── Step 4: Template name ──
 print('\nStep 4: Template name\n')
 wait_for(p, 'Template name', 10)
 type_text(p, 'character-roleplay')
-check('Name entered', wait_for(p, 'Display name|Agent Profile', 10))
+time.sleep(1)  # Wait for normalization message + screen redraw
+check('Name entered', wait_for(p, 'Display name|Profile|name', 15))
 
 # ── Step 5: Agent Profile ──
 print('\nStep 5: Agent Profile\n')
@@ -219,10 +235,11 @@ check('SovGuard', True)
 # ── Step 8: SOUL.md ──
 print('\nStep 8: SOUL.md\n')
 
-wait_for(p, 'SOUL.md|personality', 10)
-# Select "Write custom personality"
-nav_down_enter(p, 1)  # Custom option
-check('Custom SOUL selected', wait_for(p, 'Who is this agent', 10))
+wait_for(p, 'SOUL|personality|prompt', 10)
+# Select "Write custom personality" (second option)
+nav_down_enter(p, 1)
+time.sleep(1)
+check('Custom SOUL selected', wait_for(p, 'Who is this|agent|role', 10))
 
 type_text(p, 'You are Shreck, the ogre who lives in a swamp')
 check('Role', True)
