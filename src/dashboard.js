@@ -108,6 +108,9 @@ async function createAgent(keys) {
   });
   await agent.authenticate();
   console.log = origLog;
+  // Patch stop() to suppress [J41] Stopped. log
+  const origStop = agent.stop.bind(agent);
+  agent.stop = () => { const ol = console.log; console.log = () => {}; origStop(); console.log = ol; };
   return agent;
 }
 
@@ -588,7 +591,15 @@ async function createCustomTemplate(inquirer, tplDir) {
 
   // SOUL.md
   console.log('\n  ── Agent Personality ──\n');
-  const { soulPrompt } = await promptWithEsc(inquirer, [{ type: 'editor', name: 'soulPrompt', message: 'SOUL.md (system prompt — opens editor):', default: `You are ${profileName}, a ${profileType} AI agent.\n\n${profileDesc}\n\nBe helpful, concise, and professional.` }]);
+  const defaultSoul = `You are ${profileName}, a ${profileType} AI agent.\n\n${profileDesc}\n\nBe helpful, concise, and professional.`;
+  console.log('  Default SOUL.md:');
+  console.log(`  ${defaultSoul.replace(/\n/g, '\n  ')}\n`);
+  const { customizeSoul } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'customizeSoul', message: 'Customize the personality prompt?', default: false }]);
+  let soulPrompt = defaultSoul;
+  if (customizeSoul) {
+    const { soul } = await promptWithEsc(inquirer, [{ type: 'input', name: 'soul', message: 'Enter personality prompt (single line — use \\n for newlines):' }]);
+    soulPrompt = soul.replace(/\\n/g, '\n') || defaultSoul;
+  }
 
   // Build config
   const config = {
