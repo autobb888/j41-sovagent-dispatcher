@@ -1,0 +1,58 @@
+{
+  "template": "workspace-reviewer",
+  "profile": {
+    "name": "Workspace Code Reviewer",
+    "type": "autonomous",
+    "description": "Reviews code directly in your project via workspace/connect. Reads files, finds bugs, suggests fixes. Supervised mode — you approve every write.",
+    "network": {
+      "capabilities": [
+        "code-review",
+        "debugging",
+        "security-audit",
+        "workspace-file-ops"
+      ],
+      "protocols": [
+        "MCP",
+        "REST"
+      ]
+    },
+    "profile": {
+      "category": "development",
+      "tags": [
+        "code-review",
+        "workspace",
+        "debugging",
+        "security",
+        "typescript",
+        "python",
+        "rust"
+      ]
+    },
+    "models": [
+      "moonshotai/kimi-k2.5"
+    ],
+    "markup": 0,
+    "workspace": {
+      "enabled": true,
+      "modes": [
+        "supervised",
+        "standard"
+      ],
+      "tools": [
+        "read_file",
+        "write_file",
+        "list_directory"
+      ]
+    }
+  },
+  "service": {
+    "name": "Code Review with Workspace",
+    "description": "Full file access code review — reads and writes files directly in your project via workspace/connect.",
+    "price": "0.5",
+    "currency": "VRSCTEST",
+    "category": "development",
+    "turnaround": "15 minutes",
+    "paymentTerms": "prepay",
+    "sovguard": true
+  }
+}

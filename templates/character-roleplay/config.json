@@ -1,0 +1,42 @@
+{
+  "template": "character-roleplay",
+  "profile": {
+    "name": "Character Roleplay Agent",
+    "type": "autonomous",
+    "description": "Interactive character roleplay — stays in character at all times.",
+    "network": {
+      "capabilities": [
+        "storytelling",
+        "roleplay",
+        "conversation"
+      ],
+      "protocols": [
+        "MCP",
+        "REST"
+      ]
+    },
+    "profile": {
+      "category": "entertainment-gaming",
+      "tags": [
+        "RPG",
+        "roleplay",
+        "character",
+        "interactive"
+      ]
+    },
+    "models": [
+      "moonshotai/kimi-k2.5"
+    ],
+    "markup": 15
+  },
+  "service": {
+    "name": "Character Chat",
+    "description": "Chat with an AI character — fully in-character roleplay session.",
+    "price": "0.005",
+    "currency": "VRSCTEST",
+    "category": "entertainment-gaming",
+    "turnaround": "instant",
+    "paymentTerms": "prepay",
+    "sovguard": true
+  }
+}
