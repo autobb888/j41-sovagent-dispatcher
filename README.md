@@ -82,8 +82,43 @@ Select an agent to see:
 - **VDXF Keys** — all 24 on-chain keys with values, `(not set)` for empty ones
 - **Platform Profile** — name, status, trust tier, reviews, models, workspace
 - **Services** — price, category, turnaround, SovGuard, workspace capability
-- **SOUL.md** — agent personality / system prompt
+- **SOUL.md** — view or **edit** the agent personality with guided builder
 - **Jobs** — recent jobs with status, amount, description
+
+### Add New Agent
+
+Choose from 5 built-in templates or **create a custom template**:
+
+| Template | Description |
+|----------|-------------|
+| `general-assistant` | Writing, research, analysis, problem-solving |
+| `code-review` | Bug detection, security audit, optimization |
+| `data-analyst` | Statistical analysis, visualization, forecasting |
+| `character-roleplay` | In-character AI — stays in role, SovGuard enabled |
+| `workspace-reviewer` | Direct file access code review via workspace/connect |
+
+**Custom Template Builder** prompts for every field:
+- Profile: name, type, description, category (fetched from platform API), tags, markup, models, protocols, capabilities
+- Workspace: enable/disable, modes (supervised/standard)
+- Session limits: duration, tokens, messages
+- Service: name, price, currency, turnaround, payment terms, SovGuard
+- **SOUL.md personality builder**: role, traits, rules, style, catchphrases — with preview
+
+Templates are saved to `templates/<name>/` and reusable for future agents.
+
+### SOUL.md Editor
+
+Build agent personalities line by line:
+```
+? Who is this agent?: You are Shreck, an ogre in a swamp
+? Personality traits: Grumpy but kind, Scottish accent
+? Rules/constraints: Never break character, never say you are an AI
+? Communication style: Short sentences, ogre metaphors
+? Key phrases: What are ye doin in me swamp, ogres have layers
+? Anything else: You secretly love Fiona
+```
+
+Available from: Create Custom Template, or View Agents → SOUL.md → Edit.
 
 ## CLI Commands
 
@@ -471,9 +506,36 @@ j41-secure-setup --check --dispatcher   # quick config validation
 j41-secure-setup --test --dispatcher    # full test (spawns containers, attempts escapes)
 ```
 
+## Testing
+
+```bash
+# Unit test: template creation (47 checks)
+node scripts/test-create-template.js
+
+# Unit test: full agent setup flow (32 checks)
+node scripts/test-full-flow.js [agent-id] [identity-name]
+
+# Interactive TUI test (24 checks, requires pexpect)
+python3 scripts/test-interactive.py
+```
+
 ## SDK Dependency
 
-The dispatcher depends on `@j41/sovagent-sdk`. During development it is referenced as a local path (`file:../j41-sovagent-sdk`). The published package will use `@j41/sovagent-sdk@^2.0.0`.
+The dispatcher depends on `@j41/sovagent-sdk`. During development, symlink the entire package:
+
+```bash
+ln -s /path/to/j41-sovagent-sdk node_modules/@j41/sovagent-sdk
+```
+
+To rebuild the Docker image (SDK not yet on npm):
+
+```bash
+rm -rf .docker-sdk && mkdir -p .docker-sdk/dist
+cp -rL ../j41-sovagent-sdk/dist/* .docker-sdk/dist/
+cp ../j41-sovagent-sdk/package.json .docker-sdk/
+cp -rL ../j41-sovagent-sdk/node_modules .docker-sdk/node_modules
+docker build -f Dockerfile.job-agent -t j41/job-agent:latest .
+```
 
 ## License
 
