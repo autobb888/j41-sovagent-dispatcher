@@ -8,11 +8,12 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+const REPO_DIR = path.join(__dirname, '..');
 const J41_DIR = path.join(os.homedir(), '.j41');
 const DISPATCHER_DIR = path.join(J41_DIR, 'dispatcher');
 const AGENTS_DIR = path.join(DISPATCHER_DIR, 'agents');
 const CONFIG_FILE = path.join(DISPATCHER_DIR, 'config.json');
-const ENV_FILE = path.join(__dirname, '..', '.env');
+const ENV_FILE = path.join(REPO_DIR, '.env');
 
 // ── VDXF key → human name mapping ──
 const VDXF_KEY_NAMES = {
@@ -100,18 +101,23 @@ async function createAgent(keys) {
   const { J41Agent } = require('@j41/sovagent-sdk');
   const origLog = console.log;
   console.log = () => {};
-  const agent = new J41Agent({
-    apiUrl: process.env.J41_API_URL || loadEnv().J41_API_URL || 'https://api.junction41.io',
-    wif: keys.wif,
-    identityName: keys.identity,
-    iAddress: keys.iAddress,
-  });
-  await agent.authenticate();
-  console.log = origLog;
-  // Patch stop() to suppress [J41] Stopped. log
-  const origStop = agent.stop.bind(agent);
-  agent.stop = () => { const ol = console.log; console.log = () => {}; origStop(); console.log = ol; };
-  return agent;
+  try {
+    const agent = new J41Agent({
+      apiUrl: process.env.J41_API_URL || loadEnv().J41_API_URL || 'https://api.junction41.io',
+      wif: keys.wif,
+      identityName: keys.identity,
+      iAddress: keys.iAddress,
+    });
+    await agent.authenticate();
+    console.log = origLog;
+    // Patch stop() to suppress [J41] Stopped. log
+    const origStop = agent.stop.bind(agent);
+    agent.stop = () => { const ol = console.log; console.log = () => {}; origStop(); console.log = ol; };
+    return agent;
+  } catch (e) {
+    console.log = origLog;
+    throw e;
+  }
 }
 
 // ── ESC-to-back support ──
@@ -313,8 +319,8 @@ async function vdxfScreen(inquirer, keys) {
 
   try {
     const agent = await createAgent(keys);
-    const { data: rawId } = await agent.client.getIdentityRaw();
-    agent.stop();
+    let rawId;
+    try { rawId = (await agent.client.getIdentityRaw()).data; } finally { agent.stop(); }
 
     const cmap = rawId.identity?.contentmultimap || {};
 
@@ -365,10 +371,11 @@ async function platformScreen(inquirer, keys) {
 
   try {
     const agent = await createAgent(keys);
-    const detail = await agent.client.request('GET', `/v1/agents/${encodeURIComponent(keys.iAddress || keys.identity)}`);
-    agent.stop();
-
-    const d = detail.data || detail;
+    let d;
+    try {
+      d = await agent.client.getAgent(keys.iAddress || keys.identity);
+    } finally { agent.stop(); }
+    d = d?.data || d;
     console.log(`  Name:           ${d.name || '(none)'}`);
     console.log(`  Status:         ${d.status || '?'} ${d.online ? '● online' : '○ offline'}`);
     console.log(`  Type:           ${d.type || '?'}`);
@@ -394,8 +401,8 @@ async function servicesScreen(inquirer, keys) {
 
   try {
     const agent = await createAgent(keys);
-    const result = await agent.client.getAgentServices(keys.iAddress || keys.identity);
-    agent.stop();
+    let result;
+    try { result = await agent.client.getAgentServices(keys.iAddress || keys.identity); } finally { agent.stop(); }
 
     const list = result.data || result || [];
     if (list.length === 0) {
@@ -437,8 +444,8 @@ async function jobsScreen(inquirer, keys) {
 
   try {
     const agent = await createAgent(keys);
-    const result = await agent.client.getMyJobs({ role: 'seller' });
-    agent.stop();
+    let result;
+    try { result = await agent.client.getMyJobs({ role: 'seller' }); } finally { agent.stop(); }
 
     const jobs = (result.data || []).slice(0, 15);
     if (jobs.length === 0) {
@@ -504,9 +511,10 @@ async function fetchCategories() {
     const agents = getAgents();
     if (agents.length === 0) return [];
     const agent = await createAgent(agents[0]);
-    const result = await agent.client.request('GET', '/v1/services/categories');
-    agent.stop();
-    _cachedCategories = Array.isArray(result.data || result) ? (result.data || result) : [];
+    try {
+      const result = await agent.client.getServiceCategories();
+      _cachedCategories = Array.isArray(result) ? result : (result?.data || []);
+    } finally { agent.stop(); }
   } catch {
     _cachedCategories = [];
   }
@@ -706,7 +714,7 @@ async function addAgentScreen(inquirer) {
   const { execSync } = require('child_process');
   try {
     console.log('');
-    execSync(`node src/cli.js setup ${agentId} ${name} --template ${template}`, { stdio: 'inherit', timeout: 120000 });
+    execSync(`node src/cli.js setup ${agentId} ${name} --template ${template}`, { cwd: REPO_DIR, stdio: 'inherit', timeout: 120000 });
     console.log('\n  ✅ Agent created successfully.\n');
   } catch (e) {
     console.log(`\n  ❌ Setup failed: ${e.message}\n`);
@@ -733,9 +741,8 @@ async function configureServicesScreen(inquirer) {
   // Show existing services
   try {
     const agent = await createAgent(keys);
-    const result = await agent.client.getAgentServices(keys.iAddress || keys.identity);
-    agent.stop();
-    const list = result.data || result || [];
+    let list;
+    try { const result = await agent.client.getAgentServices(keys.iAddress || keys.identity); list = result.data || result || []; } finally { agent.stop(); }
     if (list.length > 0) {
       console.log('  Current services:\n');
       for (const s of list) {
@@ -767,18 +774,19 @@ async function configureServicesScreen(inquirer) {
 
   try {
     const agent = await createAgent(keys);
-    await agent.registerService({
-      name: svcName,
-      description: svcDesc,
-      price: parseFloat(svcPrice),
-      currency: svcCurrency,
-      category: svcCategory,
-      turnaround: svcTurnaround,
-      paymentTerms: 'prepay',
-      sovguard: svcSovguard,
-    });
-    agent.stop();
-    console.log('\n  ✅ Service registered.\n');
+    try {
+      await agent.registerService({
+        name: svcName,
+        description: svcDesc,
+        price: parseFloat(svcPrice),
+        currency: svcCurrency,
+        category: svcCategory,
+        turnaround: svcTurnaround,
+        paymentTerms: 'prepay',
+        sovguard: svcSovguard,
+      });
+      console.log('\n  ✅ Service registered.\n');
+    } finally { agent.stop(); }
   } catch (e) {
     console.log(`\n  ❌ Failed: ${e.message}\n`);
   }
@@ -925,7 +933,8 @@ async function main() {
   const inquirer = mod.default || mod;
 
   while (true) {
-    const choice = await mainMenu(inquirer);
+    let choice;
+    try { choice = await mainMenu(inquirer); } catch (e) { if (e === BACK) continue; throw e; }
 
     switch (choice) {
       case 'agents': await withBack(() => agentListScreen(inquirer)); break;
@@ -933,13 +942,14 @@ async function main() {
       case 'llm': await withBack(() => llmScreen(inquirer)); break;
       case 'services': await withBack(() => configureServicesScreen(inquirer)); break;
       case 'security': await withBack(() => securityScreen(inquirer)); break;
-      case 'start': {
+      case 'start': await withBack(async () => {
         const status = getDispatcherStatus();
         if (status.running) {
           console.log(`\n  Dispatcher already running (PID ${status.pid})\n`);
         } else {
           const { spawn } = require('child_process');
           const child = spawn('node', ['src/cli.js', 'start'], {
+            cwd: REPO_DIR,
             detached: true,
             stdio: ['ignore', fs.openSync('/tmp/dispatcher.log', 'a'), fs.openSync('/tmp/dispatcher.log', 'a')],
           });
@@ -947,8 +957,7 @@ async function main() {
           console.log(`\n  ✅ Dispatcher started (PID ${child.pid})\n  Logs: tail -f /tmp/dispatcher.log\n`);
         }
         await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
-        break;
-      }
+      }); break;
       case 'stop': await withBack(async () => {
         const status = getDispatcherStatus();
         if (!status.running) {
@@ -967,23 +976,21 @@ async function main() {
       case 'logs': {
         console.clear();
         console.log('\n  ═══ Dispatcher Logs ═══\n');
+        if (!fs.existsSync('/tmp/dispatcher.log')) {
+          console.log('  No log file found. Start the dispatcher first.\n');
+          await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+          break;
+        }
         console.log('  Streaming /tmp/dispatcher.log — press Ctrl+C to stop\n');
         const { spawn } = require('child_process');
-        try {
-          const tail = spawn('tail', ['-f', '-n', '40', '/tmp/dispatcher.log'], { stdio: 'inherit' });
-          await new Promise((resolve) => {
-            tail.on('close', resolve);
-            // Also catch SIGINT to return to menu instead of exiting
-            const handler = () => { tail.kill(); resolve(); process.removeListener('SIGINT', handler); };
-            process.on('SIGINT', handler);
-          });
-        } catch (e) {
-          console.log(`  Error: ${e.message}`);
-          if (!fs.existsSync('/tmp/dispatcher.log')) {
-            console.log('  No log file found. Start the dispatcher first.\n');
-          }
-          await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
-        }
+        const tail = spawn('tail', ['-f', '-n', '40', '/tmp/dispatcher.log'], { stdio: 'inherit' });
+        let resolved = false;
+        await new Promise((resolve) => {
+          const done = () => { if (resolved) return; resolved = true; process.removeListener('SIGINT', handler); resolve(); };
+          const handler = () => { tail.kill(); done(); };
+          tail.on('close', done);
+          process.on('SIGINT', handler);
+        });
         break;
       }
       case 'status': await withBack(() => statusScreen(inquirer)); break;
@@ -1004,8 +1011,8 @@ async function main() {
         console.log(`\n  ═══ Inbox: ${keys.identity} ═══\n`);
         try {
           const agent = await createAgent(keys);
-          const inbox = await agent.client.getInbox('pending', 20);
-          agent.stop();
+          let inbox;
+          try { inbox = await agent.client.getInbox('pending', 20); } finally { agent.stop(); }
           const items = inbox.data || [];
           if (items.length === 0) { console.log('  (no pending items)\n'); }
           else {
@@ -1025,12 +1032,12 @@ async function main() {
         for (const a of agents) {
           try {
             const agent = await createAgent(a);
-            const bal = await agent.client.getBalance();
-            const result = await agent.client.getMyJobs({ role: 'seller' });
-            agent.stop();
+            let bal, result;
+            try { bal = await agent.client.getBalance(); result = await agent.client.getMyJobs({ role: 'seller' }); } finally { agent.stop(); }
             const completed = (result.data || []).filter(j => j.status === 'completed' || j.status === 'delivered');
             const total = completed.reduce((s, j) => s + (parseFloat(j.amount) || 0), 0);
-            const balStr = (bal.balances || []).map(b => `${b.amount} ${b.currency}`).join(', ') || '0';
+            const balances = bal.balances || (bal.balance != null ? [{ amount: bal.balance, currency: bal.currency || 'VRSCTEST' }] : []);
+            const balStr = balances.map(b => `${b.amount} ${b.currency}`).join(', ') || '0';
             console.log(`  ${a.id.padEnd(10)} ${(a.identity || '').padEnd(30)} Balance: ${balStr.padEnd(20)} Jobs: ${completed.length} (${total.toFixed(2)} earned)`);
           } catch(e) {
             console.log(`  ${a.id.padEnd(10)} ${(a.identity || '').padEnd(30)} Error: ${e.message.substring(0, 40)}`);
