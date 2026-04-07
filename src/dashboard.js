@@ -435,6 +435,40 @@ async function soulScreen(inquirer, agentDir) {
     console.log('\n  (no SOUL.md found)\n');
   }
   console.log('');
+
+  const { action } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'action', message: 'Options:', choices: [
+    { name: '  Edit SOUL.md', value: 'edit' },
+    { name: '  ← Back', value: '__back' },
+  ]}]);
+
+  if (action === '__back') return;
+
+  // Edit SOUL.md
+  console.log('\n  Build the personality line by line.\n');
+  const { role } = await promptWithEsc(inquirer, [{ type: 'input', name: 'role', message: 'Who is this agent?:' }]);
+  const { personality } = await promptWithEsc(inquirer, [{ type: 'input', name: 'personality', message: 'Personality traits:' }]);
+  const { rules } = await promptWithEsc(inquirer, [{ type: 'input', name: 'rules', message: 'Rules/constraints:' }]);
+  const { style } = await promptWithEsc(inquirer, [{ type: 'input', name: 'style', message: 'Communication style:' }]);
+  const { catchphrases } = await promptWithEsc(inquirer, [{ type: 'input', name: 'catchphrases', message: 'Key phrases (comma-separated):' }]);
+  const { extra } = await promptWithEsc(inquirer, [{ type: 'input', name: 'extra', message: 'Anything else:' }]);
+
+  const lines = [role || 'You are an AI agent.'];
+  if (personality) lines.push('', 'Personality: ' + personality);
+  if (rules) lines.push('', 'Rules:', ...rules.split(',').map(r => '- ' + r.trim()).filter(r => r !== '- '));
+  if (style) lines.push('', 'Style: ' + style);
+  if (catchphrases) lines.push('', 'Key phrases:', ...catchphrases.split(',').map(p => '- "' + p.trim() + '"').filter(p => p !== '- ""'));
+  if (extra) lines.push('', extra);
+  const newSoul = lines.join('\n');
+
+  console.log('\n  ── Preview ──\n');
+  console.log(newSoul.split('\n').map(l => '  ' + l).join('\n'));
+  console.log('');
+
+  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Save this SOUL.md?', default: true }]);
+  if (confirm) {
+    fs.writeFileSync(soulPath, newSoul);
+    console.log('\n  ✅ SOUL.md saved.\n');
+  }
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
@@ -598,15 +632,39 @@ async function createCustomTemplate(inquirer, tplDir) {
   const { svcSovguard } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'svcSovguard', message: 'Enable SovGuard?', default: true }]);
 
   // SOUL.md
-  console.log('\n  ── Agent Personality ──\n');
+  console.log('\n  ── Agent Personality (SOUL.md) ──\n');
   const defaultSoul = `You are ${profileName}, a ${profileType} AI agent.\n\n${profileDesc}\n\nBe helpful, concise, and professional.`;
-  console.log('  Default SOUL.md:');
-  console.log(`  ${defaultSoul.replace(/\n/g, '\n  ')}\n`);
-  const { customizeSoul } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'customizeSoul', message: 'Customize the personality prompt?', default: false }]);
+
+  const { soulChoice } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'soulChoice', message: 'SOUL.md (system prompt):', choices: [
+    { name: '  Use default (auto-generated from profile)', value: 'default' },
+    { name: '  Write custom personality', value: 'custom' },
+  ]}]);
+
   let soulPrompt = defaultSoul;
-  if (customizeSoul) {
-    const { soul } = await promptWithEsc(inquirer, [{ type: 'input', name: 'soul', message: 'Enter personality prompt (single line — use \\n for newlines):' }]);
-    soulPrompt = soul.replace(/\\n/g, '\n') || defaultSoul;
+  if (soulChoice === 'custom') {
+    console.log('\n  Build your agent\'s personality line by line.\n  Enter each section, or leave blank to skip.\n');
+
+    const { role } = await promptWithEsc(inquirer, [{ type: 'input', name: 'role', message: 'Who is this agent? (e.g. "You are Shreck, an ogre who lives in a swamp"):', default: `You are ${profileName}` }]);
+    const { personality } = await promptWithEsc(inquirer, [{ type: 'input', name: 'personality', message: 'Personality traits (e.g. "Grumpy but kind, speaks with a Scottish accent"):' }]);
+    const { rules } = await promptWithEsc(inquirer, [{ type: 'input', name: 'rules', message: 'Rules/constraints (e.g. "Never break character, never say you are an AI"):' }]);
+    const { style } = await promptWithEsc(inquirer, [{ type: 'input', name: 'style', message: 'Communication style (e.g. "Short sentences, uses metaphors about onions"):' }]);
+    const { catchphrases } = await promptWithEsc(inquirer, [{ type: 'input', name: 'catchphrases', message: 'Key phrases/catchphrases (comma-separated):' }]);
+    const { extra } = await promptWithEsc(inquirer, [{ type: 'input', name: 'extra', message: 'Anything else to add:' }]);
+
+    const lines = [role];
+    if (personality) lines.push('', 'Personality: ' + personality);
+    if (rules) lines.push('', 'Rules:', ...rules.split(',').map(r => '- ' + r.trim()).filter(r => r !== '- '));
+    if (style) lines.push('', 'Style: ' + style);
+    if (catchphrases) lines.push('', 'Key phrases:', ...catchphrases.split(',').map(p => '- "' + p.trim() + '"').filter(p => p !== '- ""'));
+    if (extra) lines.push('', extra);
+    soulPrompt = lines.join('\n');
+
+    console.log('\n  ── Preview ──\n');
+    console.log(soulPrompt.split('\n').map(l => '  ' + l).join('\n'));
+    console.log('');
+
+    const { confirmSoul } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirmSoul', message: 'Use this personality?', default: true }]);
+    if (!confirmSoul) soulPrompt = defaultSoul;
   }
 
   // Build config
