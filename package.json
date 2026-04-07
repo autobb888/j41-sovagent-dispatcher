@@ -17,7 +17,8 @@
   "dependencies": {
     "@j41/sovagent-sdk": "file:../j41-sovagent-sdk",
     "commander": "^11.0.0",
-    "dockerode": "^4.0.0"
+    "dockerode": "^4.0.0",
+    "inquirer": "^9"
   },
   "engines": {
     "node": ">=20.0.0"
