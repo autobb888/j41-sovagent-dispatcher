@@ -98,7 +98,7 @@ function extractVdxfValue(entry) {
 // ── Agent factory (suppress SDK logs) ──
 
 async function createAgent(keys) {
-  const { J41Agent } = require('@j41/sovagent-sdk');
+  const { J41Agent } = require('@junction41/sovagent-sdk');
   const origLog = console.log;
   console.log = () => {};
   try {
@@ -526,7 +526,7 @@ async function statusScreen(inquirer) {
 
   // Check security
   try {
-    const secureSetup = require('@j41/secure-setup');
+    const secureSetup = require('@junction41/secure-setup');
     const isolation = await secureSetup.detectIsolation();
     console.log(`\n  Security:   ${isolation.score}/10 (${isolation.mode})`);
   } catch {
@@ -864,7 +864,7 @@ async function securityScreen(inquirer) {
 
   // Check current security status
   try {
-    const secureSetup = require('@j41/secure-setup');
+    const secureSetup = require('@junction41/secure-setup');
     const isolation = await secureSetup.detectIsolation();
     const platform = await secureSetup.detectPlatform();
 
@@ -883,8 +883,8 @@ async function securityScreen(inquirer) {
       console.log('  ✅ Security is properly configured.\n');
     }
   } catch (e) {
-    console.log(`  @j41/secure-setup not available: ${e.message}`);
-    console.log('  Install: yarn add @j41/secure-setup\n');
+    console.log(`  @junction41/secure-setup not available: ${e.message}`);
+    console.log('  Install: yarn add @junction41/secure-setup\n');
   }
 
   const { action } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'action', message: 'Options:', choices: [
@@ -901,15 +901,15 @@ async function securityScreen(inquirer) {
     switch (action) {
       case 'setup':
         console.log('\n  Running security setup...\n');
-        execSync('node -e "require(\'@j41/secure-setup\').setup(\'dispatcher\').then(r => console.log(JSON.stringify(r, null, 2)))"', { stdio: 'inherit', timeout: 60000 });
+        execSync('node -e "require(\'@junction41/secure-setup\').setup(\'dispatcher\').then(r => console.log(JSON.stringify(r, null, 2)))"', { stdio: 'inherit', timeout: 60000 });
         break;
       case 'test':
         console.log('\n  Running self-test...\n');
-        execSync('node -e "require(\'@j41/secure-setup\').selfTest().then(r => { for (const t of r.tests) console.log((t.passed ? \'  ✅\' : \'  ❌\') + \' \' + t.name + \': \' + t.detail); console.log(\'\\n  Score: \' + r.score + \'/10\'); })"', { stdio: 'inherit', timeout: 60000 });
+        execSync('node -e "require(\'@junction41/secure-setup\').selfTest().then(r => { for (const t of r.tests) console.log((t.passed ? \'  ✅\' : \'  ❌\') + \' \' + t.name + \': \' + t.detail); console.log(\'\\n  Score: \' + r.score + \'/10\'); })"', { stdio: 'inherit', timeout: 60000 });
         break;
       case 'check':
         console.log('\n  Checking profiles...\n');
-        execSync('node -e "require(\'@j41/secure-setup\').quickCheck(\'dispatcher\').then(r => { for (const c of r.checks) console.log((c.status === \'pass\' ? \'  ✅\' : \'  ⚠️ \') + \' \' + c.name + \': \' + c.detail); })"', { stdio: 'inherit', timeout: 30000 });
+        execSync('node -e "require(\'@junction41/secure-setup\').quickCheck(\'dispatcher\').then(r => { for (const c of r.checks) console.log((c.status === \'pass\' ? \'  ✅\' : \'  ⚠️ \') + \' \' + c.name + \': \' + c.detail); })"', { stdio: 'inherit', timeout: 30000 });
         break;
     }
   } catch (e) {

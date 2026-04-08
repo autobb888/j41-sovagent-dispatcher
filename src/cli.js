@@ -42,12 +42,12 @@ if (RUNTIME === 'docker') {
   }
 }
 
-// Security profile detection (from @j41/secure-setup)
+// Security profile detection (from @junction41/secure-setup)
 let secureSetup;
 try {
-  secureSetup = require('@j41/secure-setup');
+  secureSetup = require('@junction41/secure-setup');
 } catch {
-  // @j41/secure-setup not installed — security features will be skipped
+  // @junction41/secure-setup not installed — security features will be skipped
 }
 
 const J41_DIR = path.join(os.homedir(), '.j41');
@@ -592,7 +592,7 @@ async function interactiveProfileSetup(keys, soulContent) {
       const apiCallsCount = parseInt(await ask('  API calls per job (0 if none)', '0'), 10);
 
       try {
-        const { calculateListedPrice } = require('@j41/sovagent-sdk/dist/pricing/calculator.js');
+        const { calculateListedPrice } = require('@junction41/sovagent-sdk/dist/pricing/calculator.js');
         const result = calculateListedPrice({
           model: svcModel,
           inputTokens,
@@ -823,8 +823,8 @@ function createFinalizeHooks(agentId, identityName, profile, services = [], disp
         buildCanonicalAgentUpdate,
         buildUpdateIdentityCommand,
         getCanonicalVdxfDefinitionCount,
-      } = require('@j41/sovagent-sdk/dist/index.js');
-      const { buildIdentityUpdateTx } = require('@j41/sovagent-sdk/dist/identity/update.js');
+      } = require('@junction41/sovagent-sdk/dist/index.js');
+      const { buildIdentityUpdateTx } = require('@junction41/sovagent-sdk/dist/identity/update.js');
 
       const fields = profile
         ? {
@@ -1252,7 +1252,7 @@ program
     console.log(`\n→ Registering ${agentId} as ${identityName}.agentplatform@...`);
     console.log(`   Address: ${keys.address}`);
 
-    const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
     const agent = new J41Agent({
       apiUrl: J41_API_URL,
       wif: keys.wif
@@ -1322,7 +1322,7 @@ program
       }
 
       if (options.finalize) {
-        const { finalizeOnboarding } = require('@j41/sovagent-sdk/dist/index.js');
+        const { finalizeOnboarding } = require('@junction41/sovagent-sdk/dist/index.js');
         const finalizeStatePath = path.join(AGENTS_DIR, agentId, FINALIZE_STATE_FILENAME);
         console.log(`\n→ Finalizing onboarding (${options.interactive ? 'interactive' : 'headless'})...`);
 
@@ -1418,7 +1418,7 @@ program
       process.exit(1);
     }
 
-    const { J41Agent, finalizeOnboarding } = require('@j41/sovagent-sdk/dist/index.js');
+    const { J41Agent, finalizeOnboarding } = require('@junction41/sovagent-sdk/dist/index.js');
     const agent = new J41Agent({
       apiUrl: J41_API_URL,
       wif: keys.wif,
@@ -1485,7 +1485,7 @@ program
     // Strategy 1: If we have an onboardId, check its status directly
     if (keys.onboardId) {
       console.log(`   Checking onboard status (${keys.onboardId})...`);
-      const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
+      const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
       const agent = new J41Agent({
         apiUrl: J41_API_URL,
         wif: keys.wif,
@@ -1560,7 +1560,7 @@ program
 
     // Strategy 2: Try to log in — if it works, the identity exists
     console.log(`   Attempting login as ${keys.identity}...`);
-    const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
     const agent = new J41Agent({
       apiUrl: J41_API_URL,
       wif: keys.wif,
@@ -1623,7 +1623,7 @@ program
       process.exit(1);
     }
 
-    const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
     const agent = new J41Agent({
       apiUrl: J41_API_URL,
       wif: keys.wif,
@@ -1668,7 +1668,7 @@ program
       process.exit(0);
     }
 
-    const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
     let warnings = 0;
 
     for (const agentId of agents) {
@@ -1748,7 +1748,7 @@ program
       }
     }
 
-    const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
     const agent = new J41Agent({
       apiUrl: J41_API_URL,
       wif: keys.wif,
@@ -1815,7 +1815,7 @@ program
       process.exit(1);
     }
 
-    const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
     const agent = new J41Agent({
       apiUrl: J41_API_URL,
       wif: keys.wif,
@@ -1892,7 +1892,7 @@ program
 
     // ── On-chain + platform (requires identity) ──
     if (keys.identity && keys.wif) {
-      const { J41Agent, decodeContentMultimap } = require('@j41/sovagent-sdk/dist/index.js');
+      const { J41Agent, decodeContentMultimap } = require('@junction41/sovagent-sdk/dist/index.js');
       const agent = new J41Agent({
         apiUrl: J41_API_URL,
         wif: keys.wif,
@@ -2221,7 +2221,7 @@ program
 
     // ── Step 2: Register on-chain ──
     console.log('\nStep 2/4: Register identity on-chain');
-    const { J41Agent, finalizeOnboarding, RegistrationTimeoutError } = require('@j41/sovagent-sdk/dist/index.js');
+    const { J41Agent, finalizeOnboarding, RegistrationTimeoutError } = require('@junction41/sovagent-sdk/dist/index.js');
 
     if (keys.identity && keys.iAddress && keys.registrationStatus !== 'timeout') {
       console.log(`  ✓ Already registered: ${keys.identity}`);
@@ -2500,14 +2500,14 @@ program
           console.log('  ✓ Security setup complete');
         } catch (e) {
           console.error(`  Security setup failed: ${e.message}`);
-          console.error('  Run manually: yarn dlx @j41/secure-setup --dispatcher');
+          console.error('  Run manually: yarn dlx @junction41/secure-setup --dispatcher');
           // Continue — quick-check will catch issues
         }
       } else {
-        console.warn('  @j41/secure-setup not installed. Install it:');
-        console.warn('    yarn add @j41/secure-setup');
+        console.warn('  @junction41/secure-setup not installed. Install it:');
+        console.warn('    yarn add @junction41/secure-setup');
         console.warn('  Or run manually:');
-        console.warn('    yarn dlx @j41/secure-setup --dispatcher');
+        console.warn('    yarn dlx @junction41/secure-setup --dispatcher');
       }
       console.log('');
     }
@@ -2525,7 +2525,7 @@ program
             console.error(`  - ${issue.name}: ${issue.detail}`);
           }
           console.error('');
-          console.error('  Fix: yarn dlx @j41/secure-setup --dispatcher --fix');
+          console.error('  Fix: yarn dlx @junction41/secure-setup --dispatcher --fix');
           console.error('');
           if (!state._devUnsafe) {
             process.exit(1);
@@ -2541,7 +2541,7 @@ program
 
     // ── Load on-chain capabilities for VDXF policy enforcement ──
     console.log('→ Loading on-chain agent capabilities...\n');
-    const { decodeContentMultimap } = require('@j41/sovagent-sdk/dist/onboarding/vdxf.js');
+    const { decodeContentMultimap } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
     for (const agentInfo of readyAgents) {
       try {
         const agent = await getAgentSession(state, agentInfo);
@@ -2551,7 +2551,7 @@ program
           const decoded = decodeContentMultimap(id.contentmultimap);
           const hasWorkspace = !!decoded.profile?.workspaceCapability;
           // Also check raw CMM for workspace key (flat format or legacy parent key)
-          const { VDXF_KEYS: VK, PARENT_KEYS: PK } = require('@j41/sovagent-sdk/dist/onboarding/vdxf.js');
+          const { VDXF_KEYS: VK, PARENT_KEYS: PK } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
           const hasWorkspaceKey = !!id.contentmultimap[VK.workspace.capability] || !!id.contentmultimap[PK.workspace];
           const services = decoded.services || [];
           state.capabilities.set(agentInfo.id, {
@@ -2612,7 +2612,7 @@ program
       // ── WEBHOOK MODE ──
       const webhookPort = parseInt(options.webhookPort) || 9841;
       const webhookUrl = options.webhookUrl.replace(/\/+$/, '');
-      const { generateWebhookSecret } = require('@j41/sovagent-sdk/dist/webhook/verify.js');
+      const { generateWebhookSecret } = require('@junction41/sovagent-sdk/dist/webhook/verify.js');
 
       console.log(`Mode: WEBHOOK (event-driven)`);
       console.log(`  Base URL: ${webhookUrl}/webhook/<agent-id>`);
@@ -2692,7 +2692,7 @@ program
           const agent = await getAgentSession(state, agentInfo);
           const sessionToken = agent.client.getSessionToken();
           if (sessionToken) {
-            const { ChatClient } = require('@j41/sovagent-sdk/dist/chat/client.js');
+            const { ChatClient } = require('@junction41/sovagent-sdk/dist/chat/client.js');
             const chat = new ChatClient({ apiUrl: J41_API_URL, sessionToken });
             chat.onJobStatusChanged((event) => {
               if (event.status === 'requested' && !state.seen.has(event.jobId) && !state.active.has(event.jobId)) {
@@ -2744,7 +2744,7 @@ program
     // ── Profile sync — detect on-chain changes and re-register with platform ──
     const _profileHashes = new Map(); // agentId -> last known contentmultimap hash
     safeInterval(async () => {
-      const { decodeContentMultimap } = require('@j41/sovagent-sdk/dist/onboarding/vdxf.js');
+      const { decodeContentMultimap } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
       for (const agentInfo of state.agents) {
         try {
           const agent = await getAgentSession(state, agentInfo);
@@ -2870,7 +2870,7 @@ program
       for (const agentInfo of state.agents) {
         try {
           const agent = await getAgentSession(state, agentInfo);
-          const { signMessage } = require('@j41/sovagent-sdk/dist/identity/signer.js');
+          const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
           const verusId = agentInfo.iAddress || agentInfo.identity;
           const timestamp = Math.floor(Date.now() / 1000);
           const { randomUUID } = require('crypto');
@@ -3132,7 +3132,7 @@ program
 const SESSION_TTL_MS = 10 * 60 * 1000; // 10 min
 
 async function getAgentSession(state, agentInfo) {
-  const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
+  const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
   const baseUrl = J41_API_URL;
 
   const cached = state.agentSessions.get(agentInfo.id);
@@ -3430,7 +3430,7 @@ async function pollForJobs(state) {
 
         if (job.status === 'requested' && !pending?.accepted) {
           try {
-            const { signMessage } = require('@j41/sovagent-sdk/dist/identity/signer.js');
+            const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
             const fullJob = await agent.client.getJob(job.id);
             if (fullJob?.jobHash && fullJob?.buyerVerusId) {
               const timestamp = Math.floor(Date.now() / 1000);
@@ -3673,7 +3673,7 @@ async function handleWebhookEvent(state, agentId, payload) {
     case 'job.requested': {
       if (!jobId || state.seen.has(jobId) || state.active.has(jobId)) return;
       try {
-        const { signMessage } = require('@j41/sovagent-sdk/dist/identity/signer.js');
+        const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
         const agent = await getAgentSession(state, agentInfo);
         const fullJob = await agent.client.getJob(jobId);
         if (fullJob?.jobHash && fullJob?.buyerVerusId) {
@@ -3940,7 +3940,7 @@ async function handleWebhookEvent(state, agentId, payload) {
       const bountyJobId = data?.jobId || jobId;
       if (!bountyJobId || state.seen.has(bountyJobId) || state.active.has(bountyJobId)) return;
       try {
-        const { signMessage } = require('@j41/sovagent-sdk/dist/identity/signer.js');
+        const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
         const agent = await getAgentSession(state, agentInfo);
         const fullJob = await agent.client.getJob(bountyJobId);
         if (fullJob?.jobHash && fullJob?.buyerVerusId) {
@@ -4093,7 +4093,7 @@ function getExecutorEnvVars(agentInfo) {
 function buildDispatcherSecurityOpt() {
   const opts = ['no-new-privileges:true'];
 
-  // Seccomp profile — deployed by @j41/secure-setup
+  // Seccomp profile — deployed by @junction41/secure-setup
   const seccompPath = process.platform === 'linux'
     ? '/etc/j41/seccomp-agent.json'
     : path.join(os.homedir(), '.j41', 'seccomp-agent.json');
@@ -4135,7 +4135,7 @@ function getDispatcherBwrapConfig() {
     const isolation = secureSetup.detectIsolation();
     if (isolation.mode === 'bwrap') {
       const entrypointPath = path.join(
-        require.resolve('@j41/secure-setup').replace(/lib\/index\.js$/, ''),
+        require.resolve('@junction41/secure-setup').replace(/lib\/index\.js$/, ''),
         'scripts', 'entrypoint-agent.sh'
       );
       if (fs.existsSync(entrypointPath)) {
@@ -4793,7 +4793,7 @@ program
       }
 
       const keys = JSON.parse(fs.readFileSync(keysPath, 'utf-8'));
-      const { J41Agent } = require('@j41/sovagent-sdk');
+      const { J41Agent } = require('@junction41/sovagent-sdk');
       const agent = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif, identityName: keys.identity, iAddress: keys.iAddress });
       await agent.authenticate();
 
@@ -5074,8 +5074,8 @@ async function mainMenu() {
     }
 
     try {
-      const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
-      const { VDXF_KEYS, PARENT_KEYS, decodeContentMultimap } = require('@j41/sovagent-sdk/dist/onboarding/vdxf.js');
+      const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+      const { VDXF_KEYS, PARENT_KEYS, decodeContentMultimap } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
 
       const a = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif, identityName: keys.identity, iAddress: keys.iAddress });
       await a.login();
@@ -5125,7 +5125,7 @@ async function mainMenu() {
 
     console.log(`  Registering ${name}.agentplatform@... (this may take several minutes)`);
     try {
-      const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
+      const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
       const a = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif });
       const result = await a.register(name, J41_NETWORK);
       keys.identity = result.identity;
@@ -5154,9 +5154,9 @@ async function mainMenu() {
     const { profile, services, disputePolicy } = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
 
     try {
-      const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
-      const { buildAgentContentMultimap } = require('@j41/sovagent-sdk/dist/onboarding/vdxf.js');
-      const { buildIdentityUpdateTx } = require('@j41/sovagent-sdk/dist/identity/update.js');
+      const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+      const { buildAgentContentMultimap } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+      const { buildIdentityUpdateTx } = require('@junction41/sovagent-sdk/dist/identity/update.js');
 
       const a = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif, identityName: keys.identity, iAddress: keys.iAddress });
       await a.login();

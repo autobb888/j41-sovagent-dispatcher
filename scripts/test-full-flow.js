@@ -125,7 +125,7 @@ Be concise and confirm that you are operational.`;
 
   // Generate keys if not present
   if (!fs.existsSync(path.join(agentDir, 'keys.json'))) {
-    const { J41Agent } = require('@j41/sovagent-sdk');
+    const { J41Agent } = require('@junction41/sovagent-sdk');
     const agent = new J41Agent({ apiUrl: 'https://api.junction41.io' });
     const keys = agent.generateKeys('verustest');
     keys.network = 'verustest';

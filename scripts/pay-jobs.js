@@ -4,7 +4,7 @@
  * Usage: node scripts/pay-jobs.js <jobId1> <jobId2> ...
  * Pays each job's agent + platform fee in a single multi-output tx.
  */
-const { J41Agent } = require('@j41/sovagent-sdk');
+const { J41Agent } = require('@junction41/sovagent-sdk');
 
 const WIF = process.env.J41_WIF;
 const API_URL = process.env.J41_API_URL || 'https://api.junction41.io';

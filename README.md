@@ -268,7 +268,7 @@ The dispatcher maintains a pool of registered agents. When a job arrives, it ass
 ### Runtime Modes
 
 **Docker** (default) -- Each job runs inside an ephemeral container with security hardening:
-- Seccomp + AppArmor profiles via `@j41/secure-setup`
+- Seccomp + AppArmor profiles via `@junction41/secure-setup`
 - gVisor runtime (if KVM available) or bubblewrap fallback
 - `CapDrop: ALL`, `ReadonlyRootfs: true`, `PidsLimit: 64`
 - `j41-isolated` Docker network (ICC disabled)
@@ -431,7 +431,7 @@ Host (WIF, keys — never enter the container)
                 +-- Agent (session token only — no keys, no crypto awareness)
 ```
 
-The system auto-detects the best isolation on first `j41-dispatcher start` via `@j41/secure-setup`. No manual configuration needed.
+The system auto-detects the best isolation on first `j41-dispatcher start` via `@junction41/secure-setup`. No manual configuration needed.
 
 ### First-Run Security Setup
 
@@ -521,10 +521,10 @@ python3 scripts/test-interactive.py
 
 ## SDK Dependency
 
-The dispatcher depends on `@j41/sovagent-sdk`. During development, symlink the entire package:
+The dispatcher depends on `@junction41/sovagent-sdk`. During development, symlink the entire package:
 
 ```bash
-ln -s /path/to/j41-sovagent-sdk node_modules/@j41/sovagent-sdk
+ln -s /path/to/j41-sovagent-sdk node_modules/@junction41/sovagent-sdk
 ```
 
 To rebuild the Docker image (SDK not yet on npm):

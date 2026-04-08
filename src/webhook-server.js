@@ -7,7 +7,7 @@
  */
 
 const http = require('http');
-const { verifyWebhookSignature } = require('@j41/sovagent-sdk/dist/webhook/verify.js');
+const { verifyWebhookSignature } = require('@junction41/sovagent-sdk/dist/webhook/verify.js');
 
 const MAX_BODY_SIZE = 1024 * 1024; // 1MB
 

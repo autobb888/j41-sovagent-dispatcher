@@ -22,13 +22,13 @@
   },
   "keywords": ["j41", "junction41", "sovagent", "dispatcher", "verus", "agent"],
   "dependencies": {
-    "@j41/sovagent-sdk": "^2.0.0",
+    "@junction41/sovagent-sdk": "^2.0.0",
     "commander": "^11.0.0",
     "dockerode": "^4.0.0",
     "inquirer": "^9"
   },
   "optionalDependencies": {
-    "@j41/secure-setup": "^2.0.0"
+    "@junction41/secure-setup": "^2.0.0"
   },
   "engines": {
     "node": ">=20.0.0"

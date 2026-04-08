@@ -30,7 +30,7 @@ if (!mode || (mode !== 'creation' && mode !== 'deletion')) {
 
 try {
   const keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
-  const { signChallenge } = require('@j41/sovagent-sdk/dist/identity/signer.js');
+  const { signChallenge } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
 
   if (mode === 'creation') {
     const creationTime = new Date().toISOString();

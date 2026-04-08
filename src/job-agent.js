@@ -6,8 +6,8 @@
  * for privacy verification.
  */
 
-const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
-const { signMessage } = require('@j41/sovagent-sdk/dist/identity/signer.js');
+const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -863,7 +863,7 @@ setTimeout(async () => {
     // M14 fix: reuse existing _agent if available
     try {
       const agent = _agent || (() => {
-        const { J41Agent } = require('@j41/sovagent-sdk/dist/index.js');
+        const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
         const a = new J41Agent({ apiUrl: API_URL, wif: keys.wif, identityName: IDENTITY, iAddress: keys.iAddress });
         return a;
       })();
@@ -871,7 +871,7 @@ setTimeout(async () => {
       // If using existing agent, skip re-authenticate (already authed)
       if (!_agent) await agent.authenticate();
       const { message: attestMessage } = await agent.client.getDeletionAttestationMessage(JOB_ID, attestTimestamp);
-      const { signMessage: signMsg } = require('@j41/sovagent-sdk/dist/identity/signer.js');
+      const { signMessage: signMsg } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
       const attestSig = signMsg(keys.wif, attestMessage, J41_NETWORK);
 
       fs.writeFileSync(
@@ -891,7 +891,7 @@ setTimeout(async () => {
         destroyedAt: new Date().toISOString(),
         deletionMethod: 'timeout',
       };
-      const { signMessage: signMsg } = require('@j41/sovagent-sdk/dist/identity/signer.js');
+      const { signMessage: signMsg } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
       deletionAttestation.signature = signMsg(keys.wif, JSON.stringify(deletionAttestation), J41_NETWORK);
       fs.writeFileSync(
         path.join(JOB_DIR, 'deletion-attestation-timeout.json'),
@@ -923,7 +923,7 @@ async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndRes
 
       if (process.send) {
         try {
-          const { calculateListedPrice } = require('@j41/sovagent-sdk/dist/pricing/calculator.js');
+          const { calculateListedPrice } = require('@junction41/sovagent-sdk/dist/pricing/calculator.js');
           const model = process.env.J41_LLM_MODEL || 'claude-sonnet-4';
           const halfTokens = Math.floor(additionalTokens / 2);
           const pricing = calculateListedPrice({
@@ -965,8 +965,8 @@ async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndRes
  * for job completion, disputes, and rework events.
  */
 async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulPrompt, registerSessionEndResolve, ipcQueue) {
-  const { buildDeliverMessage } = require('@j41/sovagent-sdk/dist/signing/messages.js');
-  const { signMessage } = require('@j41/sovagent-sdk/dist/identity/signer.js');
+  const { buildDeliverMessage } = require('@junction41/sovagent-sdk/dist/signing/messages.js');
+  const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
 
   return new Promise((resolve) => {
     let resolved = false;
@@ -1036,7 +1036,7 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
               }
 
               const ts = Math.floor(Date.now() / 1000);
-              const { buildDisputeRespondMessage } = require('@j41/sovagent-sdk/dist/signing/messages.js');
+              const { buildDisputeRespondMessage } = require('@junction41/sovagent-sdk/dist/signing/messages.js');
               const respondMsg = buildDisputeRespondMessage({ jobHash: fullJob.jobHash, action, timestamp: ts });
               const sig = signMessage(keys.wif, respondMsg, J41_NETWORK);
 
@@ -1124,7 +1124,7 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
             if (_disputePolicy && fullJob.amount) {
               const budgetUsd = (_disputePolicy.reworkBudgetPercent / 100) * fullJob.amount * 0.5;
               try {
-                const { budgetToTokens } = require('@j41/sovagent-sdk/dist/pricing/calculator.js');
+                const { budgetToTokens } = require('@junction41/sovagent-sdk/dist/pricing/calculator.js');
                 const model = process.env.J41_LLM_MODEL || 'claude-sonnet-4';
                 tokenBudget = budgetToTokens(model, budgetUsd);
               } catch (e) {
@@ -1179,7 +1179,7 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult) {
   try {
     const { message: attestMessage, timestamp: attestTs } =
       await agent.client.getDeletionAttestationMessage(JOB_ID, attestTimestamp);
-    const { signMessage } = require('@j41/sovagent-sdk/dist/identity/signer.js');
+    const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
     const attestSig = signMessage(keys.wif, attestMessage, J41_NETWORK);
 
     fs.writeFileSync(
@@ -1203,8 +1203,8 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult) {
   try {
     console.log('→ Updating on-chain identity (job completion)...');
 
-    const { buildJobCompletionAdditions } = require('@j41/sovagent-sdk/dist/onboarding/vdxf.js');
-    const { buildIdentityUpdateTx } = require('@j41/sovagent-sdk/dist/identity/update.js');
+    const { buildJobCompletionAdditions } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+    const { buildIdentityUpdateTx } = require('@junction41/sovagent-sdk/dist/identity/update.js');
 
     const jobRecord = {
       jobHash: fullJob.jobHash,

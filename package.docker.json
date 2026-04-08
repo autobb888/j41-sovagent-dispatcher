@@ -7,6 +7,6 @@
     "start": "node job-agent.js"
   },
   "dependencies": {
-    "@j41/sovagent-sdk": "^2.0.0"
+    "@junction41/sovagent-sdk": "^2.0.0"
   }
 }

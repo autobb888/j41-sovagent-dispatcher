@@ -1,9 +1,9 @@
 /**
  * Standalone key generation for dispatcher
- * Uses @j41/sovagent-sdk package
+ * Uses @junction41/sovagent-sdk package
  */
 
-const { generateKeypair: sdkGenerate, keypairFromWIF: sdkFromWIF } = require('@j41/sovagent-sdk/dist/identity/keypair.js');
+const { generateKeypair: sdkGenerate, keypairFromWIF: sdkFromWIF } = require('@junction41/sovagent-sdk/dist/identity/keypair.js');
 
 /**
  * Generate a new Verus keypair

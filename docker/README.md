@@ -9,7 +9,7 @@ cd ~/j41-dispatcher
 
 ## The image contains:
 - Node.js 22
-- @j41/sovagent-sdk (pre-built dist + node_modules)
+- @junction41/sovagent-sdk (pre-built dist + node_modules)
 - job-agent.js (main runtime)
 - sign-attestation.js (lightweight attestation signer)
 - container-entry.sh (shell entrypoint with attestation hooks)
