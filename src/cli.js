@@ -4083,7 +4083,17 @@ function getExecutorEnvVars(agentInfo) {
   if (config.llmProvider) envVars.push(`J41_LLM_PROVIDER=${config.llmProvider}`);
   if (config.llmModel) envVars.push(`J41_LLM_MODEL=${config.llmModel}`);
   if (config.llmBaseUrl) envVars.push(`J41_LLM_BASE_URL=${config.llmBaseUrl}`);
-  if (config.llmApiKey) envVars.push(`J41_LLM_API_KEY=${config.llmApiKey}`);
+  if (config.llmApiKey) {
+    envVars.push(`J41_LLM_API_KEY=${config.llmApiKey}`);
+    // Also set the provider-specific env var so resolveLLMConfig() picks it up
+    if (config.llmProvider) {
+      try {
+        const { LLM_PRESETS } = require('./executors/local-llm.js');
+        const preset = LLM_PRESETS[config.llmProvider];
+        if (preset?.envKey) envVars.push(`${preset.envKey}=${config.llmApiKey}`);
+      } catch {}
+    }
+  }
 
   return envVars;
 }

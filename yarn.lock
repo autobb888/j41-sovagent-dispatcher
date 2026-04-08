@@ -88,23 +88,27 @@
   resolved "https://registry.yarnpkg.com/@inquirer/figures/-/figures-1.0.15.tgz#dbb49ed80df11df74268023b496ac5d9acd22b3a"
   integrity sha512-t2IEY+unGHOzAaVM5Xx6DEWKeXlDDcNPeDyUpsRc6CUhBfU3VQOEl+Vssh7VNp1dR8MdUJBWhuObjXCsVpjN5g==
 
-"@j41/sovagent-sdk@file:../j41-sovagent-sdk":
-  version "2.0.0"
-  dependencies:
-    "@bitgo/utxo-lib" "github:VerusCoin/BitGoJS#5e82f4fd"
-    "@noble/hashes" "^1.4.0"
-    "@noble/secp256k1" "^3.0.0"
-    bitcoinjs-message "^2.2.0"
-    bn.js "^5.2.2"
-    bs58check "^4.0.0"
-    json-canonicalize "^2.0.0"
-    ripemd160 "^2.0.2"
-    socket.io-client "^4.8.3"
-
 "@js-sdsl/ordered-map@^4.4.2":
   version "4.4.2"
   resolved "https://registry.yarnpkg.com/@js-sdsl/ordered-map/-/ordered-map-4.4.2.tgz#9299f82874bab9e4c7f9c48d865becbfe8d6907c"
   integrity sha512-iUKgm52T8HOE/makSxjqoWhe95ZJA1/G1sYsGev2JDKUSS14KAgg1LHb+Ba+IPow0xflbnSkOsZcO08C7w1gYw==
+
+"@junction41/secure-setup@>=0.1.0":
+  version "0.1.0"
+  resolved "https://registry.yarnpkg.com/@junction41/secure-setup/-/secure-setup-0.1.0.tgz#7943ef6417a8540527331c1f4e8d2d2389e66090"
+  integrity sha512-9Hc7UnHmYe3f746uhQar4q7uufCh0gJ7vXVxDVWuW17+pdRZuZehFfB2KfjOc7oNNynkf9Zm/0YvDDb/PDo+Ng==
+
+"@junction41/sovagent-sdk@^2.0.0":
+  version "2.0.1"
+  resolved "https://registry.yarnpkg.com/@junction41/sovagent-sdk/-/sovagent-sdk-2.0.1.tgz#f5be81320f2cf0e0fca3645e8a227fa7ce28002c"
+  integrity sha512-ERkHgbUvo8hW5TOKm3U9pgO0OSAVHYlWKUuLokexD3RfBbPGvFR8QJH5gQKTPfCmEE1cW27ZhONBy4oxYvCfug==
+  dependencies:
+    "@bitgo/utxo-lib" "github:VerusCoin/BitGoJS#5e82f4fd"
+    bitcoinjs-message "^2.2.0"
+    bs58check "2.0.0"
+    json-canonicalize "^2.0.0"
+    socket.io-client "^4.8.3"
+    verus-typescript-primitives "git+https://github.com/VerusCoin/verus-typescript-primitives.git"
 
 "@noble/curves@1.9.7":
   version "1.9.7"
@@ -113,15 +117,10 @@
   dependencies:
     "@noble/hashes" "1.8.0"
 
-"@noble/hashes@1.8.0", "@noble/hashes@^1.2.0", "@noble/hashes@^1.4.0":
+"@noble/hashes@1.8.0":
   version "1.8.0"
   resolved "https://registry.yarnpkg.com/@noble/hashes/-/hashes-1.8.0.tgz#cee43d801fcef9644b11b8194857695acd5f815a"
   integrity sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A==
-
-"@noble/secp256k1@^3.0.0":
-  version "3.0.0"
-  resolved "https://registry.yarnpkg.com/@noble/secp256k1/-/secp256k1-3.0.0.tgz#29711361db8f37b1b7e0b8d80c933013fc887475"
-  integrity sha512-NJBaR352KyIvj3t6sgT/+7xrNyF9Xk9QlLSIqUGVUYlsnDTAUqY8LOmwpcgEx4AMJXRITQ5XEVHD+mMaPfr3mg==
 
 "@protobufjs/aspromise@^1.1.1", "@protobufjs/aspromise@^1.1.2":
   version "1.1.2"
@@ -243,11 +242,6 @@ base-x@^3.0.2:
   dependencies:
     safe-buffer "^5.0.1"
 
-base-x@^5.0.0:
-  version "5.0.1"
-  resolved "https://registry.yarnpkg.com/base-x/-/base-x-5.0.1.tgz#16bf35254be1df8aca15e36b7c1dda74b2aa6b03"
-  integrity sha512-M7uio8Zt++eg3jPj+rHMfCC+IuygQHHCOU+IYsVtik6FWjuYpVt/+MRKcgsAMHh8mMFAwnB+Bs+mTrFiXjMzKg==
-
 base64-js@^1.3.1:
   version "1.5.1"
   resolved "https://registry.yarnpkg.com/base64-js/-/base64-js-1.5.1.tgz#1b1b440160a5bf7ad40b650f095963481903930a"
@@ -361,7 +355,7 @@ blake2b-wasm@^2.4.0:
     blake2b-wasm "^2.4.0"
     nanoassert "^2.0.0"
 
-bn.js@5.2.3, bn.js@^5.2.2:
+bn.js@5.2.3:
   version "5.2.3"
   resolved "https://registry.yarnpkg.com/bn.js/-/bn.js-5.2.3.tgz#16a9e409616b23fef3ccbedb8d42f13bff80295e"
   integrity sha512-EAcmnPkxpntVL+DS7bO1zhcZNvCkxqtkd0ZY53h06GNQ3DEkkGZ/gKgmDv6DdZQGj9BgfSPKtJJ7Dp1GPP8f7w==
@@ -402,13 +396,6 @@ bs58@^4.0.0:
   dependencies:
     base-x "^3.0.2"
 
-bs58@^6.0.0:
-  version "6.0.0"
-  resolved "https://registry.yarnpkg.com/bs58/-/bs58-6.0.0.tgz#a2cda0130558535dd281a2f8697df79caaf425d8"
-  integrity sha512-PD0wEnEYg6ijszw/u8s+iI3H17cTymlrwkKhDhPZq+Sokl3AU4htyBFTjAeNAlCCmg0f53g6ih3jATyCKftTfw==
-  dependencies:
-    base-x "^5.0.0"
-
 bs58check@2.0.0:
   version "2.0.0"
   resolved "https://registry.yarnpkg.com/bs58check/-/bs58check-2.0.0.tgz#b70fffd80bc72de18a040a547d7e5e08ce1b1e4e"
@@ -433,14 +420,6 @@ bs58check@^1.0.6:
   dependencies:
     bs58 "^3.1.0"
     create-hash "^1.1.0"
-
-bs58check@^4.0.0:
-  version "4.0.0"
-  resolved "https://registry.yarnpkg.com/bs58check/-/bs58check-4.0.0.tgz#46cda52a5713b7542dcb78ec2efdf78f5bf1d23c"
-  integrity sha512-FsGDOnFg9aVI9erdriULkd/JjEWONV/lQE5aYziB5PoBsXRind56lh8doIZIc9X4HoxT5x4bLjMWN1/NB8Zp5g==
-  dependencies:
-    "@noble/hashes" "^1.2.0"
-    bs58 "^6.0.0"
 
 buffer-equals@^1.0.3:
   version "1.0.4"
@@ -1163,7 +1142,7 @@ ripemd160@^1.0.0:
   resolved "https://registry.yarnpkg.com/ripemd160/-/ripemd160-1.0.1.tgz#93a4bbd4942bc574b69a8fa57c71de10ecca7d6e"
   integrity sha512-J0YlH2ow/i7d5PJX9RC1XnjmZc7cNNYWe89PIlFszvHeiEtxzA1/VYePkjQ7l1SkUejAcHeDo3IVp2WIzstXXQ==
 
-ripemd160@^2.0.0, ripemd160@^2.0.1, ripemd160@^2.0.2:
+ripemd160@^2.0.0, ripemd160@^2.0.1:
   version "2.0.3"
   resolved "https://registry.yarnpkg.com/ripemd160/-/ripemd160-2.0.3.tgz#9be54e4ba5e3559c8eee06a25cd7648bbccdf5a8"
   integrity sha512-5Di9UC0+8h1L6ZD2d7awM7E/T4uA1fJRlx6zk/NvdCCVEoAnFqvHmCuNeIKoCeIixBX/q8uM+6ycDvF8woqosA==

@@ -430,4 +430,4 @@ function generateTemplateResponse(message, job, soulPrompt) {
   return `Thanks for your message. I'm processing your request regarding: "${job.description.substring(0, 60)}". Is there anything specific you'd like me to focus on?`;
 }
 
-module.exports = { LocalLLMExecutor, LLM_PRESETS, LLM_CONFIG };
+module.exports = { LocalLLMExecutor, LLM_PRESETS, LLM_CONFIG, resolveLLMConfig };

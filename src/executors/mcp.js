@@ -9,23 +9,23 @@
  *   J41_MCP_MAX_ROUNDS     - Max tool-calling rounds per message (default: 10)
  *   J41_EXECUTOR_AUTH      - Authorization header for HTTP transport
  *   J41_EXECUTOR_TIMEOUT   - Per-request timeout in ms (default: 60000)
- *   KIMI_API_KEY           - LLM API key (required — drives tool selection)
- *   KIMI_BASE_URL          - LLM API base URL
- *   KIMI_MODEL             - LLM model name
+ *   J41_LLM_PROVIDER       - LLM provider (openai, claude, kimi, etc.)
+ *   J41_LLM_API_KEY        - LLM API key (or provider-specific env var)
+ *   J41_LLM_BASE_URL       - LLM API base URL override
+ *   J41_LLM_MODEL          - LLM model override
  *   MAX_CONVERSATION_LOG   - Max conversation entries (default: 50)
  */
 
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { Executor } = require('./base.js');
+const { resolveLLMConfig } = require('./local-llm.js');
 
 const MCP_COMMAND = process.env.J41_MCP_COMMAND || '';
 const MCP_URL = process.env.J41_MCP_URL || '';
 const EXECUTOR_AUTH = process.env.J41_EXECUTOR_AUTH || '';
 const EXECUTOR_TIMEOUT = parseInt(process.env.J41_EXECUTOR_TIMEOUT || '60000');
-const KIMI_API_KEY = process.env.KIMI_API_KEY || '';
-const KIMI_BASE_URL = process.env.KIMI_BASE_URL || 'https://api.kimi.com/coding/v1';
-const KIMI_MODEL = process.env.KIMI_MODEL || 'kimi-k2.5';
+const LLM = resolveLLMConfig();
 const MAX_TOOL_ROUNDS = parseInt(process.env.J41_MCP_MAX_ROUNDS || '10');
 const MAX_CONVERSATION_LOG = parseInt(process.env.MAX_CONVERSATION_LOG || '50');
 
@@ -50,8 +50,8 @@ class MCPExecutor extends Executor {
     if (!MCP_COMMAND && !MCP_URL) {
       throw new Error('J41_MCP_COMMAND or J41_MCP_URL is required for mcp executor');
     }
-    if (!KIMI_API_KEY) {
-      throw new Error('KIMI_API_KEY is required for mcp executor (LLM drives tool selection)');
+    if (!LLM.apiKey) {
+      throw new Error('LLM API key is required for mcp executor (LLM drives tool selection). Set J41_LLM_PROVIDER + the provider key, or J41_LLM_API_KEY.');
     }
 
     this.job = job;
@@ -211,7 +211,7 @@ class MCPExecutor extends Executor {
 
     try {
       const body = {
-        model: KIMI_MODEL,
+        model: LLM.model,
         messages,
         temperature: 0.6,
         max_tokens: 8192,
@@ -220,13 +220,15 @@ class MCPExecutor extends Executor {
         body.tools = this.openaiTools;
       }
 
-      const res = await fetch(`${KIMI_BASE_URL}/chat/completions`, {
+      const headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'j41-agent/1.0',
+        ...(LLM.customHeaders || { 'Authorization': `Bearer ${LLM.apiKey}` }),
+      };
+
+      const res = await fetch(`${LLM.baseUrl}/chat/completions`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${KIMI_API_KEY}`,
-          'User-Agent': 'j41-agent/1.0',
-        },
+        headers,
         signal: controller.signal,
         body: JSON.stringify(body),
       });

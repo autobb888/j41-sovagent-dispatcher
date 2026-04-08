@@ -174,7 +174,8 @@ async function mainMenu(inquirer) {
   console.log(`\n  Agents: ${agents.length} registered`);
   console.log(`  Dispatcher: ${status.running ? `running (PID ${status.pid})` : 'stopped'}`);
   console.log(`  Runtime: ${config.runtime || 'docker'}`);
-  console.log(`  LLM: ${env.J41_LLM_PROVIDER || '(not configured)'}`);
+  console.log(`  Global LLM: ${env.J41_LLM_PROVIDER || '(not configured)'}`);
+  console.log(`  Executor: ${env.J41_EXECUTOR || 'local-llm'} (global default — per-agent overrides via [3])`);
   console.log('');
 
   const { choice } = await promptWithEsc(inquirer, [{
@@ -184,19 +185,20 @@ async function mainMenu(inquirer) {
     choices: [
       { name: `[1]  View Agents (${agents.length} registered)`, value: 'agents' },
       { name: '[2]  Add New Agent', value: 'add' },
-      { name: '[3]  Configure LLM Provider', value: 'llm' },
-      { name: '[4]  Configure Services', value: 'services' },
-      { name: '[5]  Security Setup', value: 'security' },
+      { name: '[3]  Configure Agent Executor', value: 'executor' },
+      { name: '[4]  Configure Global LLM Default', value: 'llm' },
+      { name: '[5]  Configure Services', value: 'services' },
+      { name: '[6]  Security Setup', value: 'security' },
       new inquirer.Separator('  ── Dispatcher ──'),
-      { name: `[6]  Start Dispatcher ${status.running ? '\x1b[32m(running)\x1b[0m' : ''}`, value: 'start' },
-      { name: `[7]  Stop Dispatcher ${status.running ? '' : '\x1b[2m(not running)\x1b[0m'}`, value: 'stop' },
-      { name: '[8]  View Logs', value: 'logs' },
-      { name: '[9]  Status & Health', value: 'status' },
+      { name: `[7]  Start Dispatcher ${status.running ? '\x1b[32m(running)\x1b[0m' : ''}`, value: 'start' },
+      { name: `[8]  Stop Dispatcher ${status.running ? '' : '\x1b[2m(not running)\x1b[0m'}`, value: 'stop' },
+      { name: '[9]  View Logs', value: 'logs' },
+      { name: '[10] Status & Health', value: 'status' },
       new inquirer.Separator('  ── Tools ──'),
-      { name: '[10] Inspect Agent (on-chain)', value: 'inspect' },
-      { name: '[11] Check Inbox', value: 'inbox' },
-      { name: '[12] Earnings Summary', value: 'earnings' },
-      { name: '[13] Docker Containers', value: 'docker' },
+      { name: '[11] Inspect Agent (on-chain)', value: 'inspect' },
+      { name: '[12] Check Inbox', value: 'inbox' },
+      { name: '[13] Earnings Summary', value: 'earnings' },
+      { name: '[14] Docker Containers', value: 'docker' },
       new inquirer.Separator(),
       { name: '     Quit', value: 'quit' },
     ],
@@ -777,6 +779,41 @@ async function addAgentScreen(inquirer) {
     });
     if (result.status === 0) {
       console.log('\n  ✅ Agent created successfully.\n');
+
+      // Offer immediate executor configuration
+      const { configNow } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'configNow', message: 'Configure executor for this agent now?', default: true }]);
+      if (configNow) {
+        const execConfig = { executor: 'local-llm' };
+
+        const { execType } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 10, name: 'execType', message: 'Executor type:', choices: [
+          ...Object.entries(EXECUTOR_DESCRIPTIONS).map(([key, desc]) => ({
+            name: `  ${key.padEnd(12)} ${desc}`,
+            value: key,
+          })),
+        ]}]);
+        execConfig.executor = execType;
+
+        if (execType === 'local-llm' || execType === 'mcp') {
+          await configureLLMProvider(inquirer, execConfig);
+        }
+        if (execType === 'webhook' || execType === 'langserve' || execType === 'langgraph' || execType === 'a2a') {
+          const { url } = await promptWithEsc(inquirer, [{ type: 'input', name: 'url', message: 'Endpoint URL:' }]);
+          execConfig.executorUrl = url;
+          const { auth } = await promptWithEsc(inquirer, [{ type: 'password', name: 'auth', message: 'Authorization header (leave empty for none):', mask: '*' }]);
+          if (auth) execConfig.executorAuth = auth;
+        }
+        if (execType === 'mcp') {
+          const { cmd } = await promptWithEsc(inquirer, [{ type: 'input', name: 'cmd', message: 'MCP server command (or leave empty for HTTP):', default: '' }]);
+          if (cmd) execConfig.mcpCommand = cmd;
+          else {
+            const { url } = await promptWithEsc(inquirer, [{ type: 'input', name: 'url', message: 'MCP server URL:' }]);
+            execConfig.mcpUrl = url;
+          }
+        }
+
+        saveAgentConfig(agentId, execConfig);
+        console.log(`\n  ✅ Executor config saved. You can change it later via "Configure Agent Executor".\n`);
+      }
     } else {
       console.log(`\n  ❌ Setup failed (exit code ${result.status}).\n`);
     }
@@ -856,6 +893,249 @@ async function configureServicesScreen(inquirer) {
   }
 
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
+// ── Per-Agent Executor Configuration ──
+
+const EXECUTOR_DESCRIPTIONS = {
+  'local-llm': 'Direct LLM API — call any OpenAI-compatible provider directly',
+  'webhook':   'REST webhook — POST to n8n, Zapier, CrewAI, Dify, Flowise, or any HTTP endpoint',
+  'langserve': 'LangChain Runnables — call a LangServe /invoke endpoint',
+  'langgraph': 'LangGraph Platform — stateful threads + runs (Postgres-backed)',
+  'a2a':       'Google Agent-to-Agent — JSON-RPC 2.0 tasks/send protocol',
+  'mcp':       'MCP server + LLM — tool-calling agent loop with MCP tools',
+};
+
+function loadAgentConfig(agentId) {
+  const configPath = path.join(AGENTS_DIR, agentId, 'agent-config.json');
+  try {
+    if (fs.existsSync(configPath)) return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch {}
+  return {};
+}
+
+function saveAgentConfig(agentId, config) {
+  const agentDir = path.join(AGENTS_DIR, agentId);
+  fs.mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  const configPath = path.join(agentDir, 'agent-config.json');
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+}
+
+async function executorConfigScreen(inquirer) {
+  const agents = getAgents();
+  if (agents.length === 0) {
+    console.log('\n  No agents registered. Add an agent first.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  // Select agent
+  const { agentId } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'agentId', message: 'Select agent to configure:', choices: [
+    ...agents.map(a => {
+      const cfg = loadAgentConfig(a.id);
+      const exec = cfg.executor || 'local-llm';
+      const prov = cfg.llmProvider || loadEnv().J41_LLM_PROVIDER || '(global default)';
+      const label = exec === 'local-llm' ? `${exec} → ${prov}` : exec;
+      return { name: `  ${a.id.padEnd(10)} ${(a.identity || '').padEnd(28)} [${label}]`, value: a.id };
+    }),
+    new inquirer.Separator(),
+    { name: '  ← Back', value: '__back' },
+  ]}]);
+  if (agentId === '__back') return;
+
+  const config = loadAgentConfig(agentId);
+
+  console.clear();
+  const agentKeys = agents.find(a => a.id === agentId);
+  console.log(`\n  ═══ Executor Config: ${agentKeys?.identity || agentId} ═══\n`);
+
+  // Show current config
+  if (Object.keys(config).length > 0) {
+    console.log('  Current configuration:');
+    if (config.executor) console.log(`    Executor:  ${config.executor}`);
+    if (config.llmProvider) console.log(`    Provider:  ${config.llmProvider}`);
+    if (config.llmModel) console.log(`    Model:     ${config.llmModel}`);
+    if (config.executorUrl) console.log(`    URL:       ${config.executorUrl}`);
+    if (config.mcpCommand) console.log(`    MCP cmd:   ${config.mcpCommand}`);
+    if (config.mcpUrl) console.log(`    MCP URL:   ${config.mcpUrl}`);
+    const hasKey = config.llmApiKey || config.executorAuth;
+    if (hasKey) console.log(`    Auth:      ${hasKey.length > 12 ? '****' + hasKey.slice(-4) : '(set)'}`);
+    console.log('');
+  } else {
+    console.log('  No per-agent config — using global defaults from .env\n');
+  }
+
+  // Select executor type
+  const { executor } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'executor', message: 'Select executor type:', choices: [
+    ...Object.entries(EXECUTOR_DESCRIPTIONS).map(([key, desc]) => ({
+      name: `  ${key.padEnd(12)} ${desc}`,
+      value: key,
+    })),
+    new inquirer.Separator(),
+    { name: '  Reset to global defaults (remove per-agent config)', value: '__reset' },
+    { name: '  ← Back (no change)', value: '__back' },
+  ]}]);
+  if (executor === '__back') return;
+
+  if (executor === '__reset') {
+    const configPath = path.join(AGENTS_DIR, agentId, 'agent-config.json');
+    try { fs.unlinkSync(configPath); } catch {}
+    console.log('\n  ✅ Per-agent config removed. Agent will use global .env defaults.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  const newConfig = { executor };
+
+  // ── Executor-specific config ──
+
+  if (executor === 'local-llm' || executor === 'mcp') {
+    // LLM provider selection
+    await configureLLMProvider(inquirer, newConfig);
+  }
+
+  if (executor === 'webhook') {
+    console.log('\n  Webhook tips:');
+    console.log('    n8n:      use your n8n webhook trigger URL');
+    console.log('    CrewAI:   use your crew kickoff API endpoint');
+    console.log('    Dify:     use your Dify workflow API endpoint');
+    console.log('    Flowise:  use your Flowise chatflow API endpoint');
+    console.log('    Zapier:   use your Zapier webhook catch URL');
+    console.log('    Custom:   any REST endpoint that accepts POST\n');
+  }
+
+  if (executor === 'webhook' || executor === 'langserve' || executor === 'langgraph' || executor === 'a2a') {
+    const { url } = await promptWithEsc(inquirer, [{ type: 'input', name: 'url', message: 'Endpoint URL:', default: config.executorUrl || '' }]);
+    if (!url) {
+      console.log('\n  ❌ Endpoint URL is required for this executor.\n');
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+      return;
+    }
+    newConfig.executorUrl = url;
+
+    const { auth } = await promptWithEsc(inquirer, [{ type: 'password', name: 'auth', message: 'Authorization header (e.g. Bearer xxx, leave empty for none):', mask: '*', default: '' }]);
+    if (auth) newConfig.executorAuth = auth;
+
+    const { timeout } = await promptWithEsc(inquirer, [{ type: 'input', name: 'timeout', message: 'Timeout (ms):', default: executor === 'langgraph' || executor === 'a2a' ? '120000' : '60000' }]);
+    newConfig.executorTimeout = timeout;
+  }
+
+  if (executor === 'langgraph') {
+    const { assistant } = await promptWithEsc(inquirer, [{ type: 'input', name: 'assistant', message: 'Assistant ID:', default: config.executorAssistant || 'agent' }]);
+    newConfig.executorAssistant = assistant;
+  }
+
+  if (executor === 'mcp') {
+    const { transport } = await promptWithEsc(inquirer, [{ type: 'list', name: 'transport', message: 'MCP transport:', choices: [
+      { name: '  stdio   — spawn a local process (e.g. node server.js)', value: 'stdio' },
+      { name: '  http    — connect to a Streamable HTTP URL', value: 'http' },
+    ]}]);
+
+    if (transport === 'stdio') {
+      const { cmd } = await promptWithEsc(inquirer, [{ type: 'input', name: 'cmd', message: 'Command to start MCP server:', default: config.mcpCommand || 'node mcp-server.js' }]);
+      newConfig.mcpCommand = cmd;
+    } else {
+      const { url } = await promptWithEsc(inquirer, [{ type: 'input', name: 'url', message: 'MCP server URL:', default: config.mcpUrl || '' }]);
+      newConfig.mcpUrl = url;
+    }
+
+    const { maxRounds } = await promptWithEsc(inquirer, [{ type: 'input', name: 'maxRounds', message: 'Max tool-calling rounds per message:', default: config.mcpMaxRounds || '10' }]);
+    newConfig.mcpMaxRounds = maxRounds;
+  }
+
+  // ── Summary & confirm ──
+
+  console.log('\n  ─── New Configuration ───');
+  console.log(`    Executor:  ${newConfig.executor}`);
+  if (newConfig.llmProvider) console.log(`    Provider:  ${newConfig.llmProvider}`);
+  if (newConfig.llmModel) console.log(`    Model:     ${newConfig.llmModel}`);
+  if (newConfig.executorUrl) console.log(`    URL:       ${newConfig.executorUrl}`);
+  if (newConfig.mcpCommand) console.log(`    MCP cmd:   ${newConfig.mcpCommand}`);
+  if (newConfig.mcpUrl) console.log(`    MCP URL:   ${newConfig.mcpUrl}`);
+  if (newConfig.executorAssistant) console.log(`    Assistant: ${newConfig.executorAssistant}`);
+  if (newConfig.llmApiKey) console.log(`    API Key:   ${newConfig.llmApiKey.length > 12 ? '****' + newConfig.llmApiKey.slice(-4) : '(set)'}`);
+  if (newConfig.executorAuth) console.log(`    Auth:      ${newConfig.executorAuth.length > 12 ? '****' + newConfig.executorAuth.slice(-4) : '(set)'}`);
+  console.log('');
+
+  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Save this configuration?', default: true }]);
+  if (!confirm) return;
+
+  saveAgentConfig(agentId, newConfig);
+  console.log(`\n  ✅ Saved to ~/.j41/dispatcher/agents/${agentId}/agent-config.json`);
+  console.log('  Restart dispatcher to apply.\n');
+
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
+async function configureLLMProvider(inquirer, config) {
+  const { LLM_PRESETS } = require('./executors/local-llm.js');
+
+  // Group providers by category for readability
+  const commercial = ['openai', 'claude', 'gemini', 'grok', 'mistral', 'deepseek', 'cohere', 'perplexity'];
+  const fast = ['groq', 'together', 'fireworks'];
+  const enterprise = ['azure', 'nvidia'];
+  const kimi = ['kimi', 'kimi-nvidia'];
+  const routers = ['openrouter'];
+  const local = ['ollama', 'lmstudio', 'vllm'];
+
+  const makeChoice = (p) => {
+    const preset = LLM_PRESETS[p];
+    const keyLabel = preset.envKey ? `(${preset.envKey})` : '(no key needed)';
+    return { name: `  ${p.padEnd(14)} ${(preset.model || '').padEnd(35)} ${keyLabel}`, value: p };
+  };
+
+  const { provider } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 25, name: 'provider', message: 'Select LLM provider:', choices: [
+    new inquirer.Separator('  ── Commercial APIs ──'),
+    ...commercial.filter(p => LLM_PRESETS[p]).map(makeChoice),
+    new inquirer.Separator('  ── Fast Inference ──'),
+    ...fast.filter(p => LLM_PRESETS[p]).map(makeChoice),
+    new inquirer.Separator('  ── Enterprise ──'),
+    ...enterprise.filter(p => LLM_PRESETS[p]).map(makeChoice),
+    new inquirer.Separator('  ── Kimi / Moonshot ──'),
+    ...kimi.filter(p => LLM_PRESETS[p]).map(makeChoice),
+    new inquirer.Separator('  ── Multi-Provider Routers ──'),
+    ...routers.filter(p => LLM_PRESETS[p]).map(makeChoice),
+    new inquirer.Separator('  ── Self-Hosted / Local ──'),
+    ...local.filter(p => LLM_PRESETS[p]).map(makeChoice),
+    new inquirer.Separator(),
+    { name: '  custom        (set base URL + key manually)', value: 'custom' },
+  ]}]);
+
+  config.llmProvider = provider;
+  const preset = LLM_PRESETS[provider] || {};
+
+  // Warn about providers that need OpenAI-compatible proxy
+  if (provider === 'claude') {
+    console.log('\n  ⚠  The Anthropic API does not natively support /chat/completions.');
+    console.log('     Use OpenRouter (openrouter preset) or an OpenAI-compatible proxy.');
+    console.log('     Or set a custom base URL pointing to a compatible gateway.\n');
+  }
+  if (provider === 'azure' && !preset.baseUrl) {
+    console.log('\n  ⚠  Azure requires your deployment URL (e.g. https://YOUR.openai.azure.com/openai/deployments/YOUR-MODEL/v1)');
+    console.log('     You must set the base URL below.\n');
+  }
+
+  // Prompt for API key using the provider's specific key name
+  if (preset.envKey) {
+    const { key } = await promptWithEsc(inquirer, [{ type: 'password', name: 'key', message: `${preset.envKey}:`, mask: '*' }]);
+    if (key) config.llmApiKey = key;
+  } else if (provider === 'custom') {
+    const { baseUrl } = await promptWithEsc(inquirer, [{ type: 'input', name: 'baseUrl', message: 'Base URL (e.g. https://my-api.com/v1):' }]);
+    if (baseUrl) config.llmBaseUrl = baseUrl;
+    const { key } = await promptWithEsc(inquirer, [{ type: 'password', name: 'key', message: 'API Key (leave empty for none):', mask: '*' }]);
+    if (key) config.llmApiKey = key;
+  }
+  // else: local providers (ollama, lmstudio, vllm) — no key needed
+
+  // Model override
+  const { model } = await promptWithEsc(inquirer, [{ type: 'input', name: 'model', message: 'Model (Enter for default):', default: preset.model || '' }]);
+  if (model && model !== preset.model) config.llmModel = model;
+
+  // Custom base URL override for non-custom providers
+  if (provider !== 'custom' && provider !== 'ollama' && provider !== 'lmstudio' && provider !== 'vllm') {
+    const { baseOverride } = await promptWithEsc(inquirer, [{ type: 'input', name: 'baseOverride', message: 'Base URL override (Enter for default):', default: '' }]);
+    if (baseOverride) config.llmBaseUrl = baseOverride;
+  }
 }
 
 async function securityScreen(inquirer) {
@@ -1003,6 +1283,7 @@ async function main() {
     switch (choice) {
       case 'agents': await withBack(() => agentListScreen(inquirer)); break;
       case 'add': await withBack(() => addAgentScreen(inquirer)); break;
+      case 'executor': await withBack(() => executorConfigScreen(inquirer)); break;
       case 'llm': await withBack(() => llmScreen(inquirer)); break;
       case 'services': await withBack(() => configureServicesScreen(inquirer)); break;
       case 'security': await withBack(() => securityScreen(inquirer)); break;

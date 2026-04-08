@@ -1,6 +1,6 @@
 {
-  "name": "j41-dispatcher",
-  "version": "2.0.0",
+  "name": "@junction41/dispatcher",
+  "version": "2.0.2",
   "description": "Multi-agent orchestration for Junction41 — supports 22 LLM providers, 12 executor frameworks, workspace/connect, and on-chain VDXF identity",
   "main": "src/cli.js",
   "bin": {
@@ -28,7 +28,7 @@
     "inquirer": "^9"
   },
   "optionalDependencies": {
-    "@junction41/secure-setup": "^2.0.0"
+    "@junction41/secure-setup": ">=0.1.0"
   },
   "engines": {
     "node": ">=20.0.0"
