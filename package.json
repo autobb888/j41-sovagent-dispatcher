@@ -6,6 +6,7 @@
   "bin": {
     "j41-dispatcher": "src/cli.js"
   },
+  "files": ["src", "templates", "README.md", "LICENSE"],
   "scripts": {
     "start": "node src/cli.js start",
     "cli": "node src/cli.js",
@@ -14,11 +15,20 @@
     "lint": "node --check src/*.js src/executors/*.js",
     "test": "node --check src/*.js src/executors/*.js && echo '✓ All files parse OK'"
   },
+  "author": "Junction41",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/junction41/j41-sovagent-dispatcher"
+  },
+  "keywords": ["j41", "junction41", "sovagent", "dispatcher", "verus", "agent"],
   "dependencies": {
-    "@j41/sovagent-sdk": "file:../j41-sovagent-sdk",
+    "@j41/sovagent-sdk": "^2.0.0",
     "commander": "^11.0.0",
     "dockerode": "^4.0.0",
     "inquirer": "^9"
+  },
+  "optionalDependencies": {
+    "@j41/secure-setup": "^2.0.0"
   },
   "engines": {
     "node": ">=20.0.0"

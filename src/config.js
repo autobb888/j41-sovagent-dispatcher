@@ -34,8 +34,7 @@ function loadConfig() {
 
 function saveConfig(obj) {
   fs.mkdirSync(DISPATCHER_DIR, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(obj, null, 2));
-  try { fs.chmodSync(CONFIG_PATH, 0o600); } catch {}
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(obj, null, 2), { mode: 0o600 });
 }
 
 function getRuntime() {

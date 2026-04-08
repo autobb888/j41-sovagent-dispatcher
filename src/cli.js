@@ -3,7 +3,7 @@
  * J41 Dispatcher v2 — Ephemeral Job Containers
  * 
  * Manages pool of pre-registered agents, spawns ephemeral containers per job.
- * Max 9 concurrent. Queue if at capacity.
+ * Queue if at capacity. Default max concurrent from config (9) or env override.
  */
 
 // Auto-load .env from project root (before anything reads process.env)
@@ -11,7 +11,14 @@ const _envPath = require('path').resolve(__dirname, '..', '.env');
 if (require('fs').existsSync(_envPath)) {
   for (const line of require('fs').readFileSync(_envPath, 'utf8').split('\n')) {
     const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
-    if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+    if (m && !process.env[m[1]]) {
+      // Strip surrounding quotes (single or double) from values
+      let val = m[2];
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1);
+      }
+      process.env[m[1]] = val;
+    }
   }
 }
 
@@ -40,12 +47,7 @@ let secureSetup;
 try {
   secureSetup = require('@j41/secure-setup');
 } catch {
-  try {
-    // Local dev: try direct path
-    secureSetup = require('../j41-secure-setup/lib/index.js');
-  } catch {
-    // Not available — first-run will skip
-  }
+  // @j41/secure-setup not installed — security features will be skipped
 }
 
 const J41_DIR = path.join(os.homedir(), '.j41');
@@ -169,6 +171,10 @@ function recordDispatcherSend(jobId, amount) {
   }
   dispatcherSendHistory.perJob.get(jobId).push(record);
   dispatcherSendHistory.global.push(record);
+
+  // Prune entries older than 1 hour to prevent unbounded growth
+  const oneHourAgo = Date.now() - 3_600_000;
+  dispatcherSendHistory.global = dispatcherSendHistory.global.filter(r => r.timestamp > oneHourAgo);
 }
 
 // ── Dispatcher-side allowlist sweep timer ──
@@ -962,7 +968,7 @@ function getActiveJobs() {
 program
   .name('j41-dispatcher')
   .description('Ephemeral job container orchestrator for J41')
-  .version('0.2.0');
+  .version('2.0.0');
 
 // Config command — view/change runtime settings
 program
@@ -2471,6 +2477,12 @@ program
       retries: new Map(), // jobId -> retry count
       agentSessions: new Map(), // agentId -> { agent: J41Agent, authedAt: number }
       capabilities: new Map(), // agentId -> { workspace: bool, services: [] }
+      disputePolicy: new Map(), // agentId -> policy object
+      agentMarkup: new Map(), // agentId -> markup percentage
+      pendingPayment: new Map(), // jobId -> payment info
+      _lastSentStatus: new Map(), // jobId -> last status sent
+      _lastExtensionCheck: new Map(), // jobId -> last extension check timestamp
+      _pendingWorkspace: new Map(), // jobId -> workspace connect promise
       _devUnsafe, // security: allows local mode when true
     };
 
@@ -2561,8 +2573,6 @@ program
     console.log('');
 
     // Cache dispute policy and markup per agent from VDXF
-    if (!state.disputePolicy) state.disputePolicy = new Map();
-    if (!state.agentMarkup) state.agentMarkup = new Map();
     for (const agentInfo of readyAgents) {
       try {
         const agent = await getAgentSession(state, agentInfo);
@@ -3153,10 +3163,10 @@ function sendToJobAgent(activeInfo, msg) {
   if (activeInfo.container) {
     try {
       const msgJson = JSON.stringify(msg);
-      require('child_process').execSync(
-        `docker exec ${activeInfo.container.id} sh -c 'echo '"'"'${msgJson.replace(/'/g, "'\\''")}'"'"' > /tmp/ipc-msg.json'`,
-        { timeout: 5000, stdio: 'ignore' }
-      );
+      require('child_process').execFileSync('docker', [
+        'exec', '-i', activeInfo.container.id,
+        'sh', '-c', 'cat >> /tmp/ipc-msg.jsonl'
+      ], { input: msgJson + '\n', timeout: 5000, stdio: ['pipe', 'ignore', 'ignore'] });
       return true;
     } catch { return false; }
   }
@@ -3368,7 +3378,11 @@ function queueInsertByPriority(queue, job) {
 
 // Poll for new jobs — check ALL agents, not just available ones
 // (an agent with an active job can still have new jobs queued for it)
+let _polling = false;
 async function pollForJobs(state) {
+  if (_polling) return; // guard against concurrent polls
+  _polling = true;
+  try {
   for (let i = 0; i < state.agents.length; i++) {
     const agentInfo = state.agents[i];
     // Stagger API calls — 500ms between agents to avoid rate limits at scale
@@ -3407,12 +3421,11 @@ async function pollForJobs(state) {
         // Skip jobs in terminal states (delivered, completed, cancelled, resolved)
         const TERMINAL_STATUSES = ['delivered', 'completed', 'cancelled', 'resolved', 'resolved_rejected'];
         if (TERMINAL_STATUSES.includes(job.status)) {
-          state.seen.add(job.id);
+          state.seen.set(job.id, Date.now());
           continue;
         }
 
         // ── Step 1: Accept the job (sign commitment) if not already accepted ──
-        if (!state.pendingPayment) state.pendingPayment = new Map(); // jobId -> { accepted }
         const pending = state.pendingPayment.get(job.id);
 
         if (job.status === 'requested' && !pending?.accepted) {
@@ -3497,7 +3510,6 @@ async function pollForJobs(state) {
 
   // Check for post-delivery status transitions (poll mode fallback)
   // Track last-sent status per job to avoid duplicate IPC messages
-  if (!state._lastSentStatus) state._lastSentStatus = new Map();
   for (const [jobId, activeInfo] of state.active.entries()) {
     try {
       const agentSession = await getAgentSession(state, activeInfo.agentInfo);
@@ -3539,7 +3551,6 @@ async function pollForJobs(state) {
   }
 
   // Poll-mode fallback: check for pending extension requests on active jobs
-  if (!state._lastExtensionCheck) state._lastExtensionCheck = new Map();
   for (const [jobId, activeInfo] of state.active.entries()) {
     if (activeInfo.paused) continue; // Don't check paused jobs
     try {
@@ -3640,6 +3651,9 @@ async function pollForJobs(state) {
       state.queue.push(queuedJob);
       break; // Don't keep trying if container creation is failing
     }
+  }
+  } finally {
+    _polling = false;
   }
 }
 
@@ -3817,7 +3831,6 @@ async function handleWebhookEvent(state, agentId, payload) {
         console.log(`[Webhook] Workspace ready — notified job-agent ${jobId?.substring(0, 8)}`);
       } else {
         // Job-agent not spawned yet or no IPC — queue for delivery when ready
-        if (!state._pendingWorkspace) state._pendingWorkspace = new Map();
         state._pendingWorkspace.set(jobId, {
           sessionId: data.sessionId,
           permissions: data.permissions,
@@ -3943,6 +3956,13 @@ async function handleWebhookEvent(state, agentId, payload) {
           }
 
           state.seen.set(bountyJobId, Date.now());
+
+          // Start the job — same as poll-mode acceptance
+          try {
+            await startJob(state, agentInfo, fullJob);
+          } catch (startErr) {
+            console.error(`[Webhook] Bounty job start failed: ${startErr.message}`);
+          }
         }
       } catch (e) {
         if (!e.message?.includes('already')) console.error(`[Webhook] Bounty accept failed: ${e.message}`);
@@ -3967,18 +3987,18 @@ async function handleWebhookEvent(state, agentId, payload) {
 
     // ── SovGuard limit webhooks ──
     case 'limit.warning': {
-      const usage = event.data?.usage || '?';
-      const limit = event.data?.limit || '?';
-      const plan = event.data?.plan || '?';
-      const threshold = event.data?.threshold || 0.8;
+      const usage = data?.usage || '?';
+      const limit = data?.limit || '?';
+      const plan = data?.plan || '?';
+      const threshold = data?.threshold || 0.8;
       console.warn(`\n⚠️  [SovGuard] Usage warning: ${usage}/${limit} tokens (${Math.round(threshold * 100)}%) — plan: ${plan}`);
-      if (event.data?.upgrade_url) console.warn(`   Upgrade: ${event.data.upgrade_url}`);
+      if (data?.upgrade_url) console.warn(`   Upgrade: ${data.upgrade_url}`);
       break;
     }
     case 'limit.reached': {
-      const plan = event.data?.plan || '?';
+      const plan = data?.plan || '?';
       console.error(`\n⛔ [SovGuard] Token limit reached — plan: ${plan}. Scans will be rejected.`);
-      if (event.data?.upgrade_url) console.error(`   Upgrade: ${event.data.upgrade_url}`);
+      if (data?.upgrade_url) console.error(`   Upgrade: ${data.upgrade_url}`);
       break;
     }
 
@@ -4193,9 +4213,11 @@ async function startJobContainer(state, job, agentInfo) {
   const agentDir = path.join(AGENTS_DIR, agentInfo.id);
   const keysPath = path.join(agentDir, 'keys.json');
 
-  // H3 fix: Copy keys to a temp file at 0o640 — do NOT chmod the original.
-  // This ensures the original stays at 0o600 even if the process crashes.
-  const tmpKeysPath = path.join(jobDir, 'keys.json');
+  // Copy keys to a temp file OUTSIDE the writable job dir to avoid double-exposing the WIF.
+  // The job dir is mounted rw (/app/job), so keys must not be inside it.
+  const tmpKeysDir = path.join(os.tmpdir(), `j41-keys-${job.id}`);
+  fs.mkdirSync(tmpKeysDir, { recursive: true, mode: 0o700 });
+  const tmpKeysPath = path.join(tmpKeysDir, 'keys.json');
   fs.copyFileSync(keysPath, tmpKeysPath);
   try {
     fs.chmodSync(tmpKeysPath, 0o644); // container process needs read access; mount is :ro
@@ -4209,7 +4231,7 @@ async function startJobContainer(state, job, agentInfo) {
 
     // Remove stale container with same name (leftover from crash/restart)
     try {
-      require('child_process').execSync(`docker rm -f ${containerName}`, { stdio: 'ignore', timeout: 10000 });
+      require('child_process').execFileSync('docker', ['rm', '-f', containerName], { stdio: 'ignore', timeout: 10000 });
       console.log(`  ♻️  Removed stale container ${containerName}`);
     } catch {}
 
@@ -4229,7 +4251,7 @@ async function startJobContainer(state, job, agentInfo) {
             'KIMI_API_KEY','KIMI_BASE_URL','KIMI_MODEL',
             'ANTHROPIC_API_KEY','OPENAI_API_KEY','GROQ_API_KEY','DEEPSEEK_API_KEY',
             'MISTRAL_API_KEY','GOOGLE_API_KEY','XAI_API_KEY','OPENROUTER_API_KEY',
-            'IDLE_TIMEOUT_MS','J41_EXECUTOR','MAX_CONVERSATION_LOG',
+            'IDLE_TIMEOUT_MS','PAUSE_TTL_MS','J41_EXECUTOR','MAX_CONVERSATION_LOG',
         ].filter(k => process.env[k]).map(k => `${k}=${process.env[k]}`),
         // Per-agent executor config (from agent-config.json or keys.json)
         ...getExecutorEnvVars(agentInfo),
@@ -4322,14 +4344,18 @@ async function startJobContainer(state, job, agentInfo) {
 
     // Set timeout — offset +60s from container's internal timeout
     // so the container can self-terminate and submit attestation first
-    setTimeout(async () => {
+    const _timeoutTimer = setTimeout(async () => {
       const active = state.active.get(job.id);
       if (active) {
         console.log(`⏰ Job ${job.id} timeout, killing container`);
         await stopJobContainer(state, job.id);
       }
     }, JOB_TIMEOUT_MS + 60000);
-    
+
+    // Store timer ref so it can be cleared on job cleanup
+    const activeEntry = state.active.get(job.id);
+    if (activeEntry) activeEntry._timeoutTimer = _timeoutTimer;
+
   } catch (e) {
     console.error(`❌ Failed to start container for ${job.id}:`, e.message);
     // Return agent to pool
@@ -4369,7 +4395,16 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   } else if (!skipReturnAgent && active.paused) {
     state.retries.delete(jobId);
   }
+  // Clear timeout timer to prevent leak
+  if (active._timeoutTimer) clearTimeout(active._timeoutTimer);
+
   state.active.delete(jobId);
+
+  // Prune per-job tracking Maps to prevent memory leaks
+  state._lastSentStatus.delete(jobId);
+  state._lastExtensionCheck.delete(jobId);
+  state._pendingWorkspace.delete(jobId);
+  state.pendingPayment.delete(jobId);
 
   // ── Allowlist lifecycle: remove buyer address ──
   removeActiveJobFromAllowlist(jobId);
@@ -4574,13 +4609,17 @@ async function startJobLocal(state, job, agentInfo) {
     log.info('Job process started', { jobId: job.id, pid: child.pid, agentId: agentInfo.id });
 
     // Timeout
-    setTimeout(async () => {
+    const _timeoutTimer = setTimeout(async () => {
       const active = state.active.get(job.id);
       if (active) {
         console.log(`⏰ Job ${job.id} timeout, killing process`);
         await stopJobLocal(state, job.id);
       }
     }, JOB_TIMEOUT_MS + 60000);
+
+    // Store timer ref so it can be cleared on job cleanup
+    const activeEntry = state.active.get(job.id);
+    if (activeEntry) activeEntry._timeoutTimer = _timeoutTimer;
 
   } catch (e) {
     console.error(`❌ Failed to start local process for ${job.id}:`, e.message);
@@ -4623,8 +4662,17 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
     // Agent already in available pool from pause — just clean up retries
     state.retries.delete(jobId);
   }
+  // Clear timeout timer to prevent leak
+  if (active._timeoutTimer) clearTimeout(active._timeoutTimer);
+
   state.active.delete(jobId);
   persistActiveJobs(state.active);
+
+  // Prune per-job tracking Maps to prevent memory leaks
+  state._lastSentStatus.delete(jobId);
+  state._lastExtensionCheck.delete(jobId);
+  state._pendingWorkspace.delete(jobId);
+  state.pendingPayment.delete(jobId);
 
   // ── Allowlist lifecycle: remove buyer address ──
   removeActiveJobFromAllowlist(jobId);
@@ -4752,7 +4800,7 @@ program
       const result = await agent.respondToDispute(jobId, {
         action,
         refundPercent: options.refundPercent ? parseInt(options.refundPercent, 10) : undefined,
-        reworkCost: parseFloat(options.reworkCost) ?? 0,
+        reworkCost: parseFloat(options.reworkCost) || 0,
         message,
       });
 

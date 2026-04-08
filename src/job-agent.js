@@ -29,6 +29,8 @@ const JOB_DIR = process.env.J41_JOB_DIR || '/app/job';
 // Container metadata (from Docker labels)
 const CONTAINER_ID = process.env.HOSTNAME || 'unknown'; // Docker sets HOSTNAME to container ID
 
+let _idleMessageSent = false;
+
 // P2-1: Input sanitization helper
 function sanitizeInput(input) {
   if (typeof input !== 'string') return '';
@@ -97,7 +99,7 @@ async function main() {
     console.log('  J41_EXECUTOR_ASSISTANT  LangGraph assistant ID (default: agent)');
     console.log('  J41_MCP_COMMAND    MCP server command (mcp executor, stdio)');
     console.log('  J41_MCP_URL        MCP server URL (mcp executor, HTTP)');
-    console.log('  IDLE_TIMEOUT_MS    Idle timeout before pausing session (default: 600000)');
+    console.log('  IDLE_TIMEOUT_MS    Idle timeout before pausing session (default: 480000)');
     console.log('\nThis container is spawned by j41-dispatcher for each job.');
     process.exit(0);
   }
@@ -305,17 +307,24 @@ async function main() {
     process.on('message', handleIpcMessage);
   }
 
-  // Docker mode — poll /tmp/ipc-msg.json for messages from dispatcher
-  const IPC_FILE = '/tmp/ipc-msg.json';
-  const _ipcPoller = setInterval(async () => {
+  // Docker mode — poll /tmp/ipc-msg.jsonl for messages from dispatcher (one JSON per line)
+  const IPC_FILE = '/tmp/ipc-msg.jsonl';
+  let _ipcPoller = setInterval(async () => {
     try {
       if (!fs.existsSync(IPC_FILE)) return;
       const raw = fs.readFileSync(IPC_FILE, 'utf8').trim();
       fs.unlinkSync(IPC_FILE); // consume immediately
       if (!raw) return;
-      const msg = JSON.parse(raw);
-      console.log(`[IPC-FILE] Received: ${msg.type}`);
-      await handleIpcMessage(msg);
+      for (const line of raw.split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const msg = JSON.parse(line);
+          console.log(`[IPC-FILE] Received: ${msg.type}`);
+          await handleIpcMessage(msg);
+        } catch (parseErr) {
+          console.error(`[IPC-FILE] Failed to parse line: ${parseErr.message}`);
+        }
+      }
     } catch {}
   }, 2000);
 
@@ -378,6 +387,7 @@ async function main() {
   // ─────────────────────────────────────────
   // STEP 5: CLEANUP + ATTESTATION + IDENTITY UPDATE
   // ─────────────────────────────────────────
+  clearInterval(_ipcPoller); // Safe to clear now — post-delivery wait is done
   disconnectWorkspace();
   await performCleanup(agent, keys, fullJob, postDeliveryResult);
 }
@@ -579,7 +589,7 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   // Wait for session end or idle timeout
   await sessionPromise;
   clearInterval(idleCheck);
-  clearInterval(_ipcPoller);
+  // NOTE: _ipcPoller is NOT cleared here — it must survive for post-delivery IPC (dispute/rework)
   _wsPollerStopped = true;
   if (_wsPollTimer) clearTimeout(_wsPollTimer);
 
@@ -588,7 +598,6 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
 }
 
 let _workspaceConnecting = false;
-let _idleMessageSent = false;
 let _wsPingInterval = null;
 async function connectWorkspace(jobId, permissions, mode) {
   if (_workspaceConnected || _workspaceConnecting) return;
@@ -1109,9 +1118,11 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
             }
 
             // Calculate rework token budget
+            // NOTE: fullJob.amount is in VRSC, not USD — token budget is approximate.
+            // Using conservative $0.50/VRSC estimate until live price feed is available.
             let tokenBudget = null;
             if (_disputePolicy && fullJob.amount) {
-              const budgetUsd = (_disputePolicy.reworkBudgetPercent / 100) * fullJob.amount;
+              const budgetUsd = (_disputePolicy.reworkBudgetPercent / 100) * fullJob.amount * 0.5;
               try {
                 const { budgetToTokens } = require('@j41/sovagent-sdk/dist/pricing/calculator.js');
                 const model = process.env.J41_LLM_MODEL || 'claude-sonnet-4';

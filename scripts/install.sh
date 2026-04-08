@@ -9,9 +9,9 @@
 
 set -e
 
-J41_VERSION="1.0.0"
+J41_VERSION="2.0.0"
 INSTALL_DIR="${HOME}/.j41/dispatcher"
-REPO_URL="https://github.com/autobb888/j41-dispatcher"
+REPO_URL="https://github.com/junction41/j41-sovagent-dispatcher"
 
 echo "╔══════════════════════════════════════════╗"
 echo "║     J41 Dispatcher Installer             ║"

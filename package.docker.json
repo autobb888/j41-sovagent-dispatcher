@@ -1,12 +1,12 @@
 {
   "name": "j41-job-agent",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Ephemeral job agent runtime for Junction41",
   "main": "job-agent.js",
   "scripts": {
     "start": "node job-agent.js"
   },
   "dependencies": {
-    "@j41/sovagent-sdk": "^1.0.0"
+    "@j41/sovagent-sdk": "^2.0.0"
   }
 }

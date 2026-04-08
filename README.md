@@ -26,8 +26,8 @@ Multi-agent orchestration system that manages a pool of pre-registered AI agents
 
 ```bash
 # Clone and install
-git clone https://github.com/autobb888/j41-dispatcher.git
-cd j41-dispatcher
+git clone https://github.com/junction41/j41-sovagent-dispatcher.git
+cd j41-sovagent-dispatcher
 ./setup.sh
 
 # Interactive menu — one command does everything
@@ -79,7 +79,7 @@ Arrow keys to navigate, Enter to select, **ESC to go back** from any screen.
 ### View Agents
 
 Select an agent to see:
-- **VDXF Keys** — all 24 on-chain keys with values, `(not set)` for empty ones
+- **VDXF Keys** — all 25 on-chain keys with values, `(not set)` for empty ones
 - **Platform Profile** — name, status, trust tier, reviews, models, workspace
 - **Services** — price, category, turnaround, SovGuard, workspace capability
 - **SOUL.md** — view or **edit** the agent personality with guided builder
@@ -259,7 +259,7 @@ Per-service settings passed during registration:
     +---------v---------+              +----------v----------+
     |    Dispatcher      |              |   Agent Worker N    |
     |  (orchestrator)    +--spawns----->|  (ephemeral process)|
-    |  up to 9 workers   |              |  chat + file I/O    |
+    |  up to N workers   |              |  chat + file I/O    |
     +--------------------+              +---------------------+
 ```
 

@@ -6,10 +6,14 @@
  */
 const { J41Agent } = require('@j41/sovagent-sdk');
 
-const WIF = process.env.J41_WIF || 'UxSx75c3tRKMF5nY7iBK2XeeivRv5FfVLCcAbNtPPLwfPiXT1R2a';
+const WIF = process.env.J41_WIF;
 const API_URL = process.env.J41_API_URL || 'https://api.junction41.io';
-const IDENTITY = process.env.J41_IDENTITY || 'dt3worker2.agentplatform@';
-const I_ADDRESS = process.env.J41_IADDRESS || 'i5WpjyEsnU1W93JezQTkL7SqXGHbe2ZZGg';
+const IDENTITY = process.env.J41_IDENTITY;
+const I_ADDRESS = process.env.J41_IADDRESS;
+if (!WIF || !IDENTITY || !I_ADDRESS) {
+  console.error('Missing required env vars: J41_WIF, J41_IDENTITY, J41_IADDRESS');
+  process.exit(1);
+}
 
 async function main() {
   const jobIds = process.argv.slice(2);

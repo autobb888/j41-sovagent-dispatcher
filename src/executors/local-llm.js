@@ -301,7 +301,7 @@ async function callLLM(systemPrompt, messages) {
     if (!res.ok) {
       const err = await res.text();
       log.error('LLM API error', { status: res.status, error: err.substring(0, 200) });
-      return 'I encountered an issue generating a response. Let me try to help directly — could you rephrase your question?';
+      return { content: 'I encountered an issue generating a response. Let me try to help directly — could you rephrase your question?', usage: null };
     }
 
     const data = await res.json();

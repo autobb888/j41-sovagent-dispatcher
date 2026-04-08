@@ -331,7 +331,7 @@ class MCPExecutor extends Executor {
     await this._rpc('initialize', {
       protocolVersion: '2024-11-05',
       capabilities: {},
-      clientInfo: { name: 'j41-agent', version: '1.0.0' },
+      clientInfo: { name: 'j41-agent', version: '2.0.0' },
     });
 
     // Send initialized notification (no id = notification)

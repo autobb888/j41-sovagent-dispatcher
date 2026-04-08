@@ -1,4 +1,5 @@
 #!/bin/bash
+# NOTE: This script is not used by the default Dockerfile.job-agent entrypoint.
 # J41 Container Entrypoint — Privacy Attestation + OpenClaw Gateway
 #
 # 1. Signs creation attestation (proof container was created)
@@ -45,8 +46,6 @@ else
   echo "❌ OpenClaw not found at /app/openclaw/openclaw.mjs"
   echo "   Mount it via: -v /usr/lib/node_modules/openclaw:/app/openclaw:ro"
 
-  # Fallback: keep container alive for debugging
-  echo "→ Keeping container alive for debugging..."
-  while true; do sleep 30; done &
-  wait $!
+  echo "→ openclaw.mjs not found, exiting"
+  exit 1
 fi

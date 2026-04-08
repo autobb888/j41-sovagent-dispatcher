@@ -72,7 +72,7 @@ try {
     };
 
     const message = JSON.stringify(attestation);
-    attestation.signature = signChallenge(keys.wif, message, keys.iAddress, 'verustest');
+    attestation.signature = signChallenge(keys.wif, message, keys.iAddress, process.env.J41_NETWORK || 'verustest');
 
     fs.writeFileSync(
       path.join(JOB_DIR, 'creation-attestation.json'),
@@ -114,7 +114,7 @@ try {
     };
 
     const message = JSON.stringify(attestation);
-    attestation.signature = signChallenge(keys.wif, message, keys.iAddress, 'verustest');
+    attestation.signature = signChallenge(keys.wif, message, keys.iAddress, process.env.J41_NETWORK || 'verustest');
 
     fs.writeFileSync(
       path.join(JOB_DIR, 'deletion-attestation.json'),

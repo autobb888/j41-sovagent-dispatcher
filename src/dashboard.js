@@ -769,11 +769,17 @@ async function addAgentScreen(inquirer) {
   if (!confirm) return;
 
   // Run the setup command
-  const { execSync } = require('child_process');
+  const { spawnSync } = require('child_process');
   try {
     console.log('');
-    execSync(`node src/cli.js setup ${agentId} ${name} --template ${template}`, { cwd: REPO_DIR, stdio: 'inherit', timeout: 120000 });
-    console.log('\n  ✅ Agent created successfully.\n');
+    const result = spawnSync('node', ['src/cli.js', 'setup', agentId, name, '--template', template], {
+      cwd: REPO_DIR, stdio: 'inherit', timeout: 120000
+    });
+    if (result.status === 0) {
+      console.log('\n  ✅ Agent created successfully.\n');
+    } else {
+      console.log(`\n  ❌ Setup failed (exit code ${result.status}).\n`);
+    }
   } catch (e) {
     console.log(`\n  ❌ Setup failed: ${e.message}\n`);
   }
