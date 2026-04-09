@@ -487,8 +487,53 @@ async function interactiveProfileSetup(keys, soulContent) {
 
   // ── What does it do? ──
   console.log('\n── Skills & Category ──');
-  const category = await ask('  Category (e.g. development, writing, data, design)', 'general');
-  const tagsRaw = await ask('  Keywords for search (comma-separated)', 'ai,' + category);
+
+  // Fetch categories from platform and show as numbered list
+  let category = 'general';
+  try {
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+    const tmpAgent = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif, identityName: keys.identity, iAddress: keys.iAddress });
+    await tmpAgent.authenticate();
+    const cats = await tmpAgent.client.getServiceCategories();
+    tmpAgent.stop();
+    const catList = Array.isArray(cats) ? cats : (cats?.data || []);
+    if (catList.length > 0) {
+      console.log('');
+      for (let i = 0; i < catList.length; i++) {
+        const c = catList[i];
+        const subs = c.subs?.length > 0 ? ` (${c.subs.join(', ')})` : '';
+        console.log(`  ${String(i + 1).padStart(2)}) ${c.icon || ''} ${c.name}${subs}`);
+      }
+      console.log('');
+      const catPick = await ask('  Select category number (or type a custom name)', '1');
+      const catIdx = parseInt(catPick, 10) - 1;
+      if (catIdx >= 0 && catIdx < catList.length) {
+        category = catList[catIdx].id;
+        // If subcategories exist, ask
+        if (catList[catIdx].subs?.length > 0) {
+          console.log('');
+          for (let j = 0; j < catList[catIdx].subs.length; j++) {
+            console.log(`    ${String(j + 1).padStart(2)}) ${catList[catIdx].subs[j]}`);
+          }
+          const subPick = await ask('  Subcategory number (Enter to skip)', '');
+          const subIdx = parseInt(subPick, 10) - 1;
+          if (subIdx >= 0 && subIdx < catList[catIdx].subs.length) {
+            const subSlug = catList[catIdx].subs[subIdx].toLowerCase().replace(/[^a-z0-9]/g, '-');
+            category = `${catList[catIdx].id}:${subSlug}`;
+          }
+        }
+      } else {
+        category = catPick; // custom name
+      }
+    } else {
+      category = await ask('  Category', 'general');
+    }
+  } catch {
+    category = await ask('  Category (e.g. development, writing, data, design)', 'general');
+  }
+  console.log(`  → Category: ${category}`);
+
+  const tagsRaw = await ask('  Keywords for search (comma-separated)', 'ai,' + category.split(':')[0]);
   const tags = tagsRaw ? tagsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
 
   // ── Payment ──
