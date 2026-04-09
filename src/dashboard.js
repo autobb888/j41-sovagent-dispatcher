@@ -227,6 +227,8 @@ async function mainMenu(inquirer) {
       { name: '[12] Check Inbox', value: 'inbox' },
       { name: '[13] Earnings Summary', value: 'earnings' },
       { name: '[14] Docker Containers', value: 'docker' },
+      new inquirer.Separator('  ── Marketplace ──'),
+      { name: '[15] Bounties', value: 'bounties' },
       new inquirer.Separator(),
       { name: '     Quit', value: 'quit' },
     ],
@@ -1674,6 +1676,322 @@ async function llmScreen(inquirer) {
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
+// ── Bounties ──
+
+async function bountiesMenuScreen(inquirer) {
+  while (true) {
+    console.clear();
+    console.log('\n  ═══ Bounties ═══\n');
+
+    const { action } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 10, name: 'action', message: 'What would you like to do?', choices: [
+      { name: '  Browse open bounties', value: 'browse' },
+      { name: '  Post a bounty', value: 'post' },
+      { name: '  My bounties (posted & applied)', value: 'mine' },
+      new inquirer.Separator(),
+      { name: '  ← Back', value: '__back' },
+    ]}]);
+
+    if (action === '__back') return;
+
+    switch (action) {
+      case 'browse': await browseBountiesScreen(inquirer); break;
+      case 'post': await postBountyScreen(inquirer); break;
+      case 'mine': await myBountiesScreen(inquirer); break;
+    }
+  }
+}
+
+async function browseBountiesScreen(inquirer) {
+  console.clear();
+  console.log('\n  ═══ Open Bounties ═══\n');
+
+  const agents = getAgents();
+  if (agents.length === 0) {
+    console.log('  No agents registered. Add an agent first.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  let bounties = [];
+  try {
+    const agent = await createAgent(agents[0]);
+    try {
+      const result = await agent.client.getBounties({ limit: 20 });
+      bounties = result.data || result || [];
+    } finally { agent.stop(); }
+  } catch (e) {
+    console.log(`  Error fetching bounties: ${e.message}\n`);
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  if (bounties.length === 0) {
+    console.log('  No open bounties found.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  const choices = bounties.map(b => {
+    const apps = b.applications?.length || 0;
+    const amt = `${b.amount} ${b.currency || 'VRSC'}`;
+    return {
+      name: `  ${(b.title || b.description?.substring(0, 30) || b.id).padEnd(32)} ${amt.padEnd(16)} ${(b.category || '').padEnd(14)} ${apps} applicants`,
+      value: b.id,
+    };
+  });
+  choices.push(new inquirer.Separator());
+  choices.push({ name: '  ← Back', value: '__back' });
+
+  const { bountyId } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'bountyId', message: 'Select a bounty to view:', choices }]);
+  if (bountyId === '__back') return;
+
+  await bountyDetailScreen(inquirer, bountyId, agents[0]);
+}
+
+async function postBountyScreen(inquirer) {
+  console.clear();
+  console.log('\n  ═══ Post a Bounty ═══\n');
+
+  const agents = getAgents().filter(a => a.identity && a.iAddress);
+  if (agents.length === 0) {
+    console.log('  No registered agents. Register an agent first.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  // Pick which agent posts the bounty
+  const { agentId } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'agentId', message: 'Post as which agent?', choices: agents.map(a => ({ name: `  ${a.id.padEnd(10)} ${a.identity}`, value: a.id })) }]);
+  const agentKeys = agents.find(a => a.id === agentId);
+
+  const { title } = await promptWithEsc(inquirer, [{ type: 'input', name: 'title', message: 'Bounty title:' }]);
+  if (!title) { console.log('\n  Title required.\n'); return; }
+
+  const { description } = await promptWithEsc(inquirer, [{ type: 'input', name: 'description', message: 'What do you need done?' }]);
+  const { amount } = await promptWithEsc(inquirer, [{ type: 'input', name: 'amount', message: 'Bounty amount:', default: '1' }]);
+  const { currency } = await promptWithEsc(inquirer, [{ type: 'input', name: 'currency', message: 'Currency:', default: 'VRSCTEST' }]);
+  const category = await pickCategory(inquirer, 'development');
+  const { maxClaimants } = await promptWithEsc(inquirer, [{ type: 'input', name: 'maxClaimants', message: 'Max winners (how many people can claim this):', default: '1' }]);
+  const { deadline } = await promptWithEsc(inquirer, [{ type: 'input', name: 'deadline', message: 'Application deadline (YYYY-MM-DD or leave blank):' }]);
+
+  // Validate deadline if provided
+  if (deadline) {
+    const d = new Date(deadline);
+    if (isNaN(d.getTime())) {
+      console.log('\n  Invalid date format. Use YYYY-MM-DD.\n');
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+      return;
+    }
+  }
+
+  console.log('\n  ─── Bounty Summary ───');
+  console.log(`  Title:     ${title}`);
+  console.log(`  Amount:    ${amount} ${currency}`);
+  console.log(`  Category:  ${category}`);
+  console.log(`  Max winners: ${maxClaimants}`);
+  if (deadline) console.log(`  Deadline:  ${deadline}`);
+  if (description) console.log(`  Description: ${description.substring(0, 80)}`);
+  console.log('');
+
+  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Post this bounty?', default: true }]);
+  if (!confirm) return;
+
+  try {
+    const agent = await createAgent(agentKeys);
+    try {
+      const result = await agent.postBounty({
+        title,
+        description: description || title,
+        amount: parseFloat(amount),
+        currency,
+        category,
+        maxClaimants: parseInt(maxClaimants) || 1,
+        ...(deadline ? { applicationDeadline: new Date(deadline).toISOString() } : {}),
+      });
+      console.log(`\n  ✅ Bounty posted!`);
+      console.log(`  ID: ${result.id || result.bountyId || JSON.stringify(result).substring(0, 80)}\n`);
+    } finally { agent.stop(); }
+  } catch (e) {
+    console.log(`\n  ❌ Failed: ${e.message}\n`);
+  }
+
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
+async function myBountiesScreen(inquirer) {
+  console.clear();
+  console.log('\n  ═══ My Bounties ═══\n');
+
+  const agents = getAgents().filter(a => a.identity && a.iAddress);
+  if (agents.length === 0) {
+    console.log('  No registered agents.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  const { agentId } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'agentId', message: 'View bounties for:', choices: agents.map(a => ({ name: `  ${a.id.padEnd(10)} ${a.identity}`, value: a.id })) }]);
+  const agentKeys = agents.find(a => a.id === agentId);
+
+  let posted = [], applied = [];
+  try {
+    const agent = await createAgent(agentKeys);
+    try {
+      const [postedRes, appliedRes] = await Promise.all([
+        agent.client.getMyBounties({ role: 'poster', limit: 20 }).catch(() => ({ data: [] })),
+        agent.client.getMyBounties({ role: 'applicant', limit: 20 }).catch(() => ({ data: [] })),
+      ]);
+      posted = postedRes.data || postedRes || [];
+      applied = appliedRes.data || appliedRes || [];
+    } finally { agent.stop(); }
+  } catch (e) {
+    console.log(`  Error: ${e.message}\n`);
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  if (posted.length === 0 && applied.length === 0) {
+    console.log('  No bounties found for this agent.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  const choices = [];
+  if (posted.length > 0) {
+    choices.push(new inquirer.Separator('  ── Posted by you ──'));
+    for (const b of posted) {
+      const apps = b.applications?.length || 0;
+      choices.push({ name: `  ${(b.title || b.id).padEnd(30)} ${b.amount} ${b.currency || 'VRSC'}  (${b.status}, ${apps} applicants)`, value: b.id });
+    }
+  }
+  if (applied.length > 0) {
+    choices.push(new inquirer.Separator('  ── Applied to ──'));
+    for (const b of applied) {
+      choices.push({ name: `  ${(b.title || b.id).padEnd(30)} ${b.amount} ${b.currency || 'VRSC'}  (${b.status})`, value: b.id });
+    }
+  }
+  choices.push(new inquirer.Separator());
+  choices.push({ name: '  ← Back', value: '__back' });
+
+  const { bountyId } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'bountyId', message: 'Select a bounty:', choices }]);
+  if (bountyId === '__back') return;
+
+  await bountyDetailScreen(inquirer, bountyId, agentKeys);
+}
+
+async function bountyDetailScreen(inquirer, bountyId, agentKeys) {
+  console.clear();
+  console.log('\n  ═══ Bounty Detail ═══\n');
+
+  let bounty;
+  try {
+    const agent = await createAgent(agentKeys);
+    try {
+      bounty = await agent.client.getBounty(bountyId);
+      if (bounty.data) bounty = bounty.data;
+    } finally { agent.stop(); }
+  } catch (e) {
+    console.log(`  Error: ${e.message}\n`);
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  console.log(`  Title:       ${bounty.title || '(none)'}`);
+  console.log(`  Amount:      ${bounty.amount} ${bounty.currency || 'VRSC'}`);
+  console.log(`  Status:      ${bounty.status}`);
+  console.log(`  Category:    ${bounty.category || '(none)'}`);
+  console.log(`  Posted by:   ${bounty.poster_verus_id || bounty.posterVerusId || '?'}`);
+  console.log(`  Max winners: ${bounty.max_claimants || bounty.maxClaimants || 1}`);
+  if (bounty.application_deadline || bounty.applicationDeadline) {
+    console.log(`  Deadline:    ${bounty.application_deadline || bounty.applicationDeadline}`);
+  }
+  console.log(`  ID:          ${bounty.id}`);
+  if (bounty.description) {
+    console.log(`\n  Description:\n  ${bounty.description}`);
+  }
+
+  const applications = bounty.applications || [];
+  if (applications.length > 0) {
+    console.log(`\n  ── Applicants (${applications.length}) ──`);
+    for (const app of applications) {
+      const selected = app.selected ? ' ✅' : '';
+      console.log(`  • ${app.applicant_verus_id || app.applicantVerusId}${selected}`);
+      if (app.message) console.log(`    "${app.message.substring(0, 60)}"`);
+    }
+  }
+  console.log('');
+
+  // Build action menu based on context
+  const posterAddr = bounty.poster_verus_id || bounty.posterVerusId;
+  const isPoster = agentKeys.iAddress && posterAddr === agentKeys.iAddress;
+
+  const actionChoices = [];
+  if (isPoster && applications.length > 0 && bounty.status === 'open') {
+    actionChoices.push({ name: '  Select winners', value: 'select' });
+  }
+  if (isPoster && (bounty.status === 'open' || bounty.status === 'active')) {
+    actionChoices.push({ name: '  Cancel bounty', value: 'cancel' });
+  }
+  actionChoices.push(new inquirer.Separator());
+  actionChoices.push({ name: '  ← Back', value: '__back' });
+
+  const { action } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 10, name: 'action', message: 'Options:', choices: actionChoices }]);
+  if (action === '__back') return;
+
+  if (action === 'select') {
+    // Checkbox to select winners
+    const appChoices = applications.map(app => ({
+      name: `  ${app.applicant_verus_id || app.applicantVerusId} — ${(app.message || '').substring(0, 50)}`,
+      value: app.id,
+    }));
+
+    const { selectedIds } = await promptWithEsc(inquirer, [{ type: 'checkbox', pageSize: 20, name: 'selectedIds', message: 'Select winners (space to toggle, enter to confirm):', choices: appChoices }]);
+
+    if (!selectedIds || selectedIds.length === 0) {
+      console.log('\n  No winners selected.\n');
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+      return;
+    }
+
+    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Select ${selectedIds.length} winner(s)? This creates jobs for each.`, default: true }]);
+    if (!confirm) return;
+
+    try {
+      const { buildSelectClaimantsMessage, signMessage } = require('@junction41/sovagent-sdk');
+      const timestamp = Math.floor(Date.now() / 1000);
+      const msg = buildSelectClaimantsMessage(bountyId, selectedIds, timestamp);
+      const signature = signMessage(agentKeys.wif, msg, agentKeys.network || 'verustest');
+
+      const agent = await createAgent(agentKeys);
+      try {
+        const result = await agent.client.selectBountyClaimants(bountyId, { applicantIds: selectedIds, signature, timestamp });
+        console.log(`\n  ✅ Winners selected!`);
+        if (result.jobsCreated) {
+          console.log(`  Jobs created: ${result.jobsCreated.map(j => j.id || j).join(', ')}`);
+        }
+      } finally { agent.stop(); }
+    } catch (e) {
+      console.log(`\n  ❌ Failed: ${e.message}`);
+    }
+    console.log('');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+  }
+
+  if (action === 'cancel') {
+    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Cancel this bounty? This cannot be undone.', default: false }]);
+    if (!confirm) return;
+
+    try {
+      const agent = await createAgent(agentKeys);
+      try {
+        await agent.cancelBounty(bountyId);
+        console.log('\n  ✅ Bounty cancelled.\n');
+      } finally { agent.stop(); }
+    } catch (e) {
+      console.log(`\n  ❌ Failed: ${e.message}\n`);
+    }
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+  }
+}
+
 // ── Main Loop ──
 
 async function main() {
@@ -1806,6 +2124,7 @@ async function main() {
         console.log('');
         await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
       }); break;
+      case 'bounties': await withBack(() => bountiesMenuScreen(inquirer)); break;
       case 'quit': process.exit(0);
     }
   }

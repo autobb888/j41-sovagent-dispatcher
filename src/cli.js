@@ -5394,6 +5394,143 @@ async function mainMenu() {
   await showMain();
 }
 
+// ── Bounty commands ──
+
+program
+  .command('post-bounty <agent-id>')
+  .description('Post a new bounty using the specified agent')
+  .requiredOption('--title <title>', 'Bounty title')
+  .requiredOption('--description <text>', 'Bounty description')
+  .requiredOption('--amount <number>', 'Bounty amount')
+  .option('--currency <currency>', 'Currency', 'VRSCTEST')
+  .option('--category <category>', 'Category')
+  .option('--max-claimants <n>', 'Max number of winners', '1')
+  .option('--deadline <date>', 'Application deadline (YYYY-MM-DD)')
+  .action(async (agentId, options) => {
+    ensureDirs();
+    const keys = loadAgentKeys(agentId);
+    if (!keys || !keys.identity) {
+      console.error(`❌ Agent ${agentId} not found or not registered.`);
+      process.exit(1);
+    }
+
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+    const agent = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif, identityName: keys.identity, iAddress: keys.iAddress });
+    await agent.authenticate();
+
+    try {
+      const result = await agent.postBounty({
+        title: options.title,
+        description: options.description,
+        amount: parseFloat(options.amount),
+        currency: options.currency,
+        category: options.category,
+        maxClaimants: parseInt(options.maxClaimants) || 1,
+        ...(options.deadline ? { applicationDeadline: new Date(options.deadline).toISOString() } : {}),
+      });
+      console.log(`✅ Bounty posted: ${result.id || result.bountyId || JSON.stringify(result)}`);
+    } catch (e) {
+      console.error(`❌ ${e.message}`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('list-bounties')
+  .description('Browse open bounties on the platform')
+  .option('--category <category>', 'Filter by category')
+  .option('--limit <n>', 'Number to show', '20')
+  .option('--json', 'Output raw JSON')
+  .action(async (options) => {
+    ensureDirs();
+    const agents = listRegisteredAgents();
+    if (agents.length === 0) {
+      console.error('❌ No agents registered. Need at least one for API access.');
+      process.exit(1);
+    }
+
+    const keys = loadAgentKeys(agents[0].id);
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+    const agent = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif, identityName: keys.identity, iAddress: keys.iAddress });
+    await agent.authenticate();
+
+    try {
+      const params = { limit: parseInt(options.limit) || 20 };
+      if (options.category) params.category = options.category;
+      const result = await agent.client.getBounties(params);
+      const bounties = result.data || result || [];
+
+      if (options.json) {
+        console.log(JSON.stringify(bounties, null, 2));
+        return;
+      }
+
+      if (bounties.length === 0) {
+        console.log('No open bounties found.');
+        return;
+      }
+
+      console.log(`\n${'Title'.padEnd(32)} ${'Amount'.padEnd(16)} ${'Category'.padEnd(14)} ${'Status'.padEnd(10)} Apps`);
+      console.log(`${'─'.repeat(32)} ${'─'.repeat(16)} ${'─'.repeat(14)} ${'─'.repeat(10)} ${'─'.repeat(4)}`);
+      for (const b of bounties) {
+        const title = (b.title || b.id).substring(0, 30).padEnd(32);
+        const amt = `${b.amount} ${b.currency || 'VRSC'}`.padEnd(16);
+        const cat = (b.category || '').padEnd(14);
+        const status = (b.status || '').padEnd(10);
+        const apps = b.applications?.length || 0;
+        console.log(`${title} ${amt} ${cat} ${status} ${apps}`);
+      }
+      console.log(`\nTotal: ${bounties.length}`);
+    } catch (e) {
+      console.error(`❌ ${e.message}`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('my-bounties <agent-id>')
+  .description('List bounties posted or applied to by an agent')
+  .option('--role <role>', 'Filter: poster or applicant')
+  .option('--json', 'Output raw JSON')
+  .action(async (agentId, options) => {
+    ensureDirs();
+    const keys = loadAgentKeys(agentId);
+    if (!keys || !keys.identity) {
+      console.error(`❌ Agent ${agentId} not found or not registered.`);
+      process.exit(1);
+    }
+
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+    const agent = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif, identityName: keys.identity, iAddress: keys.iAddress });
+    await agent.authenticate();
+
+    try {
+      const params = { limit: 30 };
+      if (options.role) params.role = options.role;
+      const result = await agent.client.getMyBounties(params);
+      const bounties = result.data || result || [];
+
+      if (options.json) {
+        console.log(JSON.stringify(bounties, null, 2));
+        return;
+      }
+
+      if (bounties.length === 0) {
+        console.log('No bounties found.');
+        return;
+      }
+
+      for (const b of bounties) {
+        const apps = b.applications?.length || 0;
+        console.log(`  ${(b.title || b.id).padEnd(30)} ${b.amount} ${b.currency || 'VRSC'}  (${b.status}, ${apps} applicants)`);
+      }
+      console.log(`\nTotal: ${bounties.length}`);
+    } catch (e) {
+      console.error(`❌ ${e.message}`);
+      process.exit(1);
+    }
+  });
+
 // ── Entry point ──
 
 if (process.argv.length <= 2) {
