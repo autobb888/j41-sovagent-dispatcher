@@ -1842,6 +1842,110 @@ program
     }
   });
 
+// Update profile — remove old VDXF values and write new ones (two-block transaction)
+program
+  .command('update-profile <agent-id>')
+  .description('Update on-chain VDXF profile fields (two-transaction remove + rewrite)')
+  .option('--display-name <name>', 'Agent display name')
+  .option('--description <desc>', 'Agent description')
+  .option('--type <type>', 'Agent type (autonomous|assisted|hybrid|tool)')
+  .option('--pay-address <addr>', 'Payment address')
+  .option('--markup <n>', 'Markup percentage')
+  .option('--models <csv>', 'LLM models (comma-separated)')
+  .option('--profile-category <cat>', 'Profile category')
+  .option('--profile-tags <csv>', 'Profile tags (comma-separated)')
+  .option('--profile-website <url>', 'Website URL')
+  .option('--profile-avatar <url>', 'Avatar URL')
+  .option('--network-capabilities <csv>', 'Capabilities (comma-separated)')
+  .option('--network-endpoints <csv>', 'Endpoints (comma-separated URLs)')
+  .option('--network-protocols <csv>', 'Protocols (comma-separated)')
+  .option('--dry-run', 'Print payloads without broadcasting')
+  .action(async (agentId, options) => {
+    ensureDirs();
+
+    const keys = loadAgentKeys(agentId);
+    if (!keys) {
+      console.error(`❌ Agent ${agentId} not found.`);
+      process.exit(1);
+    }
+    if (!keys.identity || !keys.iAddress) {
+      console.error(`❌ Agent ${agentId} is not registered on-chain. Register first.`);
+      process.exit(1);
+    }
+
+    // Map CLI flags to VDXF field names
+    const fieldsToUpdate = {};
+    if (options.displayName) fieldsToUpdate.displayName = options.displayName;
+    if (options.description) fieldsToUpdate.description = options.description;
+    if (options.type) fieldsToUpdate.type = options.type;
+    if (options.payAddress) fieldsToUpdate.payAddress = options.payAddress;
+    if (options.markup) fieldsToUpdate.markup = options.markup;
+    if (options.models) fieldsToUpdate.models = JSON.stringify(options.models.split(',').map(s => s.trim()));
+    if (options.profileCategory) fieldsToUpdate.profileCategory = options.profileCategory;
+    if (options.profileTags) fieldsToUpdate.profileTags = JSON.stringify(options.profileTags.split(',').map(s => s.trim()));
+    if (options.profileWebsite) fieldsToUpdate.profileWebsite = options.profileWebsite;
+    if (options.profileAvatar) fieldsToUpdate.profileAvatar = options.profileAvatar;
+    if (options.networkCapabilities) fieldsToUpdate.networkCapabilities = JSON.stringify(options.networkCapabilities.split(',').map(s => s.trim()));
+    if (options.networkEndpoints) fieldsToUpdate.networkEndpoints = JSON.stringify(options.networkEndpoints.split(',').map(s => s.trim()));
+    if (options.networkProtocols) fieldsToUpdate.networkProtocols = JSON.stringify(options.networkProtocols.split(',').map(s => s.trim()));
+
+    if (Object.keys(fieldsToUpdate).length === 0) {
+      console.error('❌ No fields specified. Use --display-name, --description, etc.');
+      process.exit(1);
+    }
+
+    console.log(`\n→ Updating ${Object.keys(fieldsToUpdate).length} VDXF field(s) for ${keys.identity}...\n`);
+    for (const [k, v] of Object.entries(fieldsToUpdate)) {
+      console.log(`  ${k}: ${typeof v === 'string' && v.length > 60 ? v.substring(0, 60) + '...' : v}`);
+    }
+    console.log('');
+
+    if (options.dryRun) {
+      const { buildContentMultimapRemove, VDXF_KEYS } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+      const iAddrs = Object.keys(fieldsToUpdate).map(f => {
+        for (const [, keys] of Object.entries(VDXF_KEYS)) { if (keys[f]) return keys[f]; }
+        return f;
+      });
+      console.log('── Remove Payload (dry-run) ──');
+      console.log(JSON.stringify(buildContentMultimapRemove(keys.identity, iAddrs), null, 2));
+      console.log('\n── Write Values (dry-run) ──');
+      console.log(JSON.stringify(fieldsToUpdate, null, 2));
+      return;
+    }
+
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+    const { removeAndRewriteVdxfFields } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+
+    const agent = new J41Agent({
+      apiUrl: J41_API_URL,
+      wif: keys.wif,
+      identityName: keys.identity,
+      iAddress: keys.iAddress,
+    });
+
+    await agent.authenticate();
+    console.log('  ✓ Authenticated\n');
+
+    try {
+      const result = await removeAndRewriteVdxfFields({
+        agent,
+        identityName: keys.identity,
+        fieldsToUpdate,
+        chain: J41_NETWORK,
+        wif: keys.wif,
+        onProgress: (msg) => console.log(`  ${msg}`),
+      });
+
+      console.log(`\n✅ VDXF update complete!`);
+      console.log(`  Remove TX: ${result.removeTxid}`);
+      console.log(`  Write TX:  ${result.writeTxid}`);
+      console.log(`  Blocks waited: ${result.blocksWaited}`);
+    } catch (e) {
+      console.error(`\n❌ Update failed: ${e.message}`);
+      process.exit(1);
+    }
+  });
+
 // Inspect command — show everything about an agent
 program
   .command('inspect <agent-id>')

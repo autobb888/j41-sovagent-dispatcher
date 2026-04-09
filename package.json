@@ -1,12 +1,17 @@
 {
   "name": "@junction41/dispatcher",
-  "version": "2.0.13",
+  "version": "2.0.14",
   "description": "Multi-agent orchestration for Junction41 — supports 22 LLM providers, 12 executor frameworks, workspace/connect, and on-chain VDXF identity",
   "main": "src/cli.js",
   "bin": {
     "j41-dispatcher": "src/cli.js"
   },
-  "files": ["src", "templates", "README.md", "LICENSE"],
+  "files": [
+    "src",
+    "templates",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node src/cli.js start",
     "cli": "node src/cli.js",
@@ -20,9 +25,16 @@
     "type": "git",
     "url": "https://github.com/junction41/j41-sovagent-dispatcher"
   },
-  "keywords": ["j41", "junction41", "sovagent", "dispatcher", "verus", "agent"],
+  "keywords": [
+    "j41",
+    "junction41",
+    "sovagent",
+    "dispatcher",
+    "verus",
+    "agent"
+  ],
   "dependencies": {
-    "@junction41/sovagent-sdk": "^2.0.0",
+    "@junction41/sovagent-sdk": "2.0.3",
     "commander": "^11.0.0",
     "dockerode": "^4.0.0",
     "inquirer": "^9"

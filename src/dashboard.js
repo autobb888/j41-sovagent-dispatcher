@@ -315,6 +315,12 @@ async function agentDetailScreen(inquirer, agentId) {
     { name: '  View Jobs', value: 'jobs' },
   ];
 
+  // Update profile option — only for fully registered agents
+  if (!needsRegister && !needsFinalize && !finalizeIncomplete) {
+    choices.push(new inquirer.Separator('  ── Edit ──'));
+    choices.push({ name: '  Update Profile (change on-chain VDXF fields)', value: 'update_profile' });
+  }
+
   // Add retry/register/finalize options for incomplete agents
   if (needsRegister) {
     choices.push(new inquirer.Separator('  ── Fix ──'));
@@ -341,6 +347,7 @@ async function agentDetailScreen(inquirer, agentId) {
     case 'services': await servicesScreen(inquirer, keys); break;
     case 'soul': await soulScreen(inquirer, agentDir); break;
     case 'jobs': await jobsScreen(inquirer, keys); break;
+    case 'update_profile': await updateProfileScreen(inquirer, agentId, keys); break;
     case 'retry_register': await retryRegisterScreen(inquirer, agentId, keys); break;
     case 'retry_finalize': await retryFinalizeScreen(inquirer, agentId); break;
     case '__back': return;
@@ -383,6 +390,143 @@ const ALL_VDXF_KEYS = [
   { iAddr: 'i6PC1B9vgVf8bLtHcdsNunLtr6ibtnL7ZC', name: 'bounty.record' },
   { iAddr: 'iE8Z7gZmAs4NU8AqEJzV9MWHUCoUBQqfum', name: 'bounty.application' },
 ];
+
+const EDITABLE_PROFILE_FIELDS = [
+  { label: 'Display Name',    field: 'displayName',          flag: '--display-name' },
+  { label: 'Description',     field: 'description',          flag: '--description' },
+  { label: 'Type',            field: 'type',                 flag: '--type' },
+  { label: 'Pay Address',     field: 'payAddress',           flag: '--pay-address' },
+  { label: 'Markup %',        field: 'markup',               flag: '--markup' },
+  { label: 'Models',          field: 'models',               flag: '--models',               isCsv: true },
+  { label: 'Category',        field: 'profileCategory',      flag: '--profile-category' },
+  { label: 'Tags',            field: 'profileTags',          flag: '--profile-tags',          isCsv: true },
+  { label: 'Website',         field: 'profileWebsite',       flag: '--profile-website' },
+  { label: 'Avatar URL',      field: 'profileAvatar',        flag: '--profile-avatar' },
+  { label: 'Capabilities',    field: 'networkCapabilities',  flag: '--network-capabilities',  isCsv: true },
+  { label: 'Endpoints',       field: 'networkEndpoints',     flag: '--network-endpoints',     isCsv: true },
+  { label: 'Protocols',       field: 'networkProtocols',     flag: '--network-protocols',     isCsv: true },
+];
+
+// Map VDXF field names to i-addresses for reading current values
+const VDXF_FIELD_TO_IADDR = {
+  displayName: 'iKkdwxhdupLgf7v2qn4JGBQHntsBb17kjW',
+  type: 'iNxeLSDFARVQezfEt4i8CBZjTSRpFTPAyP',
+  description: 'iQr3yKEn2DXaG4GQGVAVYivC3jwcvScfzk',
+  payAddress: 'iRxxUvbDXJT5wVpnx7oc9nkYALCoDh6aTD',
+  markup: 'iBLx3rga8DewiN6gyQyC5avFin8fnnojnS',
+  models: 'iQJUQmdFSmM49cvLJfKLZnuRYsjXSmTTHY',
+  profileCategory: 'iD3quozCGbzJyZ29uvRCeecr12np2dMsvN',
+  profileTags: 'iKM57qfzmgM1sxBgR3XBQa2XCRURZ2YVo2',
+  profileWebsite: 'i7HY93tqfqCkpyKYiNtcDbioAgF8gRL9TQ',
+  profileAvatar: 'iALo91Z75iXZxMvymvQMRwo7GAeHv5veKc',
+  networkCapabilities: 'iF7174LxgcAnu3qZ7iJzSyJYthDJXBzQNw',
+  networkEndpoints: 'i5VzGsiFmJYuRr7b8aUyHzAS8vd9DC4puS',
+  networkProtocols: 'iSAVTXMb9TyWWuDDnWopFhgZpjm21WPigv',
+};
+
+async function updateProfileScreen(inquirer, agentId, keys) {
+  console.clear();
+  console.log(`\n  ═══ Update Profile: ${keys.identity} ═══\n`);
+
+  // Fetch current on-chain values
+  let currentValues = {};
+  try {
+    const agent = await createAgent(keys);
+    let rawId;
+    try { rawId = (await agent.client.getIdentityRaw()).data; } finally { agent.stop(); }
+    const cmap = rawId?.identity?.contentmultimap || {};
+
+    for (const f of EDITABLE_PROFILE_FIELDS) {
+      const iAddr = VDXF_FIELD_TO_IADDR[f.field];
+      if (iAddr && cmap[iAddr]) {
+        const val = extractVdxfValue(Array.isArray(cmap[iAddr]) ? cmap[iAddr][0] : cmap[iAddr]);
+        currentValues[f.field] = val;
+      }
+    }
+  } catch (e) {
+    console.log(`  Could not fetch current values: ${e.message}\n`);
+  }
+
+  // Show current values and let user pick which to change
+  const fieldChoices = EDITABLE_PROFILE_FIELDS.map(f => {
+    const cur = currentValues[f.field] || '(not set)';
+    const display = typeof cur === 'string' && cur.length > 50 ? cur.substring(0, 50) + '...' : cur;
+    return { name: `  ${f.label.padEnd(20)} ${display}`, value: f.field };
+  });
+
+  const { fields } = await promptWithEsc(inquirer, [{
+    type: 'checkbox',
+    pageSize: 20,
+    name: 'fields',
+    message: 'Select fields to update (space to select, enter to confirm):',
+    choices: fieldChoices,
+  }]);
+
+  if (!fields || fields.length === 0) {
+    console.log('\n  No fields selected.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  // Prompt for new values
+  const updates = {};
+  for (const fieldName of fields) {
+    const f = EDITABLE_PROFILE_FIELDS.find(e => e.field === fieldName);
+    const curVal = currentValues[fieldName] || '';
+    const displayCur = typeof curVal === 'string' ? curVal : JSON.stringify(curVal);
+
+    if (f.isCsv) {
+      // Show as comma-separated for easier editing
+      let csvDefault = '';
+      try {
+        const parsed = typeof curVal === 'string' ? JSON.parse(curVal) : curVal;
+        csvDefault = Array.isArray(parsed) ? parsed.join(', ') : displayCur;
+      } catch { csvDefault = displayCur; }
+      const { val } = await promptWithEsc(inquirer, [{ type: 'input', name: 'val', message: `  ${f.label} (comma-separated):`, default: csvDefault }]);
+      updates[fieldName] = val;
+    } else {
+      const { val } = await promptWithEsc(inquirer, [{ type: 'input', name: 'val', message: `  ${f.label}:`, default: displayCur }]);
+      updates[fieldName] = val;
+    }
+  }
+
+  // Summary
+  console.log('\n  ─── Changes ───');
+  for (const [fieldName, newVal] of Object.entries(updates)) {
+    const f = EDITABLE_PROFILE_FIELDS.find(e => e.field === fieldName);
+    const oldVal = currentValues[fieldName] || '(not set)';
+    const oldDisplay = typeof oldVal === 'string' && oldVal.length > 40 ? oldVal.substring(0, 40) + '...' : oldVal;
+    const newDisplay = typeof newVal === 'string' && newVal.length > 40 ? newVal.substring(0, 40) + '...' : newVal;
+    console.log(`  ${f.label}: ${oldDisplay} → ${newDisplay}`);
+  }
+
+  console.log('\n  ⚠️  This is a blockchain transaction — changes are permanent.');
+  console.log('  Two transactions required: remove old values → wait for block → write new values.');
+  console.log('  This typically takes 1-3 minutes.\n');
+
+  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Proceed?', default: true }]);
+  if (!confirm) return;
+
+  // Build CLI flags
+  const cliArgs = ['node', 'src/cli.js', 'update-profile', agentId];
+  for (const [fieldName, newVal] of Object.entries(updates)) {
+    const f = EDITABLE_PROFILE_FIELDS.find(e => e.field === fieldName);
+    cliArgs.push(f.flag, newVal);
+  }
+
+  console.log('');
+  const exitCode = await runCommandAsync(cliArgs[0], cliArgs.slice(1), REPO_DIR);
+
+  if (exitCode === 0) {
+    console.log('\n  ✅ Profile updated on-chain!\n');
+  } else if (exitCode === null) {
+    console.log('\n  ⚠️  Interrupted. Check transaction status manually.\n');
+  } else {
+    console.log(`\n  ❌ Update failed (exit ${exitCode}).\n`);
+  }
+
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
 
 async function vdxfScreen(inquirer, keys) {
   console.clear();
