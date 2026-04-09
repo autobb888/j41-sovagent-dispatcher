@@ -1274,26 +1274,40 @@ async function securityScreen(inquirer) {
   try {
     const secureSetup = require('@junction41/secure-setup');
     switch (action) {
-      case 'setup':
+      case 'setup': {
         console.log('\n  Running security setup...\n');
         const setupResult = await secureSetup.setup('dispatcher');
-        console.log(JSON.stringify(setupResult, null, 2));
-        break;
-      case 'test':
-        console.log('\n  Running self-test...\n');
-        const testResult = await secureSetup.selfTest();
-        for (const t of testResult.tests) {
-          console.log((t.passed ? '  ✅' : '  ❌') + ' ' + t.name + ': ' + t.detail);
+        if (setupResult.success) {
+          console.log('  ✅ Setup complete. Score: ' + setupResult.score + '/10 (' + setupResult.mode + ')');
+        } else {
+          console.log('  ❌ Setup had issues. Score: ' + setupResult.score + '/10');
         }
-        console.log('\n  Score: ' + testResult.score + '/10');
+        if (setupResult.log && setupResult.log.length > 0) {
+          console.log('');
+          for (const line of setupResult.log) console.log('  ' + line);
+        }
         break;
-      case 'check':
+      }
+      case 'test': {
+        console.log('\n  Running self-test...\n');
+        const testResult = await secureSetup.selfTest('dispatcher');
+        for (const t of (testResult.results || [])) {
+          console.log((t.passed ? '  ✅' : '  ❌') + ' ' + t.name + (t.error ? ': ' + t.error : ''));
+        }
+        console.log('\n  Score: ' + testResult.score + '/10 (' + testResult.mode + ')');
+        console.log('  ' + (testResult.passed ? '✅ All tests passed' : '❌ Some tests failed'));
+        break;
+      }
+      case 'check': {
         console.log('\n  Checking profiles...\n');
         const checkResult = await secureSetup.quickCheck('dispatcher');
-        for (const c of checkResult.checks) {
-          console.log((c.status === 'pass' ? '  ✅' : '  ⚠️ ') + ' ' + c.name + ': ' + c.detail);
+        for (const c of (checkResult.checks || [])) {
+          const icon = c.status === 'pass' ? '✅' : c.status === 'warn' ? '⚠️ ' : c.status === 'skip' ? '⏭️ ' : '❌';
+          console.log('  ' + icon + ' ' + c.name + ': ' + c.detail);
         }
+        console.log('\n  Score: ' + checkResult.score + '/10 (' + checkResult.mode + ')');
         break;
+      }
     }
   } catch (e) {
     console.log(`\n  Error: ${e.message}`);
