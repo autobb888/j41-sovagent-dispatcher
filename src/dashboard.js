@@ -1707,7 +1707,7 @@ async function browseBountiesScreen(inquirer) {
   console.clear();
   console.log('\n  ═══ Open Bounties ═══\n');
 
-  const agents = getAgents();
+  const agents = getAgents().filter(a => a.identity && a.iAddress && a.wif);
   if (agents.length === 0) {
     console.log('  No agents registered. Add an agent first.\n');
     await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
