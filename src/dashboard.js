@@ -1049,63 +1049,131 @@ async function configureServicesScreen(inquirer) {
   const keys = agents.find(a => a.id === agentId);
   if (!keys) return;
 
-  console.clear();
-  console.log(`\n  ═══ Services: ${keys.identity} ═══\n`);
+  while (true) {
+    console.clear();
+    console.log(`\n  ═══ Services: ${keys.identity} ═══\n`);
 
-  // Show existing services
-  try {
-    const agent = await createAgent(keys);
-    let list;
-    try { const result = await agent.client.getAgentServices(keys.iAddress || keys.identity); list = result.data || result || []; } finally { agent.stop(); }
+    // Fetch existing services
+    let list = [];
+    try {
+      const agent = await createAgent(keys);
+      try { const result = await agent.client.getAgentServices(keys.iAddress || keys.identity); list = result.data || result || []; } finally { agent.stop(); }
+    } catch (e) {
+      console.log(`  Could not fetch services: ${e.message}\n`);
+    }
+
     if (list.length > 0) {
-      console.log('  Current services:\n');
-      for (const s of list) {
-        console.log(`  • ${s.name} — ${s.price} ${s.currency} (${s.status})`);
+      for (let i = 0; i < list.length; i++) {
+        const s = list[i];
+        console.log(`  [${i + 1}] ${s.name}`);
+        console.log(`      Price: ${s.price} ${s.currency}  |  Status: ${s.status || 'active'}  |  Category: ${s.category || '?'}`);
+        console.log(`      Turnaround: ${s.turnaround || '?'}  |  SovGuard: ${s.sovguard ? 'yes' : 'no'}`);
+        if (s.description) console.log(`      ${s.description.substring(0, 80)}`);
+        console.log(`      ID: ${s.id}`);
+        console.log('');
       }
-      console.log('');
     } else {
       console.log('  No services registered yet.\n');
     }
-  } catch (e) {
-    console.log(`  Could not fetch services: ${e.message}\n`);
+
+    // Build action choices
+    const actionChoices = [
+      { name: '  Add new service', value: 'add' },
+    ];
+    if (list.length > 0) {
+      actionChoices.push({ name: '  Edit a service', value: 'edit' });
+      actionChoices.push({ name: '  Delete a service', value: 'delete' });
+    }
+    actionChoices.push(new inquirer.Separator());
+    actionChoices.push({ name: '  ← Back', value: '__back' });
+
+    const { action } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 10, name: 'action', message: 'What would you like to do?', choices: actionChoices }]);
+
+    if (action === '__back') return;
+
+    if (action === 'add') {
+      const { svcName } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcName', message: 'Service name:', default: 'Code Review' }]);
+      const { svcDesc } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcDesc', message: 'Description:' }]);
+      const { svcPrice } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcPrice', message: 'Price:', default: '0.5' }]);
+      const { svcCurrency } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcCurrency', message: 'Currency:', default: 'VRSCTEST' }]);
+      const svcCategory = await pickCategory(inquirer, 'development');
+      const { svcTurnaround } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcTurnaround', message: 'Turnaround:', default: '15 minutes' }]);
+      const { svcSovguard } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'svcSovguard', message: 'Enable SovGuard?', default: true }]);
+
+      try {
+        const agent = await createAgent(keys);
+        try {
+          await agent.registerService({
+            name: svcName,
+            description: svcDesc,
+            price: parseFloat(svcPrice),
+            currency: svcCurrency,
+            category: svcCategory,
+            turnaround: svcTurnaround,
+            paymentTerms: 'prepay',
+            sovguard: svcSovguard,
+          });
+          console.log('\n  ✅ Service registered.\n');
+        } finally { agent.stop(); }
+      } catch (e) {
+        console.log(`\n  ❌ Failed: ${e.message}\n`);
+      }
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
+      continue; // loop back to show updated list
+    }
+
+    if (action === 'edit') {
+      const { svcIdx } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 10, name: 'svcIdx', message: 'Select service to edit:', choices: list.map((s, i) => ({ name: `  [${i + 1}] ${s.name} — ${s.price} ${s.currency}`, value: i })) }]);
+      const svc = list[svcIdx];
+
+      console.log(`\n  Editing: ${svc.name} (${svc.id})`);
+      console.log('  Press Enter to keep current value.\n');
+
+      const { newName } = await promptWithEsc(inquirer, [{ type: 'input', name: 'newName', message: 'Name:', default: svc.name }]);
+      const { newDesc } = await promptWithEsc(inquirer, [{ type: 'input', name: 'newDesc', message: 'Description:', default: svc.description || '' }]);
+      const { newPrice } = await promptWithEsc(inquirer, [{ type: 'input', name: 'newPrice', message: 'Price:', default: String(svc.price) }]);
+      const newCategory = await pickCategory(inquirer, svc.category || 'development');
+      const { newTurnaround } = await promptWithEsc(inquirer, [{ type: 'input', name: 'newTurnaround', message: 'Turnaround:', default: svc.turnaround || '15 minutes' }]);
+
+      try {
+        const agent = await createAgent(keys);
+        try {
+          await agent.client.updateService(svc.id, {
+            name: newName,
+            description: newDesc,
+            price: parseFloat(newPrice),
+            category: newCategory,
+            turnaround: newTurnaround,
+          });
+          console.log('\n  ✅ Service updated.\n');
+        } finally { agent.stop(); }
+      } catch (e) {
+        console.log(`\n  ❌ Failed: ${e.message}\n`);
+      }
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
+      continue;
+    }
+
+    if (action === 'delete') {
+      const { svcIdx } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 10, name: 'svcIdx', message: 'Select service to delete:', choices: list.map((s, i) => ({ name: `  [${i + 1}] ${s.name} — ${s.price} ${s.currency}`, value: i })) }]);
+      const svc = list[svcIdx];
+
+      const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Delete "${svc.name}"? This cannot be undone.`, default: false }]);
+      if (!confirm) continue;
+
+      try {
+        const agent = await createAgent(keys);
+        try {
+          await agent.client.deleteService(svc.id);
+          console.log('\n  ✅ Service deleted.\n');
+        } finally { agent.stop(); }
+      } catch (e) {
+        console.log(`\n  ❌ Failed: ${e.message}\n`);
+      }
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
+      continue;
+    }
   }
-
-  const { action } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'action', message: 'What would you like to do?', choices: [
-    { name: '  Add new service', value: 'add' },
-    { name: '  ← Back', value: '__back' },
-  ]}]);
-
-  if (action === '__back') return;
-
-  // Add service interactively
-  const { svcName } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcName', message: 'Service name:', default: 'Code Review' }]);
-  const { svcDesc } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcDesc', message: 'Description:' }]);
-  const { svcPrice } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcPrice', message: 'Price:', default: '0.5' }]);
-  const { svcCurrency } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcCurrency', message: 'Currency:', default: 'VRSCTEST' }]);
-  const svcCategory = await pickCategory(inquirer, 'development');
-  const { svcTurnaround } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcTurnaround', message: 'Turnaround:', default: '15 minutes' }]);
-  const { svcSovguard } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'svcSovguard', message: 'Enable SovGuard?', default: true }]);
-
-  try {
-    const agent = await createAgent(keys);
-    try {
-      await agent.registerService({
-        name: svcName,
-        description: svcDesc,
-        price: parseFloat(svcPrice),
-        currency: svcCurrency,
-        category: svcCategory,
-        turnaround: svcTurnaround,
-        paymentTerms: 'prepay',
-        sovguard: svcSovguard,
-      });
-      console.log('\n  ✅ Service registered.\n');
-    } finally { agent.stop(); }
-  } catch (e) {
-    console.log(`\n  ❌ Failed: ${e.message}\n`);
-  }
-
-  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
 // ── Per-Agent Executor Configuration ──
