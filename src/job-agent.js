@@ -33,10 +33,12 @@ const CONTAINER_ID = process.env.HOSTNAME || 'unknown'; // Docker sets HOSTNAME 
 let _idleMessageSent = false;
 
 // Canary leak detection — blocks outbound messages containing the canary token
+// Uses SDK's evasion-resistant check (strips zero-width chars, NFKC normalize, case-insensitive)
+const { checkForCanaryLeak: _sdkCanaryCheck } = require('@junction41/sovagent-sdk/dist/safety/canary.js');
 let _canaryLeakCount = 0;
 function checkCanaryLeak(text) {
   if (!CANARY_TOKEN || !text) return false;
-  if (text.includes(CANARY_TOKEN)) {
+  if (_sdkCanaryCheck(text, CANARY_TOKEN)) {
     _canaryLeakCount++;
     console.error(`[CANARY] ⚠️ LEAK DETECTED in outbound message! (count: ${_canaryLeakCount})`);
     console.error(`[CANARY] Blocked message: ${text.substring(0, 100)}...`);
