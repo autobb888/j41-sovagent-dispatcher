@@ -465,168 +465,150 @@ async function interactiveProfileSetup(keys, soulContent) {
     const prompt = def != null ? `${q} [${def}]: ` : `${q}: `;
     rl.question(prompt, answer => resolve(answer.trim() || (def != null ? String(def) : '')));
   });
+  const yesNo = async (q, def = 'Y') => {
+    const a = (await ask(q, def)).toLowerCase();
+    return a === 'y' || a === 'yes';
+  };
 
   // Extract defaults from SOUL.md
   const soulName = (soulContent.match(/^#\s+(.+?)(?:\s*—.*)?$/m) || [])[1] || keys.identity;
   const soulDesc = (soulContent.match(/^(?!#)(?!\s*$)(.+)$/m) || [])[1] || '';
 
   console.log('\n╔══════════════════════════════════════════════════╗');
-  console.log('║  Agent Profile Setup — 25-key VDXF flat format   ║');
-  console.log('╚══════════════════════════════════════════════════╝\n');
+  console.log('║  Agent Profile Setup                             ║');
+  console.log('╚══════════════════════════════════════════════════╝');
+  console.log('  Press Enter to accept defaults shown in [brackets].\n');
 
-  // ── Core fields ──
-  console.log('── Core Agent Fields ──');
-  const name = await ask('  Display name', soulName);
-  const type = await ask('  Type (autonomous|assisted|hybrid|tool)', 'autonomous');
-  const description = await ask('  Description', soulDesc);
-  const payAddress = await ask('  Payment address (i-addr or R-addr)', keys.iAddress);
+  // ── About your agent (3 questions) ──
+  console.log('── About Your Agent ──');
+  const name = await ask('  What should buyers see as the agent name?', soulName);
+  const description = await ask('  Describe what this agent does (shown on marketplace)', soulDesc);
+  const type = 'autonomous'; // 99% of agents are autonomous, don't ask
 
-  // ── Network ──
-  console.log('\n── Network ──');
-  const capsRaw = await ask('  Capabilities (comma-separated)', 'research,writing,analysis');
-  const capabilities = capsRaw ? capsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
-  const epsRaw = await ask('  Endpoints (comma-separated URLs)', 'https://api.junction41.io/v1');
-  const endpoints = epsRaw ? epsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
-  const protosRaw = await ask('  Protocols (comma-separated: MCP,REST,A2A,WebSocket)', 'MCP,REST');
-  const protocols = protosRaw ? protosRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
-
-  // ── Profile ──
-  console.log('\n── Profile Metadata ──');
-  const category = await ask('  Category', 'general');
-  const tagsRaw = await ask('  Tags (comma-separated)', 'ai,autonomous');
+  // ── What does it do? ──
+  console.log('\n── Skills & Category ──');
+  const category = await ask('  Category (e.g. development, writing, data, design)', 'general');
+  const tagsRaw = await ask('  Keywords for search (comma-separated)', 'ai,' + category);
   const tags = tagsRaw ? tagsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
-  const website = await ask('  Website URL (optional)');
-  const avatar = await ask('  Avatar URL (optional)');
 
-  // ── Models & Pricing ──
-  console.log('\n── Models & Pricing ──');
-  const modelsRaw = await ask('  LLM models (comma-separated)', 'claude-opus-4-6');
+  // ── Payment ── (auto-fill from keys)
+  const payAddress = keys.iAddress || keys.address;
+  console.log(`\n  Payment address: ${payAddress} (auto-set from your identity)`);
+
+  // ── LLM Model ──
+  console.log('\n── AI Model ──');
+  const modelsRaw = await ask('  Which LLM model does this agent use?', 'claude-sonnet-4-6');
   const models = modelsRaw ? modelsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
-  const markupRaw = await ask('  Markup multiplier (1-50)', '1');
-  const markup = Math.max(1, Math.min(50, parseInt(markupRaw, 10) || 1));
 
-  // ── Session Limits ──
-  console.log('\n── Session Limits ──');
-  const duration = parseInt(await ask('  Max duration in seconds', '7200'), 10) || 7200;
-  const tokenLimit = parseInt(await ask('  Token limit per session', '200000'), 10) || 200000;
-  const messageLimit = parseInt(await ask('  Message limit per session', '100'), 10) || 100;
-  const maxFileSize = parseInt(await ask('  Max file size in bytes', '10485760'), 10) || 10485760;
-
-  // ── Platform Config ──
-  console.log('\n── Platform Config ──');
-  const datapolicy = await ask('  Data policy (ephemeral|session|persistent)', 'ephemeral');
-  const trustlevel = await ask('  Trust level (basic|verified|audited)', 'verified');
-  const disputeresolution = await ask('  Dispute resolution (platform|arbitration|mutual)', 'platform');
-
-  // Dispute policy (VDXF)
-  console.log('\n── Dispute Policy (published on-chain) ──');
-  const defaultAction = await ask('  Default action on dispute (rework/refund/reject)', 'rework');
-  const maxRefundPercent = parseInt(await ask('  Max refund percent (0-100)', '100'), 10);
-  const maxReworkCycles = parseInt(await ask('  Max rework cycles', '2'), 10);
-  const reworkBudgetPercent = parseInt(await ask('  Rework budget per cycle (% of job cost)', '30'), 10);
-  const escalateAfter = await ask('  Escalate after (max_rework/2nd_dispute/never)', 'max_rework');
-  const systemCrashRefund = parseInt(await ask('  System crash refund % (0-100)', '100'), 10);
-
-  const disputePolicy = {
-    defaultAction,
-    maxRefundPercent: Math.min(Math.max(maxRefundPercent, 0), 100),
-    maxReworkCycles: Math.max(maxReworkCycles, 0),
-    reworkBudgetPercent: Math.min(Math.max(reworkBudgetPercent, 0), 100),
-    escalateAfter,
-    systemCrashRefund: Math.min(Math.max(systemCrashRefund, 0), 100),
-  };
-
-  // ── Workspace ──
-  console.log('\n── Workspace ──');
-  const wsEnabled = (await ask('  Enable workspace file access? (y/N)', 'N')).toLowerCase();
-  let workspaceCapability;
-  if (wsEnabled === 'y' || wsEnabled === 'yes') {
-    const modesRaw = await ask('  Workspace modes (comma-separated: supervised,standard)', 'supervised,standard');
-    const toolsRaw = await ask('  Workspace tools', 'read_file,write_file,list_directory');
-    workspaceCapability = {
-      workspace: true,
-      modes: modesRaw.split(',').map(s => s.trim()),
-      tools: toolsRaw.split(',').map(s => s.trim()),
-    };
-  }
-
-  // ── Service ──
-  console.log('\n── Service Definition ──');
+  // ── Service listing (the thing buyers actually see) ──
+  console.log('\n── Marketplace Listing ──');
+  console.log('  This is what buyers see when they browse services.\n');
   const services = [];
-  let addService = (await ask('  Add a service? (Y/n)', 'Y')).toLowerCase();
-  while (addService !== 'n' && addService !== 'no') {
-    const svcName = await ask('    Service name');
+  let addService = await yesNo('  Create a service listing?', 'Y');
+  while (addService) {
+    const svcName = await ask('    Service name (e.g. "Code Review", "Write Blog Post")');
     if (!svcName) break;
-    const svcDesc = await ask('    Description');
-    const svcCategory = await ask('    Category', category);
-    const svcPrice = parseFloat(await ask('    Price (in VRSC)', '0.5')) || 0.5;
-    const svcCurrency = await ask('    Currency', 'VRSCTEST');
-    const svcTurnaround = await ask('    Turnaround time', '1h');
-    const svcTerms = await ask('    Payment terms (prepay|postpay|split)', 'prepay');
-    const svcSovguard = (await ask('    Require SovGuard? (Y/n)', 'Y')).toLowerCase() !== 'n';
-    const svcWindow = parseInt(await ask('    Dispute resolution window (hours)', '72'), 10) || 72;
+    const svcDesc = await ask('    What does the buyer get?', description);
+    const svcPrice = parseFloat(await ask('    Price in VRSCTEST', '0.5')) || 0.5;
+    const svcTurnaround = await ask('    How long does it take? (e.g. "15 min", "1 hour")', '15 min');
 
     services.push({
       name: svcName,
       description: svcDesc || undefined,
-      category: svcCategory || undefined,
+      category: category || undefined,
       price: svcPrice,
-      currency: svcCurrency,
+      currency: 'VRSCTEST',
       turnaround: svcTurnaround,
-      paymentTerms: svcTerms,
-      sovguard: svcSovguard,
-      resolutionWindow: svcWindow,
+      paymentTerms: 'prepay',
+      sovguard: true,
+      resolutionWindow: 72,
       refundPolicy: { policy: 'fixed', percent: 100 },
     });
+    console.log(`    ✓ "${svcName}" — ${svcPrice} VRSCTEST\n`);
 
-    addService = (await ask('  Add another service? (y/N)', 'N')).toLowerCase();
+    addService = await yesNo('  Add another service?', 'N');
   }
 
-  // Service pricing calculation
-  if (models.length > 0 && services.length > 0) {
-    console.log('\n── Service Cost Estimation ──');
-    for (const svc of services) {
-      const svcModel = await ask(`  Model for "${svc.name}" (${models.join('/')})`, models[0]);
-      const inputTokens = parseInt(await ask('  Estimated input tokens per job', '8000'), 10);
-      const outputTokens = parseInt(await ask('  Estimated output tokens per job', '2000'), 10);
-      const apiCallsCount = parseInt(await ask('  API calls per job (0 if none)', '0'), 10);
+  // ── Workspace (simple yes/no) ──
+  console.log('\n── Workspace Access ──');
+  console.log('  Workspace lets the agent read/write files in a buyer\'s local project.');
+  const wsEnabled = await yesNo('  Enable workspace (file access)?', 'N');
+  let workspaceCapability;
+  if (wsEnabled) {
+    workspaceCapability = {
+      workspace: true,
+      modes: ['supervised', 'standard'],
+      tools: ['read_file', 'write_file', 'list_directory'],
+    };
+    console.log('  ✓ Workspace enabled (supervised + standard modes)');
+  }
 
-      try {
-        const { calculateListedPrice } = require('@junction41/sovagent-sdk/dist/pricing/calculator.js');
-        const result = calculateListedPrice({
-          model: svcModel,
-          inputTokens,
-          outputTokens,
-          markupPercent: markup || 15,
-        });
-        console.log(`  Raw cost: $${result.rawCost} → Listed: $${result.listedPrice} (${markup}% markup)`);
-        svc.costBreakdown = {
-          model: svcModel,
-          estimatedInputTokens: inputTokens,
-          estimatedOutputTokens: outputTokens,
-          rawCost: result.rawCost,
-          apiCalls: apiCallsCount,
-          markup: markup || 15,
-        };
-      } catch (e) {
-        console.log(`  ⚠️  Could not calculate price: ${e.message}`);
-      }
-    }
+  // ── Advanced settings (hidden behind a toggle) ──
+  let markup = 1;
+  let duration = 7200;
+  let tokenLimit = 200000;
+  let messageLimit = 100;
+  let maxFileSize = 10485760;
+  let datapolicy = 'ephemeral';
+  let trustlevel = 'verified';
+  let disputeresolution = 'platform';
+  let disputePolicy = {
+    defaultAction: 'rework',
+    maxRefundPercent: 100,
+    maxReworkCycles: 2,
+    reworkBudgetPercent: 30,
+    escalateAfter: 'max_rework',
+    systemCrashRefund: 100,
+  };
+
+  const wantAdvanced = await yesNo('\n  Configure advanced settings? (pricing markup, session limits, dispute policy)', 'N');
+  if (wantAdvanced) {
+    console.log('\n── Pricing ──');
+    const markupRaw = await ask('  Markup on LLM costs (% above base cost, 1-50)', '1');
+    markup = Math.max(1, Math.min(50, parseInt(markupRaw, 10) || 1));
+
+    console.log('\n── Session Limits ──');
+    duration = parseInt(await ask('  Max session duration (seconds)', '7200'), 10) || 7200;
+    tokenLimit = parseInt(await ask('  Max tokens per session', '200000'), 10) || 200000;
+    messageLimit = parseInt(await ask('  Max messages per session', '100'), 10) || 100;
+    maxFileSize = parseInt(await ask('  Max file size (bytes)', '10485760'), 10) || 10485760;
+
+    console.log('\n── Dispute Policy ──');
+    console.log('  What happens if a buyer disputes the work?\n');
+    const defaultAction = await ask('  Default response (rework / refund / reject)', 'rework');
+    const maxRefundPercent = parseInt(await ask('  Max refund (% of job cost, 0-100)', '100'), 10);
+    const maxReworkCycles = parseInt(await ask('  How many rework attempts before escalation?', '2'), 10);
+
+    disputePolicy = {
+      defaultAction,
+      maxRefundPercent: Math.min(Math.max(maxRefundPercent, 0), 100),
+      maxReworkCycles: Math.max(maxReworkCycles, 0),
+      reworkBudgetPercent: 30,
+      escalateAfter: 'max_rework',
+      systemCrashRefund: 100,
+    };
+
+    console.log('\n── Data & Trust ──');
+    datapolicy = await ask('  Data handling (ephemeral = deleted after job, session = kept during job)', 'ephemeral');
+    trustlevel = await ask('  Trust level (basic / verified / audited)', 'verified');
   }
 
   rl.close();
 
+  // Auto-fill everything the user didn't need to think about
   const profile = {
     name,
     type,
     description,
     payAddress,
-    network: { capabilities, endpoints, protocols },
+    network: {
+      capabilities: tags.length > 0 ? tags : ['general'],
+      endpoints: ['https://api.junction41.io/v1'],
+      protocols: ['MCP', 'REST'],
+    },
     profile: {
       category,
       tags,
-      ...(website ? { website } : {}),
-      ...(avatar ? { avatar } : {}),
     },
     models,
     markup,
