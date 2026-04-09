@@ -11,33 +11,42 @@ const log = require('../logger.js');
 
 // ── LLM Provider Presets ──
 const LLM_PRESETS = {
-  // ── Commercial APIs ──
-  'openai':      { baseUrl: 'https://api.openai.com/v1',              model: 'gpt-4.1',                envKey: 'OPENAI_API_KEY' },
-  'claude':      { baseUrl: 'https://api.anthropic.com/v1',           model: 'claude-sonnet-4-6',      envKey: 'ANTHROPIC_API_KEY', headers: (key) => ({ 'x-api-key': key, 'anthropic-version': '2023-06-01' }) },
-  'gemini':      { baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',  model: 'gemini-2.5-pro', envKey: 'GOOGLE_API_KEY' },
-  'grok':        { baseUrl: 'https://api.x.ai/v1',                    model: 'grok-4.20',             envKey: 'XAI_API_KEY' },
-  'mistral':     { baseUrl: 'https://api.mistral.ai/v1',              model: 'mistral-large-latest',   envKey: 'MISTRAL_API_KEY' },
-  'deepseek':    { baseUrl: 'https://api.deepseek.com/v1',            model: 'deepseek-chat',          envKey: 'DEEPSEEK_API_KEY' },
-  'cohere':      { baseUrl: 'https://api.cohere.com/compatibility/v1', model: 'command-a-03-2025',     envKey: 'COHERE_API_KEY' },
-  'perplexity':  { baseUrl: 'https://api.perplexity.ai',              model: 'sonar-pro',              envKey: 'PERPLEXITY_API_KEY' },
+  // ── OpenAI ──
+  'openai':         { baseUrl: 'https://api.openai.com/v1',              model: 'gpt-4.1',                   envKey: 'OPENAI_API_KEY' },
+  'openai-mini':    { baseUrl: 'https://api.openai.com/v1',              model: 'gpt-4.1-mini',              envKey: 'OPENAI_API_KEY' },
+  'openai-o3':      { baseUrl: 'https://api.openai.com/v1',              model: 'o3',                         envKey: 'OPENAI_API_KEY' },
+  // ── Anthropic (use OpenRouter — native API is /messages not /chat/completions) ──
+  'claude-opus':    { baseUrl: 'https://openrouter.ai/api/v1',           model: 'anthropic/claude-opus-4-6',  envKey: 'OPENROUTER_API_KEY' },
+  'claude-sonnet':  { baseUrl: 'https://openrouter.ai/api/v1',           model: 'anthropic/claude-sonnet-4-6', envKey: 'OPENROUTER_API_KEY' },
+  'claude-haiku':   { baseUrl: 'https://openrouter.ai/api/v1',           model: 'anthropic/claude-haiku-4-5', envKey: 'OPENROUTER_API_KEY' },
+  // ── Google ──
+  'gemini':         { baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',  model: 'gemini-2.5-pro', envKey: 'GOOGLE_API_KEY' },
+  'gemini-flash':   { baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',  model: 'gemini-2.5-flash', envKey: 'GOOGLE_API_KEY' },
+  // ── xAI ──
+  'grok':           { baseUrl: 'https://api.x.ai/v1',                    model: 'grok-4',                    envKey: 'XAI_API_KEY' },
+  // ── Other commercial ──
+  'mistral':        { baseUrl: 'https://api.mistral.ai/v1',              model: 'mistral-large-latest',       envKey: 'MISTRAL_API_KEY' },
+  'deepseek':       { baseUrl: 'https://api.deepseek.com/v1',            model: 'deepseek-chat',              envKey: 'DEEPSEEK_API_KEY' },
+  'cohere':         { baseUrl: 'https://api.cohere.com/compatibility/v1', model: 'command-a-03-2025',         envKey: 'COHERE_API_KEY' },
+  'perplexity':     { baseUrl: 'https://api.perplexity.ai',              model: 'sonar-pro',                  envKey: 'PERPLEXITY_API_KEY' },
   // ── Fast inference ──
-  'groq':        { baseUrl: 'https://api.groq.com/openai/v1',         model: 'llama-3.3-70b-versatile', envKey: 'GROQ_API_KEY' },
-  'together':    { baseUrl: 'https://api.together.xyz/v1',            model: 'meta-llama/Llama-3.3-70B-Instruct-Turbo', envKey: 'TOGETHER_API_KEY' },
-  'fireworks':   { baseUrl: 'https://api.fireworks.ai/inference/v1',   model: 'accounts/fireworks/models/llama-v3p3-70b-instruct', envKey: 'FIREWORKS_API_KEY' },
+  'groq':           { baseUrl: 'https://api.groq.com/openai/v1',         model: 'llama-3.3-70b-versatile',   envKey: 'GROQ_API_KEY' },
+  'together':       { baseUrl: 'https://api.together.xyz/v1',            model: 'meta-llama/Llama-3.3-70B-Instruct-Turbo', envKey: 'TOGETHER_API_KEY' },
+  'fireworks':      { baseUrl: 'https://api.fireworks.ai/inference/v1',   model: 'accounts/fireworks/models/llama-v3p3-70b-instruct', envKey: 'FIREWORKS_API_KEY' },
   // ── Enterprise / cloud ──
-  'azure':       { baseUrl: '',                                         model: '',                       envKey: 'AZURE_OPENAI_API_KEY', headers: (key) => ({ 'api-key': key }) },
-  'nvidia':      { baseUrl: 'https://integrate.api.nvidia.com/v1',     model: 'nvidia/llama-3.1-nemotron-70b-instruct', envKey: 'NVIDIA_API_KEY' },
+  'azure':          { baseUrl: '',                                         model: '',                          envKey: 'AZURE_OPENAI_API_KEY', headers: (key) => ({ 'api-key': key }) },
+  'nvidia':         { baseUrl: 'https://integrate.api.nvidia.com/v1',     model: 'nvidia/llama-3.1-nemotron-70b-instruct', envKey: 'NVIDIA_API_KEY' },
   // ── Kimi / Moonshot ──
-  'kimi':        { baseUrl: 'https://api.kimi.com/coding/v1',          model: 'kimi-k2.5',             envKey: 'KIMI_API_KEY' },
-  'kimi-nvidia': { baseUrl: 'https://integrate.api.nvidia.com/v1',     model: 'moonshotai/kimi-k2.5',   envKey: 'KIMI_API_KEY' },
+  'kimi':           { baseUrl: 'https://api.kimi.com/coding/v1',          model: 'kimi-k2.5',                 envKey: 'KIMI_API_KEY' },
+  'kimi-nvidia':    { baseUrl: 'https://integrate.api.nvidia.com/v1',     model: 'moonshotai/kimi-k2.5',      envKey: 'KIMI_API_KEY' },
   // ── Routers (multi-provider) ──
-  'openrouter':  { baseUrl: 'https://openrouter.ai/api/v1',           model: 'anthropic/claude-sonnet-4.6', envKey: 'OPENROUTER_API_KEY' },
+  'openrouter':     { baseUrl: 'https://openrouter.ai/api/v1',           model: 'anthropic/claude-sonnet-4-6', envKey: 'OPENROUTER_API_KEY' },
   // ── Self-hosted / local ──
-  'ollama':      { baseUrl: 'http://localhost:11434/v1',               model: 'llama3.3',              envKey: '' },
-  'lmstudio':    { baseUrl: 'http://localhost:1234/v1',                model: 'local-model',            envKey: '' },
-  'vllm':        { baseUrl: 'http://localhost:8000/v1',                model: 'local-model',            envKey: '' },
+  'ollama':         { baseUrl: 'http://localhost:11434/v1',               model: 'llama3.3',                  envKey: '' },
+  'lmstudio':       { baseUrl: 'http://localhost:1234/v1',                model: 'local-model',               envKey: '' },
+  'vllm':           { baseUrl: 'http://localhost:8000/v1',                model: 'local-model',               envKey: '' },
   // ── Custom (configure via env vars) ──
-  'custom':      { baseUrl: '', model: '', envKey: '' },
+  'custom':         { baseUrl: '', model: '', envKey: '' },
 };
 
 function resolveLLMConfig() {

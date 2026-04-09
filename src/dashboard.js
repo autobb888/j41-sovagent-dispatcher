@@ -253,19 +253,46 @@ async function agentDetailScreen(inquirer, agentId) {
     console.log(`  SOUL.md:   ${soul.substring(0, 80).replace(/\n/g, ' ')}...`);
   }
 
+  // Detect registration state
+  const needsRegister = !keys.identity || !keys.iAddress;
+  const hasFinalize = fs.existsSync(path.join(agentDir, 'finalize-state.json'));
+  if (needsRegister) {
+    console.log(`  Status:    \x1b[33m⚠ NOT REGISTERED (has R-address only)\x1b[0m`);
+  } else if (hasFinalize) {
+    try {
+      const fState = JSON.parse(fs.readFileSync(path.join(agentDir, 'finalize-state.json'), 'utf8'));
+      if (fState.stage && fState.stage !== 'ready') {
+        console.log(`  Status:    \x1b[33m⚠ Finalize incomplete (stage: ${fState.stage})\x1b[0m`);
+      }
+    } catch {}
+  }
+  console.log('');
+
+  const choices = [
+    { name: '  View VDXF Keys (on-chain data)', value: 'vdxf' },
+    { name: '  View Platform Profile', value: 'platform' },
+    { name: '  View Services', value: 'services' },
+    { name: '  View SOUL.md', value: 'soul' },
+    { name: '  View Jobs', value: 'jobs' },
+  ];
+
+  // Add retry/register options for failed agents
+  if (needsRegister) {
+    choices.push(new inquirer.Separator('  ── Fix ──'));
+    choices.push({ name: '  \x1b[33mRetry Registration (on-chain identity)\x1b[0m', value: 'retry_register' });
+  } else if (hasFinalize) {
+    choices.push(new inquirer.Separator('  ── Fix ──'));
+    choices.push({ name: '  \x1b[33mRetry Finalize (profile/services)\x1b[0m', value: 'retry_finalize' });
+  }
+
+  choices.push(new inquirer.Separator());
+  choices.push({ name: '  ← Back to agents', value: '__back' });
+
   const { action } = await promptWithEsc(inquirer, [{
     type: 'list', pageSize: 20,
     name: 'action',
     message: 'Agent options:',
-    choices: [
-      { name: '  View VDXF Keys (on-chain data)', value: 'vdxf' },
-      { name: '  View Platform Profile', value: 'platform' },
-      { name: '  View Services', value: 'services' },
-      { name: '  View SOUL.md', value: 'soul' },
-      { name: '  View Jobs', value: 'jobs' },
-      new inquirer.Separator(),
-      { name: '  ← Back to agents', value: '__back' },
-    ],
+    choices,
   }]);
 
   switch (action) {
@@ -274,6 +301,8 @@ async function agentDetailScreen(inquirer, agentId) {
     case 'services': await servicesScreen(inquirer, keys); break;
     case 'soul': await soulScreen(inquirer, agentDir); break;
     case 'jobs': await jobsScreen(inquirer, keys); break;
+    case 'retry_register': await retryRegisterScreen(inquirer, agentId, keys); break;
+    case 'retry_finalize': await retryFinalizeScreen(inquirer, agentId); break;
     case '__back': return;
   }
 
@@ -1071,7 +1100,11 @@ async function configureLLMProvider(inquirer, config) {
   const { LLM_PRESETS } = require('./executors/local-llm.js');
 
   // Group providers by category for readability
-  const commercial = ['openai', 'claude', 'gemini', 'grok', 'mistral', 'deepseek', 'cohere', 'perplexity'];
+  const openai = ['openai', 'openai-mini', 'openai-o3'];
+  const claude = ['claude-opus', 'claude-sonnet', 'claude-haiku'];
+  const google = ['gemini', 'gemini-flash'];
+  const xai = ['grok'];
+  const commercial = ['mistral', 'deepseek', 'cohere', 'perplexity'];
   const fast = ['groq', 'together', 'fireworks'];
   const enterprise = ['azure', 'nvidia'];
   const kimi = ['kimi', 'kimi-nvidia'];
@@ -1084,8 +1117,16 @@ async function configureLLMProvider(inquirer, config) {
     return { name: `  ${p.padEnd(14)} ${(preset.model || '').padEnd(35)} ${keyLabel}`, value: p };
   };
 
-  const { provider } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 25, name: 'provider', message: 'Select LLM provider:', choices: [
-    new inquirer.Separator('  ── Commercial APIs ──'),
+  const { provider } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 30, name: 'provider', message: 'Select LLM provider:', choices: [
+    new inquirer.Separator('  ── OpenAI ──'),
+    ...openai.filter(p => LLM_PRESETS[p]).map(makeChoice),
+    new inquirer.Separator('  ── Anthropic Claude (via OpenRouter) ──'),
+    ...claude.filter(p => LLM_PRESETS[p]).map(makeChoice),
+    new inquirer.Separator('  ── Google Gemini ──'),
+    ...google.filter(p => LLM_PRESETS[p]).map(makeChoice),
+    new inquirer.Separator('  ── xAI ──'),
+    ...xai.filter(p => LLM_PRESETS[p]).map(makeChoice),
+    new inquirer.Separator('  ── Other Commercial ──'),
     ...commercial.filter(p => LLM_PRESETS[p]).map(makeChoice),
     new inquirer.Separator('  ── Fast Inference ──'),
     ...fast.filter(p => LLM_PRESETS[p]).map(makeChoice),
@@ -1104,12 +1145,7 @@ async function configureLLMProvider(inquirer, config) {
   config.llmProvider = provider;
   const preset = LLM_PRESETS[provider] || {};
 
-  // Warn about providers that need OpenAI-compatible proxy
-  if (provider === 'claude') {
-    console.log('\n  ⚠  The Anthropic API does not natively support /chat/completions.');
-    console.log('     Use OpenRouter (openrouter preset) or an OpenAI-compatible proxy.');
-    console.log('     Or set a custom base URL pointing to a compatible gateway.\n');
-  }
+  // Provider-specific guidance
   if (provider === 'azure' && !preset.baseUrl) {
     console.log('\n  ⚠  Azure requires your deployment URL (e.g. https://YOUR.openai.azure.com/openai/deployments/YOUR-MODEL/v1)');
     console.log('     You must set the base URL below.\n');
@@ -1136,6 +1172,65 @@ async function configureLLMProvider(inquirer, config) {
     const { baseOverride } = await promptWithEsc(inquirer, [{ type: 'input', name: 'baseOverride', message: 'Base URL override (Enter for default):', default: '' }]);
     if (baseOverride) config.llmBaseUrl = baseOverride;
   }
+}
+
+async function retryRegisterScreen(inquirer, agentId, keys) {
+  console.clear();
+  console.log(`\n  ═══ Retry Registration: ${agentId} ═══\n`);
+  console.log(`  R-Address: ${keys.address}`);
+  console.log(`  Network:   ${keys.network || 'verustest'}\n`);
+
+  // Check if we have a name from a previous attempt
+  const keysPath = path.join(AGENTS_DIR, agentId, 'keys.json');
+  const keysData = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+  let identityName = keysData.identityName || keysData.pendingName || '';
+
+  if (!identityName) {
+    const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'Identity name (lowercase, no spaces — becomes <name>.agentplatform@):' }]);
+    if (!name) { console.log('\n  ❌ Name required.\n'); return; }
+    identityName = name;
+  } else {
+    console.log(`  Retrying with name: ${identityName}\n`);
+  }
+
+  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${identityName}.agentplatform@ on-chain?`, default: true }]);
+  if (!confirm) return;
+
+  // Use the CLI's register command
+  const { spawnSync } = require('child_process');
+  console.log('');
+  const result = spawnSync('node', ['src/cli.js', 'register', agentId, identityName], {
+    cwd: REPO_DIR, stdio: 'inherit', timeout: 180000,
+  });
+
+  if (result.status === 0) {
+    console.log('\n  ✅ Registration successful!\n');
+  } else {
+    console.log(`\n  ❌ Registration failed (exit ${result.status}).`);
+    console.log('     Check that verusd is running and synced.\n');
+  }
+
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
+async function retryFinalizeScreen(inquirer, agentId) {
+  console.clear();
+  console.log(`\n  ═══ Retry Finalize: ${agentId} ═══\n`);
+
+  const { spawnSync } = require('child_process');
+  console.log('  Resuming finalization...\n');
+  const result = spawnSync('node', ['src/cli.js', 'finalize', agentId, '--interactive'], {
+    cwd: REPO_DIR, stdio: 'inherit', timeout: 180000,
+  });
+
+  if (result.status === 0) {
+    console.log('\n  ✅ Finalize complete!\n');
+  } else {
+    console.log(`\n  ❌ Finalize failed (exit ${result.status}).`);
+    console.log('     You can retry again later.\n');
+  }
+
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
 async function securityScreen(inquirer) {
