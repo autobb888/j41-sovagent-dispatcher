@@ -1285,6 +1285,27 @@ program
       process.exit(1);
     }
 
+    // Check if any other local agent already has this name (prevent duplicates)
+    const fullName = identityName.includes('@') ? identityName : identityName + '.agentplatform@';
+    const allAgents = listRegisteredAgents();
+    for (const other of allAgents) {
+      if (other.id === agentId) continue;
+      const otherKeys = loadAgentKeys(other.id);
+      if (!otherKeys) continue;
+      const otherName = otherKeys.identity || otherKeys.pendingName;
+      if (otherName && (otherName === fullName || otherName === identityName || otherName.replace('.agentplatform@', '') === identityName)) {
+        const status = otherKeys.registrationStatus || (otherKeys.iAddress ? 'registered' : 'pending');
+        console.error(`❌ Name "${identityName}" is already ${status} on ${other.id}.`);
+        if (status === 'timeout') {
+          console.error(`   Run: j41-dispatcher recover ${other.id}`);
+        } else if (otherKeys.iAddress) {
+          console.error(`   ${other.id} already owns this identity.`);
+        }
+        console.error(`   Pick a different name, or clear ${other.id}'s state first.`);
+        process.exit(1);
+      }
+    }
+
     console.log(`\n→ Registering ${agentId} as ${identityName}.agentplatform@...`);
     console.log(`   Address: ${keys.address}`);
 
@@ -1633,10 +1654,74 @@ program
       if (keys.iAddress) console.log(`   i-Address: ${keys.iAddress}`);
       console.log(`\n   Next: node src/cli.js finalize ${agentId}`);
     } catch (err) {
-      console.error(`\n❌ Login failed: ${err.message}`);
-      console.error(`   The identity may not exist on-chain yet.`);
-      console.error(`   Wait a few minutes and retry, or re-register.`);
-      process.exit(1);
+      console.error(`   Login with ${agentId}'s key failed: ${err.message}`);
+
+      // Strategy 3: Cross-check other agents — maybe a different agent registered this name
+      console.log(`\n   Checking if another agent owns "${keys.identity}"...`);
+      const allAgents = listRegisteredAgents();
+      let foundOwner = null;
+
+      for (const other of allAgents) {
+        if (other.id === agentId) continue;
+        const otherKeys = loadAgentKeys(other.id);
+        if (!otherKeys?.wif) continue;
+
+        try {
+          const otherAgent = new J41Agent({
+            apiUrl: J41_API_URL,
+            wif: otherKeys.wif,
+            identityName: keys.identity,
+          });
+          await otherAgent.authenticate();
+
+          // Success! This agent's key owns the identity
+          let iAddress;
+          try {
+            const idRaw = await otherAgent._client.getIdentityRaw();
+            iAddress = idRaw?.data?.identity?.identityaddress || idRaw?.iAddress;
+          } catch {}
+
+          foundOwner = { agentId: other.id, iAddress };
+          console.log(`\n   ✓ Identity "${keys.identity}" was registered by ${other.id}!`);
+          break;
+        } catch {
+          // This agent's key doesn't own it either — continue
+        }
+      }
+
+      if (foundOwner) {
+        console.log(`\n   The identity belongs to ${foundOwner.agentId}, not ${agentId}.`);
+        console.log(`   Cleaning up ${agentId}'s stale claim...`);
+
+        // Clean stale state from this agent
+        delete keys.identity;
+        delete keys.iAddress;
+        delete keys.registrationStatus;
+        delete keys.onboardId;
+        delete keys.lastOnboardStatus;
+        delete keys.pendingName;
+        fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2));
+        fs.chmodSync(path.join(AGENTS_DIR, agentId, 'keys.json'), 0o600);
+
+        // Make sure the owning agent has iAddress if it was missing
+        if (foundOwner.iAddress) {
+          const ownerKeys = loadAgentKeys(foundOwner.agentId);
+          if (ownerKeys && !ownerKeys.iAddress) {
+            ownerKeys.iAddress = foundOwner.iAddress;
+            delete ownerKeys.registrationStatus;
+            fs.writeFileSync(path.join(AGENTS_DIR, foundOwner.agentId, 'keys.json'), JSON.stringify(ownerKeys, null, 2));
+            fs.chmodSync(path.join(AGENTS_DIR, foundOwner.agentId, 'keys.json'), 0o600);
+          }
+        }
+
+        console.log(`\n✅ Resolved. "${keys.identity}" belongs to ${foundOwner.agentId}.`);
+        console.log(`   ${agentId} is now clean — register it with a different name.`);
+      } else {
+        console.error(`\n❌ Identity "${keys.identity}" not found on any local agent's key.`);
+        console.error(`   The identity may not exist on-chain yet (wait and retry),`);
+        console.error(`   or use "Re-register" in the dashboard to clear state and try again.`);
+        process.exit(1);
+      }
     }
   });
 
@@ -2366,6 +2451,20 @@ program
     if (keys.identity && keys.iAddress && keys.registrationStatus !== 'timeout') {
       console.log(`  ✓ Already registered: ${keys.identity}`);
     } else {
+      // Check for duplicate name across local agents
+      const setupFullName = identityName + '.agentplatform@';
+      const setupAllAgents = listRegisteredAgents();
+      for (const other of setupAllAgents) {
+        if (other.id === agentId) continue;
+        const otherKeys = loadAgentKeys(other.id);
+        if (!otherKeys) continue;
+        const otherName = otherKeys.identity || otherKeys.pendingName;
+        if (otherName && (otherName === setupFullName || otherName.replace('.agentplatform@', '') === identityName)) {
+          console.error(`  ❌ Name "${identityName}" is already claimed by ${other.id}.`);
+          console.error(`     Pick a different name, or clear ${other.id}'s state first.`);
+          process.exit(1);
+        }
+      }
       const agent = new J41Agent({
         apiUrl: J41_API_URL,
         wif: keys.wif,
