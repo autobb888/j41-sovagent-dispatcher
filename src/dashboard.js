@@ -149,6 +149,34 @@ function promptWithEsc(inquirer, questions) {
   });
 }
 
+/**
+ * Run an external command asynchronously with stdio inherited.
+ * Ctrl+C kills the child and returns null. No timeout — registration can take 20+ min.
+ */
+function runCommandAsync(cmd, args, cwd) {
+  return new Promise((resolve) => {
+    const { spawn } = require('child_process');
+    const child = spawn(cmd, args, { cwd, stdio: 'inherit' });
+
+    const onSigint = () => {
+      child.kill('SIGTERM');
+      resolve(null);
+    };
+    process.on('SIGINT', onSigint);
+
+    child.on('close', (code) => {
+      process.removeListener('SIGINT', onSigint);
+      resolve(code);
+    });
+
+    child.on('error', (err) => {
+      process.removeListener('SIGINT', onSigint);
+      console.error(`  Error spawning command: ${err.message}`);
+      resolve(1);
+    });
+  });
+}
+
 /** Run a screen function, catch BACK to return silently */
 async function withBack(fn) {
   try {
@@ -799,14 +827,13 @@ async function addAgentScreen(inquirer) {
   const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Proceed with setup?', default: true }]);
   if (!confirm) return;
 
-  // Run the setup command
-  const { spawnSync } = require('child_process');
+  // Run the setup command (async — registration can take 20+ minutes for block confirmations)
   try {
     console.log('');
-    const result = spawnSync('node', ['src/cli.js', 'setup', agentId, name, '--template', template], {
-      cwd: REPO_DIR, stdio: 'inherit', timeout: 120000
-    });
-    if (result.status === 0) {
+    console.log('  ℹ️  Registration waits for block confirmations (can take 5-20 min).');
+    console.log('  Press Ctrl+C to return to menu — registration continues on the platform.\n');
+    const exitCode = await runCommandAsync('node', ['src/cli.js', 'setup', agentId, name, '--template', template], REPO_DIR);
+    if (exitCode === 0) {
       console.log('\n  ✅ Agent created successfully.\n');
 
       // Offer immediate executor configuration
@@ -844,7 +871,8 @@ async function addAgentScreen(inquirer) {
         console.log(`\n  ✅ Executor config saved. You can change it later via "Configure Agent Executor".\n`);
       }
     } else {
-      console.log(`\n  ❌ Setup failed (exit code ${result.status}).\n`);
+      console.log(`\n  ❌ Setup failed (exit code ${exitCode}).`);
+      console.log('     If registration was in progress, use "Retry Registration" from the agent detail screen.\n');
     }
   } catch (e) {
     console.log(`\n  ❌ Setup failed: ${e.message}\n`);
@@ -1196,17 +1224,18 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
   const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${identityName}.agentplatform@ on-chain?`, default: true }]);
   if (!confirm) return;
 
-  // Use the CLI's register command
-  const { spawnSync } = require('child_process');
   console.log('');
-  const result = spawnSync('node', ['src/cli.js', 'register', agentId, identityName], {
-    cwd: REPO_DIR, stdio: 'inherit', timeout: 180000,
-  });
+  console.log('  ℹ️  Registration waits for block confirmations (can take 5-20 min).');
+  console.log('  Press Ctrl+C to return to menu — registration continues on the platform.\n');
+  const exitCode = await runCommandAsync('node', ['src/cli.js', 'register', agentId, identityName], REPO_DIR);
 
-  if (result.status === 0) {
+  if (exitCode === 0) {
     console.log('\n  ✅ Registration successful!\n');
+  } else if (exitCode === null) {
+    console.log('\n  ⚠️  Interrupted. Registration may still be processing on the platform.');
+    console.log('     Check back later or use "Retry Registration".\n');
   } else {
-    console.log(`\n  ❌ Registration failed (exit ${result.status}).`);
+    console.log(`\n  ❌ Registration failed (exit ${exitCode}).`);
     console.log('     Check that verusd is running and synced.\n');
   }
 
@@ -1217,16 +1246,13 @@ async function retryFinalizeScreen(inquirer, agentId) {
   console.clear();
   console.log(`\n  ═══ Retry Finalize: ${agentId} ═══\n`);
 
-  const { spawnSync } = require('child_process');
   console.log('  Resuming finalization...\n');
-  const result = spawnSync('node', ['src/cli.js', 'finalize', agentId, '--interactive'], {
-    cwd: REPO_DIR, stdio: 'inherit', timeout: 180000,
-  });
+  const exitCode = await runCommandAsync('node', ['src/cli.js', 'finalize', agentId, '--interactive'], REPO_DIR);
 
-  if (result.status === 0) {
+  if (exitCode === 0) {
     console.log('\n  ✅ Finalize complete!\n');
   } else {
-    console.log(`\n  ❌ Finalize failed (exit ${result.status}).`);
+    console.log(`\n  ❌ Finalize failed (exit ${exitCode}).`);
     console.log('     You can retry again later.\n');
   }
 
