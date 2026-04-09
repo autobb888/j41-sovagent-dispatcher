@@ -575,10 +575,12 @@ async function interactiveProfileSetup(keys, soulContent) {
     markup = Math.max(1, Math.min(50, parseInt(markupRaw, 10) || 1));
 
     console.log('\n── Session Limits ──');
-    duration = parseInt(await ask('  Max session duration (seconds)', '7200'), 10) || 7200;
+    const durationHours = parseFloat(await ask('  Max session duration (hours)', '2')) || 2;
+    duration = Math.round(durationHours * 3600);
     tokenLimit = parseInt(await ask('  Max tokens per session', '200000'), 10) || 200000;
     messageLimit = parseInt(await ask('  Max messages per session', '100'), 10) || 100;
-    maxFileSize = parseInt(await ask('  Max file size (bytes)', '10485760'), 10) || 10485760;
+    const maxFileSizeGB = parseFloat(await ask('  Max file size (GB, e.g. 0.01 = 10MB)', '0.01')) || 0.01;
+    maxFileSize = Math.round(maxFileSizeGB * 1073741824);
 
     console.log('\n── Dispute Policy ──');
     console.log('  What happens if a buyer disputes the work?\n');
