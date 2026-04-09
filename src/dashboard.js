@@ -1402,6 +1402,12 @@ async function configureLLMProvider(inquirer, config) {
   const preset = LLM_PRESETS[provider] || {};
 
   // Provider-specific guidance
+  if (provider === 'openrouter' || provider === 'claude-opus' || provider === 'claude-sonnet' || provider === 'claude-haiku') {
+    console.log('\n  OpenRouter supports 200+ models. Use the format: provider/model-name');
+    console.log('  Examples: anthropic/claude-opus-4-6, openai/gpt-4.1, google/gemini-2.5-pro,');
+    console.log('            meta-llama/llama-3.3-70b-instruct, mistralai/mistral-large-latest');
+    console.log('  Full list: https://openrouter.ai/models\n');
+  }
   if (provider === 'azure' && !preset.baseUrl) {
     console.log('\n  ⚠  Azure requires your deployment URL (e.g. https://YOUR.openai.azure.com/openai/deployments/YOUR-MODEL/v1)');
     console.log('     You must set the base URL below.\n');
@@ -1420,8 +1426,10 @@ async function configureLLMProvider(inquirer, config) {
   // else: local providers (ollama, lmstudio, vllm) — no key needed
 
   // Model override
-  const { model } = await promptWithEsc(inquirer, [{ type: 'input', name: 'model', message: 'Model (Enter for default):', default: preset.model || '' }]);
-  if (model && model !== preset.model) config.llmModel = model;
+  const isOpenRouter = provider === 'openrouter' || provider === 'claude-opus' || provider === 'claude-sonnet' || provider === 'claude-haiku';
+  const modelMsg = isOpenRouter ? 'Model (provider/model-name):' : 'Model (Enter for default):';
+  const { model } = await promptWithEsc(inquirer, [{ type: 'input', name: 'model', message: modelMsg, default: preset.model || '' }]);
+  if (model) config.llmModel = model;
 
   // Custom base URL override for non-custom providers
   if (provider !== 'custom' && provider !== 'ollama' && provider !== 'lmstudio' && provider !== 'vllm') {
