@@ -283,16 +283,27 @@ async function agentDetailScreen(inquirer, agentId) {
 
   // Detect registration state
   const needsRegister = !keys.identity || !keys.iAddress;
-  const hasFinalize = fs.existsSync(path.join(agentDir, 'finalize-state.json'));
+  const finalizeStatePath = path.join(agentDir, 'finalize-state.json');
+  const hasFinalize = fs.existsSync(finalizeStatePath);
+  let finalizeIncomplete = false;
+  let needsFinalize = false;
+
   if (needsRegister) {
     console.log(`  Status:    \x1b[33m⚠ NOT REGISTERED (has R-address only)\x1b[0m`);
   } else if (hasFinalize) {
     try {
-      const fState = JSON.parse(fs.readFileSync(path.join(agentDir, 'finalize-state.json'), 'utf8'));
+      const fState = JSON.parse(fs.readFileSync(finalizeStatePath, 'utf8'));
       if (fState.stage && fState.stage !== 'ready') {
         console.log(`  Status:    \x1b[33m⚠ Finalize incomplete (stage: ${fState.stage})\x1b[0m`);
+        finalizeIncomplete = true;
+      } else {
+        console.log(`  Status:    \x1b[32m✓ Registered & finalized\x1b[0m`);
       }
-    } catch {}
+    } catch { finalizeIncomplete = true; }
+  } else if (keys.identity && keys.iAddress) {
+    // Registered but finalize never ran — no finalize-state.json, no VDXF keys
+    console.log(`  Status:    \x1b[33m⚠ Registered but NOT FINALIZED (no profile/services on-chain)\x1b[0m`);
+    needsFinalize = true;
   }
   console.log('');
 
@@ -304,13 +315,14 @@ async function agentDetailScreen(inquirer, agentId) {
     { name: '  View Jobs', value: 'jobs' },
   ];
 
-  // Add retry/register options for failed agents
+  // Add retry/register/finalize options for incomplete agents
   if (needsRegister) {
     choices.push(new inquirer.Separator('  ── Fix ──'));
     choices.push({ name: '  \x1b[33mRetry Registration (on-chain identity)\x1b[0m', value: 'retry_register' });
-  } else if (hasFinalize) {
+  }
+  if (finalizeIncomplete || needsFinalize) {
     choices.push(new inquirer.Separator('  ── Fix ──'));
-    choices.push({ name: '  \x1b[33mRetry Finalize (profile/services)\x1b[0m', value: 'retry_finalize' });
+    choices.push({ name: '  \x1b[33mRun Finalize (publish profile/services on-chain)\x1b[0m', value: 'retry_finalize' });
   }
 
   choices.push(new inquirer.Separator());
