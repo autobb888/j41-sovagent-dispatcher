@@ -1271,20 +1271,28 @@ async function securityScreen(inquirer) {
 
   if (action === '__back') return;
 
-  const { execSync } = require('child_process');
   try {
+    const secureSetup = require('@junction41/secure-setup');
     switch (action) {
       case 'setup':
         console.log('\n  Running security setup...\n');
-        execSync('node -e "require(\'@junction41/secure-setup\').setup(\'dispatcher\').then(r => console.log(JSON.stringify(r, null, 2)))"', { stdio: 'inherit', timeout: 60000 });
+        const setupResult = await secureSetup.setup('dispatcher');
+        console.log(JSON.stringify(setupResult, null, 2));
         break;
       case 'test':
         console.log('\n  Running self-test...\n');
-        execSync('node -e "require(\'@junction41/secure-setup\').selfTest().then(r => { for (const t of r.tests) console.log((t.passed ? \'  ✅\' : \'  ❌\') + \' \' + t.name + \': \' + t.detail); console.log(\'\\n  Score: \' + r.score + \'/10\'); })"', { stdio: 'inherit', timeout: 60000 });
+        const testResult = await secureSetup.selfTest();
+        for (const t of testResult.tests) {
+          console.log((t.passed ? '  ✅' : '  ❌') + ' ' + t.name + ': ' + t.detail);
+        }
+        console.log('\n  Score: ' + testResult.score + '/10');
         break;
       case 'check':
         console.log('\n  Checking profiles...\n');
-        execSync('node -e "require(\'@junction41/secure-setup\').quickCheck(\'dispatcher\').then(r => { for (const c of r.checks) console.log((c.status === \'pass\' ? \'  ✅\' : \'  ⚠️ \') + \' \' + c.name + \': \' + c.detail); })"', { stdio: 'inherit', timeout: 30000 });
+        const checkResult = await secureSetup.quickCheck('dispatcher');
+        for (const c of checkResult.checks) {
+          console.log((c.status === 'pass' ? '  ✅' : '  ⚠️ ') + ' ' + c.name + ': ' + c.detail);
+        }
         break;
     }
   } catch (e) {
