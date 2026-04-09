@@ -1213,30 +1213,68 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
   const keysData = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
   let identityName = keysData.identityName || keysData.pendingName || '';
 
-  if (!identityName) {
-    const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'Identity name (lowercase, no spaces — becomes <name>.agentplatform@):' }]);
-    if (!name) { console.log('\n  ❌ Name required.\n'); return; }
-    identityName = name;
+  // Offer choice: recover existing (if name was already sent) or register fresh
+  const { action } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 10, name: 'action', message: 'What happened?', choices: [
+    { name: '  Registration timed out — name was already sent to J41 (recover it)', value: 'recover' },
+    { name: '  Registration never started or name was rejected (register new)', value: 'register' },
+    new inquirer.Separator(),
+    { name: '  ← Back', value: '__back' },
+  ]}]);
+
+  if (action === '__back') return;
+
+  if (action === 'recover') {
+    if (!identityName) {
+      const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'What name did you register? (e.g. "myagent" for myagent.agentplatform@):' }]);
+      if (!name) { console.log('\n  ❌ Name required.\n'); return; }
+      identityName = name;
+    }
+
+    // Save the name to keys.json so the recover command can find it
+    keysData.identity = identityName.includes('@') ? identityName : identityName + '.agentplatform@';
+    keysData.registrationStatus = 'timeout';
+    fs.writeFileSync(keysPath, JSON.stringify(keysData, null, 2));
+
+    console.log(`\n  Recovering ${keysData.identity}...\n`);
+    const exitCode = await runCommandAsync('node', ['src/cli.js', 'recover', agentId], REPO_DIR);
+
+    if (exitCode === 0) {
+      console.log('\n  ✅ Recovery successful!\n');
+    } else {
+      console.log(`\n  ❌ Recovery failed. The identity may not be on-chain yet.`);
+      console.log('     Wait a few minutes and try again.\n');
+    }
   } else {
-    console.log(`  Retrying with name: ${identityName}\n`);
-  }
+    if (!identityName) {
+      const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'Identity name (lowercase, no spaces — becomes <name>.agentplatform@):' }]);
+      if (!name) { console.log('\n  ❌ Name required.\n'); return; }
+      identityName = name;
+    } else {
+      const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'Identity name:', default: identityName }]);
+      identityName = name;
+    }
 
-  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${identityName}.agentplatform@ on-chain?`, default: true }]);
-  if (!confirm) return;
+    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${identityName}.agentplatform@ on-chain?`, default: true }]);
+    if (!confirm) return;
 
-  console.log('');
-  console.log('  ℹ️  Registration waits for block confirmations (can take 5-20 min).');
-  console.log('  Press Ctrl+C to return to menu — registration continues on the platform.\n');
-  const exitCode = await runCommandAsync('node', ['src/cli.js', 'register', agentId, identityName], REPO_DIR);
+    // Save pending name so we can recover later if it times out
+    keysData.pendingName = identityName;
+    fs.writeFileSync(keysPath, JSON.stringify(keysData, null, 2));
 
-  if (exitCode === 0) {
-    console.log('\n  ✅ Registration successful!\n');
-  } else if (exitCode === null) {
-    console.log('\n  ⚠️  Interrupted. Registration may still be processing on the platform.');
-    console.log('     Check back later or use "Retry Registration".\n');
-  } else {
-    console.log(`\n  ❌ Registration failed (exit ${exitCode}).`);
-    console.log('     Check that verusd is running and synced.\n');
+    console.log('');
+    console.log('  ℹ️  Registration waits for block confirmations (can take 5-20 min).');
+    console.log('  Press Ctrl+C to return to menu — registration continues on the platform.\n');
+    const exitCode = await runCommandAsync('node', ['src/cli.js', 'register', agentId, identityName], REPO_DIR);
+
+    if (exitCode === 0) {
+      console.log('\n  ✅ Registration successful!\n');
+    } else if (exitCode === null) {
+      console.log('\n  ⚠️  Interrupted. Registration may still be processing on the platform.');
+      console.log('     Use "Retry Registration" → "recover" to check on it.\n');
+    } else {
+      console.log(`\n  ❌ Registration failed (exit ${exitCode}).`);
+      console.log('     If the name was already committed, use "recover" instead of "register new".\n');
+    }
   }
 
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
