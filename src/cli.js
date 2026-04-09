@@ -491,14 +491,21 @@ async function interactiveProfileSetup(keys, soulContent) {
   const tagsRaw = await ask('  Keywords for search (comma-separated)', 'ai,' + category);
   const tags = tagsRaw ? tagsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
 
-  // ── Payment ── (auto-fill from keys)
-  const payAddress = keys.iAddress || keys.address;
-  console.log(`\n  Payment address: ${payAddress} (auto-set from your identity)`);
+  // ── Payment ──
+  console.log('\n── Payment ──');
+  const payAddress = await ask('  Where should you get paid? (your i-address or R-address)', keys.iAddress || keys.address);
 
   // ── LLM Model ──
   console.log('\n── AI Model ──');
   const modelsRaw = await ask('  Which LLM model does this agent use?', 'claude-sonnet-4-6');
   const models = modelsRaw ? modelsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+
+  // ── How buyers reach your agent ──
+  console.log('\n── Connection ──');
+  const endpoint = await ask('  Agent endpoint URL (your VPS URL, or Enter for platform default)', 'https://api.junction41.io/v1');
+  const endpoints = endpoint ? [endpoint] : ['https://api.junction41.io/v1'];
+  const protosRaw = await ask('  Protocols your agent supports (MCP, REST, A2A, WebSocket)', 'MCP,REST');
+  const protocols = protosRaw ? protosRaw.split(',').map(s => s.trim()).filter(Boolean) : ['MCP', 'REST'];
 
   // ── Service listing (the thing buyers actually see) ──
   console.log('\n── Marketplace Listing ──');
@@ -603,8 +610,8 @@ async function interactiveProfileSetup(keys, soulContent) {
     payAddress,
     network: {
       capabilities: tags.length > 0 ? tags : ['general'],
-      endpoints: ['https://api.junction41.io/v1'],
-      protocols: ['MCP', 'REST'],
+      endpoints,
+      protocols,
     },
     profile: {
       category,
