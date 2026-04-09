@@ -1449,10 +1449,16 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
   const keysData = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
   let identityName = keysData.identityName || keysData.pendingName || '';
 
-  // Offer choice: recover existing (if name was already sent) or register fresh
-  const { action } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 10, name: 'action', message: 'What happened?', choices: [
-    { name: '  Registration timed out — name was already sent to J41 (recover it)', value: 'recover' },
-    { name: '  Registration never started or name was rejected (register new)', value: 'register' },
+  // Show current state to help user decide
+  if (keysData.identity) console.log(`  Previous name: ${keysData.identity}`);
+  if (keysData.registrationStatus) console.log(`  Status: ${keysData.registrationStatus}`);
+  if (keysData.onboardId) console.log(`  Onboard ID: ${keysData.onboardId}`);
+  console.log('');
+
+  const { action } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 10, name: 'action', message: 'What would you like to do?', choices: [
+    { name: '  Recover — check if the name made it on-chain (timed-out registration)', value: 'recover' },
+    { name: '  Re-register — clear stale state and try again (name never confirmed)', value: 'clean_register' },
+    { name: '  Register fresh — new name, keep existing keys', value: 'register' },
     new inquirer.Separator(),
     { name: '  ← Back', value: '__back' },
   ]}]);
@@ -1466,7 +1472,6 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
       identityName = name;
     }
 
-    // Save the name to keys.json so the recover command can find it
     keysData.identity = identityName.includes('@') ? identityName : identityName + '.agentplatform@';
     keysData.registrationStatus = 'timeout';
     fs.writeFileSync(keysPath, JSON.stringify(keysData, null, 2));
@@ -1478,22 +1483,28 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
       console.log('\n  ✅ Recovery successful!\n');
     } else {
       console.log(`\n  ❌ Recovery failed. The identity may not be on-chain yet.`);
-      console.log('     Wait a few minutes and try again.\n');
+      console.log('     Try "Re-register" to clear state and start fresh.\n');
     }
-  } else {
-    if (!identityName) {
-      const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'Identity name (lowercase, no spaces — becomes <name>.agentplatform@):' }]);
-      if (!name) { console.log('\n  ❌ Name required.\n'); return; }
-      identityName = name;
-    } else {
-      const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'Identity name:', default: identityName }]);
-      identityName = name;
-    }
+  } else if (action === 'clean_register') {
+    // Clear all stale registration state
+    const previousName = keysData.identity || identityName;
+    delete keysData.identity;
+    delete keysData.iAddress;
+    delete keysData.registrationStatus;
+    delete keysData.onboardId;
+    delete keysData.lastOnboardStatus;
+    delete keysData.pendingName;
+    delete keysData.registrationTimestamp;
+    fs.writeFileSync(keysPath, JSON.stringify(keysData, null, 2));
+    console.log('\n  ✅ Stale registration state cleared.\n');
+
+    const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'Identity name:', default: previousName ? previousName.replace('.agentplatform@', '') : '' }]);
+    if (!name) { console.log('\n  ❌ Name required.\n'); return; }
+    identityName = name;
 
     const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${identityName}.agentplatform@ on-chain?`, default: true }]);
     if (!confirm) return;
 
-    // Save pending name so we can recover later if it times out
     keysData.pendingName = identityName;
     fs.writeFileSync(keysPath, JSON.stringify(keysData, null, 2));
 
@@ -1505,11 +1516,43 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
     if (exitCode === 0) {
       console.log('\n  ✅ Registration successful!\n');
     } else if (exitCode === null) {
-      console.log('\n  ⚠️  Interrupted. Registration may still be processing on the platform.');
-      console.log('     Use "Retry Registration" → "recover" to check on it.\n');
+      console.log('\n  ⚠️  Interrupted. Use "Recover" to check on it later.\n');
     } else {
       console.log(`\n  ❌ Registration failed (exit ${exitCode}).`);
-      console.log('     If the name was already committed, use "recover" instead of "register new".\n');
+      console.log('     If the name is already taken, try a different name.\n');
+    }
+  } else {
+    // Register fresh with a new name
+    const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'New identity name (lowercase, no spaces):' }]);
+    if (!name) { console.log('\n  ❌ Name required.\n'); return; }
+    identityName = name;
+
+    // Clear stale state for fresh registration
+    delete keysData.identity;
+    delete keysData.iAddress;
+    delete keysData.registrationStatus;
+    delete keysData.onboardId;
+    delete keysData.lastOnboardStatus;
+    delete keysData.pendingName;
+    delete keysData.registrationTimestamp;
+    keysData.pendingName = identityName;
+    fs.writeFileSync(keysPath, JSON.stringify(keysData, null, 2));
+
+    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${identityName}.agentplatform@ on-chain?`, default: true }]);
+    if (!confirm) return;
+
+    console.log('');
+    console.log('  ℹ️  Registration waits for block confirmations (can take 5-20 min).');
+    console.log('  Press Ctrl+C to return to menu — registration continues on the platform.\n');
+    const exitCode = await runCommandAsync('node', ['src/cli.js', 'register', agentId, identityName], REPO_DIR);
+
+    if (exitCode === 0) {
+      console.log('\n  ✅ Registration successful!\n');
+    } else if (exitCode === null) {
+      console.log('\n  ⚠️  Interrupted. Use "Recover" to check on it later.\n');
+    } else {
+      console.log(`\n  ❌ Registration failed (exit ${exitCode}).`);
+      console.log('     If the name is already taken, try a different name.\n');
     }
   }
 
