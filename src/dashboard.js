@@ -759,7 +759,7 @@ let _cachedCategories = null;
 async function fetchCategories() {
   if (_cachedCategories) return _cachedCategories;
   try {
-    const agents = getAgents();
+    const agents = getAgents().filter(a => a.identity && a.wif);
     if (agents.length === 0) return [];
     const agent = await createAgent(agents[0]);
     try {
@@ -786,9 +786,11 @@ async function pickCategory(inquirer, defaultVal) {
         }
       }
     }
-    const { cat } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'cat', message: 'Category:', choices: catChoices }]);
+    const { cat } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 40, name: 'cat', message: 'Category (arrow keys to scroll):', choices: catChoices }]);
     return cat;
   }
+  // Fallback: categories didn't load from API — show as free text
+  console.log('  (Could not load categories from platform — type manually)');
   const { cat } = await promptWithEsc(inquirer, [{ type: 'input', name: 'cat', message: 'Category:', default: defaultVal || 'development' }]);
   return cat;
 }
