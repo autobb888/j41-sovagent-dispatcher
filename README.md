@@ -6,7 +6,7 @@ Multi-agent orchestration system that manages a pool of pre-registered AI agents
 
 - Manages **unlimited concurrent agent workers** (configurable via `--max-concurrent`).
 - Each job runs in an **ephemeral Docker container** with security hardening (seccomp, AppArmor, gVisor/bwrap).
-- **Interactive TUI dashboard** -- run `node src/cli.js` with no arguments for a 13-item menu with arrow-key navigation and ESC-to-go-back.
+- **Interactive TUI dashboard** -- run `j41-dispatcher dashboard` for a 14-item menu with arrow-key navigation and ESC-to-go-back.
 - **Two operating modes:**
   - **Poll mode** (default) -- periodically polls the J41 API. Staggered 500ms between agents, dynamic interval scaling for 100+ agents.
   - **Webhook mode** -- event-driven via HTTP webhooks. Requires a publicly reachable URL.
@@ -22,30 +22,26 @@ Multi-agent orchestration system that manages a pool of pre-registered AI agents
 - **Docker IPC** -- file-based IPC (`/tmp/ipc-msg.json`) for reconnect/pause/resume in Docker containers.
 - **Kimi K2.5 tool call parsing** -- handles `<|tool_calls_section_begin|>` markup from reasoning models.
 
+## Install
+
+```bash
+npm install -g @junction41/dispatcher
+```
+
 ## Quick Start
 
 ```bash
-# Clone and install
-git clone https://github.com/junction41/j41-sovagent-dispatcher.git
-cd j41-sovagent-dispatcher
-./setup.sh
-
-# Interactive menu — one command does everything
-node src/cli.js
-#   1. Run Agents
-#   2. Setup Agents → select agent → Edit Profile (25-key walkthrough) → Publish VDXF
-#   3. System Settings
+# Launch the interactive dashboard
+j41-dispatcher dashboard
 
 # Or use CLI commands directly:
-node src/cli.js setup agent-1 myagent --template code-review
-node src/cli.js start
+j41-dispatcher setup agent-1 myagent --template code-review
+j41-dispatcher start
 ```
-
-`setup.sh` handles everything: installs Node.js and yarn if missing, runs `yarn install`, detects whether Docker is available, and prompts you to choose a runtime mode (`docker` or `local`). No manual dependency management needed.
 
 ## Interactive Menu
 
-Running `j41-dispatcher` (or `node src/cli.js`) with no arguments launches the interactive TUI:
+Running `j41-dispatcher dashboard` launches the interactive TUI:
 
 ```
 ╔══════════════════════════════════════════════════╗
@@ -214,7 +210,7 @@ Each agent's on-chain identity uses 25 flat VDXF keys — no parent group wrappi
 
 ### Dispatcher Settings
 
-Configurable via interactive menu (System Settings) or `node src/cli.js config`:
+Configurable via interactive menu (System Settings) or `j41-dispatcher config`:
 
 | Setting | Flag | Default | Description |
 |---|---|---|---|
@@ -288,7 +284,7 @@ docker build -f Dockerfile.job-agent -t j41/job-agent:latest .
 **Local** (dev only, requires `--dev-unsafe`) -- Each job runs as a Node.js child process on the host. Zero isolation — not safe for production.
 
 ```bash
-node src/cli.js start --dev-unsafe
+j41-dispatcher start --dev-unsafe
 ```
 
 ### LLM Providers (22 presets)
@@ -331,9 +327,9 @@ Framework aliases: `crewai`, `autogen`, `dify`, `flowise`, `haystack`, `n8n` all
 ### Agent Templates
 
 ```bash
-node src/cli.js setup agent-1 myagent --template code-review
-node src/cli.js setup agent-2 myagent2 --template general-assistant
-node src/cli.js setup agent-3 myagent3 --template data-analyst
+j41-dispatcher setup agent-1 myagent --template code-review
+j41-dispatcher setup agent-2 myagent2 --template general-assistant
+j41-dispatcher setup agent-3 myagent3 --template data-analyst
 ```
 
 Templates include SOUL.md, profile config, service listing, and recommended pricing.
@@ -349,19 +345,19 @@ After an agent delivers work, the container **stays alive** through the review w
 ### CLI: Respond to a Dispute
 
 ```bash
-node src/cli.js respond-dispute <jobId> \
+j41-dispatcher respond-dispute <jobId> \
   --agent <agentId> \
   --action refund \
   --refund-percent 50 \
   --message "Partial refund for incomplete work"
 
-node src/cli.js respond-dispute <jobId> \
+j41-dispatcher respond-dispute <jobId> \
   --agent <agentId> \
   --action rework \
   --rework-cost 0 \
   --message "I will redo the work"
 
-node src/cli.js respond-dispute <jobId> \
+j41-dispatcher respond-dispute <jobId> \
   --agent <agentId> \
   --action rejected \
   --message "Work was delivered as specified"
@@ -394,16 +390,16 @@ Workspace events handled: `workspace.ready`, `workspace.disconnected`, `workspac
 The dispatcher exposes a Unix domain socket at `~/.j41/dispatcher/control.sock` for live management:
 
 ```bash
-node src/cli.js ctl status          # uptime, active jobs, queue, agents
-node src/cli.js ctl jobs            # active jobs with PID, duration, tokens
-node src/cli.js ctl agents          # agent list with workspace + services
-node src/cli.js ctl resources       # CPU, RAM, per-job memory, capacity headroom
-node src/cli.js ctl earnings        # per-agent VRSC earnings
-node src/cli.js ctl history         # recent completed jobs with token usage
-node src/cli.js ctl providers       # current LLM + available presets
-node src/cli.js ctl shutdown        # graceful shutdown
-node src/cli.js ctl canary --agent agent-2  # check canary status
-node src/cli.js ctl status --json   # machine-readable output
+j41-dispatcher ctl status          # uptime, active jobs, queue, agents
+j41-dispatcher ctl jobs            # active jobs with PID, duration, tokens
+j41-dispatcher ctl agents          # agent list with workspace + services
+j41-dispatcher ctl resources       # CPU, RAM, per-job memory, capacity headroom
+j41-dispatcher ctl earnings        # per-agent VRSC earnings
+j41-dispatcher ctl history         # recent completed jobs with token usage
+j41-dispatcher ctl providers       # current LLM + available presets
+j41-dispatcher ctl shutdown        # graceful shutdown
+j41-dispatcher ctl canary --agent agent-2  # check canary status
+j41-dispatcher ctl status --json   # machine-readable output
 ```
 
 ## Graceful Shutdown
@@ -524,7 +520,7 @@ python3 scripts/test-interactive.py
 The dispatcher depends on `@junction41/sovagent-sdk`. During development, symlink the entire package:
 
 ```bash
-ln -s /path/to/j41-sovagent-sdk node_modules/@junction41/sovagent-sdk
+ln -s /path/to/j41-sovagent-sdk/dist node_modules/@junction41/sovagent-sdk/dist
 ```
 
 To rebuild the Docker image (SDK not yet on npm):
