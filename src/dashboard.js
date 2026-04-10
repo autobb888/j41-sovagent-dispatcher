@@ -227,8 +227,11 @@ async function mainMenu(inquirer) {
       { name: '[12] Check Inbox', value: 'inbox' },
       { name: '[13] Earnings Summary', value: 'earnings' },
       { name: '[14] Docker Containers', value: 'docker' },
+      new inquirer.Separator('  ── Agents ──'),
+      { name: '[15] Activate All Agents', value: 'activate_all' },
+      { name: '[16] Deactivate All Agents', value: 'deactivate_all' },
       new inquirer.Separator('  ── Marketplace ──'),
-      { name: '[15] Bounties', value: 'bounties' },
+      { name: '[17] Bounties', value: 'bounties' },
       new inquirer.Separator(),
       { name: '     Quit', value: 'quit' },
     ],
@@ -1729,6 +1732,48 @@ async function llmScreen(inquirer) {
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
+// ── Batch Activate/Deactivate ──
+
+async function batchActivateScreen(inquirer, activate) {
+  const action = activate ? 'Activate' : 'Deactivate';
+  console.clear();
+  console.log(`\n  ═══ ${action} All Agents ═══\n`);
+
+  const agents = getAgents().filter(a => a.identity && a.iAddress && a.wif);
+  if (agents.length === 0) {
+    console.log('  No registered agents found.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  console.log(`  ${agents.length} registered agent(s):\n`);
+  for (const a of agents) {
+    console.log(`    ${a.id.padEnd(12)} ${a.identity}`);
+  }
+  console.log('');
+
+  const { onChain } = await promptWithEsc(inquirer, [{ type: 'list', name: 'onChain', message: 'Update on-chain VDXF status too?', choices: [
+    { name: '  Yes — update platform + on-chain (recommended)', value: true },
+    { name: '  Platform only — faster, skip blockchain tx', value: false },
+  ]}]);
+
+  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `${action} all ${agents.length} agents?`, default: true }]);
+  if (!confirm) return;
+
+  console.log('');
+  const cliArgs = ['node', 'src/cli.js', activate ? 'activate-all' : 'deactivate-all'];
+  if (!onChain) cliArgs.push('--platform-only');
+  const exitCode = await runCommandAsync(cliArgs[0], cliArgs.slice(1), REPO_DIR);
+
+  if (exitCode === 0) {
+    console.log('');
+  } else {
+    console.log(`\n  Some agents may have failed. Check output above.\n`);
+  }
+
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
 // ── Bounties ──
 
 async function bountiesMenuScreen(inquirer) {
@@ -2177,6 +2222,8 @@ async function main() {
         console.log('');
         await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
       }); break;
+      case 'activate_all': await withBack(() => batchActivateScreen(inquirer, true)); break;
+      case 'deactivate_all': await withBack(() => batchActivateScreen(inquirer, false)); break;
       case 'bounties': await withBack(() => bountiesMenuScreen(inquirer)); break;
       case 'quit': process.exit(0);
     }
