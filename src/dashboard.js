@@ -1783,15 +1783,37 @@ async function batchActivateScreen(inquirer, activate) {
       try {
         if (activate) {
           const result = await agent.activate({ onChain });
-          console.log(`  ✓ ${agentId} (${agentKeys.identity}) — ${result.status}${result.onChainTxid ? ' tx:' + result.onChainTxid.substring(0, 12) + '...' : ''}`);
+          // Re-activate all services
+          try {
+            const svcResp = await agent.client.getMyServices();
+            const svcs = svcResp.data || [];
+            for (const svc of svcs) {
+              if (svc.status !== 'active') {
+                try { await agent.client.updateService(svc.id, { status: 'active' }); } catch {}
+              }
+            }
+            if (svcs.length > 0) console.log(`  ✓ ${agentId} (${agentKeys.identity}) — ${result.status}, ${svcs.length} service(s) activated`);
+            else console.log(`  ✓ ${agentId} (${agentKeys.identity}) — ${result.status}`);
+          } catch {
+            console.log(`  ✓ ${agentId} (${agentKeys.identity}) — ${result.status}${result.onChainTxid ? ' tx:' + result.onChainTxid.substring(0, 12) + '...' : ''}`);
+          }
         } else {
+          // Deactivate services (set inactive, don't delete)
+          try {
+            const svcResp = await agent.client.getMyServices();
+            const svcs = svcResp.data || [];
+            for (const svc of svcs) {
+              if (svc.status === 'active') {
+                try { await agent.client.updateService(svc.id, { status: 'inactive' }); } catch {}
+              }
+            }
+          } catch {}
           const result = await agent.deactivate({ onChain, removeServices: false });
           console.log(`  ✓ ${agentId} (${agentKeys.identity}) — ${result.status}`);
         }
         // Tell J41 to re-read the identity from chain
         try {
           await agent.client.refreshAgent(agentKeys.iAddress);
-          console.log(`    ↳ J41 notified (refresh)`);
         } catch {}
         succeeded++;
       } finally { agent.stop(); }

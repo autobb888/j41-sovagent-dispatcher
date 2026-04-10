@@ -1878,8 +1878,22 @@ program
     });
 
     try {
+      // Set services inactive (don't delete — so activate can bring them back)
+      let svcDeactivated = 0;
+      if (!options.keepServices) {
+        try {
+          const svcResp = await agent._client.getMyServices();
+          const svcs = svcResp.data || [];
+          for (const svc of svcs) {
+            if (svc.status === 'active') {
+              try { await agent._client.updateService(svc.id, { status: 'inactive' }); svcDeactivated++; } catch {}
+            }
+          }
+        } catch {}
+      }
+
       const result = await agent.deactivate({
-        removeServices: !options.keepServices,
+        removeServices: false, // we handle services above — don't delete them
         onChain: !options.platformOnly,
       });
 
@@ -1888,7 +1902,7 @@ program
 
       console.log(`\n✅ Agent deactivated`);
       console.log(`   Platform status: ${result.status}`);
-      console.log(`   Services removed: ${result.servicesRemoved}`);
+      if (svcDeactivated > 0) console.log(`   Services deactivated: ${svcDeactivated}`);
       if (result.onChainTxid) {
         console.log(`   On-chain txid: ${result.onChainTxid}`);
       }
@@ -1950,11 +1964,24 @@ program
     try {
       const result = await agent.activate({ onChain: !options.platformOnly });
 
+      // Re-activate services
+      let svcCount = 0;
+      try {
+        const svcResp = await agent._client.getMyServices();
+        const svcs = svcResp.data || [];
+        for (const svc of svcs) {
+          if (svc.status !== 'active') {
+            try { await agent._client.updateService(svc.id, { status: 'active' }); svcCount++; } catch {}
+          }
+        }
+      } catch {}
+
       // Tell J41 to re-read identity from chain
       try { await agent._client.refreshAgent(keys.iAddress); } catch {}
 
       console.log(`\n✅ Agent activated`);
       console.log(`   Platform status: ${result.status}`);
+      if (svcCount > 0) console.log(`   Services reactivated: ${svcCount}`);
       if (result.onChainTxid) {
         console.log(`   On-chain txid: ${result.onChainTxid}`);
       }
@@ -2015,6 +2042,13 @@ program
           iAddress: keys.iAddress,
         });
         const result = await agent.activate({ onChain: !options.platformOnly });
+        // Re-activate services
+        try {
+          const svcResp = await agent._client.getMyServices();
+          for (const svc of (svcResp.data || [])) {
+            if (svc.status !== 'active') try { await agent._client.updateService(svc.id, { status: 'active' }); } catch {}
+          }
+        } catch {}
         try { await agent._client.refreshAgent(keys.iAddress); } catch {}
         console.log(`  ✓ ${agentId} (${keys.identity}) — ${result.status}${result.onChainTxid ? ' tx:' + result.onChainTxid.substring(0, 12) + '...' : ''}`);
 
@@ -2075,9 +2109,18 @@ program
           identityName: keys.identity,
           iAddress: keys.iAddress,
         });
+        // Set services inactive (don't delete)
+        if (!options.keepServices) {
+          try {
+            const svcResp = await agent._client.getMyServices();
+            for (const svc of (svcResp.data || [])) {
+              if (svc.status === 'active') try { await agent._client.updateService(svc.id, { status: 'inactive' }); } catch {}
+            }
+          } catch {}
+        }
         const result = await agent.deactivate({
           onChain: !options.platformOnly,
-          removeServices: !options.keepServices,
+          removeServices: false, // we set inactive above, don't delete
         });
         try { await agent._client.refreshAgent(keys.iAddress); } catch {}
         console.log(`  ✓ ${agentId} (${keys.identity}) — ${result.status}`);
