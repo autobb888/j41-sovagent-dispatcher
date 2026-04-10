@@ -2852,8 +2852,9 @@ program
     validateExecutorUrl(process.env.J41_MCP_URL, 'J41_MCP_URL');
     validateExecutorUrl(process.env.KIMI_BASE_URL, 'KIMI_BASE_URL');
 
-    // Check which agents are registered on platform (+ optional finalize readiness)
+    // Check which agents are registered and ACTIVE on the platform
     const enforceFinalize = process.env.J41_REQUIRE_FINALIZE === '1';
+    const skipStatusCheck = process.env.J41_SKIP_STATUS_CHECK === '1';
     const readyAgents = [];
     for (const agentId of agents) {
       const keys = loadAgentKeys(agentId);
@@ -2865,6 +2866,24 @@ program
       if (enforceFinalize && !isFinalizedReady(agentId)) {
         console.log(`⚠️  ${agentId}: finalize state not ready (set J41_REQUIRE_FINALIZE=0 to bypass)`);
         continue;
+      }
+
+      // Check platform status — only poll for active agents
+      if (!skipStatusCheck) {
+        try {
+          const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+          const tmpAgent = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif, identityName: keys.identity, iAddress: keys.iAddress });
+          await tmpAgent.authenticate();
+          const profile = await tmpAgent._client.getAgent(keys.iAddress || keys.identity);
+          tmpAgent.stop();
+          if (profile.status === 'inactive' || profile.status === 'disabled') {
+            console.log(`⏸  ${agentId} (${keys.identity}): ${profile.status} on platform — skipping`);
+            continue;
+          }
+        } catch (e) {
+          // If we can't check, include the agent anyway (fail-open for polling)
+          console.log(`⚠️  ${agentId}: could not check platform status (${e.message}) — including`);
+        }
       }
 
       readyAgents.push({ id: agentId, ...keys });
