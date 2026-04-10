@@ -295,8 +295,8 @@ function ensureDirs() {
 
 function loadAgentKeys(agentId) {
   // P2-4: Validate agentId format to prevent path traversal
-  if (!/^agent-[1-9][0-9]*$/.test(agentId)) {
-    throw new Error('Invalid agent ID format');
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(agentId) || agentId.includes('..')) {
+    throw new Error(`Invalid agent ID format: ${agentId}`);
   }
   const keysPath = path.join(AGENTS_DIR, agentId, 'keys.json');
   if (!fs.existsSync(keysPath)) return null;
