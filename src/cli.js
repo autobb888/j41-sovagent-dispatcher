@@ -1972,6 +1972,124 @@ program
     }
   });
 
+// Activate all agents at once
+program
+  .command('activate-all')
+  .description('Activate all registered agents (platform + on-chain VDXF status)')
+  .option('--platform-only', 'Skip on-chain VDXF status update')
+  .action(async (options) => {
+    ensureDirs();
+
+    const allAgents = listRegisteredAgents();
+    const agents = allAgents.filter(a => {
+      const k = loadAgentKeys(a.id);
+      return k && k.identity && k.iAddress && k.wif;
+    });
+
+    if (agents.length === 0) {
+      console.error('❌ No registered agents found.');
+      process.exit(1);
+    }
+
+    console.log(`\n→ Activating ${agents.length} agent(s)...\n`);
+
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+    let succeeded = 0;
+    let failed = 0;
+
+    for (const a of agents) {
+      const keys = loadAgentKeys(a.id);
+      try {
+        const agent = new J41Agent({
+          apiUrl: J41_API_URL,
+          wif: keys.wif,
+          identityName: keys.identity,
+          iAddress: keys.iAddress,
+        });
+        const result = await agent.activate({ onChain: !options.platformOnly });
+        console.log(`  ✓ ${a.id} (${keys.identity}) — ${result.status}${result.onChainTxid ? ' tx:' + result.onChainTxid.substring(0, 12) + '...' : ''}`);
+
+        // Update finalize state
+        const finalizePath = path.join(AGENTS_DIR, a.id, FINALIZE_STATE_FILENAME);
+        if (fs.existsSync(finalizePath)) {
+          const state = JSON.parse(fs.readFileSync(finalizePath, 'utf-8'));
+          state.stage = 'ready';
+          delete state.deactivatedAt;
+          state.notes = state.notes || [];
+          state.notes.push(`${new Date().toISOString()} Batch activated (on-chain: ${!options.platformOnly})`);
+          fs.writeFileSync(finalizePath, JSON.stringify(state, null, 2));
+        }
+        succeeded++;
+      } catch (e) {
+        console.log(`  ✗ ${a.id} (${keys.identity}) — ${e.message}`);
+        failed++;
+      }
+    }
+
+    console.log(`\n✅ Done: ${succeeded} activated, ${failed} failed`);
+  });
+
+// Deactivate all agents at once
+program
+  .command('deactivate-all')
+  .description('Deactivate all registered agents (platform + on-chain VDXF status)')
+  .option('--platform-only', 'Skip on-chain VDXF status update')
+  .option('--keep-services', 'Keep service listings')
+  .action(async (options) => {
+    ensureDirs();
+
+    const allAgents = listRegisteredAgents();
+    const agents = allAgents.filter(a => {
+      const k = loadAgentKeys(a.id);
+      return k && k.identity && k.iAddress && k.wif;
+    });
+
+    if (agents.length === 0) {
+      console.error('❌ No registered agents found.');
+      process.exit(1);
+    }
+
+    console.log(`\n→ Deactivating ${agents.length} agent(s)...\n`);
+
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+    let succeeded = 0;
+    let failed = 0;
+
+    for (const a of agents) {
+      const keys = loadAgentKeys(a.id);
+      try {
+        const agent = new J41Agent({
+          apiUrl: J41_API_URL,
+          wif: keys.wif,
+          identityName: keys.identity,
+          iAddress: keys.iAddress,
+        });
+        const result = await agent.deactivate({
+          onChain: !options.platformOnly,
+          removeServices: !options.keepServices,
+        });
+        console.log(`  ✓ ${a.id} (${keys.identity}) — ${result.status}`);
+
+        // Update finalize state
+        const finalizePath = path.join(AGENTS_DIR, a.id, FINALIZE_STATE_FILENAME);
+        if (fs.existsSync(finalizePath)) {
+          const state = JSON.parse(fs.readFileSync(finalizePath, 'utf-8'));
+          state.stage = 'deactivated';
+          state.deactivatedAt = new Date().toISOString();
+          state.notes = state.notes || [];
+          state.notes.push(`${new Date().toISOString()} Batch deactivated (on-chain: ${!options.platformOnly})`);
+          fs.writeFileSync(finalizePath, JSON.stringify(state, null, 2));
+        }
+        succeeded++;
+      } catch (e) {
+        console.log(`  ✗ ${a.id} (${keys.identity}) — ${e.message}`);
+        failed++;
+      }
+    }
+
+    console.log(`\n✅ Done: ${succeeded} deactivated, ${failed} failed`);
+  });
+
 // Update profile — remove old VDXF values and write new ones (two-block transaction)
 program
   .command('update-profile <agent-id>')
