@@ -1788,6 +1788,11 @@ async function batchActivateScreen(inquirer, activate) {
           const result = await agent.deactivate({ onChain, removeServices: false });
           console.log(`  ✓ ${agentId} (${agentKeys.identity}) — ${result.status}`);
         }
+        // Tell J41 to re-read the identity from chain
+        try {
+          await agent.client.refreshAgent(agentKeys.iAddress);
+          console.log(`    ↳ J41 notified (refresh)`);
+        } catch {}
         succeeded++;
       } finally { agent.stop(); }
     } catch (e) {

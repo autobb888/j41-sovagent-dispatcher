@@ -1883,6 +1883,9 @@ program
         onChain: !options.platformOnly,
       });
 
+      // Tell J41 to re-read identity from chain
+      try { await agent._client.refreshAgent(keys.iAddress); } catch {}
+
       console.log(`\n✅ Agent deactivated`);
       console.log(`   Platform status: ${result.status}`);
       console.log(`   Services removed: ${result.servicesRemoved}`);
@@ -1947,6 +1950,9 @@ program
     try {
       const result = await agent.activate({ onChain: !options.platformOnly });
 
+      // Tell J41 to re-read identity from chain
+      try { await agent._client.refreshAgent(keys.iAddress); } catch {}
+
       console.log(`\n✅ Agent activated`);
       console.log(`   Platform status: ${result.status}`);
       if (result.onChainTxid) {
@@ -2009,6 +2015,7 @@ program
           iAddress: keys.iAddress,
         });
         const result = await agent.activate({ onChain: !options.platformOnly });
+        try { await agent._client.refreshAgent(keys.iAddress); } catch {}
         console.log(`  ✓ ${agentId} (${keys.identity}) — ${result.status}${result.onChainTxid ? ' tx:' + result.onChainTxid.substring(0, 12) + '...' : ''}`);
 
         // Update finalize state
@@ -2072,6 +2079,7 @@ program
           onChain: !options.platformOnly,
           removeServices: !options.keepServices,
         });
+        try { await agent._client.refreshAgent(keys.iAddress); } catch {}
         console.log(`  ✓ ${agentId} (${keys.identity}) — ${result.status}`);
 
         // Update finalize state
