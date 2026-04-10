@@ -1737,7 +1737,7 @@ async function llmScreen(inquirer) {
 async function batchActivateScreen(inquirer, activate) {
   const action = activate ? 'Activate' : 'Deactivate';
   console.clear();
-  console.log(`\n  ═══ ${action} All Agents ═══\n`);
+  console.log(`\n  ═══ ${action} Agents ═══\n`);
 
   const agents = getAgents().filter(a => a.identity && a.iAddress && a.wif);
   if (agents.length === 0) {
@@ -1746,31 +1746,57 @@ async function batchActivateScreen(inquirer, activate) {
     return;
   }
 
-  console.log(`  ${agents.length} registered agent(s):\n`);
-  for (const a of agents) {
-    console.log(`    ${a.id.padEnd(12)} ${a.identity}`);
+  // Checkbox picker — space to select/deselect, enter to confirm
+  const { selectedIds } = await promptWithEsc(inquirer, [{ type: 'checkbox', pageSize: 20, name: 'selectedIds', message: `Select agents to ${action.toLowerCase()} (space to toggle):`, choices: agents.map(a => ({
+    name: `  ${a.id.padEnd(12)} ${a.identity}`,
+    value: a.id,
+    checked: true, // all selected by default
+  }))}]);
+
+  if (!selectedIds || selectedIds.length === 0) {
+    console.log('\n  No agents selected.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
   }
-  console.log('');
 
   const { onChain } = await promptWithEsc(inquirer, [{ type: 'list', name: 'onChain', message: 'Update on-chain VDXF status too?', choices: [
     { name: '  Yes — update platform + on-chain (recommended)', value: true },
     { name: '  Platform only — faster, skip blockchain tx', value: false },
   ]}]);
 
-  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `${action} all ${agents.length} agents?`, default: true }]);
+  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `${action} ${selectedIds.length} agent(s)?`, default: true }]);
   if (!confirm) return;
 
+  // Run activate/deactivate per agent via CLI
   console.log('');
-  const cliArgs = ['node', 'src/cli.js', activate ? 'activate-all' : 'deactivate-all'];
-  if (!onChain) cliArgs.push('--platform-only');
-  const exitCode = await runCommandAsync(cliArgs[0], cliArgs.slice(1), REPO_DIR);
+  const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+  const env = loadEnv();
+  const apiUrl = env.J41_API_URL || process.env.J41_API_URL || 'https://api.junction41.io';
+  let succeeded = 0;
+  let failed = 0;
 
-  if (exitCode === 0) {
-    console.log('');
-  } else {
-    console.log(`\n  Some agents may have failed. Check output above.\n`);
+  for (const agentId of selectedIds) {
+    const agentKeys = agents.find(a => a.id === agentId);
+    if (!agentKeys) continue;
+    try {
+      const agent = await createAgent(agentKeys);
+      try {
+        if (activate) {
+          const result = await agent.activate({ onChain });
+          console.log(`  ✓ ${agentId} (${agentKeys.identity}) — ${result.status}${result.onChainTxid ? ' tx:' + result.onChainTxid.substring(0, 12) + '...' : ''}`);
+        } else {
+          const result = await agent.deactivate({ onChain, removeServices: false });
+          console.log(`  ✓ ${agentId} (${agentKeys.identity}) — ${result.status}`);
+        }
+        succeeded++;
+      } finally { agent.stop(); }
+    } catch (e) {
+      console.log(`  ✗ ${agentId} (${agentKeys.identity}) — ${e.message}`);
+      failed++;
+    }
   }
 
+  console.log(`\n  Done: ${succeeded} ${action.toLowerCase()}d, ${failed} failed\n`);
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
