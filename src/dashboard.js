@@ -1141,6 +1141,7 @@ async function configureServicesScreen(inquirer) {
       const { newPrice } = await promptWithEsc(inquirer, [{ type: 'input', name: 'newPrice', message: 'Price:', default: String(svc.price) }]);
       const newCategory = await pickCategory(inquirer, svc.category || 'development');
       const { newTurnaround } = await promptWithEsc(inquirer, [{ type: 'input', name: 'newTurnaround', message: 'Turnaround:', default: svc.turnaround || '15 minutes' }]);
+      const { newSovguard } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'newSovguard', message: 'Enable SovGuard protection?', default: svc.sovguard !== false && svc.sovguardEnabled !== false }]);
 
       try {
         const agent = await createAgent(keys);
@@ -1151,6 +1152,7 @@ async function configureServicesScreen(inquirer) {
             price: parseFloat(newPrice),
             category: newCategory,
             turnaround: newTurnaround,
+            sovguard: newSovguard,
           });
           console.log('\n  ✅ Service updated.\n');
         } finally { agent.stop(); }
