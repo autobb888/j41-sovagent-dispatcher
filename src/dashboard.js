@@ -1072,9 +1072,19 @@ async function configureServicesScreen(inquirer) {
     if (list.length > 0) {
       for (let i = 0; i < list.length; i++) {
         const s = list[i];
-        console.log(`  [${i + 1}] ${s.name}`);
-        console.log(`      Price: ${s.price} ${s.currency}  |  Status: ${s.status || 'active'}  |  Category: ${s.category || '?'}`);
-        console.log(`      Turnaround: ${s.turnaround || '?'}  |  SovGuard: ${s.sovguard ? 'yes' : 'no'}`);
+        const isApi = s.serviceType === 'api-endpoint';
+        console.log(`  [${i + 1}] ${s.name}${isApi ? ' [API ENDPOINT]' : ''}`);
+        if (isApi) {
+          console.log(`      Endpoint: ${s.endpointUrl || '?'}  |  Status: ${s.status || 'active'}  |  Category: ${s.category || '?'}`);
+          if (s.modelPricing?.length) {
+            for (const m of s.modelPricing) {
+              console.log(`      ${m.model}: ${(m.inputTokenRate * 1000000).toFixed(2)}/1M in, ${(m.outputTokenRate * 1000000).toFixed(2)}/1M out`);
+            }
+          }
+        } else {
+          console.log(`      Price: ${s.price} ${s.currency}  |  Status: ${s.status || 'active'}  |  Category: ${s.category || '?'}`);
+          console.log(`      Turnaround: ${s.turnaround || '?'}  |  SovGuard: ${s.sovguard ? 'yes' : 'no'}`);
+        }
         if (s.description) console.log(`      ${s.description.substring(0, 80)}`);
         console.log(`      ID: ${s.id}`);
         console.log('');
@@ -1085,7 +1095,8 @@ async function configureServicesScreen(inquirer) {
 
     // Build action choices
     const actionChoices = [
-      { name: '  Add new service', value: 'add' },
+      { name: '  Add agent service (jobs, chat, workspace)', value: 'add' },
+      { name: '  List API endpoint (sell raw API access)', value: 'add_api' },
     ];
     if (list.length > 0) {
       actionChoices.push({ name: '  Edit a service', value: 'edit' });
@@ -1126,7 +1137,122 @@ async function configureServicesScreen(inquirer) {
         console.log(`\n  ❌ Failed: ${e.message}\n`);
       }
       await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
-      continue; // loop back to show updated list
+      continue;
+    }
+
+    if (action === 'add_api') {
+      console.log('\n  ═══ List API Endpoint ═══');
+      console.log('  Sell raw API access — buyers get a key, call your endpoint through J41.\n');
+
+      const { apiName } = await promptWithEsc(inquirer, [{ type: 'input', name: 'apiName', message: 'Service name (e.g. "GPT-4.1 API Access"):' }]);
+      if (!apiName) { console.log('\n  Name required.\n'); continue; }
+
+      const { apiDesc } = await promptWithEsc(inquirer, [{ type: 'input', name: 'apiDesc', message: 'Description:', default: 'OpenAI-compatible API access' }]);
+      const { apiUrl } = await promptWithEsc(inquirer, [{ type: 'input', name: 'apiUrl', message: 'Your backend URL (e.g. https://my-gpu.com/v1):' }]);
+      if (!apiUrl) { console.log('\n  Endpoint URL required.\n'); continue; }
+
+      // Models and per-model pricing
+      console.log('\n  ── Model Pricing ──');
+      console.log('  Set the price per token for each model you serve.\n');
+
+      const modelPricing = [];
+      let addModel = true;
+      while (addModel) {
+        const { model } = await promptWithEsc(inquirer, [{ type: 'input', name: 'model', message: '  Model name (e.g. gpt-4.1, llama-3.3-70b):' }]);
+        if (!model) break;
+        const { inputRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'inputRate', message: `  Input token rate (VRSCTEST per 1M tokens):`, default: '2' }]);
+        const { outputRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'outputRate', message: `  Output token rate (VRSCTEST per 1M tokens):`, default: '8' }]);
+
+        modelPricing.push({
+          model,
+          inputTokenRate: parseFloat(inputRate) / 1000000,
+          outputTokenRate: parseFloat(outputRate) / 1000000,
+        });
+        console.log(`  ✓ ${model}: ${inputRate}/1M input, ${outputRate}/1M output\n`);
+
+        const more = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'more', message: '  Add another model?', default: false }]);
+        addModel = more.more;
+      }
+
+      if (modelPricing.length === 0) {
+        console.log('\n  At least one model required.\n');
+        continue;
+      }
+
+      // Rate limits
+      const { rpm } = await promptWithEsc(inquirer, [{ type: 'input', name: 'rpm', message: '\n  Rate limit — requests per minute per buyer:', default: '60' }]);
+      const { tpm } = await promptWithEsc(inquirer, [{ type: 'input', name: 'tpm', message: '  Rate limit — tokens per minute per buyer:', default: '100000' }]);
+
+      const apiCategory = await pickCategory(inquirer, 'infrastructure-ops');
+
+      // Summary
+      console.log('\n  ─── API Endpoint Summary ───');
+      console.log(`  Name:     ${apiName}`);
+      console.log(`  URL:      ${apiUrl}`);
+      console.log(`  Models:   ${modelPricing.map(m => m.model).join(', ')}`);
+      console.log(`  Category: ${apiCategory}`);
+      console.log(`  Limits:   ${rpm} req/min, ${tpm} tok/min`);
+      for (const m of modelPricing) {
+        console.log(`  ${m.model}: ${(m.inputTokenRate * 1000000).toFixed(2)}/1M in, ${(m.outputTokenRate * 1000000).toFixed(2)}/1M out`);
+      }
+      console.log('');
+
+      const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'List this API endpoint?', default: true }]);
+      if (!confirm) continue;
+
+      try {
+        const agent = await createAgent(keys);
+        try {
+          // Register as a service with api-endpoint type
+          await agent.registerService({
+            name: apiName,
+            description: apiDesc,
+            category: apiCategory,
+            price: 0, // pay-per-token, not flat price
+            currency: 'VRSCTEST',
+            turnaround: 'real-time',
+            paymentTerms: 'postpay',
+            sovguard: false,
+            serviceType: 'api-endpoint',
+            endpointUrl: apiUrl,
+            modelPricing,
+            rateLimits: {
+              requestsPerMinute: parseInt(rpm) || 60,
+              tokensPerMinute: parseInt(tpm) || 100000,
+            },
+          });
+
+          // Also update VDXF on-chain: endpoints + models
+          console.log('  ✓ Service registered on platform');
+          console.log('  → Updating on-chain VDXF keys (endpoint + models)...');
+
+          const models = modelPricing.map(m => m.model);
+          const { removeAndRewriteVdxfFields } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+
+          try {
+            await removeAndRewriteVdxfFields({
+              agent,
+              identityName: keys.identity,
+              fieldsToUpdate: {
+                type: 'api-provider',
+                networkEndpoints: JSON.stringify([apiUrl]),
+                models: JSON.stringify(models),
+              },
+              chain: keys.network || 'verustest',
+              wif: keys.wif,
+              onProgress: (msg) => console.log(`  ${msg}`),
+            });
+            console.log('\n  ✅ API endpoint listed! On-chain + platform.\n');
+          } catch (e) {
+            console.log(`\n  ✅ Listed on platform, but on-chain update failed: ${e.message}`);
+            console.log('     Run "Update Profile" to fix on-chain data later.\n');
+          }
+        } finally { agent.stop(); }
+      } catch (e) {
+        console.log(`\n  ❌ Failed: ${e.message}\n`);
+      }
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
+      continue;
     }
 
     if (action === 'edit') {
