@@ -58,42 +58,62 @@ function calculateCost(modelPricing, model, inputTokens, outputTokens) {
 }
 
 /**
- * Check if buyer has enough credit for a request.
+ * Reserve credit atomically — deducts estimated cost upfront before the request.
+ * Prevents TOCTOU race where concurrent requests both pass a balance check.
+ * After the request completes, call adjustCredit to correct the estimate.
  */
-function checkCredit(agentId, buyerVerusId, model, estimatedInputTokens, estimatedOutputTokens, modelPricing) {
+function reserveCredit(agentId, buyerVerusId, model, estimatedInputTokens, estimatedOutputTokens, modelPricing) {
   const data = loadMeters(agentId);
   const buyer = ensureBuyer(data, buyerVerusId);
   const estimatedCost = calculateCost(modelPricing, model, estimatedInputTokens, estimatedOutputTokens);
-  return {
-    allowed: buyer.balance >= estimatedCost,
-    balance: buyer.balance,
-    estimatedCost,
-  };
+
+  if (buyer.balance < estimatedCost) {
+    return { allowed: false, balance: buyer.balance, estimatedCost };
+  }
+
+  // Deduct NOW — before the async proxy request
+  buyer.balance -= estimatedCost;
+  buyer.lastActivity = new Date().toISOString();
+  saveMeters(agentId, data);
+
+  return { allowed: true, reserved: estimatedCost, balance: buyer.balance };
 }
 
 /**
- * Deduct credit after a request completes.
+ * Adjust credit after request completes — corrects the upfront reservation.
+ * If actual cost < reserved, refunds the difference. If actual > reserved, deducts more.
+ * Also records per-model usage stats.
  */
-function deductCredit(agentId, buyerVerusId, model, inputTokens, outputTokens, modelPricing) {
+function adjustCredit(agentId, buyerVerusId, model, inputTokens, outputTokens, reservedCost, modelPricing) {
   const data = loadMeters(agentId);
   const buyer = ensureBuyer(data, buyerVerusId);
-  const cost = calculateCost(modelPricing, model, inputTokens, outputTokens);
+  const actualCost = calculateCost(modelPricing, model, inputTokens, outputTokens);
+  const diff = actualCost - reservedCost; // positive = undercharged, negative = overcharged
 
-  buyer.balance = Math.max(0, buyer.balance - cost);
-  buyer.totalSpent += cost;
+  buyer.balance = Math.max(0, buyer.balance - diff);
+  buyer.totalSpent += actualCost;
   buyer.lastActivity = new Date().toISOString();
 
-  // Per-model usage tracking
   if (!buyer.usage[model]) {
     buyer.usage[model] = { requests: 0, inputTokens: 0, outputTokens: 0, cost: 0 };
   }
   buyer.usage[model].requests++;
   buyer.usage[model].inputTokens += inputTokens;
   buyer.usage[model].outputTokens += outputTokens;
-  buyer.usage[model].cost += cost;
+  buyer.usage[model].cost += actualCost;
 
   saveMeters(agentId, data);
-  return { remaining: buyer.balance, cost };
+  return { remaining: buyer.balance, cost: actualCost };
+}
+
+/**
+ * Refund a reservation (e.g., upstream failed, request never completed).
+ */
+function refundReservation(agentId, buyerVerusId, reservedCost) {
+  const data = loadMeters(agentId);
+  const buyer = ensureBuyer(data, buyerVerusId);
+  buyer.balance += reservedCost;
+  saveMeters(agentId, data);
 }
 
 /**
@@ -127,4 +147,4 @@ function getMetrics(agentId) {
   return data.buyers;
 }
 
-module.exports = { checkCredit, deductCredit, creditDeposit, getBalance, getMetrics, calculateCost };
+module.exports = { reserveCredit, adjustCredit, refundReservation, creditDeposit, getBalance, getMetrics, calculateCost };

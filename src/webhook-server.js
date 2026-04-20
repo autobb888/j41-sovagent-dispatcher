@@ -69,7 +69,7 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
       } catch (e) {
         console.error(`[Discovery] Access request failed: ${e.message}`);
         res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
+        res.end(JSON.stringify({ error: 'Access request failed' }));
       }
       return;
     }
@@ -84,7 +84,7 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
         console.error(`[Proxy] Request failed: ${e.message}`);
         if (!res.headersSent) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: e.message }));
+          res.end(JSON.stringify({ error: 'Internal proxy error' }));
         }
       }
       return;

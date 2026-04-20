@@ -8,7 +8,7 @@ const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 const { findKeyOwner, recordUsage } = require('./api-key-manager');
-const { checkCredit, deductCredit } = require('./credit-meter');
+const { reserveCredit, adjustCredit, refundReservation } = require('./credit-meter');
 
 // Safe response headers to forward from upstream (allowlist)
 const SAFE_HEADERS = new Set([
@@ -71,10 +71,10 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   const model = parsedBody.model || '';
   const isStreaming = parsedBody.stream === true;
 
-  // Check credit
+  // Reserve credit atomically (deducts upfront, adjusted after response)
   const estimatedInput = 4000;
   const estimatedOutput = 2000;
-  const creditCheck = checkCredit(agentId, record.buyerVerusId, model, estimatedInput, estimatedOutput, config.modelPricing || []);
+  const creditCheck = reserveCredit(agentId, record.buyerVerusId, model, estimatedInput, estimatedOutput, config.modelPricing || []);
   if (!creditCheck.allowed) {
     res.writeHead(402, {
       'Content-Type': 'application/json',
@@ -158,10 +158,10 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
           } catch {}
         }
 
-        // Always deduct — use actual tokens if available, estimates otherwise
+        // Adjust reservation with actual token counts (or estimates if usage absent)
         if (!deducted) {
           deducted = true;
-          const result = deductCredit(agentId, record.buyerVerusId, model, inputTok, outputTok, config.modelPricing || []);
+          const result = adjustCredit(agentId, record.buyerVerusId, model, inputTok, outputTok, creditCheck.reserved, config.modelPricing || []);
           recordUsage(agentId, key, inputTok, outputTok);
           console.log(`[PROXY] ${agentId} ${model} ${inputTok}+${outputTok} tok, cost ${result.cost.toFixed(6)} VRSC, remaining ${result.remaining.toFixed(4)}`);
         }
@@ -171,9 +171,17 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         if (!res.writableEnded) res.end();
       });
     } else {
-      // Non-streaming: read full response, meter, then send
+      // Non-streaming: read full response, adjust reservation, then send
       let chunks = [];
       proxyRes.on('data', (chunk) => chunks.push(chunk));
+      proxyRes.on('error', (err) => {
+        console.error(`[PROXY] Upstream response error: ${err.message}`);
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
+          res.end(JSON.stringify({ error: 'Upstream response interrupted' }));
+        }
+        refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
+      });
       proxyRes.on('end', () => {
         const responseBody = Buffer.concat(chunks);
         let inputTok = estimatedInput;
@@ -187,7 +195,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
           }
         } catch {}
 
-        const result = deductCredit(agentId, record.buyerVerusId, model, inputTok, outputTok, config.modelPricing || []);
+        const result = adjustCredit(agentId, record.buyerVerusId, model, inputTok, outputTok, creditCheck.reserved, config.modelPricing || []);
         recordUsage(agentId, key, inputTok, outputTok);
 
         j41Headers['X-J41-Credit-Remaining'] = result.remaining.toFixed(4);
@@ -208,6 +216,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   proxyReq.on('error', (err) => {
     if (res.headersSent || res.writableEnded) return;
     console.error(`[PROXY] Upstream error: ${err.message}`);
+    refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
     res.writeHead(502, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
     res.end(JSON.stringify({ error: 'Upstream endpoint unavailable' }));
   });
@@ -215,6 +224,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   proxyReq.on('timeout', () => {
     proxyReq.destroy();
     if (res.headersSent || res.writableEnded) return;
+    refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
     res.writeHead(504, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
     res.end(JSON.stringify({ error: 'Upstream endpoint timed out' }));
   });
