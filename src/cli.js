@@ -3096,7 +3096,7 @@ program
         return cap?.services?.some(s => s.serviceType === 'api-endpoint');
       });
       if (apiAgents.length > 0) {
-        const { mintAccessEnvelope } = require('@junction41/sovagent-sdk/dist/crypto/envelope.js');
+        const { mintAccessEnvelope, verifyAccessRequest } = require('@junction41/sovagent-sdk/dist/crypto/envelope.js');
         const { mintApiKey } = require('./api-key-manager');
 
         const agentConfigs = new Map();
@@ -3127,6 +3127,21 @@ program
             if (!sellerAgent) throw new Error('Seller not found on this dispatcher');
             const cfg = agentConfigs.get(sellerAgent.id);
             if (!cfg) throw new Error('Seller has no api-endpoint service');
+
+            // Verify buyer's signature via J41 platform (resolve R-address, check sig)
+            try {
+              const agent = await getAgentSession(state, sellerAgent);
+              const verified = await verifyAccessRequest(accessRequest, agent._client || agent.client, J41_NETWORK);
+              if (!verified) {
+                console.warn(`[Discovery] Buyer signature verification FAILED for ${accessRequest.buyerVerusId}`);
+                throw new Error('Buyer signature verification failed');
+              }
+              console.log(`[Discovery] Buyer signature verified: ${accessRequest.buyerVerusId}`);
+            } catch (e) {
+              if (e.message === 'Buyer signature verification failed') throw e;
+              // If verification fails due to network issue, log but continue (fail-open for v1)
+              console.warn(`[Discovery] Could not verify buyer signature: ${e.message} — proceeding`);
+            }
 
             // Mint API key
             const keyRecord = mintApiKey(sellerAgent.id, accessRequest.buyerVerusId);
