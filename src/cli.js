@@ -3160,9 +3160,23 @@ program
             console.log(`[Discovery] Minted key for ${accessRequest.buyerVerusId} → ${sellerAgent.id}`);
             return envelope;
           },
+          onDepositReport: async ({ buyerVerusId, sellerVerusId, txid, amount }) => {
+            const { reportDeposit } = require('./deposit-watcher');
+            const sellerAgent = state.agents.find(a =>
+              a.iAddress === sellerVerusId || a.identity === sellerVerusId
+            );
+            if (!sellerAgent) return { credited: false, message: 'Seller not found on this dispatcher' };
+            const agent = await getAgentSession(state, sellerAgent);
+            const payAddress = sellerAgent.iAddress || sellerAgent.address;
+            return reportDeposit(sellerAgent.id, agent._client || agent.client, buyerVerusId, txid, amount, payAddress);
+          },
         };
 
+        // Start background deposit poller for pending confirmations
+        const { startDepositPoller } = require('./deposit-watcher');
+        startDepositPoller(state, getAgentSession);
         console.log(`  API Proxy: ${apiAgents.length} agent(s) with api-endpoint services`);
+        console.log(`  Deposit watcher: polling every 60s for pending confirmations`);
       }
 
       // Start webhook HTTP server (with proxy context if api-endpoint agents exist)

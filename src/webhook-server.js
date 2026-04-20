@@ -9,6 +9,7 @@
 const http = require('http');
 const { verifyWebhookSignature } = require('@junction41/sovagent-sdk/dist/webhook/verify.js');
 const { handleProxyRequest } = require('./proxy-handler.js');
+const { reportDeposit } = require('./deposit-watcher.js');
 
 const MAX_BODY_SIZE = 1024 * 1024; // 1MB
 
@@ -70,6 +71,28 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
         console.error(`[Discovery] Access request failed: ${e.message}`);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Access request failed' }));
+      }
+      return;
+    }
+
+    // POST /j41/deposit/report — buyer reports a deposit txid
+    if (req.method === 'POST' && req.url === '/j41/deposit/report' && proxyContext) {
+      const body = await readBody(req, res);
+      if (body === null) return;
+      try {
+        const { buyerVerusId, sellerVerusId, txid, amount } = JSON.parse(body);
+        if (!buyerVerusId || !txid || !amount) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Missing buyerVerusId, txid, or amount' }));
+          return;
+        }
+        const result = await proxyContext.onDepositReport({ buyerVerusId, sellerVerusId, txid, amount });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        console.error(`[Deposit] Report failed: ${e.message}`);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Deposit report failed' }));
       }
       return;
     }

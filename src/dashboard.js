@@ -1109,6 +1109,7 @@ async function configureServicesScreen(inquirer) {
       actionChoices.push({ name: '  View active buyers & keys', value: 'api_buyers' });
       actionChoices.push({ name: '  View credit meters', value: 'api_credits' });
       actionChoices.push({ name: '  Revoke an API key', value: 'api_revoke' });
+      actionChoices.push({ name: '  View deposits (pending + confirmed)', value: 'api_deposits' });
     }
     actionChoices.push(new inquirer.Separator());
     actionChoices.push({ name: '  ← Back', value: '__back' });
@@ -1375,6 +1376,35 @@ async function configureServicesScreen(inquirer) {
         revokeApiKey(agentId, keyToRevoke.key);
         console.log('\n  ✅ Key revoked.\n');
       }
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
+      continue;
+    }
+
+    if (action === 'api_deposits') {
+      const depositsPath = path.join(AGENTS_DIR, agentId, 'deposits.json');
+      let deposits = { processed: [], pending: [] };
+      try {
+        if (fs.existsSync(depositsPath)) deposits = JSON.parse(fs.readFileSync(depositsPath, 'utf8'));
+      } catch {}
+
+      console.log(`\n  ── Deposits ──\n`);
+      if (deposits.pending.length > 0) {
+        console.log(`  Pending (${deposits.pending.length}):`);
+        for (const d of deposits.pending) {
+          console.log(`    ${d.txid.substring(0, 16)}...  ${d.amount} VRSC  from ${d.buyerVerusId}  (needs ${d.requiredConfirmations} conf)`);
+        }
+        console.log('');
+      }
+      const recent = deposits.processed.slice(-10);
+      if (recent.length > 0) {
+        console.log(`  Recent confirmed (${deposits.processed.length} total, showing last 10):`);
+        for (const d of recent) {
+          console.log(`    ${d.txid.substring(0, 16)}...  ${d.amount} VRSC  from ${d.buyerVerusId}  at ${d.creditedAt}`);
+        }
+      } else {
+        console.log('  No deposits recorded yet.');
+      }
+      console.log('');
       await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
       continue;
     }
