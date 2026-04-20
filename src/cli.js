@@ -3089,11 +3089,72 @@ program
         }
       }
 
-      // Start webhook HTTP server
+      // Build proxy context for api-endpoint agents
+      let proxyContext = null;
+      const apiAgents = state.agents.filter(a => {
+        const cap = state.capabilities.get(a.id);
+        return cap?.services?.some(s => s.serviceType === 'api-endpoint');
+      });
+      if (apiAgents.length > 0) {
+        const { mintAccessEnvelope } = require('@junction41/sovagent-sdk/dist/crypto/envelope.js');
+        const { mintApiKey } = require('./api-key-manager');
+
+        const agentConfigs = new Map();
+        for (const a of apiAgents) {
+          const cap = state.capabilities.get(a.id);
+          const apiSvc = cap?.services?.find(s => s.serviceType === 'api-endpoint');
+          if (apiSvc) {
+            agentConfigs.set(a.id, {
+              endpointUrl: apiSvc.endpointUrl,
+              modelPricing: apiSvc.modelPricing || [],
+              rateLimits: apiSvc.rateLimits || {},
+              identity: a.identity,
+              iAddress: a.iAddress,
+              payAddress: a.iAddress || a.address,
+              upstreamAuth: apiSvc.upstreamAuth || '',
+            });
+            console.log(`  API Proxy: ${a.id} (${a.identity}) → ${apiSvc.endpointUrl}`);
+          }
+        }
+
+        proxyContext = {
+          agentConfigs,
+          onAccessRequest: async (accessRequest) => {
+            // Find which agent the request is for
+            const sellerAgent = state.agents.find(a =>
+              a.iAddress === accessRequest.sellerVerusId || a.identity === accessRequest.sellerVerusId
+            );
+            if (!sellerAgent) throw new Error('Seller not found on this dispatcher');
+            const cfg = agentConfigs.get(sellerAgent.id);
+            if (!cfg) throw new Error('Seller has no api-endpoint service');
+
+            // Mint API key
+            const keyRecord = mintApiKey(sellerAgent.id, accessRequest.buyerVerusId);
+
+            // Build encrypted envelope
+            const payload = {
+              apiKey: keyRecord.key,
+              endpointUrl: cfg.endpointUrl,
+              expiresAt: keyRecord.expiresAt,
+              models: (cfg.modelPricing || []).map(p => p.model),
+              modelPricing: cfg.modelPricing,
+              rateLimits: cfg.rateLimits,
+            };
+
+            const envelope = mintAccessEnvelope(accessRequest, sellerAgent.wif, payload, J41_NETWORK);
+            console.log(`[Discovery] Minted key for ${accessRequest.buyerVerusId} → ${sellerAgent.id}`);
+            return envelope;
+          },
+        };
+
+        console.log(`  API Proxy: ${apiAgents.length} agent(s) with api-endpoint services`);
+      }
+
+      // Start webhook HTTP server (with proxy context if api-endpoint agents exist)
       const { startWebhookServer } = require('./webhook-server');
       startWebhookServer(webhookPort, agentWebhooks, async (agentId, payload) => {
         await handleWebhookEvent(state, agentId, payload);
-      });
+      }, proxyContext);
 
       // Safety-net: lightweight inbox count check every 5 minutes
       safeInterval(async () => {
@@ -3114,6 +3175,15 @@ program
 
     } else {
       // ── POLL MODE (default — works behind NAT) ──
+      // Warn if api-endpoint agents exist but no webhook URL
+      const apiEndpointAgents = state.agents.filter(a => {
+        const cap = state.capabilities.get(a.id);
+        return cap?.services?.some(s => s.serviceType === 'api-endpoint');
+      });
+      if (apiEndpointAgents.length > 0) {
+        console.log(`⚠️  ${apiEndpointAgents.length} agent(s) have api-endpoint services but --webhook-url is not set.`);
+        console.log(`   API proxy requires webhook mode. Add --webhook-url to enable.\n`);
+      }
       console.log(`Mode: POLL (60s interval)\n`);
 
       // WebSocket listeners for instant notification (supplement to polling)

@@ -1102,6 +1102,14 @@ async function configureServicesScreen(inquirer) {
       actionChoices.push({ name: '  Edit a service', value: 'edit' });
       actionChoices.push({ name: '  Delete a service', value: 'delete' });
     }
+    // API endpoint management (if any api-endpoint services exist)
+    const hasApiServices = list.some(s => s.serviceType === 'api-endpoint');
+    if (hasApiServices) {
+      actionChoices.push(new inquirer.Separator('  ── API Key Management ──'));
+      actionChoices.push({ name: '  View active buyers & keys', value: 'api_buyers' });
+      actionChoices.push({ name: '  View credit meters', value: 'api_credits' });
+      actionChoices.push({ name: '  Revoke an API key', value: 'api_revoke' });
+    }
     actionChoices.push(new inquirer.Separator());
     actionChoices.push({ name: '  ← Back', value: '__back' });
 
@@ -1304,6 +1312,68 @@ async function configureServicesScreen(inquirer) {
         } finally { agent.stop(); }
       } catch (e) {
         console.log(`\n  ❌ Failed: ${e.message}\n`);
+      }
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
+      continue;
+    }
+
+    if (action === 'api_buyers') {
+      const { listActiveKeys } = require('./api-key-manager');
+      const activeKeys = listActiveKeys(agentId);
+      console.log(`\n  ── Active API Keys (${activeKeys.length}) ──\n`);
+      if (activeKeys.length === 0) {
+        console.log('  No active keys.\n');
+      } else {
+        for (const k of activeKeys) {
+          const masked = k.key.substring(0, 10) + '...' + k.key.slice(-4);
+          console.log(`  ${masked}  buyer: ${k.buyerVerusId}`);
+          console.log(`    Created: ${k.createdAt}  Expires: ${k.expiresAt}`);
+          console.log(`    Usage: ${k.usage.requests} req, ${k.usage.inputTokens} in, ${k.usage.outputTokens} out\n`);
+        }
+      }
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
+      continue;
+    }
+
+    if (action === 'api_credits') {
+      const { getMetrics } = require('./credit-meter');
+      const buyers = getMetrics(agentId);
+      const buyerIds = Object.keys(buyers);
+      console.log(`\n  ── Credit Meters (${buyerIds.length} buyers) ──\n`);
+      if (buyerIds.length === 0) {
+        console.log('  No buyers with credit.\n');
+      } else {
+        for (const buyerId of buyerIds) {
+          const b = buyers[buyerId];
+          console.log(`  ${buyerId}`);
+          console.log(`    Balance: ${b.balance.toFixed(4)} VRSC  |  Deposited: ${b.totalDeposited.toFixed(4)}  |  Spent: ${b.totalSpent.toFixed(4)}`);
+          for (const [model, u] of Object.entries(b.usage || {})) {
+            console.log(`    ${model}: ${u.requests} req, ${u.inputTokens} in, ${u.outputTokens} out, ${u.cost.toFixed(6)} VRSC`);
+          }
+          console.log('');
+        }
+      }
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
+      continue;
+    }
+
+    if (action === 'api_revoke') {
+      const { listActiveKeys, revokeApiKey } = require('./api-key-manager');
+      const activeKeys = listActiveKeys(agentId);
+      if (activeKeys.length === 0) {
+        console.log('\n  No active keys to revoke.\n');
+        await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
+        continue;
+      }
+      const { keyIdx } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 10, name: 'keyIdx', message: 'Select key to revoke:', choices: activeKeys.map((k, i) => {
+        const masked = k.key.substring(0, 10) + '...' + k.key.slice(-4);
+        return { name: `  ${masked}  (${k.buyerVerusId})`, value: i };
+      })}]);
+      const keyToRevoke = activeKeys[keyIdx];
+      const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Revoke key for ${keyToRevoke.buyerVerusId}?`, default: false }]);
+      if (confirm) {
+        revokeApiKey(agentId, keyToRevoke.key);
+        console.log('\n  ✅ Key revoked.\n');
       }
       await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
       continue;
