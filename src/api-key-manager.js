@@ -22,9 +22,22 @@ function loadKeys(agentId) {
   return { keys: [] };
 }
 
+// In-memory key cache for O(1) lookups (avoids O(agents×keys) FS reads per request)
+const _keyCache = new Map(); // key → { agentId, record }
+
 function saveKeys(agentId, data) {
   const p = keysPath(agentId);
-  fs.writeFileSync(p, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(data, null, 2) + '\n');
+  fs.chmodSync(p, 0o600);
+  // Update cache
+  for (const k of data.keys) {
+    if (!k.revoked && new Date(k.expiresAt) > new Date()) {
+      _keyCache.set(k.key, { agentId, record: k });
+    } else {
+      _keyCache.delete(k.key);
+    }
+  }
 }
 
 /**
@@ -66,15 +79,29 @@ function validateApiKey(agentId, key) {
 }
 
 /**
- * Find which agent owns a key (searches all agents).
+ * Find which agent owns a key. Uses in-memory cache for O(1) lookups.
+ * Falls back to disk scan if cache miss.
  * Returns { agentId, record } or null.
  */
 function findKeyOwner(key) {
+  // Fast path: check cache
+  const cached = _keyCache.get(key);
+  if (cached) {
+    // Verify still valid (might have expired since caching)
+    if (!cached.record.revoked && new Date(cached.record.expiresAt) > new Date()) {
+      return cached;
+    }
+    _keyCache.delete(key);
+  }
+  // Slow path: scan disk (cold start or cache miss)
   try {
     const agents = fs.readdirSync(AGENTS_DIR);
     for (const agentId of agents) {
       const record = validateApiKey(agentId, key);
-      if (record) return { agentId, record };
+      if (record) {
+        _keyCache.set(key, { agentId, record });
+        return { agentId, record };
+      }
     }
   } catch {}
   return null;

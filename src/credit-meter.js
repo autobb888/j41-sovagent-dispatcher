@@ -25,7 +25,9 @@ function loadMeters(agentId) {
 
 function saveMeters(agentId, data) {
   const p = metersPath(agentId);
-  fs.writeFileSync(p, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(data, null, 2) + '\n');
+  fs.chmodSync(p, 0o600);
 }
 
 function ensureBuyer(data, buyerVerusId) {

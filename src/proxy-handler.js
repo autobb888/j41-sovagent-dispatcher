@@ -10,13 +10,25 @@ const crypto = require('crypto');
 const { findKeyOwner, recordUsage } = require('./api-key-manager');
 const { checkCredit, deductCredit } = require('./credit-meter');
 
+// Safe response headers to forward from upstream (allowlist)
+const SAFE_HEADERS = new Set([
+  'content-type', 'content-length', 'cache-control', 'vary',
+  'x-request-id', 'x-ratelimit-limit', 'x-ratelimit-remaining',
+  'x-ratelimit-reset', 'openai-model', 'openai-processing-ms',
+]);
+
+function filterHeaders(upstreamHeaders) {
+  const filtered = {};
+  for (const [key, value] of Object.entries(upstreamHeaders)) {
+    if (SAFE_HEADERS.has(key.toLowerCase())) {
+      filtered[key] = value;
+    }
+  }
+  return filtered;
+}
+
 /**
  * Handle a proxied API request.
- *
- * @param req - Incoming HTTP request
- * @param res - Outgoing HTTP response
- * @param agentConfigs - Map<agentId, { endpointUrl, modelPricing, rateLimits, identity, iAddress }>
- * @param body - Parsed request body string
  */
 async function handleProxyRequest(req, res, agentConfigs, body) {
   const requestId = crypto.randomBytes(8).toString('hex');
@@ -60,7 +72,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   const isStreaming = parsedBody.stream === true;
 
   // Check credit
-  const estimatedInput = 4000; // rough estimate for pre-check
+  const estimatedInput = 4000;
   const estimatedOutput = 2000;
   const creditCheck = checkCredit(agentId, record.buyerVerusId, model, estimatedInput, estimatedOutput, config.modelPricing || []);
   if (!creditCheck.allowed) {
@@ -79,10 +91,24 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     return;
   }
 
-  // Build upstream URL
-  // Request path after /j41/proxy/ is forwarded as-is
+  // Build upstream URL — SSRF protection: validate hostname matches configured endpoint
   const upstreamPath = req.url.replace(/^\/j41\/proxy/, '');
-  const upstreamUrl = new URL(upstreamPath, config.endpointUrl);
+  let upstreamUrl;
+  try {
+    upstreamUrl = new URL(upstreamPath, config.endpointUrl);
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Invalid request path' }));
+    return;
+  }
+
+  // SSRF check: resolved hostname must match configured endpoint
+  const configuredHost = new URL(config.endpointUrl).hostname;
+  if (upstreamUrl.hostname !== configuredHost) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Request path resolves to unauthorized host' }));
+    return;
+  }
 
   // Forward request to seller's backend
   const isHttps = upstreamUrl.protocol === 'https:';
@@ -93,12 +119,10 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     headers: {
       'Content-Type': 'application/json',
       'User-Agent': 'j41-proxy/1.0',
-      // Don't forward buyer's auth — use seller's own auth if configured
       ...(config.upstreamAuth ? { 'Authorization': config.upstreamAuth } : {}),
     },
     timeout: 60000,
   }, (proxyRes) => {
-    // Add J41 headers
     const j41Headers = {
       'X-J41-Request-Id': requestId,
       'X-J41-Session': `${record.buyerVerusId}:${requestId}`,
@@ -107,32 +131,44 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
 
     if (isStreaming) {
       // Stream response through, count tokens at the end
-      res.writeHead(proxyRes.statusCode, {
-        ...proxyRes.headers,
-        ...j41Headers,
-      });
+      const safeHeaders = filterHeaders(proxyRes.headers);
+      res.writeHead(proxyRes.statusCode, { ...safeHeaders, ...j41Headers });
 
       let fullResponse = '';
+      let deducted = false;
+
       proxyRes.on('data', (chunk) => {
+        if (res.writableEnded) return;
         fullResponse += chunk.toString();
         res.write(chunk);
       });
 
       proxyRes.on('end', () => {
-        res.end();
+        if (!res.writableEnded) res.end();
 
         // Parse SSE chunks for usage data
-        const usageMatch = fullResponse.match(/"usage"\s*:\s*(\{[^}]+\})/);
+        let inputTok = estimatedInput; // fallback to estimates
+        let outputTok = estimatedOutput;
+        const usageMatch = fullResponse.match(/"usage"\s*:\s*(\{[^}]*"prompt_tokens"[^}]*\})/);
         if (usageMatch) {
           try {
             const usage = JSON.parse(usageMatch[1]);
-            const inputTok = usage.prompt_tokens || 0;
-            const outputTok = usage.completion_tokens || 0;
-            const result = deductCredit(agentId, record.buyerVerusId, model, inputTok, outputTok, config.modelPricing || []);
-            recordUsage(agentId, key, inputTok, outputTok);
-            console.log(`[PROXY] ${agentId} ${model} ${inputTok}+${outputTok} tok, cost ${result.cost.toFixed(6)} VRSC, remaining ${result.remaining.toFixed(4)}`);
+            inputTok = usage.prompt_tokens || estimatedInput;
+            outputTok = usage.completion_tokens || estimatedOutput;
           } catch {}
         }
+
+        // Always deduct — use actual tokens if available, estimates otherwise
+        if (!deducted) {
+          deducted = true;
+          const result = deductCredit(agentId, record.buyerVerusId, model, inputTok, outputTok, config.modelPricing || []);
+          recordUsage(agentId, key, inputTok, outputTok);
+          console.log(`[PROXY] ${agentId} ${model} ${inputTok}+${outputTok} tok, cost ${result.cost.toFixed(6)} VRSC, remaining ${result.remaining.toFixed(4)}`);
+        }
+      });
+
+      proxyRes.on('error', () => {
+        if (!res.writableEnded) res.end();
       });
     } else {
       // Non-streaming: read full response, meter, then send
@@ -140,14 +176,14 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
       proxyRes.on('data', (chunk) => chunks.push(chunk));
       proxyRes.on('end', () => {
         const responseBody = Buffer.concat(chunks);
-        let inputTok = 0;
-        let outputTok = 0;
+        let inputTok = estimatedInput;
+        let outputTok = estimatedOutput;
 
         try {
           const parsed = JSON.parse(responseBody.toString());
           if (parsed.usage) {
-            inputTok = parsed.usage.prompt_tokens || 0;
-            outputTok = parsed.usage.completion_tokens || 0;
+            inputTok = parsed.usage.prompt_tokens || estimatedInput;
+            outputTok = parsed.usage.completion_tokens || estimatedOutput;
           }
         } catch {}
 
@@ -160,10 +196,8 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
           j41Headers['X-J41-Seller-PayAddress'] = config.payAddress || '';
         }
 
-        res.writeHead(proxyRes.statusCode, {
-          ...proxyRes.headers,
-          ...j41Headers,
-        });
+        const safeHeaders = filterHeaders(proxyRes.headers);
+        res.writeHead(proxyRes.statusCode, { ...safeHeaders, ...j41Headers });
         res.end(responseBody);
 
         console.log(`[PROXY] ${agentId} ${model} ${inputTok}+${outputTok} tok, cost ${result.cost.toFixed(6)} VRSC, remaining ${result.remaining.toFixed(4)}`);
@@ -172,14 +206,16 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   });
 
   proxyReq.on('error', (err) => {
+    if (res.headersSent || res.writableEnded) return;
     console.error(`[PROXY] Upstream error: ${err.message}`);
-    res.writeHead(502, { 'Content-Type': 'application/json', ...{ 'X-J41-Request-Id': requestId } });
-    res.end(JSON.stringify({ error: 'Upstream endpoint unavailable', detail: err.message }));
+    res.writeHead(502, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
+    res.end(JSON.stringify({ error: 'Upstream endpoint unavailable' }));
   });
 
   proxyReq.on('timeout', () => {
     proxyReq.destroy();
-    res.writeHead(504, { 'Content-Type': 'application/json', ...{ 'X-J41-Request-Id': requestId } });
+    if (res.headersSent || res.writableEnded) return;
+    res.writeHead(504, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
     res.end(JSON.stringify({ error: 'Upstream endpoint timed out' }));
   });
 
