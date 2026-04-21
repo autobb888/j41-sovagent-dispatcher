@@ -17,6 +17,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const { creditDeposit } = require('./credit-meter');
 
 const AGENTS_DIR = path.join(os.homedir(), '.j41', 'dispatcher', 'agents');
@@ -99,6 +100,13 @@ async function reportDeposit(agentId, client, buyerVerusId, txid, expectedAmount
     // Confirmed — credit the meter
     const result = creditDeposit(agentId, buyerVerusId, expectedAmount, txid);
 
+    // Notify J41 platform (non-blocking, non-fatal)
+    // sellerWif and network passed via closure from CLI context
+    if (reportDeposit._notifyContext) {
+      const ctx = reportDeposit._notifyContext;
+      notifyJ41DepositConfirmed(ctx.sellerWif, ctx.sellerVerusId, buyerVerusId, expectedAmount, txid, ctx.network).catch(() => {});
+    }
+
     // Mark as processed
     deposits.processed.push({
       txid,
@@ -146,6 +154,11 @@ async function pollPendingDeposits(agentId, client) {
         });
         credited++;
         console.log(`[Deposits] ${agentId}: credited ${dep.amount} VRSC from ${dep.buyerVerusId} (${dep.txid.substring(0, 12)}...)`);
+        // Notify J41
+        if (pollPendingDeposits._notifyContext) {
+          const ctx = pollPendingDeposits._notifyContext;
+          notifyJ41DepositConfirmed(ctx.sellerWif, ctx.sellerVerusId, dep.buyerVerusId, dep.amount, dep.txid, ctx.network).catch(() => {});
+        }
       } else {
         stillPending.push(dep);
       }
@@ -195,4 +208,60 @@ function startDepositPoller(state, getAgentSession) {
   return timer;
 }
 
-module.exports = { reportDeposit, pollPendingDeposits, startDepositPoller, requiredConfirmations };
+/**
+ * Notify J41 platform about a confirmed deposit.
+ * POST /v1/webhooks/dispatcher/deposit-confirmed with signed canonical body.
+ *
+ * @param sellerWif - Seller's WIF for signing the notification
+ * @param sellerVerusId - Seller's VerusID
+ * @param buyerVerusId - Buyer who deposited
+ * @param amount - Amount in VRSC
+ * @param txid - Transaction ID
+ * @param network - 'verus' or 'verustest'
+ */
+async function notifyJ41DepositConfirmed(sellerWif, sellerVerusId, buyerVerusId, amount, txid, network) {
+  const J41_API_URL = process.env.J41_API_URL || 'https://api.junction41.io';
+  try {
+    const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
+    const canonicalize = require('json-canonicalize');
+
+    const nonce = crypto.randomBytes(16).toString('hex');
+    const confirmedAt = new Date().toISOString();
+
+    // Canonical message — json-canonicalize (RFC 8785), matching J41's signed-inbound pattern
+    const payload = {
+      action: 'dispatcher.deposit-confirmed',
+      sellerVerusId,
+      buyerVerusId,
+      amountVrsc: String(amount),
+      txid,
+      confirmedAt,
+      nonce,
+    };
+    const canonical = canonicalize(payload);
+    const signature = signMessage(sellerWif, canonical, network);
+
+    const body = JSON.stringify({ ...payload, signature });
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+
+    const res = await fetch(`${J41_API_URL}/v1/webhooks/dispatcher/deposit-confirmed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'j41-dispatcher/2.0' },
+      body,
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    if (res.ok) {
+      console.log(`[Deposits] J41 notified: deposit ${txid.substring(0, 12)}... confirmed for ${buyerVerusId}`);
+    } else {
+      console.warn(`[Deposits] J41 notification failed: ${res.status} ${await res.text().catch(() => '')}`);
+    }
+  } catch (e) {
+    console.warn(`[Deposits] J41 notification failed (non-fatal): ${e.message}`);
+  }
+}
+
+module.exports = { reportDeposit, pollPendingDeposits, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed };

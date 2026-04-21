@@ -50,9 +50,15 @@ async function readBody(req, res) {
 function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
   const server = http.createServer(async (req, res) => {
     // Health check
-    if (req.method === 'GET' && req.url === '/health') {
+    if (req.method === 'GET' && (req.url === '/health' || req.url === '/j41/health')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok', agents: agentWebhooks.size, proxy: !!proxyContext }));
+      res.end(JSON.stringify({
+        service: 'dispatcher',
+        version: require('../package.json').version,
+        status: 'ok',
+        agents: agentWebhooks.size,
+        proxy: !!proxyContext,
+      }));
       return;
     }
 

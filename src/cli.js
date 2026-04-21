@@ -3172,8 +3172,15 @@ program
           },
         };
 
+        // Set notify context for deposit watcher → J41 webhook notifications
+        const { startDepositPoller, reportDeposit: _rd, pollPendingDeposits: _ppd } = require('./deposit-watcher');
+        // Each api agent gets its own notify context (use first one for now — TODO: per-agent)
+        const firstApiAgent = apiAgents[0];
+        const notifyCtx = { sellerWif: firstApiAgent.wif, sellerVerusId: firstApiAgent.iAddress || firstApiAgent.identity, network: J41_NETWORK };
+        _rd._notifyContext = notifyCtx;
+        _ppd._notifyContext = notifyCtx;
+
         // Start background deposit poller for pending confirmations
-        const { startDepositPoller } = require('./deposit-watcher');
         startDepositPoller(state, getAgentSession);
         console.log(`  API Proxy: ${apiAgents.length} agent(s) with api-endpoint services`);
         console.log(`  Deposit watcher: polling every 60s for pending confirmations`);
