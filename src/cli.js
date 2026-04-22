@@ -3003,15 +3003,50 @@ program
           const hasWorkspace = !!decoded.profile?.workspaceCapability;
           const { VDXF_KEYS: VK, PARENT_KEYS: PK } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
           const hasWorkspaceKey = !!id.contentmultimap[VK.workspace.capability] || !!id.contentmultimap[PK.workspace];
-          // Merge on-chain services with platform services (platform has serviceType etc)
+          // Merge on-chain services with platform services
           const services = platformServices.length > 0 ? platformServices : (decoded.services || []);
+          // Check if this agent has api-endpoint capabilities (on-chain type OR networkEndpoints set)
+          const agentType = decoded.profile?.type;
+          const hasEndpoints = decoded.profile?.network?.endpoints?.length > 0;
+          if (agentType === 'api-provider' || hasEndpoints) {
+            const { VDXF_KEYS: VK2 } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+            const endpointsRaw = id.contentmultimap[VK2.agent.networkEndpoints];
+            let onChainEndpoint = '';
+            if (endpointsRaw) {
+              try {
+                const epEntry = Array.isArray(endpointsRaw) ? endpointsRaw[0] : endpointsRaw;
+                const dd = epEntry['i4GC1YGEVD21afWudGoFJVdnfjJ5XWnCQv'];
+                const endpoints = JSON.parse(dd?.objectdata?.message || '[]');
+                onChainEndpoint = endpoints[0] || '';
+              } catch {}
+            }
+            // Also check agent-config.json for apiEndpointUrl (upstream LLM backend)
+            let agentConfigEndpoint = '';
+            try {
+              const agentCfgPath = path.join(AGENTS_DIR, agentInfo.id, 'agent-config.json');
+              if (fs.existsSync(agentCfgPath)) {
+                const agentCfg = JSON.parse(fs.readFileSync(agentCfgPath, 'utf8'));
+                agentConfigEndpoint = agentCfg.apiEndpointUrl || agentCfg.endpointUrl || '';
+              }
+            } catch {}
+
+            for (const svc of services) {
+              svc._isApiEndpoint = true;
+              // Priority: agent-config > on-chain VDXF networkEndpoints
+              if (!svc.endpointUrl) svc.endpointUrl = agentConfigEndpoint || onChainEndpoint;
+              if (!svc.modelPricing && decoded.services?.length > 0) {
+                const onChainSvc = decoded.services.find(s => s.modelPricing);
+                if (onChainSvc) svc.modelPricing = onChainSvc.modelPricing;
+              }
+            }
+          }
           state.capabilities.set(agentInfo.id, {
             workspace: hasWorkspace,
             hasWorkspaceKey,
             services,
             profile: decoded.profile,
           });
-          const apiCount = services.filter(s => s.serviceType === 'api-endpoint').length;
+          const apiCount = services.filter(s => s.serviceType === 'api-endpoint' || s.endpointUrl || s._isApiEndpoint).length;
           console.log(`  ${agentInfo.id}: workspace=${hasWorkspace || hasWorkspaceKey}, services=${services.length}${apiCount > 0 ? `, api-endpoints=${apiCount}` : ''}`);
         } else {
           state.capabilities.set(agentInfo.id, { workspace: false, services: platformServices, profile: null });
@@ -3114,7 +3149,7 @@ program
       let proxyContext = null;
       const apiAgents = state.agents.filter(a => {
         const cap = state.capabilities.get(a.id);
-        return cap?.services?.some(s => s.serviceType === 'api-endpoint');
+        return cap?.services?.some(s => s.serviceType === 'api-endpoint' || s.endpointUrl || s._isApiEndpoint);
       });
       if (apiAgents.length > 0) {
         const { mintAccessEnvelope, verifyAccessRequest } = require('@junction41/sovagent-sdk/dist/crypto/envelope.js');
@@ -3123,7 +3158,7 @@ program
         const agentConfigs = new Map();
         for (const a of apiAgents) {
           const cap = state.capabilities.get(a.id);
-          const apiSvc = cap?.services?.find(s => s.serviceType === 'api-endpoint');
+          const apiSvc = cap?.services?.find(s => s.serviceType === 'api-endpoint' || s.endpointUrl || s._isApiEndpoint);
           if (apiSvc) {
             agentConfigs.set(a.id, {
               endpointUrl: apiSvc.endpointUrl,
@@ -3235,7 +3270,7 @@ program
       // Warn if api-endpoint agents exist but no webhook URL
       const apiEndpointAgents = state.agents.filter(a => {
         const cap = state.capabilities.get(a.id);
-        return cap?.services?.some(s => s.serviceType === 'api-endpoint');
+        return cap?.services?.some(s => s.serviceType === 'api-endpoint' || s.endpointUrl || s._isApiEndpoint);
       });
       if (apiEndpointAgents.length > 0) {
         console.log(`⚠️  ${apiEndpointAgents.length} agent(s) have api-endpoint services but --webhook-url is not set.`);
