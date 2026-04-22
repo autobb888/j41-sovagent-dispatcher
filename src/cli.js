@@ -2927,12 +2927,16 @@ program
       console.log('');
       if (secureSetup) {
         try {
-          await secureSetup.setup('dispatcher');
+          // Timeout security setup — don't block startup if sudo hangs
+          await Promise.race([
+            secureSetup.setup('dispatcher'),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout (sudo may be required — run manually)')), 10000)),
+          ]);
           console.log('  ✓ Security setup complete');
         } catch (e) {
-          console.error(`  Security setup failed: ${e.message}`);
-          console.error('  Run manually: yarn dlx @junction41/secure-setup --dispatcher');
-          // Continue — quick-check will catch issues
+          console.error(`  Security setup: ${e.message}`);
+          console.error('  Run manually with sudo: sudo npx @junction41/secure-setup --dispatcher');
+          // Continue — non-fatal
         }
       } else {
         console.warn('  @junction41/secure-setup not installed. Install it:');
@@ -2946,7 +2950,10 @@ program
     // ── Task 19: Startup security quick-check ──────────────────
     if (secureSetup) {
       try {
-        const checkResult = await secureSetup.quickCheck('dispatcher');
+        const checkResult = await Promise.race([
+          secureSetup.quickCheck('dispatcher'),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 10000)),
+        ]);
         if (!checkResult.passed) {
           console.error('');
           console.error('  ══════════════════════════════════════════════════');
@@ -2973,28 +2980,42 @@ program
     // ── Load on-chain capabilities for VDXF policy enforcement ──
     console.log('→ Loading on-chain agent capabilities...\n');
     const { decodeContentMultimap } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
-    for (const agentInfo of readyAgents) {
+    for (let i = 0; i < readyAgents.length; i++) {
+      const agentInfo = readyAgents[i];
+      // Stagger 2s between agents to avoid rate limiting
+      if (i > 0) await new Promise(r => setTimeout(r, 2000));
       try {
         const agent = await getAgentSession(state, agentInfo);
+
+        // Fetch on-chain VDXF data
         const idRaw = await agent.client.getIdentityRaw();
         const id = idRaw.data?.identity || idRaw.identity;
+
+        // Also fetch platform services (has serviceType, endpointUrl, modelPricing)
+        let platformServices = [];
+        try {
+          const svcResp = await agent.client.getAgentServices(agentInfo.iAddress || agentInfo.identity);
+          platformServices = svcResp.data || svcResp || [];
+        } catch {}
+
         if (id?.contentmultimap) {
           const decoded = decodeContentMultimap(id.contentmultimap);
           const hasWorkspace = !!decoded.profile?.workspaceCapability;
-          // Also check raw CMM for workspace key (flat format or legacy parent key)
           const { VDXF_KEYS: VK, PARENT_KEYS: PK } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
           const hasWorkspaceKey = !!id.contentmultimap[VK.workspace.capability] || !!id.contentmultimap[PK.workspace];
-          const services = decoded.services || [];
+          // Merge on-chain services with platform services (platform has serviceType etc)
+          const services = platformServices.length > 0 ? platformServices : (decoded.services || []);
           state.capabilities.set(agentInfo.id, {
             workspace: hasWorkspace,
             hasWorkspaceKey,
-            services: services.map(s => ({ name: s.name, type: s.type })),
+            services,
             profile: decoded.profile,
           });
-          console.log(`  ${agentInfo.id}: workspace=${hasWorkspace || hasWorkspaceKey}, services=${services.length}`);
+          const apiCount = services.filter(s => s.serviceType === 'api-endpoint').length;
+          console.log(`  ${agentInfo.id}: workspace=${hasWorkspace || hasWorkspaceKey}, services=${services.length}${apiCount > 0 ? `, api-endpoints=${apiCount}` : ''}`);
         } else {
-          state.capabilities.set(agentInfo.id, { workspace: false, services: [], profile: null });
-          console.log(`  ${agentInfo.id}: no VDXF data on-chain`);
+          state.capabilities.set(agentInfo.id, { workspace: false, services: platformServices, profile: null });
+          console.log(`  ${agentInfo.id}: no VDXF data on-chain, ${platformServices.length} platform services`);
         }
       } catch (e) {
         state.capabilities.set(agentInfo.id, { workspace: false, services: [], profile: null });
