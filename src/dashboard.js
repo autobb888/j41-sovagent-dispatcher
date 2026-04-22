@@ -232,6 +232,7 @@ async function mainMenu(inquirer) {
       { name: '[16] Deactivate All Agents', value: 'deactivate_all' },
       new inquirer.Separator('  ── Marketplace ──'),
       { name: '[17] Bounties', value: 'bounties' },
+      { name: '[18] API Endpoint Setup (sell GPU/compute)', value: 'api_setup' },
       new inquirer.Separator(),
       { name: '     Quit', value: 'quit' },
     ],
@@ -2371,6 +2372,266 @@ async function bountyDetailScreen(inquirer, bountyId, agentKeys) {
   }
 }
 
+// ── API Endpoint Setup Wizard ──
+
+const LLM_SERVER_PRESETS = {
+  'vllm':     { defaultPort: 8000, path: '/v1', name: 'vLLM', hint: 'python -m vllm.entrypoints.openai.api_server --model <model> --port 8000' },
+  'ollama':   { defaultPort: 11434, path: '/v1', name: 'Ollama', hint: 'ollama serve (default port 11434)' },
+  'lmstudio': { defaultPort: 1234, path: '/v1', name: 'LM Studio', hint: 'Start LM Studio local server' },
+  'tgi':      { defaultPort: 8080, path: '/v1', name: 'Text Generation Inference', hint: 'docker run ghcr.io/huggingface/text-generation-inference --port 8080' },
+  'custom':   { defaultPort: 8080, path: '/v1', name: 'Custom OpenAI-compatible', hint: 'Any server with /v1/chat/completions' },
+};
+
+async function apiEndpointSetupScreen(inquirer) {
+  console.clear();
+  console.log('\n  ╔══════════════════════════════════════════════════╗');
+  console.log('  ║  API Endpoint Setup — Sell GPU/Compute Access    ║');
+  console.log('  ╚══════════════════════════════════════════════════╝');
+  console.log('  This wizard helps you set up everything needed to sell');
+  console.log('  API access to your LLM server on the J41 marketplace.\n');
+
+  // Step 1: Select agent
+  const agents = getAgents().filter(a => a.identity && a.iAddress && a.wif);
+  if (agents.length === 0) {
+    console.log('  No registered agents. Add and register an agent first.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  const { agentId } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'agentId', message: 'Which agent will sell API access?', choices: agents.map(a => ({ name: `  ${a.id.padEnd(12)} ${a.identity}`, value: a.id })) }]);
+  const agentKeys = agents.find(a => a.id === agentId);
+
+  // Step 2: LLM server type
+  console.log('\n  ── Step 1: LLM Server ──\n');
+  const { serverType } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 10, name: 'serverType', message: 'What LLM server are you running?', choices: [
+    ...Object.entries(LLM_SERVER_PRESETS).map(([key, preset]) => ({
+      name: `  ${preset.name.padEnd(30)} (port ${preset.defaultPort})`,
+      value: key,
+    })),
+  ]}]);
+
+  const preset = LLM_SERVER_PRESETS[serverType];
+  console.log(`\n  Tip: ${preset.hint}\n`);
+
+  // Step 3: Server URL
+  const { host } = await promptWithEsc(inquirer, [{ type: 'input', name: 'host', message: 'LLM server host:', default: 'localhost' }]);
+  const { port } = await promptWithEsc(inquirer, [{ type: 'input', name: 'port', message: 'LLM server port:', default: String(preset.defaultPort) }]);
+  const upstreamUrl = `http://${host}:${port}${preset.path}`;
+  console.log(`\n  Upstream URL: ${upstreamUrl}`);
+
+  // Step 4: Test connection
+  console.log('\n  ── Step 2: Test Connection ──\n');
+  console.log('  Testing upstream LLM server...');
+  let modelsAvailable = [];
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const testResp = await fetch(`${upstreamUrl}/models`, { signal: controller.signal });
+    clearTimeout(timer);
+    if (testResp.ok) {
+      const data = await testResp.json();
+      modelsAvailable = (data.data || data.models || []).map(m => m.id || m.name || m).filter(Boolean);
+      console.log(`  ✓ Server responded! Models found: ${modelsAvailable.length}`);
+      for (const m of modelsAvailable.slice(0, 10)) console.log(`    • ${m}`);
+      if (modelsAvailable.length > 10) console.log(`    ... and ${modelsAvailable.length - 10} more`);
+    } else {
+      console.log(`  ⚠ Server responded with ${testResp.status} — may still work for chat/completions`);
+    }
+  } catch (e) {
+    console.log(`  ✗ Could not reach ${upstreamUrl}/models: ${e.message}`);
+    console.log('    Make sure your LLM server is running.\n');
+    const { cont } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'cont', message: 'Continue anyway?', default: false }]);
+    if (!cont) return;
+  }
+
+  // Step 5: Models and pricing
+  console.log('\n  ── Step 3: Models & Pricing ──\n');
+  let selectedModels = [];
+  if (modelsAvailable.length > 0) {
+    const { models } = await promptWithEsc(inquirer, [{ type: 'checkbox', pageSize: 15, name: 'models', message: 'Select models to offer (space to toggle):', choices: modelsAvailable.map(m => ({ name: `  ${m}`, value: m, checked: true })) }]);
+    selectedModels = models;
+  }
+  if (selectedModels.length === 0) {
+    const { modelName } = await promptWithEsc(inquirer, [{ type: 'input', name: 'modelName', message: 'Model name (e.g. llama-3.3-70b):' }]);
+    if (modelName) selectedModels = [modelName];
+  }
+  if (selectedModels.length === 0) {
+    console.log('\n  At least one model required.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  const modelPricing = [];
+  for (const model of selectedModels) {
+    const { inputRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'inputRate', message: `  ${model} — input rate (VRSCTEST per 1M tokens):`, default: '2' }]);
+    const { outputRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'outputRate', message: `  ${model} — output rate (VRSCTEST per 1M tokens):`, default: '8' }]);
+    modelPricing.push({
+      model,
+      inputTokenRate: parseFloat(inputRate) / 1000000,
+      outputTokenRate: parseFloat(outputRate) / 1000000,
+    });
+  }
+
+  // Step 6: Public URL
+  console.log('\n  ── Step 4: Public URL ──');
+  console.log('  Buyers need to reach your dispatcher from the internet.\n');
+  const { publicUrl } = await promptWithEsc(inquirer, [{ type: 'input', name: 'publicUrl', message: 'Your public URL (e.g. https://myagent.example.com):', default: '' }]);
+
+  if (!publicUrl) {
+    console.log('\n  ⚠ No public URL — buyers won\'t be able to reach your dispatcher.');
+    console.log('  Options:');
+    console.log('    • Set up a Cloudflare Tunnel: cloudflared tunnel create myagent');
+    console.log('    • Use ngrok: ngrok http 9841');
+    console.log('    • Point a domain A record to this machine\'s public IP\n');
+    const { cont } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'cont', message: 'Continue without public URL?', default: false }]);
+    if (!cont) return;
+  }
+
+  // Step 7: Rate limits
+  console.log('\n  ── Step 5: Rate Limits ──\n');
+  const { rpm } = await promptWithEsc(inquirer, [{ type: 'input', name: 'rpm', message: 'Max requests per minute per buyer:', default: '60' }]);
+  const { tpm } = await promptWithEsc(inquirer, [{ type: 'input', name: 'tpm', message: 'Max tokens per minute per buyer:', default: '100000' }]);
+
+  // Step 8: Upstream auth (if the LLM server needs a key)
+  let upstreamAuth = '';
+  const { needsAuth } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'needsAuth', message: '\n  Does your LLM server require an API key?', default: false }]);
+  if (needsAuth) {
+    const { authKey } = await promptWithEsc(inquirer, [{ type: 'password', name: 'authKey', message: 'API key for upstream server:', mask: '*' }]);
+    if (authKey) upstreamAuth = `Bearer ${authKey}`;
+  }
+
+  // Summary
+  console.log('\n  ╔══════════════════════════════════════════════════╗');
+  console.log('  ║  Setup Summary                                   ║');
+  console.log('  ╚══════════════════════════════════════════════════╝\n');
+  console.log(`  Agent:      ${agentKeys.identity}`);
+  console.log(`  Upstream:   ${upstreamUrl}`);
+  console.log(`  Public URL: ${publicUrl || '(not set)'}`);
+  console.log(`  Models:     ${selectedModels.join(', ')}`);
+  console.log(`  Rate limit: ${rpm} req/min, ${tpm} tok/min`);
+  for (const p of modelPricing) {
+    console.log(`  ${p.model}: ${(p.inputTokenRate * 1000000).toFixed(1)}/1M in, ${(p.outputTokenRate * 1000000).toFixed(1)}/1M out`);
+  }
+  console.log('');
+
+  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Apply this configuration?', default: true }]);
+  if (!confirm) return;
+
+  // Apply
+  console.log('\n  Applying configuration...\n');
+
+  // 1. Write agent-config.json with upstream URL
+  const agentDir = path.join(AGENTS_DIR, agentId);
+  const agentConfig = loadAgentConfig(agentId);
+  agentConfig.apiEndpointUrl = upstreamUrl;
+  if (upstreamAuth) agentConfig.upstreamAuth = upstreamAuth;
+  saveAgentConfig(agentId, agentConfig);
+  console.log('  ✓ Agent config saved (upstream URL + auth)');
+
+  // 2. Register service on platform
+  try {
+    const agent = await createAgent(agentKeys);
+    try {
+      await agent.registerService({
+        name: `${selectedModels[0]} API Access`,
+        description: `OpenAI-compatible API access — models: ${selectedModels.join(', ')}`,
+        category: 'infrastructure-ops',
+        price: 0,
+        currency: 'VRSCTEST',
+        turnaround: 'real-time',
+        paymentTerms: 'postpay',
+        sovguard: false,
+        serviceType: 'api-endpoint',
+        endpointUrl: upstreamUrl,
+        modelPricing,
+        rateLimits: { requestsPerMinute: parseInt(rpm), tokensPerMinute: parseInt(tpm) },
+      });
+      console.log('  ✓ Service registered on platform');
+    } finally { agent.stop(); }
+  } catch (e) {
+    console.log(`  ⚠ Service registration: ${e.message} (may already exist)`);
+  }
+
+  // 3. Update VDXF on-chain (type + endpoints + models)
+  if (publicUrl) {
+    console.log('  → Updating on-chain VDXF (this takes 1-3 minutes)...');
+    try {
+      const { removeAndRewriteVdxfFields } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+      const agent = await createAgent(agentKeys);
+      try {
+        await removeAndRewriteVdxfFields({
+          agent,
+          identityName: agentKeys.identity,
+          fieldsToUpdate: {
+            networkEndpoints: JSON.stringify([publicUrl]),
+            models: JSON.stringify(selectedModels),
+          },
+          chain: agentKeys.network || 'verustest',
+          wif: agentKeys.wif,
+          onProgress: (msg) => console.log(`    ${msg}`),
+        });
+        console.log('  ✓ On-chain VDXF updated');
+
+        try { await agent.client.refreshAgent(agentKeys.iAddress); } catch {}
+        console.log('  ✓ Platform refreshed');
+      } finally { agent.stop(); }
+    } catch (e) {
+      console.log(`  ⚠ VDXF update: ${e.message}`);
+      console.log('    You can update later: j41-dispatcher update-profile ' + agentId + ' --network-endpoints "' + publicUrl + '"');
+    }
+  }
+
+  // 4. Generate systemd service file
+  console.log('');
+  const { genSystemd } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'genSystemd', message: 'Generate a systemd service file for auto-start?', default: true }]);
+  if (genSystemd) {
+    const webhookUrl = publicUrl || 'https://YOUR-DOMAIN-HERE';
+    const npmPrefix = process.env.npm_config_prefix || '/usr/local';
+    const serviceFile = `[Unit]
+Description=J41 Dispatcher — API Endpoint Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${process.env.USER || 'root'}
+WorkingDirectory=${process.env.HOME}
+ExecStart=${npmPrefix}/bin/j41-dispatcher start --webhook-url ${webhookUrl}
+Restart=always
+RestartSec=10
+Environment=J41_API_URL=https://api.junction41.io
+Environment=J41_NETWORK=verustest
+
+[Install]
+WantedBy=multi-user.target
+`;
+    const servicePath = path.join(agentDir, 'j41-dispatcher.service');
+    fs.writeFileSync(servicePath, serviceFile);
+    console.log(`  ✓ Service file saved: ${servicePath}`);
+    console.log('');
+    console.log('  To install:');
+    console.log(`    sudo cp ${servicePath} /etc/systemd/system/j41-dispatcher.service`);
+    console.log('    sudo systemctl daemon-reload');
+    console.log('    sudo systemctl enable j41-dispatcher');
+    console.log('    sudo systemctl start j41-dispatcher');
+  }
+
+  // Done
+  console.log('\n  ╔══════════════════════════════════════════════════╗');
+  console.log('  ║  ✅ Setup Complete!                               ║');
+  console.log('  ╚══════════════════════════════════════════════════╝\n');
+  console.log('  To start selling:');
+  if (publicUrl) {
+    console.log(`    j41-dispatcher start --webhook-url ${publicUrl}`);
+  } else {
+    console.log('    1. Set up a public URL (Cloudflare tunnel, ngrok, or DNS)');
+    console.log('    2. j41-dispatcher start --webhook-url https://your-url.com');
+  }
+  console.log('');
+
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
 // ── Main Loop ──
 
 async function main() {
@@ -2506,6 +2767,7 @@ async function main() {
       case 'activate_all': await withBack(() => batchActivateScreen(inquirer, true)); break;
       case 'deactivate_all': await withBack(() => batchActivateScreen(inquirer, false)); break;
       case 'bounties': await withBack(() => bountiesMenuScreen(inquirer)); break;
+      case 'api_setup': await withBack(() => apiEndpointSetupScreen(inquirer)); break;
       case 'quit': process.exit(0);
     }
   }
