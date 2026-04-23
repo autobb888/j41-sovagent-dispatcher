@@ -2784,6 +2784,107 @@ program
     console.log('');
   });
 
+// API setup — scriptable equivalent of the dashboard's apiEndpointSetupScreen.
+// Writes endpointUrl/auth/modelPricing/rateLimits/publicUrl into agent-config.json
+// and registers the service on-platform. Everything is flag-driven so CI or scripts can run it.
+program
+  .command('api-setup <agent-id>')
+  .description('Configure an agent as an API endpoint seller (non-interactive)')
+  .option('--name <name>', 'Service name (default: "<identity> API Access")')
+  .option('--description <desc>', 'Service description', 'OpenAI-compatible API access')
+  .option('--upstream-url <url>', 'Your LLM server URL (e.g. http://localhost:11434/v1)')
+  .option('--upstream-auth <token>', 'Bearer token for upstream server (optional)')
+  .option('--public-url <url>', 'Your public dispatcher URL (e.g. https://myagent.example.com)')
+  .option('--model <spec...>', 'Model pricing: "model:inputPer1M:outputPer1M" (repeatable)')
+  .option('--rpm <n>', 'Rate limit: requests/min/buyer', '60')
+  .option('--tpm <n>', 'Rate limit: tokens/min/buyer', '100000')
+  .option('--category <slug>', 'Marketplace category', 'infrastructure-ops')
+  .option('--no-register', 'Skip platform registration (write config only)')
+  .action(async (agentId, options) => {
+    const agentDir = path.join(AGENTS_DIR, agentId);
+    if (!fs.existsSync(agentDir)) {
+      console.error(`✗ Agent directory not found: ${agentDir}`);
+      process.exit(1);
+    }
+    if (!options.upstreamUrl) { console.error('✗ --upstream-url is required'); process.exit(1); }
+    if (!options.model || options.model.length === 0) { console.error('✗ at least one --model is required'); process.exit(1); }
+
+    const modelPricing = [];
+    for (const spec of options.model) {
+      const parts = spec.split(':');
+      if (parts.length !== 3) { console.error(`✗ bad --model "${spec}" — expected name:inputPer1M:outputPer1M`); process.exit(1); }
+      const [model, inp, out] = parts;
+      const inputTokenRate = parseFloat(inp) / 1000000;
+      const outputTokenRate = parseFloat(out) / 1000000;
+      if (!Number.isFinite(inputTokenRate) || !Number.isFinite(outputTokenRate)) {
+        console.error(`✗ bad --model rates in "${spec}"`); process.exit(1);
+      }
+      modelPricing.push({ model, inputTokenRate, outputTokenRate });
+    }
+
+    const rateLimits = {
+      requestsPerMinute: parseInt(options.rpm, 10),
+      tokensPerMinute: parseInt(options.tpm, 10),
+    };
+
+    // Merge into agent-config.json
+    const configPath = path.join(agentDir, 'agent-config.json');
+    let config = {};
+    try { if (fs.existsSync(configPath)) config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch {}
+    config.apiEndpointUrl = options.upstreamUrl;
+    if (options.upstreamAuth) config.apiEndpointAuth = options.upstreamAuth.startsWith('Bearer ') ? options.upstreamAuth : `Bearer ${options.upstreamAuth}`;
+    if (options.publicUrl) config.publicUrl = options.publicUrl;
+    config.modelPricing = modelPricing;
+    config.rateLimits = rateLimits;
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
+    try { fs.chmodSync(configPath, 0o600); } catch {}
+    console.log(`✓ Wrote ${configPath}`);
+
+    if (!options.register) {
+      console.log('Config saved. Skipping platform registration (--no-register).');
+      return;
+    }
+
+    // Load keys and register service on-platform
+    const keysPath = path.join(agentDir, 'keys.json');
+    if (!fs.existsSync(keysPath)) { console.error(`✗ keys.json not found for ${agentId}`); process.exit(1); }
+    const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+
+    const { J41Agent } = require('@junction41/sovagent-sdk');
+    const agent = new J41Agent({
+      apiUrl: process.env.J41_API_URL || 'https://api.junction41.io',
+      identityName: keys.identity,
+      wif: keys.wif,
+      iAddress: keys.iAddress,
+      network: process.env.J41_NETWORK || 'verustest',
+    });
+    try {
+      await agent.authenticate();
+      const svc = await agent.registerService({
+        name: options.name || `${keys.identity} API Access`,
+        description: options.description,
+        category: options.category,
+        price: 0,
+        currency: 'VRSCTEST',
+        turnaround: 'real-time',
+        paymentTerms: 'postpay',
+        sovguard: false,
+        serviceType: 'api-endpoint',
+        endpointUrl: options.upstreamUrl,
+        modelPricing,
+        rateLimits,
+      });
+      console.log(`✓ Service registered on platform (id: ${svc?.id || svc?.data?.id || '?'})`);
+      console.log('Next: start the dispatcher (j41-dispatcher start) — your service is now discoverable.');
+    } catch (e) {
+      console.error(`✗ Platform registration failed: ${e.message}`);
+      console.error('  Config was still written — rerun with --no-register to skip this step, or fix auth and retry.');
+      process.exit(1);
+    } finally {
+      try { agent.stop?.(); } catch {}
+    }
+  });
+
 // Start command — run the dispatcher (listen for jobs)
 program
   .command('start')
@@ -3053,11 +3154,38 @@ program
           console.log(`  ${agentInfo.id}: no VDXF data on-chain, ${platformServices.length} platform services`);
         }
       } catch (e) {
-        state.capabilities.set(agentInfo.id, { workspace: false, services: [], profile: null });
+        state.capabilities.set(agentInfo.id, { workspace: false, services: [], profile: null, _fetchFailed: true });
         console.log(`  ${agentInfo.id}: capability fetch failed (${e.message})`);
       }
     }
     console.log('');
+
+    // Retry loop: if any agents failed capability fetch AND no api-endpoint found,
+    // retry every 5 minutes. Operator must restart dispatcher once detected.
+    const failedAgents = readyAgents.filter(a => state.capabilities.get(a.id)?._fetchFailed);
+    const hasApiAfterLoad = readyAgents.some(a => {
+      const cap = state.capabilities.get(a.id);
+      return cap?.services?.some(s => s.serviceType === 'api-endpoint' || s.endpointUrl || s._isApiEndpoint);
+    });
+    if (failedAgents.length > 0 && !hasApiAfterLoad) {
+      console.log(`  ⚠  ${failedAgents.length} agent(s) failed capability fetch — retrying every 5min`);
+      const retryTimer = setInterval(async () => {
+        console.log('[Capabilities] Retrying failed agents...');
+        for (const agentInfo of failedAgents) {
+          try {
+            const agent = await getAgentSession(state, agentInfo);
+            const svcResp = await agent.client.getAgentServices(agentInfo.iAddress || agentInfo.identity);
+            const platformServices = svcResp.data || svcResp || [];
+            if (platformServices.some(s => s.serviceType === 'api-endpoint' || s.endpointUrl)) {
+              console.log('[Capabilities] ✓ api-endpoint agent detected — restart dispatcher to activate proxy');
+              clearInterval(retryTimer);
+              return;
+            }
+          } catch {}
+        }
+      }, 5 * 60 * 1000);
+      retryTimer.unref();
+    }
 
     // Cache dispute policy and markup per agent from VDXF
     for (const agentInfo of readyAgents) {
@@ -3185,18 +3313,18 @@ program
             if (!cfg) throw new Error('Seller has no api-endpoint service');
 
             // Verify buyer's signature via J41 platform (resolve R-address, check sig)
+            // Fail-closed by default. Set J41_SKIP_SIG_VERIFY=1 to bypass in dev.
             try {
               const agent = await getAgentSession(state, sellerAgent);
               const verified = await verifyAccessRequest(accessRequest, agent._client || agent.client, J41_NETWORK);
-              if (!verified) {
-                console.warn(`[Discovery] Buyer signature verification FAILED for ${accessRequest.buyerVerusId}`);
-                throw new Error('Buyer signature verification failed');
-              }
+              if (!verified) throw new Error('Buyer signature verification failed');
               console.log(`[Discovery] Buyer signature verified: ${accessRequest.buyerVerusId}`);
             } catch (e) {
-              if (e.message === 'Buyer signature verification failed') throw e;
-              // If verification fails due to network issue, log but continue (fail-open for v1)
-              console.warn(`[Discovery] Could not verify buyer signature: ${e.message} — proceeding`);
+              console.error(`[Discovery] Verification error: ${e.message}`);
+              if (process.env.J41_SKIP_SIG_VERIFY !== '1') {
+                throw new Error('Signature verification required — cannot mint key');
+              }
+              console.warn('[Discovery] ⚠️  Skipping verification (J41_SKIP_SIG_VERIFY=1 — dev only)');
             }
 
             // Mint API key
@@ -3228,18 +3356,25 @@ program
           },
         };
 
-        // Set notify context for deposit watcher → J41 webhook notifications
-        const { startDepositPoller, reportDeposit: _rd, pollPendingDeposits: _ppd } = require('./deposit-watcher');
-        // Each api agent gets its own notify context (use first one for now — TODO: per-agent)
-        const firstApiAgent = apiAgents[0];
-        const notifyCtx = { sellerWif: firstApiAgent.wif, sellerVerusId: firstApiAgent.iAddress || firstApiAgent.identity, network: J41_NETWORK };
-        _rd._notifyContext = notifyCtx;
-        _ppd._notifyContext = notifyCtx;
+        // Set notify context per api-endpoint agent for J41 webhook notifications
+        const { startDepositPoller, setNotifyContext } = require('./deposit-watcher');
+        for (const a of apiAgents) {
+          setNotifyContext(a.id, {
+            sellerWif: a.wif,
+            sellerVerusId: a.iAddress || a.identity,
+            network: J41_NETWORK,
+          });
+        }
 
         // Start background deposit poller for pending confirmations
         startDepositPoller(state, getAgentSession);
         console.log(`  API Proxy: ${apiAgents.length} agent(s) with api-endpoint services`);
         console.log(`  Deposit watcher: polling every 60s for pending confirmations`);
+
+        // Start upstream LLM health poller
+        const { startHealthPoller } = require('./upstream-health');
+        startHealthPoller(agentConfigs);
+        console.log(`  Upstream health: polling every 60s`);
       }
 
       // Start webhook HTTP server (with proxy context if api-endpoint agents exist)

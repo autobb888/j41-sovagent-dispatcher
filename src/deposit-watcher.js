@@ -22,6 +22,18 @@ const { creditDeposit } = require('./credit-meter');
 
 const AGENTS_DIR = path.join(os.homedir(), '.j41', 'dispatcher', 'agents');
 
+// Per-agent notify context for J41 webhook after confirmed deposit.
+// Keyed by agentId. Each context has { sellerWif, sellerVerusId, network }.
+const _notifyContexts = new Map();
+
+function setNotifyContext(agentId, ctx) {
+  _notifyContexts.set(agentId, ctx);
+}
+
+function getNotifyContext(agentId) {
+  return _notifyContexts.get(agentId);
+}
+
 // Confirmation tiers
 function requiredConfirmations(amount) {
   if (amount < 2) return 0;   // mempool OK for small amounts
@@ -100,10 +112,9 @@ async function reportDeposit(agentId, client, buyerVerusId, txid, expectedAmount
     // Confirmed — credit the meter
     const result = creditDeposit(agentId, buyerVerusId, expectedAmount, txid);
 
-    // Notify J41 platform (non-blocking, non-fatal)
-    // sellerWif and network passed via closure from CLI context
-    if (reportDeposit._notifyContext) {
-      const ctx = reportDeposit._notifyContext;
+    // Notify J41 platform (non-blocking, non-fatal) — uses per-agent context
+    const ctx = _notifyContexts.get(agentId);
+    if (ctx) {
       notifyJ41DepositConfirmed(ctx.sellerWif, ctx.sellerVerusId, buyerVerusId, expectedAmount, txid, ctx.network).catch(() => {});
     }
 
@@ -154,10 +165,10 @@ async function pollPendingDeposits(agentId, client) {
         });
         credited++;
         console.log(`[Deposits] ${agentId}: credited ${dep.amount} VRSC from ${dep.buyerVerusId} (${dep.txid.substring(0, 12)}...)`);
-        // Notify J41
-        if (pollPendingDeposits._notifyContext) {
-          const ctx = pollPendingDeposits._notifyContext;
-          notifyJ41DepositConfirmed(ctx.sellerWif, ctx.sellerVerusId, dep.buyerVerusId, dep.amount, dep.txid, ctx.network).catch(() => {});
+        // Notify J41 — uses per-agent context
+        const pollCtx = _notifyContexts.get(agentId);
+        if (pollCtx) {
+          notifyJ41DepositConfirmed(pollCtx.sellerWif, pollCtx.sellerVerusId, dep.buyerVerusId, dep.amount, dep.txid, pollCtx.network).catch(() => {});
         }
       } else {
         stillPending.push(dep);
@@ -264,4 +275,4 @@ async function notifyJ41DepositConfirmed(sellerWif, sellerVerusId, buyerVerusId,
   }
 }
 
-module.exports = { reportDeposit, pollPendingDeposits, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed };
+module.exports = { reportDeposit, pollPendingDeposits, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, setNotifyContext, getNotifyContext };

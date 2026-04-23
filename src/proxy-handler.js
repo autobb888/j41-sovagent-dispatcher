@@ -7,8 +7,58 @@
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
+const dns = require('dns').promises;
+const net = require('net');
 const { findKeyOwner, recordUsage } = require('./api-key-manager');
 const { reserveCredit, adjustCredit, refundReservation } = require('./credit-meter');
+
+function isPrivateIp(ip) {
+  if (!ip) return false;
+  const v = net.isIP(ip);
+  if (v === 4) {
+    const [a, b] = ip.split('.').map(Number);
+    if (a === 10) return true;
+    if (a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 0) return true;
+    return false;
+  }
+  if (v === 6) {
+    const lo = ip.toLowerCase();
+    if (lo === '::1' || lo === '::') return true;
+    if (lo.startsWith('fe80:') || lo.startsWith('fc') || lo.startsWith('fd')) return true;
+    // IPv4-mapped IPv6 (::ffff:a.b.c.d)
+    const m = lo.match(/^::ffff:([0-9.]+)$/);
+    if (m && isPrivateIp(m[1])) return true;
+    return false;
+  }
+  return false;
+}
+
+async function checkUpstreamHostSafe(hostname) {
+  if (process.env.J41_ALLOW_LOCAL_UPSTREAM === '1') return { safe: true };
+  const lc = hostname.toLowerCase();
+  if (lc === 'localhost' || lc.endsWith('.localhost') || lc.endsWith('.local') || lc.endsWith('.internal')) {
+    return { safe: false, reason: `hostname "${hostname}" is a local/internal name` };
+  }
+  if (net.isIP(hostname)) {
+    if (isPrivateIp(hostname)) return { safe: false, reason: `upstream IP ${hostname} is private/loopback/link-local` };
+    return { safe: true };
+  }
+  try {
+    const addrs = await dns.lookup(hostname, { all: true });
+    for (const a of addrs) {
+      if (isPrivateIp(a.address)) {
+        return { safe: false, reason: `hostname ${hostname} resolves to private address ${a.address}` };
+      }
+    }
+  } catch (e) {
+    return { safe: false, reason: `DNS lookup failed for ${hostname}: ${e.message}` };
+  }
+  return { safe: true };
+}
 
 // Safe response headers to forward from upstream (allowlist)
 const SAFE_HEADERS = new Set([
@@ -110,6 +160,15 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     return;
   }
 
+  // SSRF hardening: block private IPs unless J41_ALLOW_LOCAL_UPSTREAM=1 (dev)
+  const safety = await checkUpstreamHostSafe(upstreamUrl.hostname);
+  if (!safety.safe) {
+    refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: `Upstream blocked: ${safety.reason}` }));
+    return;
+  }
+
   // Forward request to seller's backend
   const isHttps = upstreamUrl.protocol === 'https:';
   const transport = isHttps ? https : http;
@@ -146,16 +205,23 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
       proxyRes.on('end', () => {
         if (!res.writableEnded) res.end();
 
-        // Parse SSE chunks for usage data
-        let inputTok = estimatedInput; // fallback to estimates
+        // Parse SSE chunks for usage data — scan each `data: {...}` frame with JSON.parse
+        // so nested objects like completion_tokens_details survive (the old regex broke on them).
+        let inputTok = estimatedInput;
         let outputTok = estimatedOutput;
-        const usageMatch = fullResponse.match(/"usage"\s*:\s*(\{[^}]*"prompt_tokens"[^}]*\})/);
-        if (usageMatch) {
+        for (const line of fullResponse.split(/\r?\n/)) {
+          if (!line.startsWith('data:')) continue;
+          const json = line.slice(5).trim();
+          if (!json || json === '[DONE]') continue;
           try {
-            const usage = JSON.parse(usageMatch[1]);
-            inputTok = usage.prompt_tokens || estimatedInput;
-            outputTok = usage.completion_tokens || estimatedOutput;
-          } catch {}
+            const frame = JSON.parse(json);
+            if (frame && frame.usage && typeof frame.usage === 'object') {
+              if (Number.isFinite(frame.usage.prompt_tokens)) inputTok = frame.usage.prompt_tokens;
+              if (Number.isFinite(frame.usage.completion_tokens)) outputTok = frame.usage.completion_tokens;
+            }
+          } catch {
+            // Malformed frame — skip. Upstream may send keep-alive comments starting with `:` too.
+          }
         }
 
         // Adjust reservation with actual token counts (or estimates if usage absent)

@@ -7,6 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { getHealth } = require('./upstream-health');
 
 const REPO_DIR = path.join(__dirname, '..');
 const J41_DIR = path.join(os.homedir(), '.j41');
@@ -1074,7 +1075,17 @@ async function configureServicesScreen(inquirer) {
       for (let i = 0; i < list.length; i++) {
         const s = list[i];
         const isApi = s.serviceType === 'api-endpoint';
-        console.log(`  [${i + 1}] ${s.name}${isApi ? ' [API ENDPOINT]' : ''}`);
+        let healthTag = '';
+        if (isApi) {
+          const h = getHealth(agentId);
+          if (h) {
+            const age = Math.round((Date.now() - h.lastCheck) / 1000);
+            healthTag = h.healthy ? ` [upstream: healthy ${age}s ago]` : ` [upstream: DOWN — ${h.error || 'status ' + h.status}]`;
+          } else {
+            healthTag = ' [upstream: not checked]';
+          }
+        }
+        console.log(`  [${i + 1}] ${s.name}${isApi ? ' [API ENDPOINT]' : ''}${healthTag}`);
         if (isApi) {
           console.log(`      Endpoint: ${s.endpointUrl || '?'}  |  Status: ${s.status || 'active'}  |  Category: ${s.category || '?'}`);
           if (s.modelPricing?.length) {
@@ -1111,6 +1122,7 @@ async function configureServicesScreen(inquirer) {
       actionChoices.push({ name: '  View credit meters', value: 'api_credits' });
       actionChoices.push({ name: '  Revoke an API key', value: 'api_revoke' });
       actionChoices.push({ name: '  View deposits (pending + confirmed)', value: 'api_deposits' });
+      actionChoices.push({ name: '  Submit review for a buyer session', value: 'api_review' });
     }
     actionChoices.push(new inquirer.Separator());
     actionChoices.push({ name: '  ← Back', value: '__back' });
@@ -1279,17 +1291,54 @@ async function configureServicesScreen(inquirer) {
       const { newTurnaround } = await promptWithEsc(inquirer, [{ type: 'input', name: 'newTurnaround', message: 'Turnaround:', default: svc.turnaround || '15 minutes' }]);
       const { newSovguard } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'newSovguard', message: 'Enable SovGuard protection?', default: svc.sovguard !== false && svc.sovguardEnabled !== false }]);
 
+      // API endpoint services: optionally edit pricing + rate limits
+      const isApiService = svc.serviceType === 'api-endpoint' || svc._isApiEndpoint || svc.endpointUrl;
+      let newPricing = svc.modelPricing || [];
+      let newLimits = svc.rateLimits || {};
+      let newServiceType = svc.serviceType;
+      if (isApiService) {
+        const { editPricing } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'editPricing', message: 'Edit pricing + rate limits for this API endpoint?', default: false }]);
+        if (editPricing) {
+          newPricing = [];
+          const existingModels = (svc.modelPricing || []).map(p => p.model);
+          const { models } = await promptWithEsc(inquirer, [{ type: 'input', name: 'models', message: 'Models (comma-separated):', default: existingModels.join(',') }]);
+          const modelList = models.split(',').map(s => s.trim()).filter(Boolean);
+          for (const m of modelList) {
+            const existing = (svc.modelPricing || []).find(p => p.model === m);
+            const defaultIn = existing ? String(existing.inputTokenRate * 1000000) : '2';
+            const defaultOut = existing ? String(existing.outputTokenRate * 1000000) : '8';
+            const { inRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'inRate', message: `  ${m} input rate (VRSCTEST per 1M tokens):`, default: defaultIn }]);
+            const { outRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'outRate', message: `  ${m} output rate (VRSCTEST per 1M tokens):`, default: defaultOut }]);
+            newPricing.push({
+              model: m,
+              inputTokenRate: parseFloat(inRate) / 1000000,
+              outputTokenRate: parseFloat(outRate) / 1000000,
+            });
+          }
+          const { rpm } = await promptWithEsc(inquirer, [{ type: 'input', name: 'rpm', message: 'Requests per minute per buyer:', default: String(svc.rateLimits?.requestsPerMinute || 60) }]);
+          const { tpm } = await promptWithEsc(inquirer, [{ type: 'input', name: 'tpm', message: 'Tokens per minute per buyer:', default: String(svc.rateLimits?.tokensPerMinute || 100000) }]);
+          newLimits = { requestsPerMinute: parseInt(rpm), tokensPerMinute: parseInt(tpm) };
+          newServiceType = 'api-endpoint';
+        }
+      }
+
       try {
         const agent = await createAgent(keys);
         try {
-          await agent.client.updateService(svc.id, {
+          const updatePayload = {
             name: newName,
             description: newDesc,
             price: parseFloat(newPrice),
             category: newCategory,
             turnaround: newTurnaround,
             sovguard: newSovguard,
-          });
+          };
+          if (isApiService) {
+            updatePayload.serviceType = newServiceType || 'api-endpoint';
+            updatePayload.modelPricing = newPricing;
+            updatePayload.rateLimits = newLimits;
+          }
+          await agent.client.updateService(svc.id, updatePayload);
           console.log('\n  ✅ Service updated.\n');
         } finally { agent.stop(); }
       } catch (e) {
@@ -1376,6 +1425,58 @@ async function configureServicesScreen(inquirer) {
       if (confirm) {
         revokeApiKey(agentId, keyToRevoke.key);
         console.log('\n  ✅ Key revoked.\n');
+      }
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
+      continue;
+    }
+
+    if (action === 'api_review') {
+      const { getMetrics } = require('./credit-meter');
+      const buyers = getMetrics(agentId);
+      const buyerIds = Object.keys(buyers);
+      if (buyerIds.length === 0) {
+        console.log('\n  No buyer sessions to review.\n');
+        await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
+        continue;
+      }
+      const { buyerVerusId } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 10, name: 'buyerVerusId', message: 'Which buyer session?', choices: buyerIds.map(id => {
+        const b = buyers[id];
+        const reqs = Object.values(b.usage || {}).reduce((n, u) => n + (u.requests || 0), 0);
+        return { name: `  ${id}  (${reqs} reqs, ${b.totalSpent.toFixed(4)} VRSC spent)`, value: id };
+      })}]);
+      const b = buyers[buyerVerusId];
+      const models = Object.keys(b.usage || {});
+      const requestCount = Object.values(b.usage || {}).reduce((n, u) => n + (u.requests || 0), 0);
+      const { rating } = await promptWithEsc(inquirer, [{ type: 'list', name: 'rating', message: 'Rating:', choices: [{ name: '5 — excellent', value: 5 }, { name: '4 — good', value: 4 }, { name: '3 — neutral', value: 3 }, { name: '2 — poor', value: 2 }, { name: '1 — avoid', value: 1 }] }]);
+      const { message } = await promptWithEsc(inquirer, [{ type: 'input', name: 'message', message: 'Review comment (optional):' }]);
+      const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Submit ${rating}-star review for ${buyerVerusId}?`, default: true }]);
+      if (!confirm) continue;
+
+      try {
+        const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
+        const canonicalize = require('json-canonicalize');
+        const timestamp = Date.now();
+        const sessionId = `api-session-${agentId}-${buyerVerusId}`;
+        const payload = {
+          agentVerusId: keys.iAddress || keys.identity,
+          buyerVerusId,
+          sessionId,
+          model: models[0] || '',
+          requestCount,
+          totalSpent: b.totalSpent,
+          message: message || '',
+          rating,
+          timestamp,
+        };
+        const signature = signMessage(keys.wif, canonicalize(payload), process.env.J41_NETWORK || 'verustest');
+
+        const agent = await createAgent(keys);
+        try {
+          const result = await agent.client.submitApiSessionReview({ ...payload, signature });
+          console.log(`\n  ✅ Review submitted (id: ${result.id}).\n`);
+        } finally { agent.stop(); }
+      } catch (e) {
+        console.log(`\n  ❌ Failed: ${e.message}\n`);
       }
       await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
       continue;
@@ -2475,14 +2576,50 @@ async function apiEndpointSetupScreen(inquirer) {
   // Step 6: Public URL
   console.log('\n  ── Step 4: Public URL ──');
   console.log('  Buyers need to reach your dispatcher from the internet.\n');
-  const { publicUrl } = await promptWithEsc(inquirer, [{ type: 'input', name: 'publicUrl', message: 'Your public URL (e.g. https://myagent.example.com):', default: '' }]);
+
+  // Detect cloudflared — if installed, offer to help configure a quick tunnel
+  const { execSync } = require('child_process');
+  let cloudflaredPath = '';
+  try {
+    cloudflaredPath = execSync('command -v cloudflared', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+  } catch {}
+
+  let publicUrl = '';
+  if (cloudflaredPath) {
+    console.log(`  ✓ Detected cloudflared at ${cloudflaredPath}`);
+    const { tunChoice } = await promptWithEsc(inquirer, [{ type: 'list', name: 'tunChoice', message: 'Public URL source:', choices: [
+      { name: '  I already have a named Cloudflare tunnel configured', value: 'named' },
+      { name: '  Use cloudflared quick tunnel (ephemeral *.trycloudflare.com URL — for testing)', value: 'quick' },
+      { name: '  I\'ll enter a custom URL (ngrok, own domain, etc.)', value: 'custom' },
+      { name: '  Skip (buyers won\'t be able to reach the dispatcher)', value: 'skip' },
+    ]}]);
+
+    if (tunChoice === 'named') {
+      const { tunName } = await promptWithEsc(inquirer, [{ type: 'input', name: 'tunName', message: 'Tunnel hostname (e.g. myagent.example.com):' }]);
+      if (tunName) publicUrl = tunName.startsWith('http') ? tunName : `https://${tunName}`;
+      console.log(`\n  Make sure this tunnel is actually pointed at port 9841. Commands for reference:`);
+      console.log(`    cloudflared tunnel route dns <tunnel-name> ${(publicUrl || '').replace(/^https?:\/\//, '')}`);
+      console.log(`    cloudflared tunnel run <tunnel-name>\n`);
+    } else if (tunChoice === 'quick') {
+      console.log('\n  Quick tunnels hand out a random *.trycloudflare.com URL and exit when you kill the process.');
+      console.log('  Run this in a separate terminal AFTER the dispatcher starts:');
+      console.log(`    cloudflared tunnel --url http://localhost:9841\n`);
+      const { tunUrl } = await promptWithEsc(inquirer, [{ type: 'input', name: 'tunUrl', message: 'Paste the *.trycloudflare.com URL it prints (or skip to fill in later):' }]);
+      if (tunUrl) publicUrl = tunUrl.startsWith('http') ? tunUrl : `https://${tunUrl}`;
+    } else if (tunChoice === 'custom') {
+      const { customUrl } = await promptWithEsc(inquirer, [{ type: 'input', name: 'customUrl', message: 'Your public URL (e.g. https://myagent.example.com):' }]);
+      publicUrl = customUrl;
+    }
+  } else {
+    console.log('  cloudflared not detected on this machine.');
+    console.log('    • Install: https://pkg.cloudflare.com/ (apt/yum) or `brew install cloudflared`');
+    console.log('    • Alternatives: ngrok, frp, self-hosted reverse proxy\n');
+    const { customUrl } = await promptWithEsc(inquirer, [{ type: 'input', name: 'customUrl', message: 'Your public URL (leave blank to skip):', default: '' }]);
+    publicUrl = customUrl;
+  }
 
   if (!publicUrl) {
     console.log('\n  ⚠ No public URL — buyers won\'t be able to reach your dispatcher.');
-    console.log('  Options:');
-    console.log('    • Set up a Cloudflare Tunnel: cloudflared tunnel create myagent');
-    console.log('    • Use ngrok: ngrok http 9841');
-    console.log('    • Point a domain A record to this machine\'s public IP\n');
     const { cont } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'cont', message: 'Continue without public URL?', default: false }]);
     if (!cont) return;
   }
