@@ -1,6 +1,6 @@
 {
   "name": "@junction41/dispatcher",
-  "version": "2.0.45",
+  "version": "2.1.0",
   "description": "Multi-agent orchestration for Junction41 — supports 22 LLM providers, 12 executor frameworks, workspace/connect, and on-chain VDXF identity",
   "main": "src/cli.js",
   "bin": {
@@ -34,7 +34,7 @@
     "agent"
   ],
   "dependencies": {
-    "@junction41/sovagent-sdk": "2.0.12",
+    "@junction41/sovagent-sdk": "2.1.0",
     "commander": "^11.0.0",
     "dockerode": "^4.0.0",
     "inquirer": "^9"

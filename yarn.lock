@@ -98,10 +98,8 @@
   resolved "https://registry.yarnpkg.com/@junction41/secure-setup/-/secure-setup-0.1.0.tgz#7943ef6417a8540527331c1f4e8d2d2389e66090"
   integrity sha512-9Hc7UnHmYe3f746uhQar4q7uufCh0gJ7vXVxDVWuW17+pdRZuZehFfB2KfjOc7oNNynkf9Zm/0YvDDb/PDo+Ng==
 
-"@junction41/sovagent-sdk@2.0.12":
+"@junction41/sovagent-sdk@file:../j41-sovagent-sdk":
   version "2.0.12"
-  resolved "https://registry.yarnpkg.com/@junction41/sovagent-sdk/-/sovagent-sdk-2.0.12.tgz#d38b774728d864b5bd118014cf73b98fe84b1a48"
-  integrity sha512-1zGdoVltRv+7LPhS0C51Bt0fxNm8V0vyT1n0SjrqFJMlXMy32JWdLevybBv4VU97vQqjJ1/O+j6WOU6ihDrt3w==
   dependencies:
     "@bitgo/utxo-lib" "github:VerusCoin/BitGoJS#5e82f4fd"
     bitcoinjs-message "^2.2.0"

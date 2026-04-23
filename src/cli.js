@@ -3294,6 +3294,7 @@ program
       });
       if (apiAgents.length > 0) {
         const { mintAccessEnvelope, verifyAccessRequest } = require('@junction41/sovagent-sdk/dist/crypto/envelope.js');
+        const { validateEnvelope, canonicalBytes, verifyCanonicalSignatures, CanonicalError } = require('@junction41/sovagent-sdk/dist/crypto/canonical.js');
         const { mintApiKey } = require('./api-key-manager');
 
         const agentConfigs = new Map();
@@ -3331,7 +3332,48 @@ program
 
         proxyContext = {
           agentConfigs,
-          onAccessRequest: async (accessRequest) => {
+          onAccessRequest: async (wireBody) => {
+            // Detect v2 canonical envelope vs v1 pipe-format AccessRequest.
+            // Rule per backend spec (§Dispatch rule): v2 iff body.envelope is object AND body.signatures is array.
+            const isV2 = wireBody && typeof wireBody.envelope === 'object' && Array.isArray(wireBody.signatures);
+
+            let accessRequest; // normalized to v1-like shape for downstream use
+            let canonicalMessage = null; // bytes that were signed (v2 only)
+            let signaturesV2 = null;
+
+            if (isV2) {
+              const { envelope, signatures } = wireBody;
+              if (signatures.length === 0) throw new Error('signatures array must be non-empty');
+
+              // Validate structure (steps 3–10 of backend verifier flow).
+              try { validateEnvelope(envelope); }
+              catch (e) {
+                if (e instanceof CanonicalError) throw new Error(`Canonical validation failed: ${e.code} ${e.message}`);
+                throw e;
+              }
+
+              if (envelope.action !== 'request-access') {
+                throw new Error(`Wrong action for /j41/discovery/request-access: got "${envelope.action}"`);
+              }
+
+              canonicalMessage = canonicalBytes(envelope).toString('utf8');
+              signaturesV2 = signatures;
+
+              // Normalize to v1-like shape so downstream code (mintAccessEnvelope, meter, etc.) stays unchanged.
+              accessRequest = {
+                buyerVerusId: envelope.buyer.iaddress,
+                sellerVerusId: envelope.seller.iaddress,
+                ephemeralPubKey: envelope.payload.ephemeralPubKey,
+                nonce: envelope.nonce,
+                timestamp: Math.floor(Date.parse(envelope.issuedAt) / 1000),
+                signature: signatures[0], // kept for compatibility; verify path uses signaturesV2 below
+              };
+              console.log(`[Discovery] Received v2 canonical envelope from ${accessRequest.buyerVerusId}`);
+            } else {
+              accessRequest = wireBody;
+              console.log(`[Discovery] Received v1 pipe-format envelope from ${accessRequest.buyerVerusId}`);
+            }
+
             // Find which agent the request is for
             const sellerAgent = state.agents.find(a =>
               a.iAddress === accessRequest.sellerVerusId || a.identity === accessRequest.sellerVerusId
@@ -3340,13 +3382,21 @@ program
             const cfg = agentConfigs.get(sellerAgent.id);
             if (!cfg) throw new Error('Seller has no api-endpoint service');
 
-            // Verify buyer's signature via J41 platform (resolve R-address, check sig)
+            // Verify buyer's signature. v1 uses SDK's verifyAccessRequest (pipe-format message).
+            // v2 verifies the canonical bytes against every signature in the array; passes when at least one is valid
+            // (multisig threshold is enforced by the backend; dispatcher just needs ONE valid sig to trust the envelope).
             // Fail-closed by default. Set J41_SKIP_SIG_VERIFY=1 to bypass in dev.
             try {
               const agent = await getAgentSession(state, sellerAgent);
-              const verified = await verifyAccessRequest(accessRequest, agent._client || agent.client, J41_NETWORK);
+              const client = agent._client || agent.client;
+              let verified = false;
+              if (isV2) {
+                verified = await verifyCanonicalSignatures(wireBody.envelope, signaturesV2, client, J41_NETWORK);
+              } else {
+                verified = await verifyAccessRequest(accessRequest, client, J41_NETWORK);
+              }
               if (!verified) throw new Error('Buyer signature verification failed');
-              console.log(`[Discovery] Buyer signature verified: ${accessRequest.buyerVerusId}`);
+              console.log(`[Discovery] Buyer signature verified (${isV2 ? 'v2-canonical' : 'v1-pipe'}): ${accessRequest.buyerVerusId}`);
             } catch (e) {
               console.error(`[Discovery] Verification error: ${e.message}`);
               if (process.env.J41_SKIP_SIG_VERIFY !== '1') {
@@ -3403,6 +3453,27 @@ program
         const { startHealthPoller } = require('./upstream-health');
         startHealthPoller(agentConfigs);
         console.log(`  Upstream health: polling every 60s`);
+
+        // Backend feature-flag check (soft-required: signing.canonical-v1).
+        // Matches the rollout pattern from auth.rpc-unavailable-code. Warn at startup if backend
+        // hasn't yet advertised canonical-v1; dispatcher still accepts v1 and continues.
+        try {
+          const { checkRequiredFeatures } = require('@junction41/sovagent-sdk/dist/backend-features.js');
+          const operatorIaddress = apiAgents[0]?.iAddress || null;
+          checkRequiredFeatures({
+            apiUrl: J41_API_URL,
+            softRequired: ['signing.canonical-v1'],
+            operatorIAddress: operatorIaddress,
+            dispatcherVersion: require('../package.json').version,
+          }).then(r => {
+            if (r.missing.softRequired.length === 0) {
+              console.log(`  Backend features: ${r.missing.softRequired.length === 0 ? 'signing.canonical-v1 present ✓' : ''}`);
+            }
+            // emitFeatureWarning inside checkRequiredFeatures already logged to stderr for missing features
+          }).catch(() => { /* non-fatal */ });
+        } catch {
+          // backend-features helper not present on older SDK — skip silently
+        }
       }
 
       // Start webhook HTTP server (with proxy context if api-endpoint agents exist)
