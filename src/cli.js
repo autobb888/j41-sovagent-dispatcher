@@ -3106,10 +3106,23 @@ program
           const hasWorkspaceKey = !!id.contentmultimap[VK.workspace.capability] || !!id.contentmultimap[PK.workspace];
           // Merge on-chain services with platform services
           const services = platformServices.length > 0 ? platformServices : (decoded.services || []);
-          // Check if this agent has api-endpoint capabilities (on-chain type OR networkEndpoints set)
+          // Check if this agent has api-endpoint capabilities.
+          // Sources: (a) on-chain profile type, (b) on-chain networkEndpoints, (c) any platform
+          // service declared as serviceType='api-endpoint', (d) agent-config.json apiEndpointUrl.
+          // Any of these flips the agent into proxy mode — operators who fix one but not the
+          // others shouldn't silently lose proxy support.
           const agentType = decoded.profile?.type;
           const hasEndpoints = decoded.profile?.network?.endpoints?.length > 0;
-          if (agentType === 'api-provider' || hasEndpoints) {
+          const hasApiService = services.some(s => s.serviceType === 'api-endpoint');
+          let hasConfiguredUpstream = false;
+          try {
+            const agentCfgPath = path.join(AGENTS_DIR, agentInfo.id, 'agent-config.json');
+            if (fs.existsSync(agentCfgPath)) {
+              const agentCfg = JSON.parse(fs.readFileSync(agentCfgPath, 'utf8'));
+              hasConfiguredUpstream = !!(agentCfg.apiEndpointUrl || agentCfg.endpointUrl);
+            }
+          } catch {}
+          if (agentType === 'api-provider' || hasEndpoints || hasApiService || hasConfiguredUpstream) {
             const { VDXF_KEYS: VK2 } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
             const endpointsRaw = id.contentmultimap[VK2.agent.networkEndpoints];
             let onChainEndpoint = '';
@@ -3288,16 +3301,31 @@ program
           const cap = state.capabilities.get(a.id);
           const apiSvc = cap?.services?.find(s => s.serviceType === 'api-endpoint' || s.endpointUrl || s._isApiEndpoint);
           if (apiSvc) {
+            // Pull modelPricing/rateLimits/upstreamAuth from agent-config.json as fallback when
+            // the platform service is missing them (old services registered before Bug 1 fix, or
+            // operators using local-only config without platform registration).
+            let localCfg = {};
+            try {
+              const localCfgPath = path.join(AGENTS_DIR, a.id, 'agent-config.json');
+              if (fs.existsSync(localCfgPath)) localCfg = JSON.parse(fs.readFileSync(localCfgPath, 'utf8'));
+            } catch {}
+            const modelPricing = (Array.isArray(apiSvc.modelPricing) && apiSvc.modelPricing.length)
+              ? apiSvc.modelPricing
+              : (localCfg.modelPricing || []);
+            const rateLimits = (apiSvc.rateLimits && Object.keys(apiSvc.rateLimits).length)
+              ? apiSvc.rateLimits
+              : (localCfg.rateLimits || {});
+            const upstreamAuth = apiSvc.upstreamAuth || localCfg.apiEndpointAuth || '';
             agentConfigs.set(a.id, {
               endpointUrl: apiSvc.endpointUrl,
-              modelPricing: apiSvc.modelPricing || [],
-              rateLimits: apiSvc.rateLimits || {},
+              modelPricing,
+              rateLimits,
               identity: a.identity,
               iAddress: a.iAddress,
               payAddress: a.iAddress || a.address,
-              upstreamAuth: apiSvc.upstreamAuth || '',
+              upstreamAuth,
             });
-            console.log(`  API Proxy: ${a.id} (${a.identity}) → ${apiSvc.endpointUrl}`);
+            console.log(`  API Proxy: ${a.id} (${a.identity}) → ${apiSvc.endpointUrl} (${modelPricing.length} model(s) priced)`);
           }
         }
 

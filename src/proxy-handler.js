@@ -121,6 +121,19 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   const model = parsedBody.model || '';
   const isStreaming = parsedBody.stream === true;
 
+  // Reject unpriced models up front. calculateCost returns 0 for unknown models, which would
+  // let requests through for free — the seller explicitly declared which models they serve by
+  // pricing them, so anything not in that list is an unsupported model.
+  const priced = (config.modelPricing || []).map(p => p.model);
+  if (!priced.includes(model)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      error: `Model '${model}' is not offered by this seller`,
+      supportedModels: priced,
+    }));
+    return;
+  }
+
   // Reserve credit atomically (deducts upfront, adjusted after response)
   const estimatedInput = 4000;
   const estimatedOutput = 2000;
