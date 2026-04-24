@@ -3382,11 +3382,11 @@ program
             const cfg = agentConfigs.get(sellerAgent.id);
             if (!cfg) throw new Error('Seller has no api-endpoint service');
 
-            // Verify buyer's signature.
+            // Verify buyer's signature. Fail-closed — no escape hatch.
             //
             // v1 (pipe-format): the buyer signs with their R-address, which is embedded
             //   in the AccessRequest itself — dispatcher verifies locally via bitcoinjs-message.
-            //   No external resolver needed. Fail-closed.
+            //   No external resolver needed.
             //
             // v2 (canonical): the buyer signs over JCS-canonical bytes, identified only by
             //   i-address. J41 backend verified the signature against verusd's getidentity +
@@ -3395,36 +3395,25 @@ program
             //   to primary R-addresses, so we can't re-verify independently. Operators who
             //   want independent verification (e.g. once J41 exposes primary addresses on
             //   GET /v1/agents/:id) can set J41_REQUIRE_LOCAL_V2_VERIFY=1.
-            //
-            // J41_SKIP_SIG_VERIFY=1 is a dev-only escape hatch that bypasses BOTH paths.
-            try {
-              const agent = await getAgentSession(state, sellerAgent);
-              const client = agent._client || agent.client;
+            const sessionAgent = await getAgentSession(state, sellerAgent);
+            const client = sessionAgent._client || sessionAgent.client;
 
-              if (isV2) {
-                const requireLocalV2 = process.env.J41_REQUIRE_LOCAL_V2_VERIFY === '1';
-                if (requireLocalV2) {
-                  const verified = await verifyCanonicalSignatures(wireBody.envelope, signaturesV2, client, J41_NETWORK);
-                  if (!verified) throw new Error('Buyer signature verification failed (v2 local)');
-                  console.log(`[Discovery] Buyer signature verified (v2 local): ${accessRequest.buyerVerusId}`);
-                } else {
-                  // Trust J41's upstream verification. Envelope was already canonical-validated
-                  // (structure/size/windows/nonce) by validateEnvelope() above — signature is the
-                  // only thing we're relying on J41 for.
-                  console.log(`[Discovery] v2 envelope accepted under J41-forwarded trust: ${accessRequest.buyerVerusId}`);
-                }
+            if (isV2) {
+              if (process.env.J41_REQUIRE_LOCAL_V2_VERIFY === '1') {
+                const verified = await verifyCanonicalSignatures(wireBody.envelope, signaturesV2, client, J41_NETWORK);
+                if (!verified) throw new Error('Buyer signature verification failed (v2 local)');
+                console.log(`[Discovery] Buyer signature verified (v2 local): ${accessRequest.buyerVerusId}`);
               } else {
-                // v1 always verifies locally — buyer's R-address is in the request.
-                const verified = await verifyAccessRequest(accessRequest, client, J41_NETWORK);
-                if (!verified) throw new Error('Buyer signature verification failed (v1)');
-                console.log(`[Discovery] Buyer signature verified (v1): ${accessRequest.buyerVerusId}`);
+                // Trust J41's upstream verification. Envelope was already canonical-validated
+                // (structure/size/windows/nonce) by validateEnvelope() above — signature is the
+                // only thing we're relying on J41 for.
+                console.log(`[Discovery] v2 envelope accepted under J41-forwarded trust: ${accessRequest.buyerVerusId}`);
               }
-            } catch (e) {
-              console.error(`[Discovery] Verification error: ${e.message}`);
-              if (process.env.J41_SKIP_SIG_VERIFY !== '1') {
-                throw new Error('Signature verification required — cannot mint key');
-              }
-              console.warn('[Discovery] ⚠️  Skipping verification (J41_SKIP_SIG_VERIFY=1 — dev only, do NOT use in production)');
+            } else {
+              // v1 always verifies locally — buyer's R-address is in the request.
+              const verified = await verifyAccessRequest(accessRequest, client, J41_NETWORK);
+              if (!verified) throw new Error('Buyer signature verification failed (v1)');
+              console.log(`[Discovery] Buyer signature verified (v1): ${accessRequest.buyerVerusId}`);
             }
 
             // Mint API key
