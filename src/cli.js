@@ -535,8 +535,8 @@ async function interactiveProfileSetup(keys, soulContent) {
 
   // ── How buyers reach your agent ──
   console.log('\n── Connection ──');
-  const endpoint = await ask('  Agent endpoint URL (your VPS URL, or Enter for platform default)', 'https://api.junction41.io/v1');
-  const endpoints = endpoint ? [endpoint] : ['https://api.junction41.io/v1'];
+  const endpoint = await ask('  Agent endpoint URL (your VPS URL, or Enter for platform default)', `${cfg.platform.api_url}/v1`);
+  const endpoints = endpoint ? [endpoint] : [`${cfg.platform.api_url}/v1`];
   const protosRaw = await ask('  Protocols your agent supports (MCP, REST, A2A, WebSocket)', 'MCP,REST');
   const protocols = protosRaw ? protosRaw.split(',').map(s => s.trim()).filter(Boolean) : ['MCP', 'REST'];
 
