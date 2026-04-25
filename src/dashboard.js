@@ -14,7 +14,9 @@ const J41_DIR = path.join(os.homedir(), '.j41');
 const DISPATCHER_DIR = path.join(J41_DIR, 'dispatcher');
 const AGENTS_DIR = path.join(DISPATCHER_DIR, 'agents');
 const CONFIG_FILE = path.join(DISPATCHER_DIR, 'config.json');
-const ENV_FILE = path.join(REPO_DIR, '.env');
+
+const { loadDispatcherConfig, saveDispatcherConfig } = require('./config-loader.js');
+function loadCfg() { return loadDispatcherConfig(); }
 
 // ── VDXF key → human name mapping ──
 const VDXF_KEY_NAMES = {
@@ -48,17 +50,6 @@ const VDXF_KEY_NAMES = {
 
 function loadConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { return {}; }
-}
-
-function loadEnv() {
-  const env = {};
-  try {
-    for (const line of fs.readFileSync(ENV_FILE, 'utf8').split('\n')) {
-      const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
-      if (m) env[m[1]] = m[2];
-    }
-  } catch {}
-  return env;
 }
 
 function getAgents() {
@@ -104,7 +95,7 @@ async function createAgent(keys) {
   console.log = () => {};
   try {
     const agent = new J41Agent({
-      apiUrl: process.env.J41_API_URL || loadEnv().J41_API_URL || 'https://api.junction41.io',
+      apiUrl: loadCfg().platform.api_url,
       wif: keys.wif,
       identityName: keys.identity,
       iAddress: keys.iAddress,
@@ -194,7 +185,7 @@ async function mainMenu(inquirer) {
   const agents = getAgents();
   const status = getDispatcherStatus();
   const config = loadConfig();
-  const env = loadEnv();
+  const cfg = loadCfg();
 
   console.clear();
   console.log('╔══════════════════════════════════════════════════╗');
@@ -203,8 +194,8 @@ async function mainMenu(inquirer) {
   console.log(`\n  Agents: ${agents.length} registered`);
   console.log(`  Dispatcher: ${status.running ? `running (PID ${status.pid})` : 'stopped'}`);
   console.log(`  Runtime: ${config.runtime || 'docker'}`);
-  console.log(`  Global LLM: ${env.J41_LLM_PROVIDER || '(not configured)'}`);
-  console.log(`  Executor: ${env.J41_EXECUTOR || 'local-llm'} (global default — per-agent overrides via [3])`);
+  console.log(`  Global LLM: ${cfg.llm.provider || '(not configured)'}`);
+  console.log(`  Executor: ${cfg.executor.type || 'local-llm'} (global default — per-agent overrides via [3])`);
   console.log('');
 
   const { choice } = await promptWithEsc(inquirer, [{
@@ -729,8 +720,8 @@ async function statusScreen(inquirer) {
 
   const status = getDispatcherStatus();
   const config = loadConfig();
-  const env = loadEnv();
-  const apiUrl = env.J41_API_URL || process.env.J41_API_URL || 'https://api.junction41.io';
+  const cfg = loadCfg();
+  const apiUrl = cfg.platform.api_url;
 
   // ── Section 1: Dispatcher ──
   const dispatcherVersion = (() => {
@@ -753,7 +744,7 @@ async function statusScreen(inquirer) {
   console.log(`  Version:    ${dispatcherVersion}  (SDK ${sdkVersion})`);
   console.log(`  Runtime:    ${config.runtime || 'docker'}`);
   console.log(`  Process:    ${status.running ? `\x1b[32mrunning\x1b[0m (PID ${status.pid}${uptime})` : '\x1b[2mnot running\x1b[0m'}`);
-  console.log(`  Mode:       ${env.J41_WEBHOOK_URL || process.env.J41_WEBHOOK_URL ? 'webhook' : 'poll'}`);
+  console.log(`  Mode:       ${cfg.runtime.webhook_url ? 'webhook' : 'poll'}`);
 
   // ── Section 2: Backend ──
   console.log(`\n  ── Backend ──`);
@@ -861,7 +852,7 @@ async function statusScreen(inquirer) {
   }
 
   // ── Section 6: Webhook / tunnel ──
-  const webhookUrl = env.J41_WEBHOOK_URL || process.env.J41_WEBHOOK_URL;
+  const webhookUrl = cfg.runtime.webhook_url;
   if (webhookUrl) {
     console.log(`\n  ── Webhook / tunnel ──`);
     console.log(`  Public URL: ${webhookUrl}`);
@@ -1616,7 +1607,7 @@ async function configureServicesScreen(inquirer) {
           rating,
           timestamp,
         };
-        const signature = signMessage(keys.wif, canonicalize(payload), process.env.J41_NETWORK || 'verustest');
+        const signature = signMessage(keys.wif, canonicalize(payload), loadCfg().platform.network);
 
         const agent = await createAgent(keys);
         try {
@@ -1700,7 +1691,7 @@ async function executorConfigScreen(inquirer) {
     ...agents.map(a => {
       const cfg = loadAgentConfig(a.id);
       const exec = cfg.executor || 'local-llm';
-      const prov = cfg.llmProvider || loadEnv().J41_LLM_PROVIDER || '(global default)';
+      const prov = cfg.llmProvider || loadCfg().llm.provider || '(global default)';
       const label = exec === 'local-llm' ? `${exec} → ${prov}` : exec;
       return { name: `  ${a.id.padEnd(10)} ${(a.identity || '').padEnd(28)} [${label}]`, value: a.id };
     }),
@@ -1728,7 +1719,7 @@ async function executorConfigScreen(inquirer) {
     if (hasKey) console.log(`    Auth:      ${hasKey.length > 12 ? '****' + hasKey.slice(-4) : '(set)'}`);
     console.log('');
   } else {
-    console.log('  No per-agent config — using global defaults from .env\n');
+    console.log('  No per-agent config — using global defaults from ~/.j41/dispatcher/config.toml\n');
   }
 
   // Select executor type
@@ -1746,7 +1737,7 @@ async function executorConfigScreen(inquirer) {
   if (executor === '__reset') {
     const configPath = path.join(AGENTS_DIR, agentId, 'agent-config.json');
     try { fs.unlinkSync(configPath); } catch {}
-    console.log('\n  ✅ Per-agent config removed. Agent will use global .env defaults.\n');
+    console.log('\n  ✅ Per-agent config removed. Agent will use global config.toml defaults.\n');
     await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
     return;
   }
@@ -2145,9 +2136,11 @@ async function llmScreen(inquirer) {
   console.clear();
   console.log(`\n  ═══ LLM Provider Configuration ═══\n`);
 
-  const env = loadEnv();
-  console.log(`  Current: ${env.J41_LLM_PROVIDER || '(not set)'}`);
-  console.log(`  API Key: ${env.KIMI_API_KEY ? '****' + env.KIMI_API_KEY.slice(-8) : '(not set)'}\n`);
+  const cfg = loadCfg();
+  const currentProvider = cfg.llm.provider || '';
+  const currentKey = (currentProvider && cfg.provider_keys[currentProvider]) || cfg.llm.api_key || '';
+  console.log(`  Current: ${currentProvider || '(not set)'}`);
+  console.log(`  API Key: ${currentKey ? '****' + currentKey.slice(-8) : '(not set)'}\n`);
 
   try {
     const { LLM_PRESETS } = require('./executors/local-llm.js');
@@ -2160,7 +2153,7 @@ async function llmScreen(inquirer) {
       choices: [
         ...providers.map(p => {
           const preset = LLM_PRESETS[p];
-          const current = env.J41_LLM_PROVIDER === p ? ' ◄ current' : '';
+          const current = currentProvider === p ? ' ◄ current' : '';
           return { name: `  ${p.padEnd(14)} ${(preset.model || '').padEnd(40)} ${preset.envKey || ''}${current}`, value: p };
         }),
         new inquirer.Separator(),
@@ -2171,7 +2164,7 @@ async function llmScreen(inquirer) {
     if (provider === '__back') return;
 
     const preset = LLM_PRESETS[provider];
-    let apiKey = env[preset.envKey] || '';
+    let apiKey = (cfg.provider_keys[provider]) || cfg.llm.api_key || '';
 
     if (preset.envKey && !apiKey) {
       const { key } = await promptWithEsc(inquirer, [{
@@ -2183,25 +2176,14 @@ async function llmScreen(inquirer) {
       apiKey = key;
     }
 
-    // Write to .env
-    let envContent = '';
-    try { envContent = fs.readFileSync(ENV_FILE, 'utf8'); } catch {}
-    // Update or add provider
-    if (envContent.includes('J41_LLM_PROVIDER=')) {
-      envContent = envContent.replace(/J41_LLM_PROVIDER=.*/, `J41_LLM_PROVIDER=${provider}`);
-    } else {
-      envContent += `\nJ41_LLM_PROVIDER=${provider}`;
-    }
-    // Update or add API key
+    // Persist provider + key to ~/.j41/dispatcher/config.toml
+    const partial = { llm: { provider } };
     if (preset.envKey && apiKey) {
-      if (envContent.includes(`${preset.envKey}=`)) {
-        envContent = envContent.replace(new RegExp(`${preset.envKey}=.*`), `${preset.envKey}=${apiKey}`);
-      } else {
-        envContent += `\n${preset.envKey}=${apiKey}`;
-      }
+      // preset.envKey is OPENAI_API_KEY etc.; map to provider_keys.<provider>
+      partial.provider_keys = { [provider]: apiKey };
     }
-    fs.writeFileSync(ENV_FILE, envContent.trim() + '\n');
-    console.log(`\n  ✅ Updated .env — provider: ${provider}`);
+    saveDispatcherConfig(partial);
+    console.log(`\n  ✅ Updated ~/.j41/dispatcher/config.toml — provider: ${provider}`);
     console.log(`  Restart dispatcher to apply.\n`);
   } catch (e) {
     console.log(`  Error: ${e.message}\n`);
@@ -2248,8 +2230,7 @@ async function batchActivateScreen(inquirer, activate) {
   // Run activate/deactivate per agent via CLI
   console.log('');
   const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
-  const env = loadEnv();
-  const apiUrl = env.J41_API_URL || process.env.J41_API_URL || 'https://api.junction41.io';
+  const apiUrl = loadCfg().platform.api_url;
   let succeeded = 0;
   let failed = 0;
 
