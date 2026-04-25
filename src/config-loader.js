@@ -125,7 +125,104 @@ function saveDispatcherConfig(partial) {
   return file;
 }
 
+// --- Migration helpers ---
+
+const ENV_TO_TOML = Object.fromEntries(ENV_OVERRIDES.map(([env, dotted, kind]) => [env, { dotted, kind }]));
+
+const PROVIDER_KEY_ENV_MAP = {
+  OPENAI_API_KEY: 'openai',
+  ANTHROPIC_API_KEY: 'anthropic',
+  GOOGLE_API_KEY: 'google',
+  XAI_API_KEY: 'xai',
+  GROQ_API_KEY: 'groq',
+  DEEPSEEK_API_KEY: 'deepseek',
+  MISTRAL_API_KEY: 'mistral',
+  TOGETHER_API_KEY: 'together',
+  FIREWORKS_API_KEY: 'fireworks',
+  NVIDIA_API_KEY: 'nvidia',
+  COHERE_API_KEY: 'cohere',
+  PERPLEXITY_API_KEY: 'perplexity',
+  OPENROUTER_API_KEY: 'openrouter',
+  KIMI_API_KEY: 'kimi',
+};
+
+const MIGRATION_BANNER = [
+  '# MIGRATED — values from this file have been moved to:',
+  '#   ~/.j41/dispatcher/config.toml',
+  '# This file is no longer read by the dispatcher and is safe to delete',
+  '# after verifying config.toml has the expected values.',
+  '#',
+].join('\n');
+
+function parseDotEnv(text) {
+  const out = {};
+  for (const line of text.split('\n')) {
+    if (!line || line.trim().startsWith('#')) continue;
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+    if (m) out[m[1]] = m[2].replace(/^["'](.*)["']$/, '$1');
+  }
+  return out;
+}
+
+// Like deepMerge, but `over` only writes keys that aren't already present
+// (or are empty string) in `base`. Used so an existing config.toml wins.
+function mergeMissingOnly(base, over) {
+  const out = deepClone(base);
+  for (const [k, v] of Object.entries(over || {})) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      out[k] = mergeMissingOnly(out[k] && typeof out[k] === 'object' ? out[k] : {}, v);
+    } else if (out[k] === undefined || out[k] === '' || out[k] === null) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+function migrateLegacyEnv(opts = {}) {
+  const envFile = opts.envFile || path.resolve(__dirname, '..', '.env');
+  if (!fs.existsSync(envFile)) return { migrated: false, reason: 'no-env-file' };
+  const text = fs.readFileSync(envFile, 'utf8');
+  if (text.startsWith('# MIGRATED')) return { migrated: false, reason: 'already-migrated' };
+
+  // Build the partial from .env contents
+  const parsed = parseDotEnv(text);
+  const partial = {};
+  for (const [envName, val] of Object.entries(parsed)) {
+    if (!val) continue;
+    const map = ENV_TO_TOML[envName];
+    if (map) {
+      let v = val;
+      if (map.kind === 'int') v = parseInt(val);
+      else if (map.kind === 'bool1') v = val === '1' || val === 'true';
+      setPath(partial, map.dotted, v);
+    } else if (PROVIDER_KEY_ENV_MAP[envName]) {
+      setPath(partial, `provider_keys.${PROVIDER_KEY_ENV_MAP[envName]}`, val);
+    }
+  }
+  if (Object.keys(partial).length === 0) {
+    fs.writeFileSync(envFile, MIGRATION_BANNER + '\n' + text);
+    return { migrated: false, reason: 'no-recognized-keys' };
+  }
+
+  // If config.toml already exists, merge — but only fill gaps; don't overwrite
+  // values the operator has already set in the new file.
+  let existing = {};
+  try { existing = TOML.parse(fs.readFileSync(CONFIG_FILE(), 'utf8')); } catch {}
+  const merged = mergeMissingOnly(existing, partial);
+  saveDispatcherConfig(merged);
+  fs.writeFileSync(envFile, MIGRATION_BANNER + '\n' + text);
+  return { migrated: true, target: CONFIG_FILE() };
+}
+
+let migrationAttempted = false;
+
+function _resetMigrationState() { migrationAttempted = false; }
+
 function loadDispatcherConfig(opts = {}) {
+  if (!opts.skipMigration && !migrationAttempted) {
+    migrationAttempted = true;
+    try { migrateLegacyEnv({ envFile: opts.legacyEnvFile }); } catch {}
+  }
   const file = CONFIG_FILE();
   let onDisk = {};
   try { onDisk = TOML.parse(fs.readFileSync(file, 'utf8')); } catch {}
@@ -133,4 +230,4 @@ function loadDispatcherConfig(opts = {}) {
   return applyEnvOverrides(merged);
 }
 
-module.exports = { loadDispatcherConfig, saveDispatcherConfig, CONFIG_FILE };
+module.exports = { loadDispatcherConfig, saveDispatcherConfig, migrateLegacyEnv, CONFIG_FILE, _resetMigrationState };
