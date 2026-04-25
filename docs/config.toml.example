@@ -53,5 +53,23 @@ perplexity = ""
 openrouter = ""
 kimi = ""
 
+[proxy]
+upstream_timeout_ms = 60000     # raise to 300000 for long local-LLM queries
+estimated_input_tokens = 4000   # fallback when token counter not available
+estimated_output_tokens = 2000  # fallback when no max_tokens in request body
+suggested_topup_vrsc = 10       # X-J41-Credit-SuggestedTopup header default
+
+[deposit]
+poll_interval_ms = 60000        # how often to scan for new VRSC deposits
+
+[health]
+poll_interval_ms = 60000        # how often upstream-health pings each agent's upstream
+
+[webhook]
+max_body_bytes = 1048576        # 1 MiB inbound body cap
+
+[retry]
+rate_limit_backoff_multiplier = 3   # multiplier on baseDelayMs for HTTP 429 responses
+
 [debug]
 chat = false                # enables [chat] event log when true (privacy-sensitive)
