@@ -11,6 +11,7 @@ const dns = require('dns').promises;
 const net = require('net');
 const { findKeyOwner, recordUsage } = require('./api-key-manager');
 const { reserveCredit, adjustCredit, refundReservation } = require('./credit-meter');
+const { loadDispatcherConfig } = require('./config-loader.js');
 
 function isPrivateIp(ip) {
   if (!ip) return false;
@@ -38,7 +39,7 @@ function isPrivateIp(ip) {
 }
 
 async function checkUpstreamHostSafe(hostname) {
-  if (process.env.J41_ALLOW_LOCAL_UPSTREAM === '1') return { safe: true };
+  if (loadDispatcherConfig().runtime.allow_local_upstream) return { safe: true };
   const lc = hostname.toLowerCase();
   if (lc === 'localhost' || lc.endsWith('.localhost') || lc.endsWith('.local') || lc.endsWith('.internal')) {
     return { safe: false, reason: `hostname "${hostname}" is a local/internal name` };

@@ -19,6 +19,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { creditDeposit } = require('./credit-meter');
+const { loadDispatcherConfig } = require('./config-loader.js');
 
 const AGENTS_DIR = path.join(os.homedir(), '.j41', 'dispatcher', 'agents');
 
@@ -231,7 +232,7 @@ function startDepositPoller(state, getAgentSession) {
  * @param network - 'verus' or 'verustest'
  */
 async function notifyJ41DepositConfirmed(sellerWif, sellerVerusId, buyerVerusId, amount, txid, network) {
-  const J41_API_URL = process.env.J41_API_URL || 'https://api.junction41.io';
+  const J41_API_URL = loadDispatcherConfig().platform.api_url;
   try {
     const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
     const canonicalize = require('json-canonicalize');

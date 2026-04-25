@@ -74,7 +74,8 @@ function startControlServer(state, handlers) {
 
   // HTTP health check on port 9842 (for Docker/k8s/monitoring)
   const http = require('http');
-  const healthPort = parseInt(process.env.J41_HEALTH_PORT || '9842');
+  const { loadDispatcherConfig } = require('./config-loader.js');
+  const healthPort = loadDispatcherConfig().runtime.health_port;
   const healthServer = http.createServer((req, res) => {
     if (req.url === '/health' || req.url === '/') {
       const uptimeMs = Date.now() - startedAt;

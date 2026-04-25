@@ -10,8 +10,10 @@
  * Default is human-readable text format.
  */
 
-const LOG_LEVEL = (process.env.J41_LOG_LEVEL || 'info').toLowerCase();
-const LOG_FORMAT = (process.env.J41_LOG_FORMAT || 'text').toLowerCase();
+const { loadDispatcherConfig } = require('./config-loader.js');
+const _cfg = loadDispatcherConfig();
+const LOG_LEVEL = _cfg.logging.level.toLowerCase();
+const LOG_FORMAT = _cfg.logging.format.toLowerCase();
 
 const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
 const currentLevel = LEVELS[LOG_LEVEL] ?? 1;
