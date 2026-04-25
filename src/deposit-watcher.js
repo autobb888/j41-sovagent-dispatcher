@@ -199,7 +199,7 @@ async function pollPendingDeposits(agentId, client) {
  * @returns Timer ID (for cleanup)
  */
 function startDepositPoller(state, getAgentSession) {
-  const POLL_INTERVAL = 60000; // 60 seconds
+  const POLL_INTERVAL = loadDispatcherConfig().deposit.poll_interval_ms;
 
   const timer = setInterval(async () => {
     for (const agentInfo of state.agents) {
