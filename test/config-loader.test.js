@@ -109,3 +109,53 @@ test('migrateLegacyEnv merges into existing config.toml without overwriting', wi
   assert.strictEqual(cfg.provider_keys.openai, 'sk-from-env');
   fs.rmSync(fakeRepoDir, { recursive: true, force: true });
 }));
+
+test('loadDispatcherConfig caches within TTL; saveDispatcherConfig invalidates', withTmpHome(async () => {
+  const { loadDispatcherConfig, saveDispatcherConfig, invalidateConfigCache, _resetMigrationState } = require('../src/config-loader.js');
+  _resetMigrationState();
+  invalidateConfigCache();
+  // First (no-opts) load primes the cache
+  const a = loadDispatcherConfig();
+  // Mutate disk directly behind the cache's back; cached load should NOT see it
+  saveDispatcherConfig({ platform: { network: 'verus' } });
+  // saveDispatcherConfig invalidated the cache, so next load reflects the write
+  const b = loadDispatcherConfig();
+  assert.strictEqual(b.platform.network, 'verus');
+  // A second immediate load should be cache-served (same reference)
+  const c = loadDispatcherConfig();
+  assert.strictEqual(c, b, 'second call within TTL returns cached object');
+  // Initial load returned defaults, post-save load reflects the change
+  assert.strictEqual(a.platform.network, 'verustest');
+}));
+
+test('opts-bearing loadDispatcherConfig bypasses cache', withTmpHome(async () => {
+  const { loadDispatcherConfig, saveDispatcherConfig, invalidateConfigCache, _resetMigrationState } = require('../src/config-loader.js');
+  _resetMigrationState();
+  invalidateConfigCache();
+  saveDispatcherConfig({ platform: { network: 'verus' } });
+  // No-opts call populates cache
+  const cached = loadDispatcherConfig();
+  assert.strictEqual(cached.platform.network, 'verus');
+  // skipMigration:true is opts → bypass cache; verify it still reads disk fresh
+  const fresh = loadDispatcherConfig({ skipMigration: true });
+  assert.strictEqual(fresh.platform.network, 'verus');
+  // Different object (not cache-served)
+  assert.notStrictEqual(fresh, cached);
+}));
+
+test('saveDispatcherConfig recovers from a stale lock file', withTmpHome(async () => {
+  const { saveDispatcherConfig, CONFIG_FILE, _resetMigrationState } = require('../src/config-loader.js');
+  _resetMigrationState();
+  const dir = path.dirname(CONFIG_FILE());
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const lockFile = CONFIG_FILE() + '.lock';
+  fs.writeFileSync(lockFile, '99999');
+  // Backdate it 60s so stale-lock cleanup fires
+  const past = (Date.now() / 1000) - 60;
+  fs.utimesSync(lockFile, past, past);
+  // Should succeed (clears stale lock, takes lock, writes, releases)
+  const result = saveDispatcherConfig({ platform: { network: 'verus' } });
+  assert.ok(result.endsWith('config.toml'));
+  // Lock file is gone after the write
+  assert.strictEqual(fs.existsSync(lockFile), false);
+}));

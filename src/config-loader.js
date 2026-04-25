@@ -69,6 +69,11 @@ const ENV_OVERRIDES = [
   ['J41_LLM_MODEL',          'llm.model',                'string'],
   ['J41_LLM_BASE_URL',       'llm.base_url',             'string'],
   ['J41_LLM_API_KEY',        'llm.api_key',              'string'],
+  // J41_DEBUG_CHAT has a dual-read pattern by design: the dispatcher reads
+  // it via cfg.debug.chat (here) to decide whether to inject J41_DEBUG_CHAT=1
+  // into job containers (see buildContainerEnv in cli.js); job-agent.js then
+  // reads process.env.J41_DEBUG_CHAT directly inside the container, since
+  // process.env is the only Docker→process channel. Both reads are correct.
   ['J41_DEBUG_CHAT',         'debug.chat',               'bool1'],
 ];
 
@@ -109,20 +114,72 @@ function stripDefaults(cur, defaults) {
   return out;
 }
 
+// Sync sleep using Atomics.wait — used in the file-lock retry loop.
+function sleepSync(ms) {
+  const buf = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(buf), 0, 0, ms);
+}
+
+// Advisory file lock around the read-modify-write cycle in saveDispatcherConfig.
+// Two simultaneous dashboards racing a write could otherwise produce a torn
+// merge (each reads the pre-write state, A's write lands, then B's write
+// overwrites with B's view that doesn't include A's changes). The lock makes
+// concurrent saves serial, so each one merges over the other's committed state.
+// Stale-lock detection (>30s old) protects against a writer that crashed mid-save.
+function withConfigLock(fn) {
+  const lockFile = CONFIG_FILE() + '.lock';
+  const dir = path.dirname(lockFile);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const STALE_MS = 30_000;
+  const TIMEOUT_MS = 10_000;
+  const start = Date.now();
+  let fd;
+  while (true) {
+    try {
+      fd = fs.openSync(lockFile, 'wx', 0o600);
+      break;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      // Stale lock cleanup
+      try {
+        const stat = fs.statSync(lockFile);
+        if (Date.now() - stat.mtimeMs > STALE_MS) {
+          try { fs.unlinkSync(lockFile); } catch {}
+          continue;
+        }
+      } catch {}
+      if (Date.now() - start > TIMEOUT_MS) {
+        throw new Error(`config.toml lock timeout after ${TIMEOUT_MS}ms (${lockFile})`);
+      }
+      sleepSync(50);
+    }
+  }
+  try {
+    try { fs.writeSync(fd, String(process.pid)); } catch {}
+    return fn();
+  } finally {
+    try { fs.closeSync(fd); } catch {}
+    try { fs.unlinkSync(lockFile); } catch {}
+  }
+}
+
 function saveDispatcherConfig(partial) {
   const file = CONFIG_FILE();
-  const dir = path.dirname(file);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  let existing = {};
-  try { existing = TOML.parse(fs.readFileSync(file, 'utf8')); } catch {}
-  const next = deepMerge(deepMerge(DEFAULTS, existing), partial);
-  // Strip default-equal keys to keep file readable:
-  const out = stripDefaults(next, DEFAULTS);
-  const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, TOML.stringify(out), { mode: 0o600 });
-  fs.renameSync(tmp, file);
-  try { fs.chmodSync(file, 0o600); } catch {}
-  return file;
+  return withConfigLock(() => {
+    const dir = path.dirname(file);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    let existing = {};
+    try { existing = TOML.parse(fs.readFileSync(file, 'utf8')); } catch {}
+    const next = deepMerge(deepMerge(DEFAULTS, existing), partial);
+    // Strip default-equal keys to keep file readable:
+    const out = stripDefaults(next, DEFAULTS);
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, TOML.stringify(out), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    try { fs.chmodSync(file, 0o600); } catch {}
+    invalidateConfigCache();
+    return file;
+  });
 }
 
 // --- Migration helpers ---
@@ -218,7 +275,23 @@ let migrationAttempted = false;
 
 function _resetMigrationState() { migrationAttempted = false; }
 
+// In-process cache for hot-path readers (proxy-handler runs this per-request).
+// 1s TTL is a deliberate compromise: short enough that an operator hand-editing
+// config.toml sees changes within a second, long enough that a heavy proxy
+// load isn't paying TOML-parse cost on every request. saveDispatcherConfig
+// invalidates the cache automatically so dashboard writes are visible
+// immediately. Tests pass opts to bypass cache entirely.
+const CACHE_TTL_MS = 1000;
+let _cachedConfig = null;
+let _cachedAt = 0;
+
+function invalidateConfigCache() { _cachedConfig = null; _cachedAt = 0; }
+
 function loadDispatcherConfig(opts = {}) {
+  const useCache = Object.keys(opts).length === 0;
+  if (useCache && _cachedConfig && (Date.now() - _cachedAt) < CACHE_TTL_MS) {
+    return _cachedConfig;
+  }
   if (!opts.skipMigration && !migrationAttempted) {
     migrationAttempted = true;
     try { migrateLegacyEnv({ envFile: opts.legacyEnvFile }); } catch {}
@@ -227,7 +300,12 @@ function loadDispatcherConfig(opts = {}) {
   let onDisk = {};
   try { onDisk = TOML.parse(fs.readFileSync(file, 'utf8')); } catch {}
   const merged = deepMerge(DEFAULTS, onDisk);
-  return applyEnvOverrides(merged);
+  const result = applyEnvOverrides(merged);
+  if (useCache) {
+    _cachedConfig = result;
+    _cachedAt = Date.now();
+  }
+  return result;
 }
 
-module.exports = { loadDispatcherConfig, saveDispatcherConfig, migrateLegacyEnv, CONFIG_FILE, _resetMigrationState };
+module.exports = { loadDispatcherConfig, saveDispatcherConfig, migrateLegacyEnv, invalidateConfigCache, CONFIG_FILE, _resetMigrationState };
