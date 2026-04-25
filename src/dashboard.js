@@ -725,34 +725,187 @@ async function jobsScreen(inquirer, keys) {
 
 async function statusScreen(inquirer) {
   console.clear();
-  console.log(`\n  ═══ Dispatcher Status ═══\n`);
+  console.log(`\n  ═══ Dispatcher Status & Health ═══\n`);
 
   const status = getDispatcherStatus();
   const config = loadConfig();
   const env = loadEnv();
+  const apiUrl = env.J41_API_URL || process.env.J41_API_URL || 'https://api.junction41.io';
 
-  console.log(`  Running:    ${status.running ? `yes (PID ${status.pid})` : 'no'}`);
+  // ── Section 1: Dispatcher ──
+  const dispatcherVersion = (() => {
+    try { return require(path.join(REPO_DIR, 'package.json')).version; } catch { return 'unknown'; }
+  })();
+  const sdkVersion = (() => {
+    try {
+      const sdkPkgPath = path.join(REPO_DIR, 'node_modules/@junction41/sovagent-sdk/package.json');
+      return JSON.parse(fs.readFileSync(sdkPkgPath, 'utf8')).version;
+    } catch { return 'unknown'; }
+  })();
+  let uptime = '';
+  if (status.running) {
+    try {
+      const etimes = require('child_process').execSync(`ps -p ${status.pid} -o etime= 2>/dev/null`, { encoding: 'utf8' }).trim();
+      uptime = etimes ? `, up ${etimes}` : '';
+    } catch {}
+  }
+  console.log(`  ── Dispatcher ──`);
+  console.log(`  Version:    ${dispatcherVersion}  (SDK ${sdkVersion})`);
   console.log(`  Runtime:    ${config.runtime || 'docker'}`);
-  console.log(`  LLM:        ${env.J41_LLM_PROVIDER || '(not set)'}`);
-  console.log(`  API:        ${env.J41_API_URL || 'https://api.junction41.io'}`);
+  console.log(`  Process:    ${status.running ? `\x1b[32mrunning\x1b[0m (PID ${status.pid}${uptime})` : '\x1b[2mnot running\x1b[0m'}`);
+  console.log(`  Mode:       ${env.J41_WEBHOOK_URL || process.env.J41_WEBHOOK_URL ? 'webhook' : 'poll'}`);
 
-  // Check Docker
+  // ── Section 2: Backend ──
+  console.log(`\n  ── Backend ──`);
+  console.log(`  URL:        ${apiUrl}`);
+  let backendVersion = null;
+  try {
+    const sdkPath = path.join(REPO_DIR, 'node_modules/@junction41/sovagent-sdk/dist/backend-features.js');
+    if (fs.existsSync(sdkPath)) {
+      const { fetchBackendVersion } = require(sdkPath);
+      backendVersion = await fetchBackendVersion(apiUrl);
+    }
+  } catch {}
+  if (backendVersion) {
+    console.log(`  Reachable:  \x1b[32myes\x1b[0m (commit ${backendVersion.commit})`);
+    const want = ['signing.canonical-v1', 'service.api-endpoint-fields', 'auth.rpc-unavailable-code', 'reviews.api-session', 'proxy.forward-access'];
+    for (const f of want) {
+      const present = backendVersion.features.includes(f);
+      console.log(`    ${present ? '\x1b[32m✓\x1b[0m' : '\x1b[33m⚠\x1b[0m'}  ${f}${present ? '' : '  (missing)'}`);
+    }
+  } else {
+    console.log(`  Reachable:  \x1b[31mno\x1b[0m  (could not fetch /v1/version)`);
+  }
+
+  // ── Section 3: Trust mode ──
+  console.log(`\n  ── Verification trust mode ──`);
+  const requireLocalV2 = process.env.J41_REQUIRE_LOCAL_V2_VERIFY === '1' || env.J41_REQUIRE_LOCAL_V2_VERIFY === '1';
+  if (requireLocalV2) {
+    console.log(`  v2 envelopes: \x1b[33mlocal verification required\x1b[0m  (J41_REQUIRE_LOCAL_V2_VERIFY=1)`);
+    console.log(`               needs J41 to expose primary R-addresses on GET /v1/agents/:id`);
+  } else {
+    console.log(`  v2 envelopes: trust J41-forwarded verification  (default)`);
+  }
+  console.log(`  v1 envelopes: always verified locally  (R-address embedded in request)`);
+
+  // ── Section 4: Agents ──
+  const agents = getAgents();
+  const registered = agents.filter(a => a.identity);
+  console.log(`\n  ── Agents ──`);
+  console.log(`  Registered: ${registered.length}  (total local: ${agents.length})`);
+
+  // Identify api-endpoint agents (config-side, since dispatcher may not be running)
+  const apiAgents = [];
+  for (const a of registered) {
+    const cfgPath = path.join(AGENTS_DIR, a.id, 'agent-config.json');
+    if (fs.existsSync(cfgPath)) {
+      try {
+        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+        if (cfg.apiEndpointUrl || cfg.endpointUrl) {
+          apiAgents.push({ ...a, _cfg: cfg });
+        }
+      } catch {}
+    }
+  }
+  console.log(`  api-endpoint configured (local): ${apiAgents.length}`);
+
+  // ── Section 5: API Proxy stats (only if any api-endpoint agents) ──
+  if (apiAgents.length > 0) {
+    console.log(`\n  ── API Proxy ──`);
+    let totalDeposited = 0, totalSpent = 0, totalActiveKeys = 0;
+    const live = status.running;
+    let getHealth = null;
+    if (live) {
+      try { getHealth = require(path.join(REPO_DIR, 'src/upstream-health.js')).getHealth; } catch {}
+    }
+    for (const a of apiAgents) {
+      const cfg = a._cfg;
+      const upstream = cfg.apiEndpointUrl || cfg.endpointUrl;
+      let healthTag = '';
+      if (live && getHealth) {
+        const h = getHealth(a.id);
+        if (h) {
+          const ageS = Math.round((Date.now() - h.lastCheck) / 1000);
+          healthTag = h.healthy
+            ? `  \x1b[32m[healthy ${ageS}s ago]\x1b[0m`
+            : `  \x1b[31m[DOWN — ${h.error || 'status ' + h.status}]\x1b[0m`;
+        } else {
+          healthTag = `  \x1b[2m[no health check yet]\x1b[0m`;
+        }
+      }
+      console.log(`  ${a.id}  (${a.identity})`);
+      console.log(`    Upstream:  ${upstream}${healthTag}`);
+      console.log(`    Models:    ${(cfg.modelPricing || []).map(m => m.model).join(', ') || '(none priced)'}`);
+
+      // Active API keys
+      try {
+        const keysPath = path.join(AGENTS_DIR, a.id, 'api-keys.json');
+        if (fs.existsSync(keysPath)) {
+          const data = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+          const active = (data.keys || []).filter(k => !k.revoked && new Date(k.expiresAt) > new Date());
+          totalActiveKeys += active.length;
+          console.log(`    API keys:  ${active.length} active`);
+        }
+      } catch {}
+
+      // Credit meter rollup
+      try {
+        const meterPath = path.join(AGENTS_DIR, a.id, 'credit-meters.json');
+        if (fs.existsSync(meterPath)) {
+          const data = JSON.parse(fs.readFileSync(meterPath, 'utf8'));
+          const buyers = Object.values(data.buyers || {});
+          const dep = buyers.reduce((n, b) => n + (b.totalDeposited || 0), 0);
+          const sp = buyers.reduce((n, b) => n + (b.totalSpent || 0), 0);
+          totalDeposited += dep;
+          totalSpent += sp;
+          console.log(`    Buyers:    ${buyers.length}  (deposited ${dep.toFixed(4)} VRSC, spent ${sp.toFixed(4)})`);
+        }
+      } catch {}
+    }
+    console.log(`  Total:    ${totalActiveKeys} active key(s), deposited ${totalDeposited.toFixed(4)}, spent ${totalSpent.toFixed(4)} VRSC`);
+  }
+
+  // ── Section 6: Webhook / tunnel ──
+  const webhookUrl = env.J41_WEBHOOK_URL || process.env.J41_WEBHOOK_URL;
+  if (webhookUrl) {
+    console.log(`\n  ── Webhook / tunnel ──`);
+    console.log(`  Public URL: ${webhookUrl}`);
+    if (status.running) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 5000);
+        const res = await fetch(`${webhookUrl.replace(/\/$/, '')}/j41/health`, { signal: controller.signal });
+        clearTimeout(timer);
+        if (res.ok) {
+          const b = await res.json();
+          console.log(`  Reachable:  \x1b[32myes\x1b[0m  (echoed version ${b.version}, agents ${b.agents}, proxy ${b.proxy ? 'on' : 'off'})`);
+        } else {
+          console.log(`  Reachable:  \x1b[31mno\x1b[0m  (HTTP ${res.status})`);
+        }
+      } catch (e) {
+        console.log(`  Reachable:  \x1b[31mno\x1b[0m  (${e.message})`);
+      }
+    } else {
+      console.log(`  Reachable:  \x1b[2m(dispatcher not running — start it to probe)\x1b[0m`);
+    }
+  }
+
+  // ── Section 7: Docker + Security (kept from previous version) ──
+  console.log(`\n  ── Runtime ──`);
   try {
     const docker = require('child_process').execSync('docker ps --filter name=j41-job --format "{{.Names}} {{.Status}}"', { encoding: 'utf8', timeout: 5000 }).trim();
     const containers = docker ? docker.split('\n') : [];
-    console.log(`\n  Active containers: ${containers.length}`);
+    console.log(`  Active containers: ${containers.length}`);
     for (const c of containers) console.log(`    ${c}`);
   } catch {
-    console.log(`\n  Docker: not available`);
+    console.log(`  Docker:     not available`);
   }
-
-  // Check security
   try {
     const secureSetup = require('@junction41/secure-setup');
     const isolation = await secureSetup.detectIsolation();
-    console.log(`\n  Security:   ${isolation.score}/10 (${isolation.mode})`);
+    console.log(`  Security:   ${isolation.score}/10 (${isolation.mode})`);
   } catch {
-    console.log(`\n  Security:   (secure-setup not available)`);
+    console.log(`  Security:   (secure-setup not available)`);
   }
 
   console.log('');
