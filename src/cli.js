@@ -6,22 +6,6 @@
  * Queue if at capacity. Default max concurrent from config (9) or env override.
  */
 
-// Auto-load .env from project root (before anything reads process.env)
-const _envPath = require('path').resolve(__dirname, '..', '.env');
-if (require('fs').existsSync(_envPath)) {
-  for (const line of require('fs').readFileSync(_envPath, 'utf8').split('\n')) {
-    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
-    if (m && !process.env[m[1]]) {
-      // Strip surrounding quotes (single or double) from values
-      let val = m[2];
-      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-        val = val.slice(1, -1);
-      }
-      process.env[m[1]] = val;
-    }
-  }
-}
-
 const { Command } = require('commander');
 const fs = require('fs');
 const path = require('path');
@@ -29,6 +13,8 @@ const os = require('os');
 const { spawn } = require('child_process');
 const { getRuntime, persistActiveJobs, loadActiveJobs, saveConfig, loadConfig } = require('./config');
 const log = require('./logger');
+const { loadDispatcherConfig } = require('./config-loader.js');
+const cfg = loadDispatcherConfig();
 
 const RUNTIME = getRuntime();
 
@@ -58,10 +44,12 @@ const JOBS_DIR = path.join(DISPATCHER_DIR, 'jobs');
 const SEEN_JOBS_PATH = path.join(DISPATCHER_DIR, 'seen-jobs.json');
 const FINALIZE_STATE_FILENAME = 'finalize-state.json';
 
-const J41_API_URL = process.env.J41_API_URL || 'https://api.junction41.io';
-const J41_NETWORK = process.env.J41_NETWORK || 'verustest';
+const J41_API_URL = cfg.platform.api_url;
+const J41_NETWORK = cfg.platform.network;
 const _cfg = loadConfig();
-const MAX_AGENTS = process.env.J41_MAX_CONCURRENT ? parseInt(process.env.J41_MAX_CONCURRENT) : (_cfg.maxConcurrent ? parseInt(_cfg.maxConcurrent) : Infinity);
+const MAX_AGENTS = cfg.runtime.max_concurrent > 0
+  ? cfg.runtime.max_concurrent
+  : (_cfg.maxConcurrent ? parseInt(_cfg.maxConcurrent) : Infinity);
 const JOB_TIMEOUT_MS = (_cfg.jobTimeoutMin || 60) * 60 * 1000;
 const MAX_RETRIES = 2;
 const SEEN_JOBS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -2852,11 +2840,11 @@ program
 
     const { J41Agent } = require('@junction41/sovagent-sdk');
     const agent = new J41Agent({
-      apiUrl: process.env.J41_API_URL || 'https://api.junction41.io',
+      apiUrl: cfg.platform.api_url,
       identityName: keys.identity,
       wif: keys.wif,
       iAddress: keys.iAddress,
-      network: process.env.J41_NETWORK || 'verustest',
+      network: cfg.platform.network,
     });
     try {
       await agent.authenticate();
@@ -2944,18 +2932,18 @@ program
     console.log(`Max concurrent: ${MAX_AGENTS === Infinity ? 'unlimited' : MAX_AGENTS}`);
     console.log(`Job timeout: ${JOB_TIMEOUT_MS / 60000} min`);
     if (RUNTIME === 'docker') {
-      console.log(`Keep containers: ${process.env.J41_KEEP_CONTAINERS === '1' ? 'ON (debug)' : 'OFF'}`);
+      console.log(`Keep containers: ${cfg.runtime.keep_containers ? 'ON (debug)' : 'OFF'}`);
     }
     console.log('Privacy: Deletion attestations\n');
 
     // H5: Validate executor URLs at startup (SSRF protection)
-    validateExecutorUrl(process.env.J41_EXECUTOR_URL, 'J41_EXECUTOR_URL');
-    validateExecutorUrl(process.env.J41_MCP_URL, 'J41_MCP_URL');
-    validateExecutorUrl(process.env.KIMI_BASE_URL, 'KIMI_BASE_URL');
+    validateExecutorUrl(cfg.executor.url, 'executor.url');
+    validateExecutorUrl(cfg.executor.mcp_url, 'executor.mcp_url');
+    validateExecutorUrl(cfg.llm.base_url, 'llm.base_url');
 
     // Check which agents are registered and ACTIVE on the platform
-    const enforceFinalize = process.env.J41_REQUIRE_FINALIZE === '1';
-    const skipStatusCheck = process.env.J41_SKIP_STATUS_CHECK === '1';
+    const enforceFinalize = cfg.runtime.require_finalize;
+    const skipStatusCheck = cfg.runtime.skip_status_check;
     const readyAgents = [];
     for (const agentId of agents) {
       const keys = loadAgentKeys(agentId);
@@ -4873,25 +4861,85 @@ async function checkPendingInbox(state) {
   }
 }
 
-// M7: Read per-agent executor config and return as env vars for container
-function getExecutorEnvVars(agentInfo) {
-  const envVars = [];
-  const agentDir = path.join(AGENTS_DIR, agentInfo.id);
-
-  // Try agent-config.json first, then fall back to keys.json
+// Load per-agent config (agent-config.json with fallback to executor fields in keys.json).
+// Returns {} if nothing is set. Used by both getExecutorEnvVars() and buildContainerEnv().
+function loadAgentConfig(agentId) {
+  const agentDir = path.join(AGENTS_DIR, agentId);
   let config = {};
   try {
     const configPath = path.join(agentDir, 'agent-config.json');
     if (fs.existsSync(configPath)) {
       config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
     } else {
-      // Fall back to executor fields in keys.json
       const keys = JSON.parse(fs.readFileSync(path.join(agentDir, 'keys.json'), 'utf8'));
       if (keys.executor) config = keys;
     }
   } catch {
-    // No config — use defaults
+    // No config — caller falls back to defaults
   }
+  return config;
+}
+
+// Build the env vars passed to a job container. Sources provider keys from
+// cfg.provider_keys (NOT process.env), so the dispatcher process can run
+// without provider keys in its own environment.
+function buildContainerEnv(job, agentInfo, agentCfg, canaryToken, jobDir, keysPath) {
+  const { LLM_PRESETS } = require('./executors/local-llm.js');
+  // Per-agent override > global cfg
+  const provider = (agentCfg && agentCfg.llmProvider) || cfg.llm.provider || '';
+  const preset = LLM_PRESETS[provider];
+  const baseUrl = (agentCfg && agentCfg.llmBaseUrl) || cfg.llm.base_url || (preset && preset.baseUrl) || '';
+  const model = (agentCfg && agentCfg.llmModel) || cfg.llm.model || (preset && preset.model) || '';
+  const apiKey =
+    (agentCfg && agentCfg.llmApiKey) ||
+    (provider && cfg.provider_keys[provider]) ||
+    cfg.llm.api_key ||
+    '';
+
+  const env = {
+    J41_API_URL: cfg.platform.api_url,
+    J41_NETWORK: cfg.platform.network,
+    J41_AGENT_ID: agentInfo.id,
+    J41_IDENTITY: agentInfo.identity,
+    J41_JOB_ID: job.id,
+    J41_JOB_DIR: jobDir,
+    J41_KEYS_FILE: keysPath,
+    J41_SOUL_FILE: path.join(path.dirname(keysPath), 'SOUL.md'),
+    J41_CANARY_TOKEN: canaryToken,
+    JOB_TIMEOUT_MS: String(JOB_TIMEOUT_MS),
+    J41_EXECUTOR: (agentCfg && agentCfg.executor) || cfg.executor.type,
+    J41_LLM_PROVIDER: provider,
+    J41_LLM_BASE_URL: baseUrl,
+    J41_LLM_MODEL: model,
+    J41_LLM_API_KEY: apiKey,
+  };
+
+  // Also populate the preset-specific env-key (e.g. OPENAI_API_KEY) for
+  // executors that look it up by preset.envKey rather than the generic name.
+  if (preset && preset.envKey && apiKey) {
+    env[preset.envKey] = apiKey;
+  }
+
+  // Per-job lifecycle from service config (not from cfg)
+  if (job.lifecycle?.idleTimeout) env.IDLE_TIMEOUT_MS = String(job.lifecycle.idleTimeout * 60000);
+  if (job.lifecycle?.pauseTTL) env.PAUSE_TTL_MS = String(job.lifecycle.pauseTTL * 60000);
+
+  // Optional MCP / executor-specific
+  if (cfg.executor.mcp_command) env.J41_MCP_COMMAND = cfg.executor.mcp_command;
+  if (cfg.executor.mcp_url)     env.J41_MCP_URL = cfg.executor.mcp_url;
+  if (cfg.executor.auth)        env.J41_EXECUTOR_AUTH = cfg.executor.auth;
+  if (cfg.executor.timeout_ms)  env.J41_EXECUTOR_TIMEOUT = String(cfg.executor.timeout_ms);
+  if (cfg.executor.url)         env.J41_EXECUTOR_URL = cfg.executor.url;
+
+  if (cfg.debug.chat) env.J41_DEBUG_CHAT = '1';
+
+  return env;
+}
+
+// M7: Read per-agent executor config and return as env vars for container
+function getExecutorEnvVars(agentInfo) {
+  const envVars = [];
+  const config = loadAgentConfig(agentInfo.id);
 
   if (config.executor) envVars.push(`J41_EXECUTOR=${config.executor}`);
   if (config.executorUrl) envVars.push(`J41_EXECUTOR_URL=${config.executorUrl}`);
@@ -5060,7 +5108,7 @@ async function startJobContainer(state, job, agentInfo) {
   }
 
   try {
-    const keepContainers = process.env.J41_KEEP_CONTAINERS === '1';
+    const keepContainers = cfg.runtime.keep_containers;
     const containerName = `j41-job-${job.id}`;
 
     // Remove stale container with same name (leftover from crash/restart)
@@ -5072,24 +5120,15 @@ async function startJobContainer(state, job, agentInfo) {
     const container = await docker.createContainer({
       name: containerName,
       Image: 'j41/job-agent:latest',  // PRE-BAKED IMAGE
-      Env: [
-        `J41_API_URL=${J41_API_URL}`,
-        `J41_NETWORK=${J41_NETWORK}`,
-        `J41_AGENT_ID=${agentInfo.id}`,
-        `J41_IDENTITY=${agentInfo.identity}`,
-        `J41_JOB_ID=${job.id}`,
-        `JOB_TIMEOUT_MS=${JOB_TIMEOUT_MS}`,
-        `J41_CANARY_TOKEN=${canaryToken}`,
-        // LLM config (pass through from dispatcher env — new generic + legacy)
-        ...['J41_LLM_PROVIDER','J41_LLM_BASE_URL','J41_LLM_API_KEY','J41_LLM_MODEL',
-            'KIMI_API_KEY','KIMI_BASE_URL','KIMI_MODEL',
-            'ANTHROPIC_API_KEY','OPENAI_API_KEY','GROQ_API_KEY','DEEPSEEK_API_KEY',
-            'MISTRAL_API_KEY','GOOGLE_API_KEY','XAI_API_KEY','OPENROUTER_API_KEY',
-            'IDLE_TIMEOUT_MS','PAUSE_TTL_MS','J41_EXECUTOR','MAX_CONVERSATION_LOG',
-        ].filter(k => process.env[k]).map(k => `${k}=${process.env[k]}`),
-        // Per-agent executor config (from agent-config.json or keys.json)
-        ...getExecutorEnvVars(agentInfo),
-      ],
+      // Docker bind-mounts keys.json/SOUL.md/job into /app/* — strip the
+      // host-path env vars buildContainerEnv emits (they're host paths and would
+      // override the in-container defaults the job-agent expects: /app/keys.json,
+      // /app/SOUL.md, /app/job).
+      Env: Object.entries(buildContainerEnv(job, agentInfo, loadAgentConfig(agentInfo.id), canaryToken, jobDir, tmpKeysPath))
+            .filter(([k, v]) => v !== undefined && v !== '' &&
+              k !== 'J41_KEYS_FILE' && k !== 'J41_SOUL_FILE' && k !== 'J41_JOB_DIR')
+            .map(([k, v]) => `${k}=${v}`)
+            .concat(getExecutorEnvVars(agentInfo).filter(s => !s.startsWith('J41_LLM_'))),
       HostConfig: {
         Binds: [
           // job dir must be writable for attestation artifacts (creation/deletion json)
@@ -5218,7 +5257,7 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
 
   // Cleanup job dir (retain for debugging if requested)
   const jobDir = path.join(JOBS_DIR, jobId);
-  if (fs.existsSync(jobDir) && process.env.J41_KEEP_CONTAINERS !== '1') {
+  if (fs.existsSync(jobDir) && !cfg.runtime.keep_containers) {
     fs.rmSync(jobDir, { recursive: true });
   }
 
@@ -5296,47 +5335,19 @@ async function startJobLocal(state, job, agentInfo) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
   }
 
-  // Platform config — required for job-agent
-  env.J41_API_URL = J41_API_URL;
-  env.J41_NETWORK = J41_NETWORK;
-  env.J41_AGENT_ID = agentInfo.id;
-  env.J41_IDENTITY = agentInfo.identity;
-  env.J41_JOB_ID = job.id;
-  env.JOB_TIMEOUT_MS = String(JOB_TIMEOUT_MS);
-  env.J41_KEYS_FILE = keysPath;
-  env.J41_SOUL_FILE = path.join(agentDir, 'SOUL.md');
-  env.J41_JOB_DIR = jobDir;
-  env.J41_CANARY_TOKEN = canaryToken;
-
-  // Session lifecycle config from service (passed via job API response)
-  if (job.lifecycle?.idleTimeout) env.IDLE_TIMEOUT_MS = String(job.lifecycle.idleTimeout * 60000);
-  if (job.lifecycle?.pauseTTL) env.PAUSE_TTL_MS = String(job.lifecycle.pauseTTL * 60000);
-
-  // Optional LLM config — only pass through if set in parent
-  const OPTIONAL_PASSTHROUGH = [
-    // LLM provider (new generic)
-    'J41_LLM_PROVIDER', 'J41_LLM_BASE_URL', 'J41_LLM_API_KEY', 'J41_LLM_MODEL',
-    // Legacy Kimi env vars (backwards compatible)
-    'KIMI_API_KEY', 'KIMI_BASE_URL', 'KIMI_MODEL',
-    // Provider-specific API keys (for presets)
-    'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GROQ_API_KEY', 'DEEPSEEK_API_KEY', 'MISTRAL_API_KEY',
-    'GOOGLE_API_KEY', 'XAI_API_KEY', 'COHERE_API_KEY', 'PERPLEXITY_API_KEY',
-    'TOGETHER_API_KEY', 'FIREWORKS_API_KEY', 'NVIDIA_API_KEY', 'AZURE_OPENAI_API_KEY', 'OPENROUTER_API_KEY',
-    // Other
-    'IDLE_TIMEOUT_MS', 'J41_MCP_COMMAND', 'J41_MCP_URL',
-    'J41_EXECUTOR_AUTH', 'J41_EXECUTOR_TIMEOUT', 'J41_MCP_MAX_ROUNDS',
-    'J41_EXECUTOR', 'MAX_CONVERSATION_LOG',
-  ];
-  for (const key of OPTIONAL_PASSTHROUGH) {
-    if (process.env[key] !== undefined) env[key] = process.env[key];
+  // Platform/job/LLM config — sourced from cfg, NOT process.env. Provider keys
+  // come from cfg.provider_keys; never inherit from dispatcher's environment.
+  const containerEnv = buildContainerEnv(job, agentInfo, loadAgentConfig(agentInfo.id), canaryToken, jobDir, keysPath);
+  for (const [k, v] of Object.entries(containerEnv)) {
+    if (v !== undefined && v !== '') env[k] = String(v);
   }
-
-  // Per-agent executor env vars (from agent-config.json)
+  // Per-agent executor env vars (from agent-config.json) — preserves webhook /
+  // langgraph URLs and other per-agent fields not covered by buildContainerEnv.
   const executorVars = getExecutorEnvVars(agentInfo);
-  executorVars.forEach(v => {
-    const [key, ...rest] = v.split('=');
-    env[key] = rest.join('=');
-  });
+  for (const s of executorVars) {
+    const eq = s.indexOf('=');
+    if (eq > 0 && !s.startsWith('J41_LLM_')) env[s.slice(0, eq)] = s.slice(eq + 1);
+  }
 
   try {
     const child = spawn('node', [path.join(__dirname, 'job-agent.js')], {
@@ -5484,7 +5495,7 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
 
   // Cleanup job dir
   const jobDir = path.join(JOBS_DIR, jobId);
-  if (fs.existsSync(jobDir) && process.env.J41_KEEP_CONTAINERS !== '1') {
+  if (fs.existsSync(jobDir) && !cfg.runtime.keep_containers) {
     fs.rmSync(jobDir, { recursive: true });
   }
 
@@ -6217,7 +6228,9 @@ program
 
 // ── Entry point ──
 
-if (process.argv.length <= 2) {
+if (process.env.NODE_ENV === 'test') {
+  module.exports = { buildContainerEnv, loadAgentConfig };
+} else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
 } else {
