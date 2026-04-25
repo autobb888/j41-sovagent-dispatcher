@@ -3,7 +3,7 @@
  * J41 Dispatcher v2 — Ephemeral Job Containers
  * 
  * Manages pool of pre-registered agents, spawns ephemeral containers per job.
- * Queue if at capacity. Default max concurrent from config (9) or env override.
+ * Queue if at capacity. Default max concurrent from config.toml (0 = unlimited).
  */
 
 const { Command } = require('commander');
@@ -4932,6 +4932,11 @@ function buildContainerEnv(job, agentInfo, agentCfg, canaryToken, jobDir, keysPa
   if (cfg.executor.url)         env.J41_EXECUTOR_URL = cfg.executor.url;
 
   if (cfg.debug.chat) env.J41_DEBUG_CHAT = '1';
+
+  // Container-side retry tuning. job-agent.js reads this from process.env directly
+  // (Docker is its only env channel); without forwarding, the configured value would
+  // never reach the container.
+  env.J41_RATE_LIMIT_BACKOFF_MULTIPLIER = String(cfg.retry.rate_limit_backoff_multiplier);
 
   return env;
 }
