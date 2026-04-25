@@ -38,8 +38,8 @@ function isPrivateIp(ip) {
   return false;
 }
 
-async function checkUpstreamHostSafe(hostname) {
-  if (loadDispatcherConfig().runtime.allow_local_upstream) return { safe: true };
+async function checkUpstreamHostSafe(hostname, cfg) {
+  if (cfg.runtime.allow_local_upstream) return { safe: true };
   const lc = hostname.toLowerCase();
   if (lc === 'localhost' || lc.endsWith('.localhost') || lc.endsWith('.local') || lc.endsWith('.internal')) {
     return { safe: false, reason: `hostname "${hostname}" is a local/internal name` };
@@ -82,6 +82,7 @@ function filterHeaders(upstreamHeaders) {
  * Handle a proxied API request.
  */
 async function handleProxyRequest(req, res, agentConfigs, body) {
+  const cfg = loadDispatcherConfig();
   const requestId = crypto.randomBytes(8).toString('hex');
 
   // Extract API key from Authorization header
@@ -136,14 +137,14 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   }
 
   // Reserve credit atomically (deducts upfront, adjusted after response)
-  const estimatedInput = 4000;
-  const estimatedOutput = 2000;
+  const estimatedInput = cfg.proxy.estimated_input_tokens;
+  const estimatedOutput = cfg.proxy.estimated_output_tokens;
   const creditCheck = reserveCredit(agentId, record.buyerVerusId, model, estimatedInput, estimatedOutput, config.modelPricing || []);
   if (!creditCheck.allowed) {
     res.writeHead(402, {
       'Content-Type': 'application/json',
       'X-J41-Credit-Remaining': '0',
-      'X-J41-Credit-SuggestedTopup': '10',
+      'X-J41-Credit-SuggestedTopup': String(cfg.proxy.suggested_topup_vrsc),
       'X-J41-Seller-PayAddress': config.payAddress || '',
     });
     res.end(JSON.stringify({
@@ -175,7 +176,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   }
 
   // SSRF hardening: block private IPs unless J41_ALLOW_LOCAL_UPSTREAM=1 (dev)
-  const safety = await checkUpstreamHostSafe(upstreamUrl.hostname);
+  const safety = await checkUpstreamHostSafe(upstreamUrl.hostname, cfg);
   if (!safety.safe) {
     refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
     res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -194,7 +195,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
       'User-Agent': 'j41-proxy/1.0',
       ...(config.upstreamAuth ? { 'Authorization': config.upstreamAuth } : {}),
     },
-    timeout: 60000,
+    timeout: cfg.proxy.upstream_timeout_ms,
   }, (proxyRes) => {
     const j41Headers = {
       'X-J41-Request-Id': requestId,
@@ -280,7 +281,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
 
         j41Headers['X-J41-Credit-Remaining'] = result.remaining.toFixed(4);
         if (result.remaining < 1) {
-          j41Headers['X-J41-Credit-SuggestedTopup'] = '10';
+          j41Headers['X-J41-Credit-SuggestedTopup'] = String(cfg.proxy.suggested_topup_vrsc);
           j41Headers['X-J41-Seller-PayAddress'] = config.payAddress || '';
         }
 
