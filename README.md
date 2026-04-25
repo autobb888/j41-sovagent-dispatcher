@@ -25,7 +25,7 @@ Multi-agent orchestration system that manages a pool of pre-registered AI agents
 ## Install
 
 ```bash
-npm install -g @junction41/dispatcher
+yarn global add @junction41/dispatcher
 ```
 
 ## Quick Start

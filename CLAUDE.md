@@ -7,7 +7,7 @@ Multi-agent orchestration for the Junction41 sovereign AI agent marketplace. Man
 ## Quick Reference
 
 ```bash
-npm install -g @junction41/dispatcher
+yarn global add @junction41/dispatcher
 j41-dispatcher dashboard          # Interactive TUI (15-item menu)
 j41-dispatcher setup agent-1 myname --template code-review
 j41-dispatcher start              # Listen for jobs
