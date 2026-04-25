@@ -4,6 +4,8 @@
  * proxy can short-circuit 503 instead of timing out against a dead upstream.
  */
 
+const { loadDispatcherConfig } = require('./config-loader.js');
+
 const _health = new Map(); // agentId → { healthy: bool, lastCheck: number, status?: number, error?: string }
 
 /**
@@ -30,7 +32,8 @@ async function checkUpstream(url, timeoutMs = 5000) {
  * @param {number} [intervalMs=60000] - Poll interval
  * @returns {NodeJS.Timer} Timer handle (unref'd — won't keep process alive)
  */
-function startHealthPoller(agentConfigs, intervalMs = 60000) {
+function startHealthPoller(agentConfigs, intervalMs) {
+  intervalMs = intervalMs ?? loadDispatcherConfig().health.poll_interval_ms;
   // Run an immediate check, then periodically
   const runCheck = async () => {
     for (const [agentId, cfg] of agentConfigs.entries()) {
