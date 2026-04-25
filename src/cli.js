@@ -3382,35 +3382,21 @@ program
             const cfg = agentConfigs.get(sellerAgent.id);
             if (!cfg) throw new Error('Seller has no api-endpoint service');
 
-            // Verify buyer's signature. Fail-closed — no escape hatch.
+            // Verify buyer's signature locally. Fail-closed, no escape hatch, no trust delegation.
             //
-            // v1 (pipe-format): the buyer signs with their R-address, which is embedded
-            //   in the AccessRequest itself — dispatcher verifies locally via bitcoinjs-message.
-            //   No external resolver needed.
-            //
-            // v2 (canonical): the buyer signs over JCS-canonical bytes, identified only by
-            //   i-address. J41 backend verified the signature against verusd's getidentity +
-            //   verifymessage before forwarding to us. Dispatcher trusts J41's verification
-            //   by default — there is currently no public endpoint to resolve an i-address
-            //   to primary R-addresses, so we can't re-verify independently. Operators who
-            //   want independent verification (e.g. once J41 exposes primary addresses on
-            //   GET /v1/agents/:id) can set J41_REQUIRE_LOCAL_V2_VERIFY=1.
+            // v1 (pipe-format): R-address is embedded in the AccessRequest — verified directly
+            //   via bitcoinjs-message.
+            // v2 (canonical): i-address only. Resolved to primary R-addresses + multisig
+            //   threshold via J41's public GET /v1/identity/:id/keys endpoint, then verified
+            //   the same way as v1. minimumSignatures from the resolver is enforced.
             const sessionAgent = await getAgentSession(state, sellerAgent);
             const client = sessionAgent._client || sessionAgent.client;
 
             if (isV2) {
-              if (process.env.J41_REQUIRE_LOCAL_V2_VERIFY === '1') {
-                const verified = await verifyCanonicalSignatures(wireBody.envelope, signaturesV2, client, J41_NETWORK);
-                if (!verified) throw new Error('Buyer signature verification failed (v2 local)');
-                console.log(`[Discovery] Buyer signature verified (v2 local): ${accessRequest.buyerVerusId}`);
-              } else {
-                // Trust J41's upstream verification. Envelope was already canonical-validated
-                // (structure/size/windows/nonce) by validateEnvelope() above — signature is the
-                // only thing we're relying on J41 for.
-                console.log(`[Discovery] v2 envelope accepted under J41-forwarded trust: ${accessRequest.buyerVerusId}`);
-              }
+              const verified = await verifyCanonicalSignatures(wireBody.envelope, signaturesV2, client, J41_NETWORK);
+              if (!verified) throw new Error('Buyer signature verification failed (v2)');
+              console.log(`[Discovery] Buyer signature verified (v2): ${accessRequest.buyerVerusId}`);
             } else {
-              // v1 always verifies locally — buyer's R-address is in the request.
               const verified = await verifyAccessRequest(accessRequest, client, J41_NETWORK);
               if (!verified) throw new Error('Buyer signature verification failed (v1)');
               console.log(`[Discovery] Buyer signature verified (v1): ${accessRequest.buyerVerusId}`);

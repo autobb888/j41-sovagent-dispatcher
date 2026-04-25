@@ -777,16 +777,11 @@ async function statusScreen(inquirer) {
     console.log(`  Reachable:  \x1b[31mno\x1b[0m  (could not fetch /v1/version)`);
   }
 
-  // ── Section 3: Trust mode ──
-  console.log(`\n  ── Verification trust mode ──`);
-  const requireLocalV2 = process.env.J41_REQUIRE_LOCAL_V2_VERIFY === '1' || env.J41_REQUIRE_LOCAL_V2_VERIFY === '1';
-  if (requireLocalV2) {
-    console.log(`  v2 envelopes: \x1b[33mlocal verification required\x1b[0m  (J41_REQUIRE_LOCAL_V2_VERIFY=1)`);
-    console.log(`               needs J41 to expose primary R-addresses on GET /v1/agents/:id`);
-  } else {
-    console.log(`  v2 envelopes: trust J41-forwarded verification  (default)`);
-  }
-  console.log(`  v1 envelopes: always verified locally  (R-address embedded in request)`);
+  // ── Section 3: Verification ──
+  console.log(`\n  ── Signature verification ──`);
+  console.log(`  v1 envelopes: local — R-address embedded in request`);
+  console.log(`  v2 envelopes: local — primary addresses resolved via /v1/identity/:id/keys`);
+  console.log(`  Mode:         fail-closed; no bypass flags`);
 
   // ── Section 4: Agents ──
   const agents = getAgents();
