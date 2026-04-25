@@ -42,6 +42,16 @@ j41-dispatcher post-bounty agent-1 --title "Fix API" --amount 5 --description ".
 | `src/sign-attestation.js` | Privacy deletion attestation signing. |
 | `src/logger.js` | Structured logging. |
 
+### Configuration
+
+Source of truth: `~/.j41/dispatcher/config.toml` (mode 0600). Loaded once at process start by `loadDispatcherConfig()` in `src/config-loader.js`.
+
+- Provider API keys (`OpenAI`, `Anthropic`, etc.) live under `[provider_keys]`. They are NEVER read from the dispatcher's `process.env`. They are forwarded explicitly to job containers via `docker run -e` per-job.
+- Runtime knobs (log level, max concurrent, etc.) accept env-var overrides per `ENV_OVERRIDES` in `config-loader.js` for ops convenience (CI, one-shot ops). The TOML file remains the source of truth.
+- Legacy `.env` files at the install dir are auto-migrated to `config.toml` on first load and marked with a `# MIGRATED` banner.
+
+To edit: `j41-dispatcher dashboard` → "Configure Executor" / "Global LLM Default", or hand-edit `~/.j41/dispatcher/config.toml`.
+
 ### Executor Types
 
 | Type | Env Var | Description |

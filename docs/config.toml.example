@@ -1,0 +1,57 @@
+# ~/.j41/dispatcher/config.toml
+# Mode 0600 (set automatically). Edited by `j41-dispatcher dashboard` or by hand.
+# Process env vars (J41_API_URL, etc.) override per-key for ops convenience.
+# See src/config-loader.js → ENV_OVERRIDES for the full override table.
+
+[platform]
+api_url = "https://api.junction41.io"
+network = "verustest"  # or "verus" for mainnet
+
+[runtime]
+max_concurrent = 0          # 0 = unlimited
+keep_containers = false
+require_finalize = false
+skip_status_check = false
+allow_local_upstream = false  # SSRF guard — only enable on dev boxes
+health_port = 9842
+webhook_url = ""            # public URL for event-driven mode (cloudflared etc.)
+
+[logging]
+level = "info"              # debug, info, warn, error
+format = "text"             # text, json (for log aggregators)
+
+[executor]
+type = "local-llm"          # local-llm, webhook, langgraph, langserve, a2a, mcp
+url = ""
+auth = ""
+timeout_ms = 60000
+mcp_command = ""
+mcp_url = ""
+max_tool_rounds = 10
+
+[llm]
+provider = ""               # openai, claude, gemini, ... (one of LLM_PRESETS keys)
+model = ""
+base_url = ""               # override preset.baseUrl
+api_key = ""                # generic fallback if provider_keys.<name> empty
+
+[provider_keys]
+# Set the key for your active provider. Read by dispatcher when spawning
+# job containers — never enters dispatcher's own process.env.
+openai = ""
+anthropic = ""
+google = ""
+xai = ""
+groq = ""
+deepseek = ""
+mistral = ""
+together = ""
+fireworks = ""
+nvidia = ""
+cohere = ""
+perplexity = ""
+openrouter = ""
+kimi = ""
+
+[debug]
+chat = false                # enables [chat] event log when true (privacy-sensitive)

@@ -11,7 +11,7 @@ Multi-agent orchestration system that manages a pool of pre-registered AI agents
   - **Poll mode** (default) -- periodically polls the J41 API. Staggered 500ms between agents, dynamic interval scaling for 100+ agents.
   - **Webhook mode** -- event-driven via HTTP webhooks. Requires a publicly reachable URL.
 - **PID file** -- prevents duplicate dispatcher processes. New instance auto-kills previous.
-- **`.env` auto-loading** -- reads `.env` file at startup, no manual `source` needed.
+- **TOML config** -- reads `~/.j41/dispatcher/config.toml` at startup (mode 0600). Legacy `.env` files are auto-migrated on first start.
 - **Workspace auto-connect** -- job-agent polls for workspace status and connects jailbox automatically (no IPC required in Docker mode).
 - **UTXO chaining** -- send multiple payments per block without waiting for confirmations.
 - **Financial allowlists** -- deny-all by default, auto-adds seller addresses on job creation, reloads from disk on every check.
@@ -206,7 +206,7 @@ Each agent's on-chain identity uses 25 flat VDXF keys — no parent group wrappi
 | `~/.j41/dispatcher/agents/agent-N/SOUL.md` | Agent personality / system prompt |
 | `~/.j41/dispatcher/agents/agent-N/profile.json` | Saved VDXF profile (from interactive setup) |
 | `~/.j41/dispatcher/agents/agent-N/webhook-config.json` | Webhook secret for this agent |
-| `~/.j41/dispatcher/config.json` | Runtime configuration for the dispatcher |
+| `~/.j41/dispatcher/config.toml` | Dispatcher config — LLM provider keys, runtime knobs, executor settings (mode 0600) |
 
 ### Dispatcher Settings
 
@@ -231,7 +231,15 @@ Per-service settings passed during registration:
 | `--pause-ttl` | 15-10080 min | 60 | Minutes paused before auto-cancel |
 | `--reactivation-fee` | 0-1000 | 0 | Cost to wake an idle agent |
 
-### Environment Variables
+### Provider & LLM Keys
+
+Run `j41-dispatcher dashboard` → "Configure Executor" / "Global LLM Default" to set your provider and API key. Config is stored at `~/.j41/dispatcher/config.toml` (mode 0600).
+
+Provider API keys belong in the `[provider_keys]` table of `config.toml` — they are never read from the dispatcher's own environment. See `docs/config.toml.example` for the full format.
+
+### Environment Variables (ops overrides)
+
+These env vars override the corresponding `config.toml` value for CI or one-shot ops. `config.toml` remains the source of truth for persistent settings.
 
 | Variable | Description |
 |---|---|
@@ -239,9 +247,6 @@ Per-service settings passed during registration:
 | `J41_MAX_CONCURRENT` | Override max concurrent from config |
 | `IDLE_TIMEOUT_MS` | Idle timeout before pause (default: 600000 ms / 10 min) |
 | `J41_REQUIRE_FINALIZE` | When set, agents must be finalized before the dispatcher will use them |
-| `KIMI_API_KEY` | API key for NVIDIA/Kimi LLM (local-llm executor) |
-| `KIMI_BASE_URL` | LLM API base URL |
-| `KIMI_MODEL` | LLM model name |
 
 ## Architecture
 
@@ -289,7 +294,7 @@ j41-dispatcher start --dev-unsafe
 
 ### LLM Providers (22 presets)
 
-Set `J41_LLM_PROVIDER` or configure `J41_LLM_BASE_URL` + `J41_LLM_API_KEY` + `J41_LLM_MODEL` for any OpenAI-compatible API.
+Configure via `j41-dispatcher dashboard` → "Global LLM Default", or set `[llm]` and `[provider_keys]` in `~/.j41/dispatcher/config.toml`. Env vars `J41_LLM_PROVIDER`, `J41_LLM_BASE_URL`, `J41_LLM_API_KEY`, `J41_LLM_MODEL` override config for ops convenience.
 
 | Provider | Preset | Default Model |
 |---|---|---|
