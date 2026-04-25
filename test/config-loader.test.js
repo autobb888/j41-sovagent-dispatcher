@@ -143,6 +143,21 @@ test('opts-bearing loadDispatcherConfig bypasses cache', withTmpHome(async () =>
   assert.notStrictEqual(fresh, cached);
 }));
 
+test('migrateLegacyEnv refuses to banner real .env when HOME is /tmp-sandboxed', withTmpHome(async (t, tmp) => {
+  const { migrateLegacyEnv, _resetMigrationState } = require('../src/config-loader.js');
+  _resetMigrationState();
+  // Stage a "real" install-dir .env that we DO NOT want bannered
+  const fakeRealRepo = fs.mkdtempSync(path.join('/var', 'tmp', 'j41-')).replace('/var/tmp/', '/home/realuser-mock/');
+  // Can't actually write under /home/realuser-mock — use a sibling tmpdir but treat it as the
+  // "real" install dir by NOT passing it as opts.envFile (so the default code path defaults to
+  // path.resolve(__dirname, '..', '.env') — which is the actual repo .env). The guard fires
+  // because HOME is /tmp-sandboxed.
+  const result = migrateLegacyEnv();  // no opts → falls through to default install-dir .env
+  // Expected: refused with reason 'sandboxed-home' (or no-op return). MUST NOT touch real .env.
+  assert.strictEqual(result.migrated, false);
+  assert.strictEqual(result.reason, 'sandboxed-home');
+}));
+
 test('extended schema sections load with defaults', withTmpHome(async () => {
   const { loadDispatcherConfig, _resetMigrationState, invalidateConfigCache } = require('../src/config-loader.js');
   _resetMigrationState();

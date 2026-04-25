@@ -253,9 +253,30 @@ function mergeMissingOnly(base, over) {
   return out;
 }
 
+// Detect a sandboxed HOME (test runs that override HOME=/tmp/...). In that mode,
+// CONFIG_FILE() resolves under the sandbox but the default envFile resolves to
+// the REAL install-dir .env. Without this guard, a sandboxed test could banner
+// the real .env while writing config.toml to the sandbox — leaving the real
+// dispatcher in a broken state (banner says migrated, but no config.toml exists
+// in the real HOME). Refuse migration in that scenario unless the caller passes
+// an explicit envFile (in which case they're testing the migration itself and
+// know what they're doing).
+function isSandboxedHome() {
+  const home = os.homedir();
+  return home.startsWith('/tmp/') || home.startsWith('/var/tmp/') || home.startsWith('/private/tmp/');
+}
+
 function migrateLegacyEnv(opts = {}) {
+  const explicitEnvFile = !!opts.envFile;
   const envFile = opts.envFile || path.resolve(__dirname, '..', '.env');
   if (!fs.existsSync(envFile)) return { migrated: false, reason: 'no-env-file' };
+  // Sandbox guard: if HOME is /tmp-rooted AND the caller did not supply an
+  // explicit envFile, refuse to mutate whichever .env we'd default to (almost
+  // certainly the real install-dir one, which is exactly the cross-boundary
+  // pattern we want to avoid).
+  if (!explicitEnvFile && isSandboxedHome()) {
+    return { migrated: false, reason: 'sandboxed-home' };
+  }
   const text = fs.readFileSync(envFile, 'utf8');
   if (text.startsWith('# MIGRATED')) return { migrated: false, reason: 'already-migrated' };
 
