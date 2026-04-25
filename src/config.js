@@ -12,7 +12,6 @@ const ACTIVE_JOBS_PATH = path.join(DISPATCHER_DIR, 'active-jobs.json');
 
 const DEFAULTS = {
   runtime: 'docker',
-  maxConcurrent: 9,
   jobTimeoutMin: 60,
   // Extension auto-approve thresholds
   extensionAutoApprove: true,
