@@ -20,6 +20,7 @@ const IDENTITY = process.env.J41_IDENTITY;
 const JOB_ID = process.env.J41_JOB_ID;
 const TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS || '3600000');
 const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '480000'); // idle → pause (8 min, before backend's 10-min auto-deliver)
+const RATE_LIMIT_BACKOFF_MULTIPLIER = parseInt(process.env.J41_RATE_LIMIT_BACKOFF_MULTIPLIER || '3');
 
 const J41_NETWORK = process.env.J41_NETWORK || 'verustest';
 const KEYS_FILE = process.env.J41_KEYS_FILE || '/app/keys.json';
@@ -71,7 +72,7 @@ async function withRetry(fn, label, { maxAttempts = 3, baseDelayMs = 1000 } = {}
       console.error(`[RETRY] ${label} attempt ${attempt}/${maxAttempts} failed: ${e.message}`);
       if (isLast) throw e;
       // Longer backoff for rate-limit 429s
-      const delay = (e.statusCode === 429 ? baseDelayMs * 3 : baseDelayMs) * Math.pow(2, attempt - 1);
+      const delay = (e.statusCode === 429 ? baseDelayMs * RATE_LIMIT_BACKOFF_MULTIPLIER : baseDelayMs) * Math.pow(2, attempt - 1);
       await new Promise(r => setTimeout(r, delay));
     }
   }
@@ -889,13 +890,19 @@ process.on('SIGTERM', async () => {
   process.exit(130);
 });
 
-// Soft timeout warning — 5 min before hard kill
+// Soft timeout warning — fires at 90% of timeout (min 1 min before hard kill)
+// Behavior change vs <2.1.6: warning timing scales with TIMEOUT_MS instead of fixed 5min.
+// - 60-min job: 6min warning (was 5min)
+// - 20-min job: 2min warning (was 5min)
+// - ≤11-min job: 1min floor
+const _warningMs = Math.max(60000, TIMEOUT_MS * 0.9);
+const _warningRemainingMs = Math.round((TIMEOUT_MS - _warningMs) / 60000);
 setTimeout(() => {
-  console.warn('⚠️  Job approaching timeout — 5 minutes remaining');
+  console.warn(`⚠️  Job approaching timeout — ${_warningRemainingMs} minute(s) remaining`);
   if (_agent && !_paused) {
-    try { _agent.sendChatMessage(JOB_ID, 'This session will end in 5 minutes. Wrapping up current work.'); } catch {}
+    try { _agent.sendChatMessage(JOB_ID, `This session will end in ${_warningRemainingMs} minute(s). Wrapping up current work.`); } catch {}
   }
-}, TIMEOUT_MS - 300000);
+}, _warningMs);
 
 // Timeout protection (J4: also submit attestation to API, not just disk)
 setTimeout(async () => {
