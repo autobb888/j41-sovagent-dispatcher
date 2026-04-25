@@ -10,8 +10,9 @@ const http = require('http');
 const { verifyWebhookSignature } = require('@junction41/sovagent-sdk/dist/webhook/verify.js');
 const { handleProxyRequest } = require('./proxy-handler.js');
 const { reportDeposit } = require('./deposit-watcher.js');
+const { loadDispatcherConfig } = require('./config-loader.js');
 
-const MAX_BODY_SIZE = 1024 * 1024; // 1MB
+const MAX_BODY_SIZE = loadDispatcherConfig().webhook.max_body_bytes;
 
 /** Read request body with size limit. Returns string or null (error already sent). */
 async function readBody(req, res) {
