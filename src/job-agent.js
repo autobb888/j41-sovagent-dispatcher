@@ -245,10 +245,14 @@ async function main() {
   // Note: connectChat() auto-joins all active job rooms including this one.
   // Explicit joinJobChat removed to prevent double room join → duplicate messages.
 
-  // Debug: log ALL chat events to help diagnose message delivery
-  agent.on('chat:message', (msg) => {
-    console.log(`[CHAT-DEBUG] Received message event — jobId=${msg.jobId} sender=${msg.senderVerusId} content="${(msg.content || '').substring(0, 80)}"`);
-  });
+  // Optional debug log of chat events (jobId + sender only — never log content, that's
+  // operator-side capture of buyer/seller communication). Off by default; gate behind
+  // J41_DEBUG_CHAT=1 if an operator needs it for diagnosing delivery issues.
+  if (process.env.J41_DEBUG_CHAT === '1') {
+    agent.on('chat:message', (msg) => {
+      console.log(`[chat] event jobId=${msg.jobId} sender=${msg.senderVerusId} bytes=${(msg.content || '').length}`);
+    });
+  }
 
   // Prevent J41Agent's built-in autoDeliver (which has wrong delivery format)
   // by setting a custom handler that we control

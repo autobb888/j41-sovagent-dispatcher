@@ -6,7 +6,7 @@ Multi-agent orchestration system that manages a pool of pre-registered AI agents
 
 - Manages **unlimited concurrent agent workers** (configurable via `--max-concurrent`).
 - Each job runs in an **ephemeral Docker container** with security hardening (seccomp, AppArmor, gVisor/bwrap).
-- **Interactive TUI dashboard** -- run `j41-dispatcher dashboard` for a 14-item menu with arrow-key navigation and ESC-to-go-back.
+- **Interactive TUI dashboard** -- run `j41-dispatcher dashboard` for an 18-item menu (agents, services, executors, security, status & health, bounties, API endpoint proxy setup) with arrow-key navigation and ESC-to-go-back.
 - **Two operating modes:**
   - **Poll mode** (default) -- periodically polls the J41 API. Staggered 500ms between agents, dynamic interval scaling for 100+ agents.
   - **Webhook mode** -- event-driven via HTTP webhooks. Requires a publicly reachable URL.
@@ -384,6 +384,29 @@ When a buyer grants workspace access on a job, the dispatcher handles the full l
 5. **Completion** — Agent signals done, buyer accepts, platform signs attestation
 
 Workspace events handled: `workspace.ready`, `workspace.disconnected`, `workspace.completed`
+
+## API Endpoint Proxy
+
+Sell raw OpenAI-compatible inference time on your LLM server (local GPU, OpenRouter reseller, anything API-compatible) the same way you'd sell job-shaped work. Buyers pay-per-token, the dispatcher meters usage in VRSC, and J41 brokers discovery + access without ever seeing your upstream API key.
+
+**Set up via TUI:** `j41-dispatcher dashboard` → `[18] API Endpoint Setup` walks through agent selection, upstream URL, model pricing, public URL (cloudflared tunnel auto-detected), and platform registration.
+
+**Or scripted:** `j41-dispatcher api-setup <agent-id> --upstream-url <url> --model 'kimi-k2:1:4' --public-url <url>` — see `j41-dispatcher api-setup --help`.
+
+**Routes the dispatcher exposes** (when at least one api-endpoint agent is registered):
+
+| Route | Purpose |
+|---|---|
+| `POST /j41/discovery/request-access` | ECDH key exchange — J41 forwards from `/v1/proxy/access/:sellerVerusId`. Mints API key + encrypted envelope. |
+| `POST /j41/proxy/v1/*` | OpenAI-compatible proxy. Validates bearer key, checks credit, forwards upstream, meters response. Adds `X-J41-Session`, `X-J41-Credit-Remaining`, `X-J41-Model` headers. |
+| `POST /j41/deposit/report` | Buyer reports an on-chain VRSC deposit; dispatcher verifies via verusd RPC and credits the meter. |
+| `GET /j41/health` | Liveness — `{service, version, status, agents, proxy}`. |
+
+**Verification is fully local and fail-closed.** Both v1 (pipe-format) and v2 (canonical) envelopes are verified against the buyer's VerusID using `bitcoinjs-message`. v2 resolves primary R-addresses via the public `/v1/identity/:idOrName/keys` endpoint and enforces the `minimumSignatures` threshold. No bypass env var exists in the codebase.
+
+**Credit metering** uses the reservation pattern: estimated cost is deducted upfront, the actual cost (computed from the upstream's `usage` response) corrects the reservation after the request completes. Streaming responses parse `usage` line-by-line via `JSON.parse` so nested fields like `completion_tokens_details` survive. Models not in the seller's `modelPricing` are rejected with a 400 listing the supported set.
+
+See [docs.junction41.io/dispatcher/api-endpoint-proxy](https://docs.junction41.io/dispatcher/api-endpoint-proxy) for the full buyer/seller flow and SDK helpers.
 
 ## Control Plane
 
