@@ -143,6 +143,21 @@ test('opts-bearing loadDispatcherConfig bypasses cache', withTmpHome(async () =>
   assert.notStrictEqual(fresh, cached);
 }));
 
+test('extended schema sections load with defaults', withTmpHome(async () => {
+  const { loadDispatcherConfig, _resetMigrationState, invalidateConfigCache } = require('../src/config-loader.js');
+  _resetMigrationState();
+  invalidateConfigCache();
+  const cfg = loadDispatcherConfig({ skipMigration: true });
+  assert.strictEqual(cfg.proxy.upstream_timeout_ms, 60000);
+  assert.strictEqual(cfg.proxy.estimated_input_tokens, 4000);
+  assert.strictEqual(cfg.proxy.estimated_output_tokens, 2000);
+  assert.strictEqual(cfg.proxy.suggested_topup_vrsc, 10);
+  assert.strictEqual(cfg.deposit.poll_interval_ms, 60000);
+  assert.strictEqual(cfg.health.poll_interval_ms, 60000);
+  assert.strictEqual(cfg.webhook.max_body_bytes, 1048576);
+  assert.strictEqual(cfg.retry.rate_limit_backoff_multiplier, 3);
+}));
+
 test('saveDispatcherConfig recovers from a stale lock file', withTmpHome(async () => {
   const { saveDispatcherConfig, CONFIG_FILE, _resetMigrationState } = require('../src/config-loader.js');
   _resetMigrationState();
