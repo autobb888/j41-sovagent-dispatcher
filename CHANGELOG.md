@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.1.11 — 2026-04-26
+
+**Root-cause fix for agent identity file permissions** (continues from 2.1.10).
+
+The 2.1.10 audit on a real operator's machine surfaced 11/11 agent dirs at 0775 and 2/11 `keys.json` files at 0664 — world-readable. 2.1.10 fixed the `mkdirSync(agentDir, ...)` call sites to pass `mode: 0o700`, but a deeper investigation showed the underlying issue had **four layers**:
+
+1. **The dispatcher relied on the operator's `umask`** for files written without explicit mode. On Ubuntu's user-private-groups default (`umask 0002`), files default to 0664 and dirs to 0775 — world-readable. A different operator with `umask 0027` would have gotten 0750/0640. **Non-deterministic across deployments** — that's the real defect.
+2. `mkdirSync(agentDir, ...)` calls without explicit mode (fixed in 2.1.10).
+3. `writeFileSync(keys.json, ...)` writes that relied on a follow-up `chmodSync(0o600)`. The brief window between write and chmod was racy. One write (the registration-timeout path at cli.js:2673) had no chmod at all.
+4. Files created by older dispatcher versions persist with whatever mode they were created at — chmod patches don't apply retroactively.
+
+**2.1.11 fixes (defense in depth):**
+
+- `process.umask(0o077)` at the very top of `cli.js` so the entire process produces 0700 dirs and 0600 files by default. Even if a future code path forgets `{ mode: 0o600 }`, it still gets a safe default.
+- All 12 `writeFileSync(keys.json, ...)` call sites now pass `{ mode: 0o600 }` atomically. Eliminates the write-then-chmod race window.
+- The defense-in-depth sweep in `ensureDirs()` (added in 2.1.10) continues to handle case 4 — re-locks any pre-existing bad-mode files on every CLI invocation.
+
+After upgrading and running any `j41-dispatcher <subcommand>`, all existing agent files self-heal. New agents are created with strict modes regardless of operator umask.
+
 ## 2.1.10 — 2026-04-26
 
 **Permission hardening for agent identity files.** A real-world audit on a host with 11 agents found:

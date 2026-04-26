@@ -1,10 +1,17 @@
 #!/usr/bin/env node
 /**
  * J41 Dispatcher v2 — Ephemeral Job Containers
- * 
+ *
  * Manages pool of pre-registered agents, spawns ephemeral containers per job.
  * Queue if at capacity. Default max concurrent from config.toml (0 = unlimited).
  */
+
+// Defense-in-depth (2.1.11): force a strict umask for the entire process so
+// any future fs.writeFileSync / mkdirSync that forgets an explicit mode still
+// produces 0700 dirs and 0600 files. Operators on systems with looser umasks
+// (e.g. Ubuntu's user-private-groups default 0002 → 0775/0664) would otherwise
+// inherit world-readable agent identity files.
+process.umask(0o077);
 
 const { Command } = require('commander');
 const fs = require('fs');
@@ -1230,10 +1237,8 @@ program
       const { generateKeypair } = require('./keygen.js');
       const keys = generateKeypair(J41_NETWORK);
       
-      fs.writeFileSync(
-        path.join(agentDir, 'keys.json'),
-        JSON.stringify({ ...keys, network: J41_NETWORK }, null, 2)
-      );
+      fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify({ ...keys, network: J41_NETWORK }, null, 2)
+      , { mode: 0o600 });
       fs.chmodSync(path.join(agentDir, 'keys.json'), 0o600);
       
       // Write SOUL template
@@ -1333,10 +1338,8 @@ program
       // Save identity to keys file
       keys.identity = result.identity;
       keys.iAddress = result.iAddress;
-      fs.writeFileSync(
-        path.join(AGENTS_DIR, agentId, 'keys.json'),
-        JSON.stringify(keys, null, 2)
-      );
+      fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2)
+      , { mode: 0o600 });
 
       console.log(`\n✅ ${agentId} identity registered on-chain!`);
       console.log(`   Identity: ${result.identity}`);
@@ -1425,10 +1428,8 @@ program
         keys.registrationTimestamp = new Date().toISOString();
         if (e.onboardId) keys.onboardId = e.onboardId;
         if (e.lastStatus) keys.lastOnboardStatus = e.lastStatus;
-        fs.writeFileSync(
-          path.join(AGENTS_DIR, agentId, 'keys.json'),
-          JSON.stringify(keys, null, 2)
-        );
+        fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2)
+        , { mode: 0o600 });
         fs.chmodSync(path.join(AGENTS_DIR, agentId, 'keys.json'), 0o600);
         console.error(`\n⚠️  Partial state saved to keys.json`);
         console.error(`   The identity "${keys.identity}" may already exist on-chain.`);
@@ -1589,10 +1590,8 @@ program
             delete keys.registrationTimestamp;
             delete keys.onboardId;
             delete keys.lastOnboardStatus;
-            fs.writeFileSync(
-              path.join(AGENTS_DIR, agentId, 'keys.json'),
-              JSON.stringify(keys, null, 2)
-            );
+            fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2)
+            , { mode: 0o600 });
             fs.chmodSync(path.join(AGENTS_DIR, agentId, 'keys.json'), 0o600);
             console.log(`\n✅ Recovery successful!`);
             console.log(`   Identity: ${keys.identity}`);
@@ -1610,10 +1609,8 @@ program
           delete keys.onboardId;
           delete keys.lastOnboardStatus;
           delete keys.identity;
-          fs.writeFileSync(
-            path.join(AGENTS_DIR, agentId, 'keys.json'),
-            JSON.stringify(keys, null, 2)
-          );
+          fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2)
+          , { mode: 0o600 });
           process.exit(1);
         }
 
@@ -1655,10 +1652,8 @@ program
       delete keys.registrationTimestamp;
       delete keys.onboardId;
       delete keys.lastOnboardStatus;
-      fs.writeFileSync(
-        path.join(AGENTS_DIR, agentId, 'keys.json'),
-        JSON.stringify(keys, null, 2)
-      );
+      fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2)
+      , { mode: 0o600 });
       fs.chmodSync(path.join(AGENTS_DIR, agentId, 'keys.json'), 0o600);
 
       console.log(`\n✅ Recovery successful!`);
@@ -1712,7 +1707,7 @@ program
         delete keys.onboardId;
         delete keys.lastOnboardStatus;
         delete keys.pendingName;
-        fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2));
+        fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2), { mode: 0o600 });
         fs.chmodSync(path.join(AGENTS_DIR, agentId, 'keys.json'), 0o600);
 
         // Make sure the owning agent has iAddress if it was missing
@@ -1721,7 +1716,7 @@ program
           if (ownerKeys && !ownerKeys.iAddress) {
             ownerKeys.iAddress = foundOwner.iAddress;
             delete ownerKeys.registrationStatus;
-            fs.writeFileSync(path.join(AGENTS_DIR, foundOwner.agentId, 'keys.json'), JSON.stringify(ownerKeys, null, 2));
+            fs.writeFileSync(path.join(AGENTS_DIR, foundOwner.agentId, 'keys.json'), JSON.stringify(ownerKeys, null, 2), { mode: 0o600 });
             fs.chmodSync(path.join(AGENTS_DIR, foundOwner.agentId, 'keys.json'), 0o600);
           }
         }
@@ -2611,7 +2606,7 @@ program
       const { generateKeypair } = require('./keygen.js');
       keys = generateKeypair(J41_NETWORK);
       keys.network = J41_NETWORK;
-      fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2));
+      fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2), { mode: 0o600 });
       fs.chmodSync(path.join(agentDir, 'keys.json'), 0o600);
       console.log(`  ✓ Keys generated (${keys.address})`);
     }
@@ -2662,7 +2657,7 @@ program
         keys.iAddress = regResult.iAddress;
         delete keys.registrationStatus;
         delete keys.onboardId;
-        fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2));
+        fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2), { mode: 0o600 });
         fs.chmodSync(path.join(agentDir, 'keys.json'), 0o600);
         console.log(`  ✓ Registered: ${regResult.identity} (${regResult.iAddress})`);
       } catch (e) {
@@ -2670,7 +2665,7 @@ program
           keys.identity = e.identityName || (identityName + '.agentplatform@');
           keys.registrationStatus = 'timeout';
           if (e.onboardId) keys.onboardId = e.onboardId;
-          fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2));
+          fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2), { mode: 0o600 });
           console.error(`  ⚠️  Registration timed out. Run: node src/cli.js recover ${agentId}`);
           console.error(`     Then re-run: node src/cli.js setup ${agentId} ${identityName} [flags...]`);
           process.exit(1);
@@ -6075,7 +6070,7 @@ async function mainMenu() {
     const { generateKeypair } = require('./keygen.js');
     const keys = generateKeypair(J41_NETWORK);
     keys.network = J41_NETWORK;
-    fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2));
+    fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2), { mode: 0o600 });
     fs.chmodSync(path.join(agentDir, 'keys.json'), 0o600);
     fs.writeFileSync(path.join(agentDir, 'SOUL.md'), `# ${id}\n\nA helpful AI assistant on the J41 platform.`);
     console.log(`\n  Created ${id} (${keys.address})`);
