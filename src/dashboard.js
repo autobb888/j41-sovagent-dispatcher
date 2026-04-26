@@ -187,9 +187,10 @@ async function mainMenu(inquirer) {
   const config = loadConfig();
   const cfg = loadCfg();
 
+  const dispatcherVersion = require('../package.json').version;
   console.clear();
   console.log('╔══════════════════════════════════════════════════╗');
-  console.log('║  J41 Dispatcher — Setup & Management             ║');
+  console.log(`║  J41 Dispatcher v${dispatcherVersion.padEnd(8)} — Setup & Management    ║`);
   console.log('╚══════════════════════════════════════════════════╝');
   console.log(`\n  Agents: ${agents.length} registered`);
   console.log(`  Dispatcher: ${status.running ? `running (PID ${status.pid})` : 'stopped'}`);

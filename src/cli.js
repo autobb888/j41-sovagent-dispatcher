@@ -6149,7 +6149,7 @@ program
       process.exit(1);
     }
 
-    const keys = loadAgentKeys(agents[0].id);
+    const keys = loadAgentKeys(agents[0]);
     const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
     const agent = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif, identityName: keys.identity, iAddress: keys.iAddress });
     await agent.authenticate();

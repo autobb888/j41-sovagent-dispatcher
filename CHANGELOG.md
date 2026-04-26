@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.1.9 — 2026-04-26
+
+- **Dashboard banner now shows version** (`J41 Dispatcher v2.1.9 — Setup & Management`). Operators can confirm what they're running at a glance without dropping to a shell.
+- **Fixed `browse-bounties` crash** — `cli.js:6152` had the same `agents[0].id` bug pattern fixed in 3 other sites in 2.1.8. With the multi-agent loop fixes that shipped in 2.1.8, this was the last instance.
+
 ## 2.1.8 — 2026-04-26
 
 Two bug fixes caught by live operator testing:
