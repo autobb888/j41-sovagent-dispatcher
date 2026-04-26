@@ -992,7 +992,7 @@ function getActiveJobs() {
 program
   .name('j41-dispatcher')
   .description('Ephemeral job container orchestrator for J41')
-  .version('2.0.0');
+  .version(require('../package.json').version);
 
 // Config command — view/change runtime settings
 program
@@ -1277,19 +1277,19 @@ program
     const fullName = identityName.includes('@') ? identityName : identityName + '.agentplatform@';
     const allAgents = listRegisteredAgents();
     for (const other of allAgents) {
-      if (other.id === agentId) continue;
-      const otherKeys = loadAgentKeys(other.id);
+      if (other === agentId) continue;
+      const otherKeys = loadAgentKeys(other);
       if (!otherKeys) continue;
       const otherName = otherKeys.identity || otherKeys.pendingName;
       if (otherName && (otherName === fullName || otherName === identityName || otherName.replace('.agentplatform@', '') === identityName)) {
         const status = otherKeys.registrationStatus || (otherKeys.iAddress ? 'registered' : 'pending');
-        console.error(`❌ Name "${identityName}" is already ${status} on ${other.id}.`);
+        console.error(`❌ Name "${identityName}" is already ${status} on ${other}.`);
         if (status === 'timeout') {
-          console.error(`   Run: j41-dispatcher recover ${other.id}`);
+          console.error(`   Run: j41-dispatcher recover ${other}`);
         } else if (otherKeys.iAddress) {
-          console.error(`   ${other.id} already owns this identity.`);
+          console.error(`   ${other} already owns this identity.`);
         }
-        console.error(`   Pick a different name, or clear ${other.id}'s state first.`);
+        console.error(`   Pick a different name, or clear ${other}'s state first.`);
         process.exit(1);
       }
     }
@@ -1650,8 +1650,8 @@ program
       let foundOwner = null;
 
       for (const other of allAgents) {
-        if (other.id === agentId) continue;
-        const otherKeys = loadAgentKeys(other.id);
+        if (other === agentId) continue;
+        const otherKeys = loadAgentKeys(other);
         if (!otherKeys?.wif) continue;
 
         try {
@@ -1669,8 +1669,8 @@ program
             iAddress = idRaw?.data?.identity?.identityaddress || idRaw?.iAddress;
           } catch {}
 
-          foundOwner = { agentId: other.id, iAddress };
-          console.log(`\n   ✓ Identity "${keys.identity}" was registered by ${other.id}!`);
+          foundOwner = { agentId: other, iAddress };
+          console.log(`\n   ✓ Identity "${keys.identity}" was registered by ${other}!`);
           break;
         } catch {
           // This agent's key doesn't own it either — continue
@@ -2616,13 +2616,13 @@ program
       const setupFullName = identityName + '.agentplatform@';
       const setupAllAgents = listRegisteredAgents();
       for (const other of setupAllAgents) {
-        if (other.id === agentId) continue;
-        const otherKeys = loadAgentKeys(other.id);
+        if (other === agentId) continue;
+        const otherKeys = loadAgentKeys(other);
         if (!otherKeys) continue;
         const otherName = otherKeys.identity || otherKeys.pendingName;
         if (otherName && (otherName === setupFullName || otherName.replace('.agentplatform@', '') === identityName)) {
-          console.error(`  ❌ Name "${identityName}" is already claimed by ${other.id}.`);
-          console.error(`     Pick a different name, or clear ${other.id}'s state first.`);
+          console.error(`  ❌ Name "${identityName}" is already claimed by ${other}.`);
+          console.error(`     Pick a different name, or clear ${other}'s state first.`);
           process.exit(1);
         }
       }
