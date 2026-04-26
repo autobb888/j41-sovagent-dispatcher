@@ -279,6 +279,30 @@ function ensureDirs() {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
   });
+  // Defense-in-depth: re-lock any existing agent dirs / keys that older
+  // dispatcher versions (or unrelated tools) may have created with looser
+  // permissions. Cheap idempotent sweep — runs on every CLI invocation.
+  try {
+    if (fs.existsSync(AGENTS_DIR)) {
+      for (const id of fs.readdirSync(AGENTS_DIR)) {
+        const agentDir = path.join(AGENTS_DIR, id);
+        try {
+          const st = fs.statSync(agentDir);
+          if (!st.isDirectory()) continue;
+          if ((st.mode & 0o777) !== 0o700) fs.chmodSync(agentDir, 0o700);
+          // Sensitive per-agent files: lock to 0600 if present
+          for (const f of ['keys.json', 'agent-config.json', 'finalize-state.json', 'vdxf-update.json', 'vdxf-update.cmd']) {
+            const p = path.join(agentDir, f);
+            try {
+              if (fs.existsSync(p) && (fs.statSync(p).mode & 0o777) !== 0o600) {
+                fs.chmodSync(p, 0o600);
+              }
+            } catch {}
+          }
+        } catch {}
+      }
+    }
+  } catch {}
 }
 
 function loadAgentKeys(agentId) {
@@ -1198,7 +1222,7 @@ program
         continue;
       }
       
-      fs.mkdirSync(agentDir, { recursive: true });
+      fs.mkdirSync(agentDir, { recursive: true, mode: 0o700 });
       
       // Generate keypair using standalone keygen (no SDK build needed)
       console.log(`  ${agentId}: generating keys...`);
@@ -2583,7 +2607,7 @@ program
       keys = loadAgentKeys(agentId);
       console.log(`  ✓ Keys exist (${keys.address})`);
     } else {
-      fs.mkdirSync(agentDir, { recursive: true });
+      fs.mkdirSync(agentDir, { recursive: true, mode: 0o700 });
       const { generateKeypair } = require('./keygen.js');
       keys = generateKeypair(J41_NETWORK);
       keys.network = J41_NETWORK;
@@ -6047,7 +6071,7 @@ async function mainMenu() {
       return;
     }
 
-    fs.mkdirSync(agentDir, { recursive: true });
+    fs.mkdirSync(agentDir, { recursive: true, mode: 0o700 });
     const { generateKeypair } = require('./keygen.js');
     const keys = generateKeypair(J41_NETWORK);
     keys.network = J41_NETWORK;
