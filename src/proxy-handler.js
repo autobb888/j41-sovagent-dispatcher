@@ -136,6 +136,21 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     return;
   }
 
+  // Per-buyer rate limit (2.1.14). Token bucket keyed by buyerVerusId.
+  {
+    const { checkRate } = require('./proxy-rate-limiter.js');
+    const rate = checkRate(record.buyerVerusId, cfg.proxy);
+    if (!rate.allowed) {
+      res.writeHead(429, {
+        'Content-Type': 'application/json',
+        'Retry-After': String(rate.retryAfterSec),
+        'X-J41-RateLimit-Limit': String(cfg.proxy.rate_limit_rps),
+      });
+      res.end(JSON.stringify({ error: 'Rate limit exceeded', retryAfter: rate.retryAfterSec }));
+      return;
+    }
+  }
+
   // Reserve credit atomically (deducts upfront, adjusted after response)
   const estimatedInput = cfg.proxy.estimated_input_tokens;
   const estimatedOutput = cfg.proxy.estimated_output_tokens;
