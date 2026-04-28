@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.1.14 — 2026-04-28
+
+**Resilience patch.** Two fixes addressing economic-griefing vectors that bite at scale:
+
+1. **Per-buyer rate limit at the proxy.** Token bucket keyed by `buyerVerusId`. Defaults: 10 RPS per buyer, 30-burst. Configurable via `[proxy]` keys `rate_limit_rps`, `rate_limit_burst`, `rate_limit_max_buckets` (default 10k LRU cap on distinct buyers tracked). Idle buckets evicted after 5 min, LRU-evicted at the cap. Returns HTTP 429 with `Retry-After` header. Prevents a buyer with valid auth from saturating the upstream + draining their own credit on errors.
+
+2. **Circuit breaker on proxy → upstream.** `upstream-health.js` was already polling `/models` every 60s but the proxy never gated on the result. Now: after `circuit_threshold = 3` consecutive failed probes, `circuitOpenedAt` timestamp is set and the proxy returns 503 immediately for `circuit_open_ms = 30s` instead of forwarding to a dead upstream. After the open window expires, traffic flows through (half-open via real requests). On any successful probe, `circuitOpenedAt` resets to null and the circuit closes.
+
+The `circuitOpenedAt` mechanic was a fix from plan review — the original draft used `lastCheck` (set every poll), which would have left the circuit permanently open. Now the timestamp is sticky from threshold-cross to next successful probe.
+
+Pure additive — no breaking API/wire changes. Operators with default config get the protections automatically. 50 unit tests passing (was 40).
+
 ## 2.1.13 — 2026-04-28
 
 **Security patch — required for mainnet.** Two fixes:
