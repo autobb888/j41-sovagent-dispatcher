@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.1.13 — 2026-04-28
+
+**Security patch — required for mainnet.** Two fixes:
+
+1. **Revoke webhook now requires HMAC signature.** Previously the `/j41/api-access/revoke` endpoint (introduced in 2.1.12) accepted unauthenticated POSTs — anyone with a dispatcher's public URL could revoke any seller's API keys for any known buyer. The endpoint now requires `x-webhook-signature: sha256=<hex>` header with the body HMAC-signed using the **seller's per-agent webhook secret** (same secret already used for `/webhook/:agentId` events since 2.0.x). Missing signature → 401. Wrong signature → 403. Unknown seller → 404. Backend coordination required (see below).
+2. **Nonce replay protection on v2 access envelopes.** Dispatcher now tracks recently-seen nonces (in-memory, 11-min TTL = max envelope window + 1 min grace, 100k LRU cap). Replayed envelopes within their expiry window throw `v2 envelope rejected: replay` and the proxy refuses to mint a duplicate API key.
+
+**Backend rollout order** (REQUIRED — do not invert):
+1. Backend ships HMAC-signing on `DELETE /v1/me/api-access/:grantId` revoke fan-out FIRST (one-line change — the per-agent webhook secrets are already stored from `POST /v1/me/webhooks` registrations).
+2. Then ship dispatcher 2.1.13. If dispatcher ships first, revoke calls return 401 until backend catches up — bad operationally but not a security regression.
+
+40 unit tests passing (was 32; +4 nonce-cache, +4 revoke-webhook).
+
 ## 2.1.12 — 2026-04-27
 
 **Revoke webhook endpoint** — closes the half-shipped revoke flow that the platform's `/api-access` dashboard now exposes. New endpoint:
