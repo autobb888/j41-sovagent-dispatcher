@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.1.12 — 2026-04-27
+
+**Revoke webhook endpoint** — closes the half-shipped revoke flow that the platform's `/api-access` dashboard now exposes. New endpoint:
+
+```
+POST /j41/api-access/revoke
+Content-Type: application/json
+
+{
+  "sellerVerusId": "i...",
+  "buyerVerusId":  "i...",   // optional; if set, revokes ALL active keys this buyer holds for this seller
+  "apiKey":        "sk-..."  // optional; if set, revokes that exact key
+}
+
+→ 200 { "revoked": <number>, "buyerVerusId"?: "i..." }
+```
+
+Wired to `api-key-manager.revokeApiKey()` so the proxy refuses further requests with the revoked key. The platform's `DELETE /v1/me/api-access/:grantId` is the natural caller — when a buyer hits "Revoke" on the dashboard, J41 deletes its grant metadata and posts here to invalidate the key locally.
+
+If neither `buyerVerusId` nor `apiKey` is provided, returns 400. If the seller isn't on this dispatcher, returns `{ revoked: 0, reason: 'seller-not-found' }` (200).
+
 ## 2.1.11 — 2026-04-26
 
 **Root-cause fix for agent identity file permissions** (continues from 2.1.10).

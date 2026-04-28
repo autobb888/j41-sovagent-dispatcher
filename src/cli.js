@@ -3436,6 +3436,37 @@ program
             const payAddress = sellerAgent.iAddress || sellerAgent.address;
             return reportDeposit(sellerAgent.id, agent._client || agent.client, buyerVerusId, txid, amount, payAddress);
           },
+          onApiAccessRevoke: async ({ sellerVerusId, buyerVerusId, apiKey }) => {
+            // Platform → dispatcher webhook called from DELETE /v1/me/api-access/:grantId
+            // Mark all matching API keys as revoked locally so the proxy refuses further calls.
+            const { listActiveKeys, revokeApiKey, findKeyOwner } = require('./api-key-manager');
+            const sellerAgent = state.agents.find(a =>
+              a.iAddress === sellerVerusId || a.identity === sellerVerusId
+            );
+            if (!sellerAgent) return { revoked: 0, reason: 'seller-not-found' };
+
+            // Path A: caller specified an exact apiKey
+            if (apiKey) {
+              const owner = findKeyOwner(apiKey);
+              if (!owner || owner.agentId !== sellerAgent.id) {
+                return { revoked: 0, reason: 'key-not-found' };
+              }
+              const ok = revokeApiKey(sellerAgent.id, apiKey);
+              return { revoked: ok ? 1 : 0, buyerVerusId: owner.record.buyerVerusId };
+            }
+
+            // Path B: caller specified a buyer — revoke ALL active keys this buyer holds for this seller
+            if (buyerVerusId) {
+              const active = listActiveKeys(sellerAgent.id).filter(r => r.buyerVerusId === buyerVerusId);
+              let count = 0;
+              for (const r of active) {
+                if (revokeApiKey(sellerAgent.id, r.key)) count++;
+              }
+              return { revoked: count };
+            }
+
+            return { revoked: 0, reason: 'no-target' };
+          },
         };
 
         // Set notify context per api-endpoint agent for J41 webhook notifications

@@ -104,6 +104,34 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
       return;
     }
 
+    // POST /j41/api-access/revoke — platform tells us a buyer's grant was revoked
+    // Body shape: { sellerVerusId, buyerVerusId, grantId?, apiKey? }
+    // The platform calls this from DELETE /v1/me/api-access/:grantId so the
+    // dispatcher can mark the API key revoked locally (proxy refuses further calls).
+    if (req.method === 'POST' && req.url === '/j41/api-access/revoke' && proxyContext) {
+      const body = await readBody(req, res);
+      if (body === null) return;
+      try {
+        const payload = JSON.parse(body);
+        const { sellerVerusId, buyerVerusId, apiKey } = payload || {};
+        if (!sellerVerusId || (!buyerVerusId && !apiKey)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Missing sellerVerusId and either buyerVerusId or apiKey' }));
+          return;
+        }
+        const result = proxyContext.onApiAccessRevoke
+          ? await proxyContext.onApiAccessRevoke(payload)
+          : { revoked: 0, reason: 'no-handler' };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        console.error(`[ApiAccessRevoke] failed: ${e.message}`);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Revoke failed' }));
+      }
+      return;
+    }
+
     // POST /j41/proxy/v1/* — forwarded API requests
     if (req.method === 'POST' && req.url?.startsWith('/j41/proxy/') && proxyContext?.agentConfigs) {
       const body = await readBody(req, res);
