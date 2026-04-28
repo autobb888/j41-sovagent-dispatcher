@@ -3505,8 +3505,9 @@ program
 
         // Start upstream LLM health poller
         const { startHealthPoller } = require('./upstream-health');
-        startHealthPoller(agentConfigs);
-        console.log(`  Upstream health: polling every 60s`);
+        const cfgForHealth = loadDispatcherConfig();
+        startHealthPoller(agentConfigs, undefined, cfgForHealth.proxy.circuit_threshold);
+        console.log(`  Upstream health: polling every 60s (circuit threshold=${cfgForHealth.proxy.circuit_threshold})`);
 
         // Backend feature-flag check (soft-required: signing.canonical-v1).
         // Matches the rollout pattern from auth.rpc-unavailable-code. Warn at startup if backend

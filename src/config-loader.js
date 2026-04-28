@@ -38,6 +38,8 @@ const DEFAULTS = Object.freeze({
     rate_limit_rps: 10,             // tokens-per-second per buyer
     rate_limit_burst: 30,           // max bucket size per buyer
     rate_limit_max_buckets: 10000,  // LRU cap on # of distinct buyers tracked
+    circuit_threshold: 3,           // consecutive_failures before circuit opens
+    circuit_open_ms: 30000,         // how long the circuit stays open after tripping
   },
   deposit: { poll_interval_ms: 60000 },
   health: { poll_interval_ms: 60000 },
@@ -75,6 +77,8 @@ const ENV_OVERRIDES = [
   ['J41_PROXY_RATE_LIMIT_RPS',         'proxy.rate_limit_rps',         'int'],
   ['J41_PROXY_RATE_LIMIT_BURST',       'proxy.rate_limit_burst',       'int'],
   ['J41_PROXY_RATE_LIMIT_MAX_BUCKETS', 'proxy.rate_limit_max_buckets', 'int'],
+  ['J41_PROXY_CIRCUIT_THRESHOLD',      'proxy.circuit_threshold',      'int'],
+  ['J41_PROXY_CIRCUIT_OPEN_MS',        'proxy.circuit_open_ms',        'int'],
   ['J41_DEPOSIT_POLL_INTERVAL', 'deposit.poll_interval_ms', 'int'],
   ['J41_HEALTH_POLL_INTERVAL',  'health.poll_interval_ms',  'int'],
   ['J41_WEBHOOK_MAX_BODY',      'webhook.max_body_bytes',   'int'],

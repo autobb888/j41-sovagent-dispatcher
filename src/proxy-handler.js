@@ -151,6 +151,32 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     }
   }
 
+  // Circuit breaker (2.1.14): if upstream-health has tripped the circuit
+  // for this agent and we're still inside the open window, fail fast with 503.
+  // circuitOpenedAt is set when consecutive_failures first crosses
+  // cfg.proxy.circuit_threshold; reset to null on next successful probe.
+  // After circuit_open_ms elapses we let traffic through (half-open: probe via real requests).
+  {
+    const { getHealth } = require('./upstream-health.js');
+    const health = getHealth(agentId);
+    if (
+      health &&
+      health.circuitOpenedAt &&
+      Date.now() - health.circuitOpenedAt < cfg.proxy.circuit_open_ms
+    ) {
+      res.writeHead(503, {
+        'Content-Type': 'application/json',
+        'X-J41-Upstream-Circuit': 'open',
+        'Retry-After': String(Math.ceil(cfg.proxy.circuit_open_ms / 1000)),
+      });
+      res.end(JSON.stringify({
+        error: 'Upstream temporarily unavailable',
+        consecutive_failures: health.consecutive_failures,
+      }));
+      return;
+    }
+  }
+
   // Reserve credit atomically (deducts upfront, adjusted after response)
   const estimatedInput = cfg.proxy.estimated_input_tokens;
   const estimatedOutput = cfg.proxy.estimated_output_tokens;
