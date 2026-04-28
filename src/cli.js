@@ -3467,6 +3467,14 @@ program
 
             return { revoked: 0, reason: 'no-target' };
           },
+          lookupAgentSecret: (sellerVerusId) => {
+            const sellerAgent = state.agents.find(a =>
+              a.iAddress === sellerVerusId || a.identity === sellerVerusId
+            );
+            if (!sellerAgent) return null;
+            const w = agentWebhooks.get(sellerAgent.id);
+            return w?.secret || null;
+          },
         };
 
         // Set notify context per api-endpoint agent for J41 webhook notifications

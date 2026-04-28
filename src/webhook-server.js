@@ -104,24 +104,45 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
       return;
     }
 
-    // POST /j41/api-access/revoke — platform tells us a buyer's grant was revoked
-    // Body shape: { sellerVerusId, buyerVerusId, grantId?, apiKey? }
-    // The platform calls this from DELETE /v1/me/api-access/:grantId so the
-    // dispatcher can mark the API key revoked locally (proxy refuses further calls).
     if (req.method === 'POST' && req.url === '/j41/api-access/revoke' && proxyContext) {
       const body = await readBody(req, res);
       if (body === null) return;
+
+      const signature = req.headers['x-webhook-signature'] || '';
+      if (!signature) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing x-webhook-signature' }));
+        return;
+      }
+
+      let payload;
+      try { payload = JSON.parse(body); } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid JSON' }));
+        return;
+      }
+
+      const { sellerVerusId } = payload || {};
+      if (!sellerVerusId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing sellerVerusId' }));
+        return;
+      }
+
+      const secret = proxyContext.lookupAgentSecret?.(sellerVerusId);
+      if (!secret) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Seller not found on this dispatcher' }));
+        return;
+      }
+      if (!verifyWebhookSignature(body, signature, secret)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid signature' }));
+        return;
+      }
+
       try {
-        const payload = JSON.parse(body);
-        const { sellerVerusId, buyerVerusId, apiKey } = payload || {};
-        if (!sellerVerusId || (!buyerVerusId && !apiKey)) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Missing sellerVerusId and either buyerVerusId or apiKey' }));
-          return;
-        }
-        const result = proxyContext.onApiAccessRevoke
-          ? await proxyContext.onApiAccessRevoke(payload)
-          : { revoked: 0, reason: 'no-handler' };
+        const result = await proxyContext.onApiAccessRevoke(payload);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
       } catch (e) {
