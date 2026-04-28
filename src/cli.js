@@ -3366,6 +3366,17 @@ program
               canonicalMessage = canonicalBytes(envelope).toString('utf8');
               signaturesV2 = signatures;
 
+              // Replay protection (2.1.13): reject any nonce we've already accepted
+              // within its expiry window.
+              {
+                const { checkAndRecordNonce } = require('./nonce-cache.js');
+                const expiresMs = Date.parse(envelope.expiresAt);
+                const replayCheck = checkAndRecordNonce(envelope.nonce, expiresMs);
+                if (!replayCheck.ok) {
+                  throw new Error(`v2 envelope rejected: ${replayCheck.reason} (nonce=${envelope.nonce.slice(0, 8)}…)`);
+                }
+              }
+
               // Normalize to v1-like shape so downstream code (mintAccessEnvelope, meter, etc.) stays unchanged.
               accessRequest = {
                 buyerVerusId: envelope.buyer.iaddress,
