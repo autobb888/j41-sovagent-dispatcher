@@ -82,19 +82,34 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
       return;
     }
 
-    // POST /j41/deposit/report — buyer reports a deposit txid
+    // POST /j41/deposit/report — buyer reports a deposit txid (signed)
     if (req.method === 'POST' && req.url === '/j41/deposit/report' && proxyContext) {
       const body = await readBody(req, res);
       if (body === null) return;
       try {
-        const { buyerVerusId, sellerVerusId, txid, amount } = JSON.parse(body);
-        if (!buyerVerusId || !txid || !amount) {
+        const report = JSON.parse(body);
+        const { buyerVerusId, sellerVerusId, txid, amount, signature } = report || {};
+        if (!buyerVerusId || !sellerVerusId || !txid || amount == null) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Missing buyerVerusId, txid, or amount' }));
+          res.end(JSON.stringify({ error: 'Missing buyerVerusId, sellerVerusId, txid, or amount' }));
           return;
         }
-        const result = await proxyContext.onDepositReport({ buyerVerusId, sellerVerusId, txid, amount });
-        res.writeHead(200, { 'Content-Type': 'application/json' });
+        // Reports MUST be signed by the buyer (anti credit-theft). Reject early
+        // if no signature is present so unauthenticated callers get 401.
+        if (!signature) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Missing signature — deposit reports must be signed by the buyer (buildDepositReportMessage + signMessage)' }));
+          return;
+        }
+        const result = await proxyContext.onDepositReport(report);
+        // Map authentication/verification failures to proper HTTP status codes.
+        const STATUS_BY_CODE = {
+          MISSING_FIELDS: 400, IDENTITY_LOOKUP_FAILED: 400, MULTISIG_UNSUPPORTED: 400,
+          STALE: 401, BAD_SIGNATURE: 403, SENDER_MISMATCH: 403, REPLAY: 409,
+          SELLER_NOT_FOUND: 404,
+        };
+        const status = result && result.code && STATUS_BY_CODE[result.code] ? STATUS_BY_CODE[result.code] : 200;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
       } catch (e) {
         console.error(`[Deposit] Report failed: ${e.message}`);

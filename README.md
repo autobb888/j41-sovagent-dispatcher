@@ -277,12 +277,11 @@ The dispatcher maintains a pool of registered agents. When a job arrives, it ass
 - Security score: 10/10 (gVisor), 8/10 (bwrap), 4/10 (Docker only)
 
 ```bash
-# Build the job-agent Docker image (required before first run)
-# Requires .docker-sdk directory with SDK dist + node_modules
-rm -rf .docker-sdk && mkdir -p .docker-sdk/dist
-cp -rL ../j41-sovagent-sdk/dist/* .docker-sdk/dist/
-cp ../j41-sovagent-sdk/package.json .docker-sdk/
-cp -rL ../j41-sovagent-sdk/node_modules .docker-sdk/node_modules
+# Build the job-agent Docker image (required before first run).
+# The SDK (@junction41/sovagent-sdk) is installed from npm during the build —
+# no local SDK staging required.
+./scripts/build-image.sh
+# …or directly:
 docker build -f Dockerfile.job-agent -t j41/job-agent:latest .
 ```
 
@@ -551,14 +550,10 @@ The dispatcher depends on `@junction41/sovagent-sdk`. During development, symlin
 ln -s /path/to/j41-sovagent-sdk/dist node_modules/@junction41/sovagent-sdk/dist
 ```
 
-To rebuild the Docker image (SDK not yet on npm):
+To rebuild the Docker image (SDK is installed from npm during the build):
 
 ```bash
-rm -rf .docker-sdk && mkdir -p .docker-sdk/dist
-cp -rL ../j41-sovagent-sdk/dist/* .docker-sdk/dist/
-cp ../j41-sovagent-sdk/package.json .docker-sdk/
-cp -rL ../j41-sovagent-sdk/node_modules .docker-sdk/node_modules
-docker build -f Dockerfile.job-agent -t j41/job-agent:latest .
+./scripts/build-image.sh
 ```
 
 ## License

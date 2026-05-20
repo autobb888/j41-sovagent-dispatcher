@@ -3415,8 +3415,14 @@ program
               if (!verified) throw new Error('Buyer signature verification failed (v2)');
               console.log(`[Discovery] Buyer signature verified (v2): ${accessRequest.buyerVerusId}`);
             } else {
-              const verified = await verifyAccessRequest(accessRequest, client, J41_NETWORK);
-              if (!verified) throw new Error('Buyer signature verification failed (v1)');
+              // Enforce freshness + single-use nonce (replay protection) in
+              // addition to the signature. The nonce-cache check-and-records,
+              // so a captured request cannot be re-submitted to re-mint a key.
+              const { checkAndRecordNonce } = require('./nonce-cache');
+              const verified = await verifyAccessRequest(accessRequest, client, J41_NETWORK, {
+                isReplay: (nonce) => !checkAndRecordNonce(String(nonce), Date.now() + 10 * 60 * 1000).ok,
+              });
+              if (!verified) throw new Error('Buyer signature verification failed, stale, or replayed (v1)');
               console.log(`[Discovery] Buyer signature verified (v1): ${accessRequest.buyerVerusId}`);
             }
 
@@ -3437,15 +3443,15 @@ program
             console.log(`[Discovery] Minted key for ${accessRequest.buyerVerusId} → ${sellerAgent.id}`);
             return envelope;
           },
-          onDepositReport: async ({ buyerVerusId, sellerVerusId, txid, amount }) => {
+          onDepositReport: async (report) => {
             const { reportDeposit } = require('./deposit-watcher');
             const sellerAgent = state.agents.find(a =>
-              a.iAddress === sellerVerusId || a.identity === sellerVerusId
+              a.iAddress === report.sellerVerusId || a.identity === report.sellerVerusId
             );
-            if (!sellerAgent) return { credited: false, message: 'Seller not found on this dispatcher' };
+            if (!sellerAgent) return { credited: false, message: 'Seller not found on this dispatcher', code: 'SELLER_NOT_FOUND' };
             const agent = await getAgentSession(state, sellerAgent);
             const payAddress = sellerAgent.iAddress || sellerAgent.address;
-            return reportDeposit(sellerAgent.id, agent._client || agent.client, buyerVerusId, txid, amount, payAddress);
+            return reportDeposit(sellerAgent.id, agent._client || agent.client, report, payAddress, J41_NETWORK);
           },
           onApiAccessRevoke: async ({ sellerVerusId, buyerVerusId, apiKey }) => {
             // Platform → dispatcher webhook called from DELETE /v1/me/api-access/:grantId

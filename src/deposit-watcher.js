@@ -20,8 +20,73 @@ const os = require('os');
 const crypto = require('crypto');
 const { creditDeposit } = require('./credit-meter');
 const { loadDispatcherConfig } = require('./config-loader.js');
+const { checkAndRecordNonce } = require('./nonce-cache');
 
 const AGENTS_DIR = path.join(os.homedir(), '.j41', 'dispatcher', 'agents');
+
+// Deposit reports must be signed within this window (replay/freshness bound).
+const DEPOSIT_REPORT_MAX_AGE_MS = 5 * 60 * 1000;
+
+/** Currency symbol for a network (deposits are in the chain's native coin). */
+function networkCurrency(network) {
+  return network === 'verus' ? 'VRSC' : 'VRSCTEST';
+}
+
+/**
+ * Authenticate a buyer-submitted deposit report.
+ *
+ * Verifies the report is signed by the claimed `buyerVerusId` (against its
+ * on-chain primary address), is fresh, and has an unused nonce. This stops an
+ * attacker from anonymously claiming someone else's payment, and stops replay
+ * of a captured report.
+ *
+ * NOTE: proving control of buyerVerusId is necessary but not sufficient to
+ * prove buyerVerusId *funded* the tx — that requires platform sender
+ * verification (see reportDeposit's expectedSender handling and
+ * docs/backend-requests/deposit-sender-verification.md).
+ *
+ * @returns {{ok: true} | {ok: false, code: string, message: string}}
+ */
+async function verifyDepositReport(client, report, network) {
+  const { buyerVerusId, sellerVerusId, txid, amount, nonce, timestamp, signature } = report || {};
+  if (!buyerVerusId || !sellerVerusId || !txid || amount == null || !nonce || !timestamp || !signature) {
+    return { ok: false, code: 'MISSING_FIELDS', message: 'Missing required signed-report fields (buyerVerusId, sellerVerusId, txid, amount, nonce, timestamp, signature)' };
+  }
+
+  // 1. Freshness — reject stale or future-dated reports.
+  const ts = Number(timestamp);
+  if (!Number.isFinite(ts) || Math.abs(Date.now() - ts * 1000) > DEPOSIT_REPORT_MAX_AGE_MS) {
+    return { ok: false, code: 'STALE', message: 'Report timestamp is outside the allowed freshness window' };
+  }
+
+  // 2. Replay — single-use nonce, remembered past the freshness window.
+  const replay = checkAndRecordNonce(String(nonce), ts * 1000 + DEPOSIT_REPORT_MAX_AGE_MS * 2);
+  if (!replay.ok) {
+    return { ok: false, code: 'REPLAY', message: 'Deposit report nonce has already been used' };
+  }
+
+  // 3. Signature — must match the buyer's on-chain identity.
+  const { buildDepositReportMessage, verifyMessage } = require('@junction41/sovagent-sdk/dist/index.js');
+  const message = buildDepositReportMessage({ buyerVerusId, sellerVerusId, txid, amount, nonce, timestamp: ts });
+
+  let keys;
+  try {
+    keys = await client.getIdentityKeys(buyerVerusId);
+  } catch (e) {
+    return { ok: false, code: 'IDENTITY_LOOKUP_FAILED', message: `Could not resolve buyer identity: ${e.message}` };
+  }
+  const primaryAddresses = (keys && keys.primaryAddresses) || [];
+  const minSigs = (keys && keys.minimumSignatures) || 1;
+  if (minSigs > 1) {
+    return { ok: false, code: 'MULTISIG_UNSUPPORTED', message: 'Multisig buyer identities cannot self-report deposits (single signature provided)' };
+  }
+  const signed = primaryAddresses.some((addr) => verifyMessage(message, addr, signature, network));
+  if (!signed) {
+    return { ok: false, code: 'BAD_SIGNATURE', message: 'Deposit report signature does not match the buyer identity' };
+  }
+
+  return { ok: true };
+}
 
 // Per-agent notify context for J41 webhook after confirmed deposit.
 // Keyed by agentId. Each context has { sellerWif, sellerVerusId, network }.
@@ -62,17 +127,27 @@ function saveDeposits(agentId, data) {
 }
 
 /**
- * Report a deposit (buyer-initiated). Verifies on-chain and credits meter.
+ * Report a deposit (buyer-initiated). Authenticates the signed report, verifies
+ * on-chain, and credits the meter.
  *
  * @param agentId - Seller agent ID
  * @param client - Authenticated J41Client
- * @param buyerVerusId - Who's claiming the deposit
- * @param txid - Transaction ID
- * @param expectedAmount - Amount buyer claims they sent
+ * @param report - Signed report { buyerVerusId, sellerVerusId, txid, amount, nonce, timestamp, signature }
  * @param payAddress - Seller's pay address (to verify output)
- * @returns { credited: boolean, message: string, balance?: number }
+ * @param network - 'verus' | 'verustest' (for signature verification + currency)
+ * @returns { credited: boolean, message: string, balance?: number, code?: string }
  */
-async function reportDeposit(agentId, client, buyerVerusId, txid, expectedAmount, payAddress) {
+async function reportDeposit(agentId, client, report, payAddress, network = 'verustest') {
+  // ── Authenticate the report before doing anything else ──
+  const auth = await verifyDepositReport(client, report, network);
+  if (!auth.ok) {
+    console.warn(`[Deposit] Rejected report for ${agentId}: ${auth.code} — ${auth.message}`);
+    return { credited: false, message: auth.message, code: auth.code };
+  }
+
+  const { buyerVerusId, txid } = report;
+  const expectedAmount = Number(report.amount);
+
   // Check if already processed
   const deposits = loadDeposits(agentId);
   if (deposits.processed.some(d => d.txid === txid)) {
@@ -85,11 +160,29 @@ async function reportDeposit(agentId, client, buyerVerusId, txid, expectedAmount
       txid,
       expectedAddress: payAddress,
       expectedAmount,
-      currency: 'VRSCTEST',
+      currency: networkCurrency(network),
+      // Ask the platform to confirm the funding tx came from the buyer. On
+      // platforms that support it this is the authoritative anti-misattribution
+      // check; older platforms omit the sender fields (handled below).
+      expectedSender: buyerVerusId,
     });
 
     if (!verification.valid) {
       return { credited: false, message: `Payment not found or amount mismatch: ${verification.reason || 'invalid'}` };
+    }
+
+    // Sender binding: if the platform verified the sender, enforce it matches
+    // the claiming buyer. If it could not be verified (false), refuse. If the
+    // field is absent, the platform doesn't verify sender yet — fall back to
+    // the signature-based authentication above (auth-only) and warn.
+    if (verification.senderVerified === false) {
+      return { credited: false, code: 'SENDER_MISMATCH', message: 'Funding transaction sender could not be confirmed to belong to the claiming buyer' };
+    }
+    if (verification.senderVerified === true && verification.senderVerusId && verification.senderVerusId !== buyerVerusId) {
+      return { credited: false, code: 'SENDER_MISMATCH', message: 'Funding transaction sender does not match the claiming buyer' };
+    }
+    if (verification.senderVerified === undefined) {
+      console.warn(`[Deposit] Platform did not return sender verification for ${txid.substring(0, 12)}… — crediting on signature auth only (see backend-requests/deposit-sender-verification.md)`);
     }
 
     // Check confirmations
@@ -276,4 +369,4 @@ async function notifyJ41DepositConfirmed(sellerWif, sellerVerusId, buyerVerusId,
   }
 }
 
-module.exports = { reportDeposit, pollPendingDeposits, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, setNotifyContext, getNotifyContext };
+module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
