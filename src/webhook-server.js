@@ -20,12 +20,15 @@ const { handleProxyRequest } = require('./proxy-handler.js');
  * @param {http.IncomingHttpHeaders} headers
  * @param {string} secret
  */
-function verifyInboundWebhook(rawBody, headers, secret) {
+function verifyInboundWebhook(rawBody, headers, secret, opts = {}) {
   const tsSig = headers['x-webhook-signature-timestamped'];
   const ts = headers['x-webhook-timestamp'];
   if (tsSig && ts) {
     return verifyWebhookSignatureWithTimestamp(rawBody, tsSig, secret, Number(ts), { toleranceSeconds: 300 });
   }
+  // requireTimestamped: refuse the legacy body-only HMAC so an on-path attacker
+  // can't strip the timestamped header to force a replayable downgrade.
+  if (opts.requireTimestamped) return false;
   // Legacy fallback (dropped once all dispatchers send the timestamped header).
   return verifyWebhookSignature(rawBody, headers['x-webhook-signature'] || '', secret);
 }
@@ -170,9 +173,13 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
         res.end(JSON.stringify({ error: 'Seller not found on this dispatcher' }));
         return;
       }
-      if (!verifyInboundWebhook(body, req.headers, secret)) {
+      // Revoke is sensitive (knocks a buyer offline) — require the timestamped
+      // signature so a captured legacy-signed revoke can't be replayed. Escape
+      // hatch J41_ALLOW_LEGACY_REVOKE=1 for the dual-sign rollout window.
+      const requireTimestamped = process.env.J41_ALLOW_LEGACY_REVOKE !== '1';
+      if (!verifyInboundWebhook(body, req.headers, secret, { requireTimestamped })) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid or stale signature' }));
+        res.end(JSON.stringify({ error: 'Invalid or stale signature (timestamped signature required)' }));
         return;
       }
 

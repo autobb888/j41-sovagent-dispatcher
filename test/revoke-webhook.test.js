@@ -69,14 +69,14 @@ test('revoke webhook: 404 when seller not on this dispatcher', async (t) => {
   assert.match(r.body, /Seller not found/);
 });
 
-test('revoke webhook: 200 with valid signature', async (t) => {
+test('revoke webhook: legacy-only signature is REJECTED by default (replay-downgrade guard)', async (t) => {
   const { server, port } = await startServer();
   t.after(() => server.close());
   const body = JSON.stringify({ sellerVerusId: 'iSELLER', buyerVerusId: 'iBUYER' });
+  // A valid LEGACY body-only HMAC must no longer be accepted on the revoke path —
+  // the timestamped signature is required so it can't be replayed.
   const r = await postJson(port, '/j41/api-access/revoke', body, { 'x-webhook-signature': hmac(body, 'test-secret-1234') });
-  assert.strictEqual(r.status, 200);
-  const parsed = JSON.parse(r.body);
-  assert.strictEqual(parsed.revoked, 1);
+  assert.strictEqual(r.status, 403);
 });
 
 const tsHmac = (ts, body, secret) =>
