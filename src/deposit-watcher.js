@@ -167,8 +167,13 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
       expectedSender: buyerVerusId,
     });
 
-    if (!verification.valid) {
-      return { credited: false, message: `Payment not found or amount mismatch: ${verification.reason || 'invalid'}` };
+    // Canonical field is `verified` (the platform has no `valid`). On a provable
+    // sender mismatch the platform forces verified=false with reason
+    // "sender_mismatch", so this single check also blocks misattribution.
+    if (!verification.verified) {
+      const reason = verification.reason || 'invalid';
+      const code = reason === 'sender_mismatch' ? 'SENDER_MISMATCH' : undefined;
+      return { credited: false, code, message: `Payment verification failed: ${reason}` };
     }
 
     // Sender binding: if the platform verified the sender, enforce it matches

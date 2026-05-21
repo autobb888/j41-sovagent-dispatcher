@@ -7,8 +7,28 @@
  */
 
 const http = require('http');
-const { verifyWebhookSignature } = require('@junction41/sovagent-sdk/dist/webhook/verify.js');
+const { verifyWebhookSignature, verifyWebhookSignatureWithTimestamp } = require('@junction41/sovagent-sdk/dist/webhook/verify.js');
 const { handleProxyRequest } = require('./proxy-handler.js');
+
+/**
+ * Verify an inbound platform webhook. Prefers the timestamped signature
+ * (X-Webhook-Signature-Timestamped + X-Webhook-Timestamp, HMAC over
+ * "<ts>.<body>", 5-min freshness window) for replay protection, and falls back
+ * to the legacy body-only signature during the platform's dual-sign rollout.
+ *
+ * @param {string|Buffer} rawBody
+ * @param {http.IncomingHttpHeaders} headers
+ * @param {string} secret
+ */
+function verifyInboundWebhook(rawBody, headers, secret) {
+  const tsSig = headers['x-webhook-signature-timestamped'];
+  const ts = headers['x-webhook-timestamp'];
+  if (tsSig && ts) {
+    return verifyWebhookSignatureWithTimestamp(rawBody, tsSig, secret, Number(ts), { toleranceSeconds: 300 });
+  }
+  // Legacy fallback (dropped once all dispatchers send the timestamped header).
+  return verifyWebhookSignature(rawBody, headers['x-webhook-signature'] || '', secret);
+}
 const { reportDeposit } = require('./deposit-watcher.js');
 const { loadDispatcherConfig } = require('./config-loader.js');
 
@@ -123,10 +143,10 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
       const body = await readBody(req, res);
       if (body === null) return;
 
-      const signature = req.headers['x-webhook-signature'] || '';
+      const signature = req.headers['x-webhook-signature'] || req.headers['x-webhook-signature-timestamped'] || '';
       if (!signature) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Missing x-webhook-signature' }));
+        res.end(JSON.stringify({ error: 'Missing webhook signature' }));
         return;
       }
 
@@ -150,9 +170,9 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
         res.end(JSON.stringify({ error: 'Seller not found on this dispatcher' }));
         return;
       }
-      if (!verifyWebhookSignature(body, signature, secret)) {
+      if (!verifyInboundWebhook(body, req.headers, secret)) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid signature' }));
+        res.end(JSON.stringify({ error: 'Invalid or stale signature' }));
         return;
       }
 
@@ -232,7 +252,7 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
     }
 
     const rawBody = Buffer.concat(chunks);
-    const signature = req.headers['x-webhook-signature'] || '';
+    const signature = req.headers['x-webhook-signature'] || req.headers['x-webhook-signature-timestamped'] || '';
 
     if (!signature) {
       res.writeHead(401);
@@ -242,9 +262,9 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
 
     // O(1) lookup — verify against this agent's secret only
     const config = agentWebhooks.get(agentId);
-    if (!verifyWebhookSignature(rawBody, signature, config.secret)) {
+    if (!verifyInboundWebhook(rawBody, req.headers, config.secret)) {
       res.writeHead(401);
-      res.end('Invalid signature');
+      res.end('Invalid or stale signature');
       return;
     }
 
