@@ -53,8 +53,14 @@ function ensureBuyer(data, buyerVerusId) {
  */
 function calculateCost(modelPricing, model, inputTokens, outputTokens) {
   const pricing = (modelPricing || []).find(p => p.model === model);
-  if (!pricing) return 0; // unknown model — free (or reject in caller)
-  return (inputTokens * pricing.inputTokenRate) + (outputTokens * pricing.outputTokenRate);
+  if (!pricing) return 0; // unknown model — caller rejects before reaching here
+  const ir = Number(pricing.inputTokenRate);
+  const or = Number(pricing.outputTokenRate);
+  // Fail CLOSED on invalid pricing: a NaN/negative/Infinite rate must never
+  // compute to a free (0/NaN) or negative cost — that would be exploitable
+  // free usage / credit injection. Infinity makes reserveCredit deny the request.
+  if (!Number.isFinite(ir) || !Number.isFinite(or) || ir < 0 || or < 0) return Infinity;
+  return (inputTokens * ir) + (outputTokens * or);
 }
 
 /**
