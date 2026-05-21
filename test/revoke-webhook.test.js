@@ -48,7 +48,7 @@ test('revoke webhook: 401 when x-webhook-signature missing', async (t) => {
   t.after(() => server.close());
   const r = await postJson(port, '/j41/api-access/revoke', { sellerVerusId: 'iSELLER', buyerVerusId: 'iBUYER' });
   assert.strictEqual(r.status, 401);
-  assert.match(r.body, /Missing x-webhook-signature/);
+  assert.match(r.body, /Missing webhook signature/);
 });
 
 test('revoke webhook: 403 when signature invalid', async (t) => {
@@ -57,7 +57,7 @@ test('revoke webhook: 403 when signature invalid', async (t) => {
   const body = JSON.stringify({ sellerVerusId: 'iSELLER', buyerVerusId: 'iBUYER' });
   const r = await postJson(port, '/j41/api-access/revoke', body, { 'x-webhook-signature': 'sha256=deadbeef' });
   assert.strictEqual(r.status, 403);
-  assert.match(r.body, /Invalid signature/);
+  assert.match(r.body, /Invalid or stale signature/);
 });
 
 test('revoke webhook: 404 when seller not on this dispatcher', async (t) => {
@@ -77,4 +77,32 @@ test('revoke webhook: 200 with valid signature', async (t) => {
   assert.strictEqual(r.status, 200);
   const parsed = JSON.parse(r.body);
   assert.strictEqual(parsed.revoked, 1);
+});
+
+const tsHmac = (ts, body, secret) =>
+  'sha256=' + crypto.createHmac('sha256', secret).update(`${ts}.${body}`).digest('hex');
+
+test('revoke webhook: 200 with valid timestamped signature', async (t) => {
+  const { server, port } = await startServer();
+  t.after(() => server.close());
+  const body = JSON.stringify({ sellerVerusId: 'iSELLER', buyerVerusId: 'iBUYER' });
+  const ts = Math.floor(Date.now() / 1000);
+  const r = await postJson(port, '/j41/api-access/revoke', body, {
+    'x-webhook-timestamp': String(ts),
+    'x-webhook-signature-timestamped': tsHmac(ts, body, 'test-secret-1234'),
+  });
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual(JSON.parse(r.body).revoked, 1);
+});
+
+test('revoke webhook: 403 when timestamped signature is stale', async (t) => {
+  const { server, port } = await startServer();
+  t.after(() => server.close());
+  const body = JSON.stringify({ sellerVerusId: 'iSELLER', buyerVerusId: 'iBUYER' });
+  const ts = Math.floor(Date.now() / 1000) - 3600; // 1h old, outside 300s window
+  const r = await postJson(port, '/j41/api-access/revoke', body, {
+    'x-webhook-timestamp': String(ts),
+    'x-webhook-signature-timestamped': tsHmac(ts, body, 'test-secret-1234'),
+  });
+  assert.strictEqual(r.status, 403);
 });

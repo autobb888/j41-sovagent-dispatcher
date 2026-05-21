@@ -1,8 +1,10 @@
 'use strict';
 /**
- * Per-buyer token bucket rate limiter for the proxy hot path.
+ * Per-(agent,buyer) token bucket rate limiter for the proxy hot path.
  *
- * Keyed by buyerVerusId. Each bucket: { tokens, lastRefill, lastTouch }.
+ * Keyed by `agentId\0buyerVerusId` so a buyer's traffic to one seller cannot
+ * consume or evict another seller's bucket for the same buyer. Each bucket:
+ * { tokens, lastRefill, lastTouch }.
  * Refills at cfg.rate_limit_rps tokens/sec, capped at cfg.rate_limit_burst.
  *
  * Memory bound: idle buckets (no touch in IDLE_TTL_MS) evicted by sweep;
@@ -36,21 +38,24 @@ function _ensureSweep() {
 }
 
 /**
- * Check + consume one token for the given buyer.
+ * Check + consume one token for the given (agent, buyer) pair.
+ * @param {string} agentId - The seller agent the request targets
  * @param {string} buyerVerusId
  * @param {{rate_limit_rps: number, rate_limit_burst: number, rate_limit_max_buckets: number}} cfg
  * @returns {{ allowed: true } | { allowed: false, retryAfterSec: number }}
  */
-function checkRate(buyerVerusId, cfg) {
-  if (typeof buyerVerusId !== 'string' || buyerVerusId.length === 0) {
+function checkRate(agentId, buyerVerusId, cfg) {
+  if (typeof agentId !== 'string' || agentId.length === 0 ||
+      typeof buyerVerusId !== 'string' || buyerVerusId.length === 0) {
     return { allowed: false, retryAfterSec: 1 };
   }
+  const bucketKey = `${agentId.length}:${agentId}:${buyerVerusId}`;
   _sweepCap = Math.max(1, cfg.rate_limit_max_buckets || 10_000);
   _ensureSweep();
   const burst = Math.max(1, cfg.rate_limit_burst);
   const rps = Math.max(0.001, cfg.rate_limit_rps);
   const now = Date.now();
-  let b = _buckets.get(buyerVerusId);
+  let b = _buckets.get(bucketKey);
   if (!b) {
     b = { tokens: burst, lastRefill: now, lastTouch: now };
     // Eviction only if strictly over cap — avoids evicting on the insert that takes us TO the cap
@@ -58,7 +63,7 @@ function checkRate(buyerVerusId, cfg) {
       const oldest = _buckets.keys().next().value;
       if (oldest !== undefined) _buckets.delete(oldest);
     }
-    _buckets.set(buyerVerusId, b);
+    _buckets.set(bucketKey, b);
   } else {
     const elapsed = (now - b.lastRefill) / 1000;
     b.tokens = Math.min(burst, b.tokens + elapsed * rps);

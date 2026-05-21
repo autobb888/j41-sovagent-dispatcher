@@ -90,7 +90,13 @@ function adjustCredit(agentId, buyerVerusId, model, inputTokens, outputTokens, r
   const actualCost = calculateCost(modelPricing, model, inputTokens, outputTokens);
   const diff = actualCost - reservedCost; // positive = undercharged, negative = overcharged
 
-  buyer.balance = Math.max(0, buyer.balance - diff);
+  // Settle the true cost. Do NOT clamp at zero: if actual usage exceeded the
+  // upfront reservation, the balance must be allowed to go negative (debt) so
+  // the overage is recovered. Clamping here previously absorbed the overage as
+  // free usage, which a buyer could exploit near a zero balance. reserveCredit
+  // blocks the next request while the balance is below the next estimate, so a
+  // negative balance simply means "blocked until topped up".
+  buyer.balance = buyer.balance - diff;
   buyer.totalSpent += actualCost;
   buyer.lastActivity = new Date().toISOString();
 

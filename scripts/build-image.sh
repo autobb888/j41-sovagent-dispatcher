@@ -46,10 +46,8 @@ cp "$DISPATCHER_DIR/src/logger.js" .build-temp/src/
 cp "$DISPATCHER_DIR/src/executors/"*.js .build-temp/src/executors/
 cp "$DISPATCHER_DIR/Dockerfile.job-agent" .build-temp/Dockerfile
 
-# Copy pre-built SDK for Docker (not published to npm yet)
-if [ -d "$DISPATCHER_DIR/.docker-sdk" ]; then
-    cp -r "$DISPATCHER_DIR/.docker-sdk" .build-temp/.docker-sdk
-fi
+# SDK is installed from npm during the image build (see Dockerfile.job-agent);
+# no local SDK staging required.
 
 # Build
 docker build \

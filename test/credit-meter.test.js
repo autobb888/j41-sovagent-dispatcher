@@ -71,6 +71,19 @@ test('refundReservation returns funds when upstream fails', () => {
   assert.ok(Math.abs(getBalance(AGENT, buyer) - 50) < 1e-9);
 });
 
+test('adjustCredit recovers overage as debt (no clamp) and blocks next request', () => {
+  const buyer = 'iOverageBuyer';
+  creditDeposit(AGENT, buyer, 0.01, 'tx-overage-1');
+  const r = reserveCredit(AGENT, buyer, 'gpt-4', 1000, 500, PRICING);
+  assert.equal(r.allowed, true);
+  // Actual usage massively exceeds the estimate — the overage must be recovered
+  // as debt (negative balance), NOT absorbed as free usage.
+  adjustCredit(AGENT, buyer, 'gpt-4', 100_000, 100_000, r.reserved, PRICING);
+  assert.ok(getBalance(AGENT, buyer) < 0, `balance should be negative (debt), got ${getBalance(AGENT, buyer)}`);
+  // While in debt, further requests are denied until topped up.
+  assert.equal(reserveCredit(AGENT, buyer, 'gpt-4', 1000, 500, PRICING).allowed, false);
+});
+
 test('concurrent reserveCredit calls cannot overdraw (TOCTOU guard)', () => {
   const buyer = 'iConcurrentBuyer';
   creditDeposit(AGENT, buyer, 1, 'tx-conc-1');

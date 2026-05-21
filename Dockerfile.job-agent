@@ -16,11 +16,12 @@ WORKDIR /app
 # PRE-INSTALL DEPENDENCIES (baked into image)
 # ─────────────────────────────────────────
 
-# Copy SDK (not published to npm — bundled from local build)
-COPY .docker-sdk /app/node_modules/@j41/sovagent-sdk
-
-# Copy package.json
+# Install dependencies from npm. The SDK is published as
+# @junction41/sovagent-sdk@2.1.1 (pinned in package.docker.json); npm pulls it
+# and its transitive deps, and runs its postinstall (verus-typescript-primitives
+# patch) automatically. This layer is cached unless package.docker.json changes.
 COPY package.docker.json ./package.json
+RUN npm install --omit=dev --no-audit --no-fund && npm cache clean --force
 
 # Copy executor source files
 COPY src/executors ./executors

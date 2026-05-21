@@ -136,10 +136,11 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     return;
   }
 
-  // Per-buyer rate limit (2.1.14). Token bucket keyed by buyerVerusId.
+  // Per-(agent,buyer) rate limit. Token bucket keyed by agentId+buyerVerusId so
+  // a buyer's traffic to one seller can't influence/evict another seller's bucket.
   {
     const { checkRate } = require('./proxy-rate-limiter.js');
-    const rate = checkRate(record.buyerVerusId, cfg.proxy);
+    const rate = checkRate(agentId, record.buyerVerusId, cfg.proxy);
     if (!rate.allowed) {
       res.writeHead(429, {
         'Content-Type': 'application/json',

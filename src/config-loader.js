@@ -280,14 +280,15 @@ function isSandboxedHome() {
 function migrateLegacyEnv(opts = {}) {
   const explicitEnvFile = !!opts.envFile;
   const envFile = opts.envFile || path.resolve(__dirname, '..', '.env');
-  if (!fs.existsSync(envFile)) return { migrated: false, reason: 'no-env-file' };
-  // Sandbox guard: if HOME is /tmp-rooted AND the caller did not supply an
-  // explicit envFile, refuse to mutate whichever .env we'd default to (almost
-  // certainly the real install-dir one, which is exactly the cross-boundary
-  // pattern we want to avoid).
+  // Sandbox guard FIRST: if HOME is /tmp-rooted AND the caller did not supply
+  // an explicit envFile, refuse default-path migration entirely. We must never
+  // mutate the real install-dir .env from a sandboxed test HOME — whether or
+  // not it currently exists — so this is checked before the existence
+  // short-circuit, making the guard reliable regardless of the working tree.
   if (!explicitEnvFile && isSandboxedHome()) {
     return { migrated: false, reason: 'sandboxed-home' };
   }
+  if (!fs.existsSync(envFile)) return { migrated: false, reason: 'no-env-file' };
   const text = fs.readFileSync(envFile, 'utf8');
   if (text.startsWith('# MIGRATED')) return { migrated: false, reason: 'already-migrated' };
 
