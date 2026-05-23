@@ -126,10 +126,14 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
         }
         const result = await proxyContext.onDepositReport(report);
         // Map authentication/verification failures to proper HTTP status codes.
+        // KEYS_UNSIGNED / KEYS_BAD_SIGNATURE are SERVER-side trust-anchor failures
+        // (the platform's signed identity-keys response is missing or tampered),
+        // not a client error — return 502 so upstream sees the platform fault.
         const STATUS_BY_CODE = {
           MISSING_FIELDS: 400, IDENTITY_LOOKUP_FAILED: 400, MULTISIG_UNSUPPORTED: 400,
           STALE: 401, BAD_SIGNATURE: 403, SENDER_MISMATCH: 403, REPLAY: 409,
           SELLER_NOT_FOUND: 404,
+          KEYS_UNSIGNED: 502, KEYS_BAD_SIGNATURE: 502,
         };
         const status = result && result.code && STATUS_BY_CODE[result.code] ? STATUS_BY_CODE[result.code] : 200;
         res.writeHead(status, { 'Content-Type': 'application/json' });

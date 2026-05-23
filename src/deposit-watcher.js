@@ -73,7 +73,12 @@ async function verifyDepositReport(client, report, network) {
   try {
     keys = await client.getIdentityKeys(buyerVerusId);
   } catch (e) {
-    return { ok: false, code: 'IDENTITY_LOOKUP_FAILED', message: `Could not resolve buyer identity: ${e.message}` };
+    // Preserve KEYS_UNSIGNED / KEYS_BAD_SIGNATURE from the SDK's pinned
+    // platform-signature check (server-side trust-anchor failure → 502) so the
+    // HTTP layer doesn't mislabel them as a 400/client error. Any other lookup
+    // failure (identity doesn't exist, network blip) stays IDENTITY_LOOKUP_FAILED.
+    const code = (e && (e.code === 'KEYS_UNSIGNED' || e.code === 'KEYS_BAD_SIGNATURE')) ? e.code : 'IDENTITY_LOOKUP_FAILED';
+    return { ok: false, code, message: `Could not resolve buyer identity: ${e.message}` };
   }
   const primaryAddresses = (keys && keys.primaryAddresses) || [];
   const minSigs = (keys && keys.minimumSignatures) || 1;
