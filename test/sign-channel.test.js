@@ -175,6 +175,156 @@ test('client throws CHANNEL_DOWN if the channel dir is missing', async () => {
   );
 });
 
+test('executeOnChain: container can invoke a registered executor; result is passed through', async () => {
+  const channelDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'j41-sign-test-'));
+  const calls = [];
+  const host = new SignChannelHost({
+    channelDir,
+    jobId: 'job-exec',
+    wif: 'UfakeWIF000000000000000000000000000000000000000000000000', // not used by this executor
+    network: NET,
+    getJob: async () => ({ id: 'job-exec', jobHash: 'a'.repeat(64) }),
+    executors: {
+      ping: async (params, ctx) => {
+        calls.push({ params, jobId: ctx.jobId });
+        return { pong: true, echo: params.value };
+      },
+    },
+  });
+  await host.start();
+  const client = new SignChannelClient({ channelDir, timeoutMs: 3000 });
+  try {
+    const result = await client.executeOnChain('ping', { value: 42 });
+    assert.deepStrictEqual(result, { pong: true, echo: 42 });
+    assert.deepStrictEqual(calls[0], { params: { kind: 'ping', value: 42 }, jobId: 'job-exec' });
+  } finally {
+    await host.destroy();
+  }
+});
+
+test('executeOnChain: unknown executor name is rejected (default-deny)', async () => {
+  const channelDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'j41-sign-test-'));
+  const host = new SignChannelHost({
+    channelDir,
+    jobId: 'job-1',
+    wif: 'U0000000000000000000000000000000000000000000000000000000',
+    network: NET,
+    getJob: async () => ({ id: 'job-1' }),
+    executors: { onlyThis: async () => ({}) },
+  });
+  await host.start();
+  const client = new SignChannelClient({ channelDir, timeoutMs: 3000 });
+  try {
+    await assert.rejects(
+      () => client.executeOnChain('somethingElse'),
+      (e) => e instanceof SignChannelError && e.code === 'UNKNOWN_EXECUTOR',
+    );
+  } finally {
+    await host.destroy();
+  }
+});
+
+test('executeOnChain: executor throws → wrapped as EXECUTOR_ERROR', async () => {
+  const channelDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'j41-sign-test-'));
+  const host = new SignChannelHost({
+    channelDir,
+    jobId: 'job-1',
+    wif: 'U0000000000000000000000000000000000000000000000000000000',
+    network: NET,
+    getJob: async () => ({ id: 'job-1' }),
+    executors: { boom: async () => { throw new Error('kaboom'); } },
+  });
+  await host.start();
+  const client = new SignChannelClient({ channelDir, timeoutMs: 3000 });
+  try {
+    await assert.rejects(
+      () => client.executeOnChain('boom'),
+      (e) => e instanceof SignChannelError && e.code === 'EXECUTOR_ERROR' && /kaboom/.test(e.message),
+    );
+  } finally {
+    await host.destroy();
+  }
+});
+
+test('executeOnChain: container call reaches host-side; container never references WIF', async () => {
+  // The full buildIdentityUpdateTx happy path has SDK tests of its own; here
+  // we only need to prove the channel correctly hands the call to a host-side
+  // executor that has access to the WIF (`ctx.wif`) while the container's
+  // params object does not. We use a stub executor and assert the wiring.
+  const ctx = await setup();
+  try {
+    let receivedCtx = null;
+    let receivedParams = null;
+    ctx.host.executors.fakeOnChain = async (params, hctx) => {
+      receivedCtx = hctx;
+      receivedParams = params;
+      return { txid: 'tx_from_host', usedWif: Boolean(hctx.wif) };
+    };
+
+    // Container-side: invoke with NO wif anywhere in params (this is the
+    // invariant under broker mode — the container code never types `wif`).
+    const result = await ctx.client.executeOnChain('fakeOnChain', {
+      jobRecord: { jobHash: ctx.job.jobHash, amount: 5 },
+    });
+
+    assert.strictEqual(result.txid, 'tx_from_host');
+    assert.strictEqual(result.usedWif, true, 'host-side ctx must carry the WIF');
+    assert.strictEqual(receivedCtx.wif, ctx.kp.wif, 'executor ctx.wif must match the host-side WIF');
+    assert.strictEqual(receivedCtx.jobId, ctx.jobId);
+    assert.strictEqual(typeof receivedCtx.getJob, 'function');
+    // Container params reach the executor verbatim — minus the 'kind' field
+    // which the channel framing adds.
+    assert.strictEqual(receivedParams.jobRecord.jobHash, ctx.job.jobHash);
+    // Sanity: the JSON request on the wire didn't carry a 'wif' field.
+    // (Can't read the file post-facto since it's deleted, but we can assert
+    // on what the executor received.)
+    assert.strictEqual('wif' in receivedParams, false, 'wif must NOT appear in container-supplied params');
+  } finally {
+    await teardown(ctx);
+  }
+});
+
+test('jobCompletionUpdateExecutor: rejects when jobRecord.jobHash mismatches authoritative job', async () => {
+  const { jobCompletionUpdateExecutor } = require('../src/broker-executors.js');
+  const ctx = await setup();
+  try {
+    const fakeClient = { async getIdentityRaw() { throw new Error('should not be called'); } };
+    const executor = jobCompletionUpdateExecutor({ getClient: async () => fakeClient });
+    ctx.host.executors.jobCompletionUpdate = executor;
+
+    await assert.rejects(
+      () => ctx.client.executeOnChain('jobCompletionUpdate', {
+        jobRecord: { jobHash: 'f'.repeat(64), amount: 5 },  // wrong jobHash
+      }),
+      (e) => e instanceof SignChannelError && e.code === 'EXECUTOR_ERROR' && /jobHash mismatch/.test(e.message),
+    );
+  } finally {
+    await teardown(ctx);
+  }
+});
+
+test('jobCompletionUpdateExecutor: returns skipped on no UTXOs (no throw)', async () => {
+  const { jobCompletionUpdateExecutor } = require('../src/broker-executors.js');
+  const ctx = await setup();
+  try {
+    const fakeClient = {
+      async getIdentityRaw() {
+        return { data: { identity: {}, prevOutput: { txid: 'a'.repeat(64), vout: 0 } } };
+      },
+      async getUtxos() { return { utxos: [] }; },
+    };
+    const executor = jobCompletionUpdateExecutor({ getClient: async () => fakeClient });
+    ctx.host.executors.jobCompletionUpdate = executor;
+
+    const result = await ctx.client.executeOnChain('jobCompletionUpdate', {
+      jobRecord: { jobHash: ctx.job.jobHash, amount: 5 },
+    });
+    assert.deepStrictEqual(result, { skipped: true, reason: 'no-utxos' });
+  } finally {
+    await teardown(ctx);
+  }
+});
+
 test('end-to-end: J41Agent constructed with the client routes accept through the broker', async () => {
   // This is the integration touchpoint that step 4 will rely on: the agent's
   // checkForJobs() accept path uses signer.signBrokered, which goes over the

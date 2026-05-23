@@ -65,6 +65,28 @@ class SignChannelClient {
     return res.signature;
   }
 
+  /**
+   * Ask the dispatcher to perform a named on-chain action host-side. Used for
+   * operations that need the WIF inline with tx-building (e.g. building +
+   * broadcasting an `updateidentity` tx) — the container never sees the WIF.
+   *
+   * The dispatcher registers a finite set of executors (e.g.
+   * `jobCompletionUpdate`) at channel construction time; any other `kind` is
+   * rejected as `UNKNOWN_EXECUTOR`. The container has no way to invoke an
+   * arbitrary host-side function — only the explicitly-listed kinds.
+   *
+   * @param {string} kind     The executor name (must be registered host-side).
+   * @param {object} [params] Executor-specific parameters.
+   * @returns {Promise<object>} The executor's result object (kind-specific).
+   */
+  async executeOnChain(kind, params = {}) {
+    if (typeof kind !== 'string' || !kind) {
+      throw new SignChannelError('BAD_REQUEST', 'executeOnChain: kind required');
+    }
+    const res = await this._send('executeOnChain', { kind, ...params });
+    return res;
+  }
+
   /** RemoteSigner.signBrokered — request the broker to sign a structured
    *  protocol message (accept/deliver/dispute_respond). */
   async signBrokered(req) {

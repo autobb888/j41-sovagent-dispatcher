@@ -70,9 +70,21 @@ class SignChannelHost {
    *                                   dispatcher implements this against the
    *                                   platform API — NEVER trust the request
    *                                   for any of these fields.
+   * @param {Record<string, (params: object, ctx: { wif: string, network: string, jobId: string, getJob: () => Promise<object> }) => Promise<object>>} [opts.executors]
+   *                                   Named host-side executors for the
+   *                                   `executeOnChain` channel method. The
+   *                                   container can only invoke executors that
+   *                                   are explicitly registered here (default-
+   *                                   deny). Each executor receives the
+   *                                   request `params` plus a `ctx` with the
+   *                                   WIF + network + jobId + getJob lookup so
+   *                                   it can build/broadcast on-chain ops
+   *                                   without the container ever seeing the
+   *                                   WIF. Throwing from an executor returns
+   *                                   `{ ok: false, error: { code: 'EXECUTOR_ERROR', message } }`.
    * @param {(line: string) => void} [opts.log]  Structured-log sink.
    */
-  constructor({ channelDir, jobId, wif, network = 'verustest', getJob, log }) {
+  constructor({ channelDir, jobId, wif, network = 'verustest', getJob, executors, log }) {
     if (!channelDir) throw new Error('SignChannelHost: channelDir required');
     if (!jobId) throw new Error('SignChannelHost: jobId required');
     if (typeof wif !== 'string' || wif.length === 0) {
@@ -88,6 +100,7 @@ class SignChannelHost {
     this._wif = wif;
     this.network = network;
     this.getJob = getJob;
+    this.executors = executors || {};
     this.log = log || (() => {});
     this._watcher = null;
     this._pollTimer = null;
@@ -225,6 +238,32 @@ class SignChannelHost {
       });
       if (!result.ok) return { ok: false, error: { code: result.code, message: result.reason } };
       return { ok: true, result: { signature: result.signature } };
+    }
+
+    if (method === 'executeOnChain') {
+      // The container can only invoke executors that the dispatcher explicitly
+      // registered at construction time (default-deny). The executor name is
+      // the ONLY way the container reaches host-side code; we don't allow
+      // arbitrary function names.
+      const kind = params.kind;
+      if (typeof kind !== 'string' || !this.executors[kind]) {
+        return {
+          ok: false,
+          error: { code: 'UNKNOWN_EXECUTOR', message: `no executor registered for kind: ${kind}` },
+        };
+      }
+      const ctx = {
+        wif: this._wif,
+        network: this.network,
+        jobId: this.jobId,
+        getJob: this.getJob,
+      };
+      try {
+        const result = await this.executors[kind](params, ctx);
+        return { ok: true, result: result || {} };
+      } catch (e) {
+        return { ok: false, error: { code: 'EXECUTOR_ERROR', message: e.message } };
+      }
     }
 
     if (method === 'signBrokered') {
