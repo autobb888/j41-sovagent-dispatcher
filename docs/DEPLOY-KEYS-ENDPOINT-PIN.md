@@ -43,11 +43,18 @@ store) and restart:
 J41_PLATFORM_SIGNER=RBgxQwD7mMLCfciTN68RjBQHsH68vcnUKb
 ```
 
-That's it. No code change. The SDK (`@junction41/sovagent-sdk@2.3.0`) sees the
-env at every `getIdentityKeys` call, requires `platformSignature` on the
+That's it. No code change. The SDK (**`@junction41/sovagent-sdk@2.3.1`+**) sees
+the env at every `getIdentityKeys` call, requires `platformSignature` on the
 response, recomputes the JCS-canonical payload, and verifies it as a Verus
 message signature against the pinned R-address. Failures throw `J41Error` with
 `code === 'KEYS_UNSIGNED'` or `'KEYS_BAD_SIGNATURE'`.
+
+> **SDK 2.3.0 is NOT compatible with verusd `signmessage`** — its Verus
+> message verifier was tautologically cross-tested against a sibling client
+> that shared the same bug. Pinning on 2.3.0 would brick every
+> `getIdentityKeys` call with `KEYS_BAD_SIGNATURE`. **Use 2.3.1 or later.**
+> End-to-end verified live against the real staging signer
+> `RBgxQwD7mMLCfciTN68RjBQHsH68vcnUKb`.
 
 ## Post-deploy verification
 
