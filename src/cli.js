@@ -21,6 +21,14 @@ const { spawn } = require('child_process');
 const { getRuntime, persistActiveJobs, loadActiveJobs, saveConfig, loadConfig } = require('./config');
 const log = require('./logger');
 const { loadDispatcherConfig } = require('./config-loader.js');
+const { SignChannelHost } = require('./sign-channel-host.js');
+const { defaultExecutors } = require('./broker-executors.js');
+
+/** Feature flag: route in-container signing through the host-side broker
+ *  instead of mounting the WIF into the container. Default OFF; flip to ON
+ *  via env after Docker-validated end-to-end on testnet. See
+ *  src/sign-broker.js / src/sign-channel-host.js / src/job-signer.js. */
+const SIGNING_BROKER_ENABLED = process.env.J41_SIGNING_BROKER === '1';
 const cfg = loadDispatcherConfig();
 
 const RUNTIME = getRuntime();
@@ -5176,16 +5184,71 @@ async function startJobContainer(state, job, agentInfo) {
   const agentDir = path.join(AGENTS_DIR, agentInfo.id);
   const keysPath = path.join(agentDir, 'keys.json');
 
-  // Copy keys to a temp file OUTSIDE the writable job dir to avoid double-exposing the WIF.
-  // The job dir is mounted rw (/app/job), so keys must not be inside it.
-  const tmpKeysDir = path.join(os.tmpdir(), `j41-keys-${job.id}`);
-  fs.mkdirSync(tmpKeysDir, { recursive: true, mode: 0o700 });
-  const tmpKeysPath = path.join(tmpKeysDir, 'keys.json');
-  fs.copyFileSync(keysPath, tmpKeysPath);
-  try {
-    fs.chmodSync(tmpKeysPath, 0o644); // container process needs read access; mount is :ro
-  } catch {
-    // best effort on systems that don't support chmod
+  // Two mutually-exclusive paths:
+  //  - BROKER MODE: WIF stays on host inside a SignChannelHost closure; the
+  //    container only sees the bind-mounted JSON channel at /app/sign.
+  //  - LEGACY MODE: copy keys.json to a temp file, mount it :ro at
+  //    /app/keys.json (the pre-2.4 behavior).
+  let tmpKeysPath = null;           // legacy mode only
+  let signerChannelDir = null;      // broker mode only
+  let signerHost = null;            // broker mode only
+  let signerTeardown = null;        // broker mode only
+  const hostKeys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+
+  if (SIGNING_BROKER_ENABLED) {
+    signerChannelDir = path.join(os.tmpdir(), `j41-sign-${job.id}`);
+    const { executors, teardown } = defaultExecutors({
+      apiUrl: cfg.platform.api_url,
+      wif: hostKeys.wif,
+      identityName: agentInfo.identity,
+      iAddress: hostKeys.iAddress,
+      network: cfg.platform.network,
+    });
+    signerTeardown = teardown;
+    signerHost = new SignChannelHost({
+      channelDir: signerChannelDir,
+      jobId: job.id,
+      wif: hostKeys.wif,
+      network: cfg.platform.network,
+      // Authoritative job lookup: re-fetch from the platform every time the
+      // broker needs to verify a sign request. The dispatcher trusts ONLY
+      // the platform for amount/buyer/jobHash — never the container.
+      getJob: async () => {
+        // Lazy + cheap: use a temporary J41Client session per call. The
+        // platform's read endpoint is cached server-side so this is fine.
+        // eslint-disable-next-line global-require
+        const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+        const a = new J41Agent({
+          apiUrl: cfg.platform.api_url,
+          wif: hostKeys.wif,
+          identityName: agentInfo.identity,
+          iAddress: hostKeys.iAddress,
+        });
+        await a.authenticate();
+        try {
+          const j = await a.client.getJob(job.id);
+          return j;
+        } finally {
+          a.stop();
+        }
+      },
+      executors,
+      log: (line) => console.log(`  [sign-channel ${job.id.substring(0, 8)}] ${line}`),
+    });
+    await signerHost.start();
+    console.log(`  🔒 Signing broker active for ${job.id} (channel: ${signerChannelDir})`);
+  } else {
+    // Copy keys to a temp file OUTSIDE the writable job dir to avoid double-exposing the WIF.
+    // The job dir is mounted rw (/app/job), so keys must not be inside it.
+    const tmpKeysDir = path.join(os.tmpdir(), `j41-keys-${job.id}`);
+    fs.mkdirSync(tmpKeysDir, { recursive: true, mode: 0o700 });
+    tmpKeysPath = path.join(tmpKeysDir, 'keys.json');
+    fs.copyFileSync(keysPath, tmpKeysPath);
+    try {
+      fs.chmodSync(tmpKeysPath, 0o644); // container process needs read access; mount is :ro
+    } catch {
+      // best effort on systems that don't support chmod
+    }
   }
 
   try {
@@ -5198,23 +5261,36 @@ async function startJobContainer(state, job, agentInfo) {
       console.log(`  ♻️  Removed stale container ${containerName}`);
     } catch {}
 
+    // Extra env vars under broker mode: tell job-agent.js to use the channel
+    // and pass the iAddress (we no longer have keys.json inside the container
+    // to read it from). The defensive guard in job-agent.js refuses to start
+    // if J41_SIGNING_BROKER=1 and /app/keys.json *also* exists.
+    const brokerEnv = SIGNING_BROKER_ENABLED
+      ? [`J41_SIGNING_BROKER=1`, `J41_SIGNING_CHANNEL_DIR=/app/sign`, `J41_IADDRESS=${hostKeys.iAddress}`]
+      : [];
+
+    // Bind mounts differ by mode: legacy mounts the WIF; broker mounts the channel.
+    const signingBinds = SIGNING_BROKER_ENABLED
+      ? [`${signerChannelDir}:/app/sign`]                      // rw — container writes req/, reads resp/
+      : [`${tmpKeysPath}:/app/keys.json:ro`];
+
     const container = await docker.createContainer({
       name: containerName,
       Image: 'j41/job-agent:latest',  // PRE-BAKED IMAGE
-      // Docker bind-mounts keys.json/SOUL.md/job into /app/* — strip the
-      // host-path env vars buildContainerEnv emits (they're host paths and would
-      // override the in-container defaults the job-agent expects: /app/keys.json,
-      // /app/SOUL.md, /app/job).
+      // Docker bind-mounts SOUL.md/job (and keys.json OR /app/sign) into /app/* —
+      // strip the host-path env vars buildContainerEnv emits (they're host paths and
+      // would override the in-container defaults the job-agent expects).
       Env: Object.entries(buildContainerEnv(job, agentInfo, loadAgentConfig(agentInfo.id), canaryToken, jobDir, tmpKeysPath))
             .filter(([k, v]) => v !== undefined && v !== '' &&
               k !== 'J41_KEYS_FILE' && k !== 'J41_SOUL_FILE' && k !== 'J41_JOB_DIR')
             .map(([k, v]) => `${k}=${v}`)
-            .concat(getExecutorEnvVars(agentInfo).filter(s => !s.startsWith('J41_LLM_'))),
+            .concat(getExecutorEnvVars(agentInfo).filter(s => !s.startsWith('J41_LLM_')))
+            .concat(brokerEnv),
       HostConfig: {
         Binds: [
           // job dir must be writable for attestation artifacts (creation/deletion json)
           `${jobDir}:/app/job`,
-          `${tmpKeysPath}:/app/keys.json:ro`,
+          ...signingBinds,
           `${path.join(agentDir, 'SOUL.md')}:/app/SOUL.md:ro`,
         ],
         // Run as host UID so bind-mounted job dir is writable
@@ -5260,6 +5336,10 @@ async function startJobContainer(state, job, agentInfo) {
       reworkCount: 0,
       reactivationFee: job.lifecycle?.reactivationFee ?? null,
       pauseCount: 0,
+      // Broker-mode resources — tracked here so stopJobContainer can tear them down.
+      _signerHost: signerHost,
+      _signerChannelDir: signerChannelDir,
+      _signerTeardown: signerTeardown,
     });
 
     // Mark as seen immediately to avoid duplicate pickup loops while status remains requested
@@ -5335,6 +5415,21 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
 
   // H3: No need to restore keys.json chmod — original was never modified.
   // The temp copy in jobDir will be cleaned up below.
+
+  // Tear down the signing broker (broker mode): stop the watcher, run the
+  // executor teardown (closes the cached J41Agent inside the executors), and
+  // remove the channel directory. Best-effort — log on failure but don't
+  // block job cleanup.
+  if (active._signerHost) {
+    try {
+      await active._signerHost.destroy();   // includes channel-dir rm
+    } catch (e) {
+      console.error(`[Cleanup] signer host destroy failed for ${jobId}:`, e.message);
+    }
+  }
+  if (active._signerTeardown) {
+    try { await active._signerTeardown(); } catch { /* best-effort */ }
+  }
 
   // Cleanup job dir (retain for debugging if requested)
   const jobDir = path.join(JOBS_DIR, jobId);
