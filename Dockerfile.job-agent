@@ -30,6 +30,7 @@ COPY src/executors ./executors
 
 # Copy logger
 COPY src/logger.js ./
+COPY src/config-loader.js ./
 
 # Copy runtime scripts (baked into image)
 COPY src/job-agent.js ./

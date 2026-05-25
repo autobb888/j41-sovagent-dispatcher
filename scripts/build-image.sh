@@ -43,6 +43,10 @@ cp "$DISPATCHER_DIR/src/job-agent.js" .build-temp/src/
 cp "$DISPATCHER_DIR/src/sign-attestation.js" .build-temp/src/
 cp "$DISPATCHER_DIR/src/container-entry.sh" .build-temp/src/
 cp "$DISPATCHER_DIR/src/logger.js" .build-temp/src/
+# logger.js requires config-loader.js (graceful-missing config.toml; reads
+# DEFAULTS at top-level). Missing in older build scripts — caused the
+# container to crash on import. Fixed here.
+cp "$DISPATCHER_DIR/src/config-loader.js" .build-temp/src/
 # Broker mode runtime files (J41_SIGNING_BROKER=1). Always copied — the
 # container code-path can run with broker off, but if broker is on the
 # files must be present (job-agent.js requires them).
