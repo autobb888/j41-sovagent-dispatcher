@@ -16,12 +16,14 @@ WORKDIR /app
 # PRE-INSTALL DEPENDENCIES (baked into image)
 # ─────────────────────────────────────────
 
-# Install dependencies from npm. The SDK is published as
-# @junction41/sovagent-sdk@2.1.1 (pinned in package.docker.json); npm pulls it
-# and its transitive deps, and runs its postinstall (verus-typescript-primitives
-# patch) automatically. This layer is cached unless package.docker.json changes.
+# Install dependencies. By default the SDK is pulled from npm via the pin in
+# package.docker.json. For local-SDK builds (J41_USE_LOCAL_SDK=1 in
+# scripts/build-image.sh), the script swaps the SDK dep to file:./local-sdk.tgz
+# and stages the tarball; the unconditional COPY below picks up the placeholder
+# in the default case and the real tarball in the override case.
 COPY package.docker.json ./package.json
-RUN npm install --omit=dev --no-audit --no-fund && npm cache clean --force
+COPY local-sdk.tgz ./local-sdk.tgz
+RUN npm install --omit=dev --no-audit --no-fund && npm cache clean --force && rm -f /app/local-sdk.tgz
 
 # Copy executor source files
 COPY src/executors ./executors
@@ -33,6 +35,12 @@ COPY src/logger.js ./
 COPY src/job-agent.js ./
 COPY src/sign-attestation.js ./
 COPY src/container-entry.sh ./
+# Broker mode (J41_SIGNING_BROKER=1) — container-side file-channel client +
+# unified signer surface. Both are required for `job-agent.js` to start; the
+# defensive guard in job-agent.js refuses to run if broker mode is on but
+# these aren't present.
+COPY src/sign-channel-client.js ./
+COPY src/job-signer.js ./
 RUN chmod +x container-entry.sh
 
 # ─────────────────────────────────────────
