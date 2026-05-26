@@ -7,11 +7,12 @@
  */
 
 const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
-const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { createExecutor, EXECUTOR_TYPE } = require('./executors/index.js');
+const { createJobSigner } = require('./job-signer.js');
+const { SignChannelClient } = require('./sign-channel-client.js');
 const log = require('./logger.js');
 
 const API_URL = process.env.J41_API_URL;
@@ -27,6 +28,35 @@ const KEYS_FILE = process.env.J41_KEYS_FILE || '/app/keys.json';
 const SOUL_FILE = process.env.J41_SOUL_FILE || '/app/SOUL.md';
 const JOB_DIR = process.env.J41_JOB_DIR || '/app/job';
 const CANARY_TOKEN = process.env.J41_CANARY_TOKEN || '';
+
+/** True when this container should route signing through the host-side
+ *  broker (no WIF in container). Default off for now — flipped on after
+ *  end-to-end Docker validation in step 5. */
+const SIGNING_BROKER_ENABLED = process.env.J41_SIGNING_BROKER === '1';
+/** Channel directory the dispatcher bind-mounts when broker mode is on.
+ *  Both subdirs (`req/`, `resp/`) must exist before this process starts. */
+const SIGNING_BROKER_CHANNEL_DIR = process.env.J41_SIGNING_CHANNEL_DIR || '/app/sign';
+
+/**
+ * Construct the right signer for this container. In broker mode the
+ * `SignChannelClient` is built from the bind-mounted channel directory and
+ * we don't even need the WIF (the local-fallback path's `wif` arg is
+ * ignored). In legacy mode we use the WIF from /app/keys.json the same way
+ * the pre-broker code did.
+ *
+ * Returns a `JobSigner` with a uniform API regardless of mode.
+ */
+function buildSigner(keys) {
+  const channelClient = SIGNING_BROKER_ENABLED
+    ? new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR })
+    : null;
+  return createJobSigner({
+    wif: keys?.wif,
+    network: J41_NETWORK,
+    channelClient,
+    brokerEnabled: SIGNING_BROKER_ENABLED,
+  });
+}
 
 // Container metadata (from Docker labels)
 const CONTAINER_ID = process.env.HOSTNAME || 'unknown'; // Docker sets HOSTNAME to container ID
@@ -132,8 +162,31 @@ async function main() {
   console.log(`Timeout: ${TIMEOUT_MS / 60000} min`);
   console.log(`Executor: ${EXECUTOR_TYPE}\n`);
 
-  // Load keys
-  const keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
+  // Load keys. In broker mode the WIF stays on the host — the container
+  // shouldn't have `/app/keys.json` mounted at all. We fall back to env-var
+  // iAddress so the J41Agent constructor still has what it needs.
+  let keys;
+  if (SIGNING_BROKER_ENABLED) {
+    const envIAddress = process.env.J41_IADDRESS || '';
+    if (!envIAddress) {
+      throw new Error('J41_SIGNING_BROKER=1 but J41_IADDRESS env is missing — dispatcher must inject it');
+    }
+    keys = { iAddress: envIAddress }; // no wif
+    if (fs.existsSync(KEYS_FILE)) {
+      // Defensive — if the dispatcher accidentally still mounts keys.json
+      // under broker mode, fail loudly so we don't silently fall back to
+      // local-WIF signing while the operator thinks we're brokered.
+      throw new Error(
+        `J41_SIGNING_BROKER=1 but ${KEYS_FILE} exists in the container — refuse to start (would defeat the broker; remove the mount)`,
+      );
+    }
+  } else {
+    keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
+  }
+
+  // The unified signer: routes via channel in broker mode, local WIF otherwise.
+  const signer = buildSigner(keys);
+  console.log(`[SIGNER] mode=${signer.mode}`);
 
   // Load SOUL personality
   let soulPrompt = '';
@@ -176,10 +229,15 @@ async function main() {
   console.log(`  Buyer: ${job.buyer}`);
   console.log(`  Payment: ${job.amount} ${job.currency}\n`);
 
-  // Initialize agent
+  // Initialize agent. In broker mode we hand the J41Agent the file-channel
+  // client as its `signer` (SDK 2.4.0+); the agent then routes every signing
+  // path through it and never touches a WIF. In legacy mode we pass `wif`
+  // and the agent signs in-process the way it always did.
   const agent = new J41Agent({
     apiUrl: API_URL,
-    wif: keys.wif,
+    ...(SIGNING_BROKER_ENABLED
+      ? { signer: new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR }) }
+      : { wif: keys.wif }),
     identityName: IDENTITY,
     iAddress: keys.iAddress,
   });
@@ -214,11 +272,15 @@ async function main() {
   if (fullJob.status === 'accepted' || fullJob.status === 'in_progress') {
     log.info('Job already accepted', { jobId: JOB_ID, status: fullJob.status });
   } else {
-    const timestamp = Math.floor(Date.now() / 1000);
-    const acceptMsg = `J41-ACCEPT|Job:${fullJob.jobHash}|Buyer:${fullJob.buyerVerusId}|Amt:${fullJob.amount} ${fullJob.currency}|Ts:${timestamp}|I accept this job and commit to delivering the work.`;
-    const acceptSig = signMessage(keys.wif, acceptMsg, J41_NETWORK);
-    await withRetry(() => agent.client.acceptJob(job.id, acceptSig, timestamp), 'acceptJob');
-    log.info('Job accepted', { jobId: JOB_ID, buyer: fullJob.buyerVerusId, amount: fullJob.amount, currency: fullJob.currency });
+    const brokered = await signer.signAccept({
+      jobId: job.id,
+      jobHash: fullJob.jobHash,
+      buyerVerusId: fullJob.buyerVerusId,
+      amount: fullJob.amount,
+      currency: fullJob.currency,
+    });
+    await withRetry(() => agent.client.acceptJob(job.id, brokered.signature, brokered.timestamp), 'acceptJob');
+    log.info('Job accepted', { jobId: JOB_ID, buyer: fullJob.buyerVerusId, amount: fullJob.amount, currency: fullJob.currency, signer: signer.mode });
   }
 
   // Connect to chat (guarded — job is already accepted, must not crash without delivery)
@@ -230,11 +292,9 @@ async function main() {
     // Deliver a "failed" result so the accepted job isn't left in limbo
     const failContent = `Chat connection failed: ${chatErr.message}`;
     const failHash = require('crypto').createHash('sha256').update(failContent).digest('hex');
-    const deliverTimestamp = Math.floor(Date.now() / 1000);
-    const deliverMessage = `J41-DELIVER|Job:${fullJob.jobHash}|Delivery:${failHash}|Ts:${deliverTimestamp}|I have delivered the work for this job.`;
-    const deliverSig = signMessage(keys.wif, deliverMessage, J41_NETWORK);
+    const brokered = await signer.signDeliver({ jobId: job.id, jobHash: fullJob.jobHash, deliveryHash: failHash });
     await withRetry(
-      () => agent.client.deliverJob(job.id, failHash, deliverSig, deliverTimestamp, failContent),
+      () => agent.client.deliverJob(job.id, failHash, brokered.signature, brokered.timestamp, failContent),
       'deliverJob-chatfail',
       { maxAttempts: 5, baseDelayMs: 2000 }
     );
@@ -333,8 +393,16 @@ async function main() {
           if (_disputePolicy) console.log(`[IPC] Dispute policy received (default=${_disputePolicy.defaultAction})`);
           break;
         default:
-          // Queue for post-delivery handler
-          ipcQueue.push(msg);
+          // Docker mode: process.on('message') never fires, so future messages
+          // arriving via the file-IPC poller must be routed directly to the
+          // registered post-delivery handler. Fall back to the queue only if
+          // the handler isn't registered yet (waitForPostDelivery drains the
+          // queue on entry).
+          if (_postDeliveryHandler) {
+            await _postDeliveryHandler(msg);
+          } else {
+            ipcQueue.push(msg);
+          }
           break;
     }
   }
@@ -391,13 +459,16 @@ async function main() {
   if (CANARY_TOKEN && result.content) {
     result.content = result.content.split(CANARY_TOKEN).join('[redacted]');
   }
-  const deliverTimestamp = Math.floor(Date.now() / 1000);
-  const deliverHash = result.hash || 'failed';
-  const deliverMessage = `J41-DELIVER|Job:${fullJob.jobHash}|Delivery:${deliverHash}|Ts:${deliverTimestamp}|I have delivered the work for this job.`;
-  const deliverSig = signMessage(keys.wif, deliverMessage, J41_NETWORK);
+  // 'failed' is not a 64-char hex SHA-256 — the broker policy would reject
+  // it. Compute a real hash of the failure sentinel so both paths agree.
+  let deliverHash = result.hash;
+  if (!deliverHash) {
+    deliverHash = require('crypto').createHash('sha256').update('failed').digest('hex');
+  }
+  const brokered = await signer.signDeliver({ jobId: job.id, jobHash: fullJob.jobHash, deliveryHash: deliverHash });
 
   await withRetry(
-    () => agent.client.deliverJob(job.id, deliverHash, deliverSig, deliverTimestamp, result.content.substring(0, 200)),
+    () => agent.client.deliverJob(job.id, deliverHash, brokered.signature, brokered.timestamp, result.content.substring(0, 200)),
     'deliverJob',
     { maxAttempts: 5, baseDelayMs: 2000 }
   );
@@ -422,7 +493,7 @@ async function main() {
   } else {
     console.log('→ Entering post-delivery review window...');
     console.log('  Container stays alive until job.completed or dispute resolution.\n');
-    postDeliveryResult = await waitForPostDelivery(job, agent, keys, fullJob, executor, soulPrompt, (resolve) => { setSessionEndResolve(resolve); }, ipcQueue);
+    postDeliveryResult = await waitForPostDelivery(job, agent, keys, fullJob, executor, soulPrompt, (resolve) => { setSessionEndResolve(resolve); }, ipcQueue, signer);
   }
 
   // ─────────────────────────────────────────
@@ -430,7 +501,7 @@ async function main() {
   // ─────────────────────────────────────────
   clearInterval(_ipcPoller); // Safe to clear now — post-delivery wait is done
   disconnectWorkspace();
-  await performCleanup(agent, keys, fullJob, postDeliveryResult);
+  await performCleanup(agent, keys, fullJob, postDeliveryResult, signer);
 }
 
 // ─────────────────────────────────────────
@@ -865,13 +936,16 @@ process.on('SIGTERM', async () => {
     // Clean up executor
     if (_executor) await _executor.cleanup().catch(() => {});
 
-    // Submit deletion attestation
-    const keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
+    // Submit deletion attestation. In broker mode we have no keys.json — use
+    // the file-channel signer directly. In legacy mode read the WIF as before.
     const attestTimestamp = Math.floor(Date.now() / 1000);
     try {
       if (_agent) {
         const { message: attestMessage } = await _agent.client.getDeletionAttestationMessage(JOB_ID, attestTimestamp);
-        const attestSig = signMessage(keys.wif, attestMessage, J41_NETWORK);
+        const sigtermSigner = SIGNING_BROKER_ENABLED
+          ? createJobSigner({ channelClient: new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR }), brokerEnabled: true })
+          : createJobSigner({ wif: JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8')).wif, network: J41_NETWORK, brokerEnabled: false });
+        const attestSig = await sigtermSigner.signMessage(attestMessage);
         fs.writeFileSync(
           path.join(JOB_DIR, 'deletion-attestation-sigterm.json'),
           JSON.stringify({ jobId: JOB_ID, message: attestMessage, signature: attestSig, timestamp: attestTimestamp }, null, 2)
@@ -909,7 +983,15 @@ setTimeout(async () => {
   console.error('⏰ Job timeout! Signing deletion attestation and exiting.');
 
   try {
-    const keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
+    // Build a fresh signer for this code path — in broker mode reads from the
+    // channel; in legacy mode reads keys.json off disk.
+    let keys = null;
+    if (!SIGNING_BROKER_ENABLED) {
+      keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
+    }
+    const timeoutSigner = SIGNING_BROKER_ENABLED
+      ? createJobSigner({ channelClient: new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR }), brokerEnabled: true })
+      : createJobSigner({ wif: keys.wif, network: J41_NETWORK, brokerEnabled: false });
     const attestTimestamp = Math.floor(Date.now() / 1000);
 
     // Try to use the platform's canonical attestation flow (J4)
@@ -917,15 +999,18 @@ setTimeout(async () => {
     try {
       const agent = _agent || (() => {
         const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
-        const a = new J41Agent({ apiUrl: API_URL, wif: keys.wif, identityName: IDENTITY, iAddress: keys.iAddress });
+        // In broker mode the agent runs without a WIF; pass signer instead.
+        const cfg = SIGNING_BROKER_ENABLED
+          ? { apiUrl: API_URL, signer: new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR }), identityName: IDENTITY, iAddress: process.env.J41_IADDRESS }
+          : { apiUrl: API_URL, wif: keys.wif, identityName: IDENTITY, iAddress: keys.iAddress };
+        const a = new J41Agent(cfg);
         return a;
       })();
 
       // If using existing agent, skip re-authenticate (already authed)
       if (!_agent) await agent.authenticate();
       const { message: attestMessage } = await agent.client.getDeletionAttestationMessage(JOB_ID, attestTimestamp);
-      const { signMessage: signMsg } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
-      const attestSig = signMsg(keys.wif, attestMessage, J41_NETWORK);
+      const attestSig = await timeoutSigner.signMessage(attestMessage);
 
       fs.writeFileSync(
         path.join(JOB_DIR, 'deletion-attestation-timeout.json'),
@@ -944,8 +1029,7 @@ setTimeout(async () => {
         destroyedAt: new Date().toISOString(),
         deletionMethod: 'timeout',
       };
-      const { signMessage: signMsg } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
-      deletionAttestation.signature = signMsg(keys.wif, JSON.stringify(deletionAttestation), J41_NETWORK);
+      deletionAttestation.signature = await timeoutSigner.signMessage(JSON.stringify(deletionAttestation));
       fs.writeFileSync(
         path.join(JOB_DIR, 'deletion-attestation-timeout.json'),
         JSON.stringify(deletionAttestation, null, 2)
@@ -1017,10 +1101,7 @@ async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndRes
  * Post-delivery wait loop. Listens for IPC messages from dispatcher
  * for job completion, disputes, and rework events.
  */
-async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulPrompt, registerSessionEndResolve, ipcQueue) {
-  const { buildDeliverMessage } = require('@junction41/sovagent-sdk/dist/signing/messages.js');
-  const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
-
+async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulPrompt, registerSessionEndResolve, ipcQueue, signer) {
   return new Promise((resolve) => {
     let resolved = false;
     const safeResolve = (val) => { if (!resolved) { resolved = true; resolve(val); } };
@@ -1088,17 +1169,18 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
                 reworkCost = (policy.reworkBudgetPercent || 30) / 100 * (fullJob.amount || 0);
               }
 
-              const ts = Math.floor(Date.now() / 1000);
-              const { buildDisputeRespondMessage } = require('@junction41/sovagent-sdk/dist/signing/messages.js');
-              const respondMsg = buildDisputeRespondMessage({ jobHash: fullJob.jobHash, action, timestamp: ts });
-              const sig = signMessage(keys.wif, respondMsg, J41_NETWORK);
+              const brokered = await signer.signDisputeRespond({
+                jobId: job.id,
+                jobHash: fullJob.jobHash,
+                action,
+              });
 
               await withRetry(
                 () => agent.client.respondToDispute(job.id, {
                   action,
                   message: `Auto per VDXF policy: ${action}`,
-                  timestamp: ts,
-                  signature: sig,
+                  timestamp: brokered.timestamp,
+                  signature: brokered.signature,
                   ...(action === 'refund' ? { refundPercent } : {}),
                   ...(action === 'rework' ? { reworkCost } : {}),
                 }),
@@ -1188,12 +1270,15 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
             const reworkResult = await resumeJob(job, agent, soulPrompt, executor, registerSessionEndResolve, reworkContext, tokenBudget);
             console.log('✅ Rework completed — re-delivering...');
 
-            const ts = Math.floor(Date.now() / 1000);
-            const hash = reworkResult.hash || 'rework';
-            const deliverMsg = buildDeliverMessage({ jobHash: fullJob.jobHash, deliveryHash: hash, timestamp: ts });
-            const sig = signMessage(keys.wif, deliverMsg, J41_NETWORK);
+            // 'rework' is not a hex SHA-256; hash the sentinel so the
+            // broker policy accepts it and both paths agree.
+            let hash = reworkResult.hash;
+            if (!hash) {
+              hash = require('crypto').createHash('sha256').update('rework').digest('hex');
+            }
+            const brokered = await signer.signDeliver({ jobId: job.id, jobHash: fullJob.jobHash, deliveryHash: hash });
             await withRetry(
-              () => agent.client.deliverJob(job.id, hash, sig, ts, reworkResult.content?.substring(0, 200)),
+              () => agent.client.deliverJob(job.id, hash, brokered.signature, brokered.timestamp, reworkResult.content?.substring(0, 200)),
               'deliverJob (rework)',
               { maxAttempts: 5, baseDelayMs: 2000 }
             );
@@ -1223,41 +1308,59 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
 /**
  * Final cleanup: attestation, file deletion, identity update, exit.
  */
-async function performCleanup(agent, keys, fullJob, postDeliveryResult) {
-  log.info('Performing final cleanup', { jobId: JOB_ID });
+async function performCleanup(agent, keys, fullJob, postDeliveryResult, signer) {
+  log.info('Performing final cleanup', { jobId: JOB_ID, signer: signer?.mode });
 
-  const attestTimestamp = Math.floor(Date.now() / 1000);
-
-  // Deletion attestation
+  // Deletion attestation. Build + sign locally using the SDK primitives, write
+  // the file BEFORE attempting to submit — that way the local artifact (which
+  // contains the broker-signed canonical attestation) is preserved even if
+  // the platform submit fails for unrelated reasons (e.g. attestedBy/auth
+  // identity mismatches surfaced during broker validation).
+  //
+  // The signed bytes are the JCS canonicalization of the payload — JSON, not
+  // a J41-prefixed protocol string — so they pass the broker's
+  // assertNotProtocolMessage signing-oracle guard cleanly. The older
+  // `getDeletionAttestationMessage` → raw `signMessage(J41-DELETE-...)` flow
+  // was correctly refused by the broker; this avoids it.
   try {
-    const { message: attestMessage, timestamp: attestTs } =
-      await agent.client.getDeletionAttestationMessage(JOB_ID, attestTimestamp);
-    const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
-    const attestSig = signMessage(keys.wif, attestMessage, J41_NETWORK);
+    const {
+      generateAttestationPayload,
+      signAttestationWith,
+    } = require('@junction41/sovagent-sdk/dist/privacy/attestation.js');
+
+    const now = new Date().toISOString();
+    const payload = generateAttestationPayload({
+      jobId: JOB_ID,
+      containerId: CONTAINER_ID,
+      createdAt: now,
+      destroyedAt: now,
+      dataVolumes: [JOB_DIR],
+      attestedBy: agent.identityName,
+    });
+    const attestation = await signAttestationWith(payload, (msg) => signer.signMessage(msg));
 
     fs.writeFileSync(
       path.join(JOB_DIR, 'deletion-attestation.json'),
       JSON.stringify({
-        jobId: JOB_ID,
-        message: attestMessage,
-        signature: attestSig,
-        timestamp: attestTs,
+        ...attestation,
         disputeOutcome: postDeliveryResult.disputeOutcome || null,
       }, null, 2)
     );
+    log.info('Deletion attestation signed', { jobId: JOB_ID, sigLength: attestation.signature?.length });
 
-    const result = await agent.client.submitDeletionAttestation(JOB_ID, attestSig, attestTs);
-    log.info('Deletion attestation submitted', { jobId: JOB_ID, verified: result.signatureVerified });
+    try {
+      await agent._client.submitAttestation(attestation);
+      log.info('Deletion attestation submitted', { jobId: JOB_ID });
+    } catch (submitErr) {
+      console.log('⚠️  Submit failed (local attestation file still written):', submitErr.message);
+    }
   } catch (e) {
-    console.log('⚠️  Could not submit attestation:', e.message);
+    console.log('⚠️  Could not build/sign attestation:', e.message);
   }
 
   // On-chain identity update: job.record + review.record
   try {
     console.log('→ Updating on-chain identity (job completion)...');
-
-    const { buildJobCompletionAdditions } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
-    const { buildIdentityUpdateTx } = require('@junction41/sovagent-sdk/dist/identity/update.js');
 
     const jobRecord = {
       jobHash: fullJob.jobHash,
@@ -1303,26 +1406,50 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult) {
       console.log(`  Dispute outcome: ${postDeliveryResult.disputeOutcome.action}`);
     }
 
-    const additions = buildJobCompletionAdditions({ jobRecord, reviewRecord, workspaceAttestation });
-
-    // Read identity + UTXOs, build and broadcast signed tx
-    const identityRawResp = await agent.client.getIdentityRaw();
-    const identityData = identityRawResp.data || identityRawResp;
-    const utxoResp = await agent.client.getUtxos();
-    const utxos = utxoResp.utxos || utxoResp;
-
-    if (utxos.length > 0) {
-      const rawhex = buildIdentityUpdateTx({
-        wif: keys.wif,
-        identityData,
-        utxos,
-        vdxfAdditions: additions,
-        network: J41_NETWORK,
-      });
-      const txResult = await agent.client.broadcast(rawhex);
-      log.info('On-chain identity updated', { jobId: JOB_ID, txid: txResult.txid || txResult });
+    if (signer.mode === 'broker') {
+      // Broker mode: defer on-chain identity-update to the dispatcher's host
+      // Inbox processor. When the buyer marks the job completed, the platform
+      // queues a `job_record` inbox item for the seller; checkPendingInbox()
+      // on the host picks it up and calls agent.acceptJobRecord(), which (a)
+      // builds + signs + broadcasts the job-completion identity-update tx
+      // with the local WIF, and (b) marks the platform inbox item accepted.
+      //
+      // The container's prior executeOnChain('jobCompletionUpdate') path
+      // raced with the Inbox processor: same VDXF entry, two broadcasts, the
+      // second always rejected by the network (UTXOs already consumed) and
+      // the platform inbox item was left in a half-handled state when the
+      // container path won. Letting the Inbox processor own this end-state
+      // produces a single broadcast and a clean inbox.
+      //
+      // The jobCompletionUpdate broker executor is kept (broker-executors.js)
+      // for callers that still want a container-driven path (e.g., timeout
+      // resolution where no buyer completion exists to queue an inbox item).
+      log.info('On-chain identity update deferred to host Inbox processor (broker mode)', { jobId: JOB_ID });
     } else {
-      console.log('⚠️  No UTXOs available — skipping on-chain update');
+      // Legacy local-WIF path — unchanged from pre-broker behavior.
+      const { buildJobCompletionAdditions } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+      const { buildIdentityUpdateTx } = require('@junction41/sovagent-sdk/dist/identity/update.js');
+
+      const additions = buildJobCompletionAdditions({ jobRecord, reviewRecord, workspaceAttestation });
+
+      const identityRawResp = await agent.client.getIdentityRaw();
+      const identityData = identityRawResp.data || identityRawResp;
+      const utxoResp = await agent.client.getUtxos();
+      const utxos = utxoResp.utxos || utxoResp;
+
+      if (utxos.length > 0) {
+        const rawhex = buildIdentityUpdateTx({
+          wif: keys.wif,
+          identityData,
+          utxos,
+          vdxfAdditions: additions,
+          network: J41_NETWORK,
+        });
+        const txResult = await agent.client.broadcast(rawhex);
+        log.info('On-chain identity updated', { jobId: JOB_ID, txid: txResult.txid || txResult });
+      } else {
+        console.log('⚠️  No UTXOs available — skipping on-chain update');
+      }
     }
   } catch (e) {
     console.log('⚠️  Identity update error:', e.message);

@@ -21,11 +21,18 @@ const {
   buildAcceptMessage,
   buildDeliverMessage,
   buildDisputeRespondMessage,
+  assertNotProtocolMessage,
 } = require('@junction41/sovagent-sdk/dist/signing/messages.js');
 const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
 
 const MAX_TS_SKEW_S = 300;
 const HEX64 = /^[0-9a-f]{64}$/i;
+/** Hard ceiling on the size of a generic-message signing request. The
+ *  legitimate paths (auth challenge ~64 chars, JCS attestation ~500 chars,
+ *  status messages ~200 chars, bounty/job/review payloads <2KB) all sit
+ *  well under this — but a compromised container shouldn't be able to use
+ *  the signer as a bulk-data oracle either. */
+const MAX_GENERIC_MESSAGE_BYTES = 4096;
 
 /** Error with a machine-readable code for the broker's policy rejections. */
 class BrokerPolicyError extends Error {
@@ -115,4 +122,60 @@ function signBrokeredRequest({ job, request, wif, network = 'verustest', now }) 
   return { ok: true, signature, timestamp: built.timestamp, message: built.message };
 }
 
-module.exports = { buildBrokeredMessage, signBrokeredRequest, BrokerPolicyError, MAX_TS_SKEW_S };
+/**
+ * Sign an arbitrary container-supplied message under the *generic* policy.
+ * Used for the non-broker-gated paths: auth challenge, registerWithJ41
+ * payload, status changes, bounty/job/review payloads, deletion attestation
+ * (canonical-JSON of the attestation payload).
+ *
+ * The policy is:
+ *   1. Length cap (`MAX_GENERIC_MESSAGE_BYTES`) — no bulk oracle.
+ *   2. `assertNotProtocolMessage` (NFKC + zero-width strip + `/^J41-[a-z0-9-]*\|/i`)
+ *      — refuse anything shaped like a `J41-<ACTION>|…` protocol message.
+ *      Those MUST go through `signBrokeredRequest` so the message is
+ *      reconstructed from authoritative state; otherwise a MITM auth
+ *      challenge could trick the agent into signing, e.g., a deposit
+ *      report or a status change.
+ *
+ * @returns {{ ok: true, signature: string }
+ *          | { ok: false, code: string, reason: string }}
+ */
+function signGenericMessage({ message, wif, network = 'verustest' }) {
+  if (typeof message !== 'string') {
+    return { ok: false, code: 'BAD_MESSAGE', reason: 'message must be a string' };
+  }
+  // Byte-length cap (UTF-8). Reject early so an attacker can't tie up the
+  // signer with megabyte messages.
+  const byteLen = Buffer.byteLength(message, 'utf8');
+  if (byteLen > MAX_GENERIC_MESSAGE_BYTES) {
+    return {
+      ok: false,
+      code: 'MESSAGE_TOO_LARGE',
+      reason: `message is ${byteLen} bytes; max ${MAX_GENERIC_MESSAGE_BYTES}`,
+    };
+  }
+  // Oracle defense: refuse to sign anything that looks like a J41 protocol
+  // message via the generic path. The brokered path is the only way to get
+  // a `J41-<ACTION>|…` signature, and it reconstructs the bytes itself.
+  try {
+    assertNotProtocolMessage(message);
+  } catch (e) {
+    return { ok: false, code: 'PROTOCOL_SHAPED', reason: e.message };
+  }
+  let signature;
+  try {
+    signature = signMessage(wif, message, network);
+  } catch (e) {
+    return { ok: false, code: 'SIGN_ERROR', reason: e.message };
+  }
+  return { ok: true, signature };
+}
+
+module.exports = {
+  buildBrokeredMessage,
+  signBrokeredRequest,
+  signGenericMessage,
+  BrokerPolicyError,
+  MAX_TS_SKEW_S,
+  MAX_GENERIC_MESSAGE_BYTES,
+};
