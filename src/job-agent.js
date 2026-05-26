@@ -393,8 +393,16 @@ async function main() {
           if (_disputePolicy) console.log(`[IPC] Dispute policy received (default=${_disputePolicy.defaultAction})`);
           break;
         default:
-          // Queue for post-delivery handler
-          ipcQueue.push(msg);
+          // Docker mode: process.on('message') never fires, so future messages
+          // arriving via the file-IPC poller must be routed directly to the
+          // registered post-delivery handler. Fall back to the queue only if
+          // the handler isn't registered yet (waitForPostDelivery drains the
+          // queue on entry).
+          if (_postDeliveryHandler) {
+            await _postDeliveryHandler(msg);
+          } else {
+            ipcQueue.push(msg);
+          }
           break;
     }
   }
