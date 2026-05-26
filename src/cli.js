@@ -3725,24 +3725,32 @@ program
     });
 
     // ── Set agents active on-chain + platform ──
-    console.log('\n→ Setting agents active...');
-    for (let i = 0; i < readyAgents.length; i++) {
-      const agentInfo = readyAgents[i];
-      // Stagger activation — 1s between agents to avoid rate limits at scale
-      if (i > 0) await new Promise(r => setTimeout(r, 1000));
-      try {
-        const agent = await getAgentSession(state, agentInfo);
-        const result = await agent.activate({ onChain: true });
-        console.log(`  ✅ ${agentInfo.id}: active (on-chain txid: ${result.onChainTxid || 'skipped'})`);
-        // Trigger backend re-index so marketplace reflects active status immediately
+    // J41_NO_STATUS_TOGGLE=1: leave platform state alone at startup. Useful for
+    // broker-validation runs where the operator pre-activates specific agents
+    // and does not want the dispatcher to bulk-activate every "ready" agent
+    // (which fires an on-chain identity-update tx per agent).
+    if (process.env.J41_NO_STATUS_TOGGLE === '1') {
+      console.log('\n→ Skipping auto-activate (J41_NO_STATUS_TOGGLE=1) — using current platform state');
+    } else {
+      console.log('\n→ Setting agents active...');
+      for (let i = 0; i < readyAgents.length; i++) {
+        const agentInfo = readyAgents[i];
+        // Stagger activation — 1s between agents to avoid rate limits at scale
+        if (i > 0) await new Promise(r => setTimeout(r, 1000));
         try {
-          await agent.client.refreshAgent(agentInfo.iAddress || agentInfo.identity);
-          console.log(`  ✅ ${agentInfo.id}: backend refreshed`);
+          const agent = await getAgentSession(state, agentInfo);
+          const result = await agent.activate({ onChain: true });
+          console.log(`  ✅ ${agentInfo.id}: active (on-chain txid: ${result.onChainTxid || 'skipped'})`);
+          // Trigger backend re-index so marketplace reflects active status immediately
+          try {
+            await agent.client.refreshAgent(agentInfo.iAddress || agentInfo.identity);
+            console.log(`  ✅ ${agentInfo.id}: backend refreshed`);
+          } catch (e) {
+            console.log(`  ⚠️  ${agentInfo.id}: backend refresh failed (${e.message.slice(0, 60)})`);
+          }
         } catch (e) {
-          console.log(`  ⚠️  ${agentInfo.id}: backend refresh failed (${e.message.slice(0, 60)})`);
+          console.log(`  ⚠️  ${agentInfo.id}: activation failed (${e.message.slice(0, 60)})`);
         }
-      } catch (e) {
-        console.log(`  ⚠️  ${agentInfo.id}: activation failed (${e.message.slice(0, 60)})`);
       }
     }
 
@@ -3763,7 +3771,13 @@ program
       console.log('   Press Ctrl+C again for emergency exit.\n');
 
       // 1. Set agents offline (stop accepting new jobs)
+      // J41_NO_STATUS_TOGGLE=1: don't flip platform state on shutdown.
+      const _skipStatusToggle = process.env.J41_NO_STATUS_TOGGLE === '1';
       for (const agentInfo of state.agents) {
+        if (_skipStatusToggle) {
+          console.log(`   ⏭️  ${agentInfo.id}: skipping deactivate (J41_NO_STATUS_TOGGLE=1)`);
+          continue;
+        }
         try {
           const agent = await getAgentSession(state, agentInfo);
           const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
@@ -4288,10 +4302,17 @@ async function pollForJobs(state) {
 
       const agent = await getAgentSession(state, agentInfo);
 
-      // Fetch all active jobs in one call (requested + accepted + in_progress)
-      // Single API call instead of 3 separate ones to reduce rate limiting
-      const result = await agent.client.getMyJobs({ role: 'seller' });
-      const allJobs = Array.isArray(result?.data) ? result.data : [];
+      // Default getMyJobs({role:'seller'}) excludes in_progress server-side, so
+      // jobs that transitioned to in_progress between polls (e.g. paid in another
+      // session) become invisible. Fetch in_progress explicitly and merge.
+      const [defaultRes, inProgRes] = await Promise.all([
+        agent.client.getMyJobs({ role: 'seller' }),
+        agent.client.getMyJobs({ role: 'seller', status: 'in_progress' }),
+      ]);
+      const _merged = new Map();
+      for (const j of (defaultRes?.data || [])) _merged.set(j.id, j);
+      for (const j of (inProgRes?.data || [])) _merged.set(j.id, j);
+      const allJobs = [..._merged.values()];
       const jobs = allJobs.filter(j =>
         j.status === 'requested' || j.status === 'accepted' || j.status === 'in_progress'
       );
@@ -5099,6 +5120,11 @@ function getDispatcherNetworkMode() {
 }
 
 function getDispatcherBwrapConfig() {
+  // J41_DISABLE_BWRAP=1: skip the bubblewrap entrypoint wrapper. Useful for
+  // broker validation where the bwrap --ro-bind /app /app re-mount obscures
+  // the bind-mounted job-dir permissions. Trades the extra isolation layer
+  // for clarity — Docker --user + ReadonlyRootfs + CapDrop still apply.
+  if (process.env.J41_DISABLE_BWRAP === '1') return {};
   // If gVisor is NOT the runtime and bwrap IS installed, use bwrap entrypoint
   if (!secureSetup) return {};
 
@@ -5277,10 +5303,16 @@ async function startJobContainer(state, job, agentInfo) {
     const container = await docker.createContainer({
       name: containerName,
       Image: 'j41/job-agent:latest',  // PRE-BAKED IMAGE
+      // Run as host UID so bind-mounted job dir is writable. MUST be at the
+      // top level of the createContainer body — `User` under HostConfig is
+      // silently ignored by the Docker engine, which then falls back to the
+      // Dockerfile's USER j41-agent (UID ~999) and EACCES on bind-mounted
+      // files written by the host user.
+      User: `${process.getuid()}:${process.getgid()}`,
       // Docker bind-mounts SOUL.md/job (and keys.json OR /app/sign) into /app/* —
       // strip the host-path env vars buildContainerEnv emits (they're host paths and
       // would override the in-container defaults the job-agent expects).
-      Env: Object.entries(buildContainerEnv(job, agentInfo, loadAgentConfig(agentInfo.id), canaryToken, jobDir, tmpKeysPath))
+      Env: Object.entries(buildContainerEnv(job, agentInfo, loadAgentConfig(agentInfo.id), canaryToken, jobDir, tmpKeysPath || keysPath))
             .filter(([k, v]) => v !== undefined && v !== '' &&
               k !== 'J41_KEYS_FILE' && k !== 'J41_SOUL_FILE' && k !== 'J41_JOB_DIR')
             .map(([k, v]) => `${k}=${v}`)
@@ -5293,8 +5325,6 @@ async function startJobContainer(state, job, agentInfo) {
           ...signingBinds,
           `${path.join(agentDir, 'SOUL.md')}:/app/SOUL.md:ro`,
         ],
-        // Run as host UID so bind-mounted job dir is writable
-        User: `${process.getuid()}:${process.getgid()}`,
         AutoRemove: !keepContainers,
         Memory: 2 * 1024 * 1024 * 1024, // 2GB
         CpuQuota: 100000, // 1 CPU core
