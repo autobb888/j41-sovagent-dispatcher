@@ -1311,22 +1311,34 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
 async function performCleanup(agent, keys, fullJob, postDeliveryResult, signer) {
   log.info('Performing final cleanup', { jobId: JOB_ID, signer: signer?.mode });
 
-  // Deletion attestation. Use the SDK's attestDeletion path — it builds a
-  // JCS-canonicalized payload and signs via signAttestationWith (which routes
-  // through signer.signMessage when a signer is configured). The canonical
-  // bytes do NOT start with `J41-`, so they pass the broker's
-  // assertNotProtocolMessage signing-oracle guard cleanly.
+  // Deletion attestation. Build + sign locally using the SDK primitives, write
+  // the file BEFORE attempting to submit — that way the local artifact (which
+  // contains the broker-signed canonical attestation) is preserved even if
+  // the platform submit fails for unrelated reasons (e.g. attestedBy/auth
+  // identity mismatches surfaced during broker validation).
   //
-  // The older `getDeletionAttestationMessage` → `signMessage` → `submitDeletionAttestation`
-  // flow signed a server-supplied `J41-DELETE-...|...` string which the broker
-  // (correctly) refused to sign. That flow remains for non-broker callers but
-  // isn't exercised here.
+  // The signed bytes are the JCS canonicalization of the payload — JSON, not
+  // a J41-prefixed protocol string — so they pass the broker's
+  // assertNotProtocolMessage signing-oracle guard cleanly. The older
+  // `getDeletionAttestationMessage` → raw `signMessage(J41-DELETE-...)` flow
+  // was correctly refused by the broker; this avoids it.
   try {
-    const attestation = await agent.attestDeletion(
-      JOB_ID,
-      CONTAINER_ID,
-      { dataVolumes: [JOB_DIR] },
-    );
+    const {
+      generateAttestationPayload,
+      signAttestationWith,
+    } = require('@junction41/sovagent-sdk/dist/privacy/attestation.js');
+
+    const now = new Date().toISOString();
+    const payload = generateAttestationPayload({
+      jobId: JOB_ID,
+      containerId: CONTAINER_ID,
+      createdAt: now,
+      destroyedAt: now,
+      dataVolumes: [JOB_DIR],
+      attestedBy: agent.identityName,
+    });
+    const attestation = await signAttestationWith(payload, (msg) => signer.signMessage(msg));
+
     fs.writeFileSync(
       path.join(JOB_DIR, 'deletion-attestation.json'),
       JSON.stringify({
@@ -1334,9 +1346,16 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult, signer) 
         disputeOutcome: postDeliveryResult.disputeOutcome || null,
       }, null, 2)
     );
-    log.info('Deletion attestation submitted', { jobId: JOB_ID });
+    log.info('Deletion attestation signed', { jobId: JOB_ID, sigLength: attestation.signature?.length });
+
+    try {
+      await agent._client.submitAttestation(attestation);
+      log.info('Deletion attestation submitted', { jobId: JOB_ID });
+    } catch (submitErr) {
+      console.log('⚠️  Submit failed (local attestation file still written):', submitErr.message);
+    }
   } catch (e) {
-    console.log('⚠️  Could not submit attestation:', e.message);
+    console.log('⚠️  Could not build/sign attestation:', e.message);
   }
 
   // On-chain identity update: job.record + review.record
