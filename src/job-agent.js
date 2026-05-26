@@ -1311,27 +1311,30 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
 async function performCleanup(agent, keys, fullJob, postDeliveryResult, signer) {
   log.info('Performing final cleanup', { jobId: JOB_ID, signer: signer?.mode });
 
-  const attestTimestamp = Math.floor(Date.now() / 1000);
-
-  // Deletion attestation
+  // Deletion attestation. Use the SDK's attestDeletion path — it builds a
+  // JCS-canonicalized payload and signs via signAttestationWith (which routes
+  // through signer.signMessage when a signer is configured). The canonical
+  // bytes do NOT start with `J41-`, so they pass the broker's
+  // assertNotProtocolMessage signing-oracle guard cleanly.
+  //
+  // The older `getDeletionAttestationMessage` → `signMessage` → `submitDeletionAttestation`
+  // flow signed a server-supplied `J41-DELETE-...|...` string which the broker
+  // (correctly) refused to sign. That flow remains for non-broker callers but
+  // isn't exercised here.
   try {
-    const { message: attestMessage, timestamp: attestTs } =
-      await agent.client.getDeletionAttestationMessage(JOB_ID, attestTimestamp);
-    const attestSig = await signer.signMessage(attestMessage);
-
+    const attestation = await agent.attestDeletion(
+      JOB_ID,
+      CONTAINER_ID,
+      { dataVolumes: [JOB_DIR] },
+    );
     fs.writeFileSync(
       path.join(JOB_DIR, 'deletion-attestation.json'),
       JSON.stringify({
-        jobId: JOB_ID,
-        message: attestMessage,
-        signature: attestSig,
-        timestamp: attestTs,
+        ...attestation,
         disputeOutcome: postDeliveryResult.disputeOutcome || null,
       }, null, 2)
     );
-
-    const result = await agent.client.submitDeletionAttestation(JOB_ID, attestSig, attestTs);
-    log.info('Deletion attestation submitted', { jobId: JOB_ID, verified: result.signatureVerified });
+    log.info('Deletion attestation submitted', { jobId: JOB_ID });
   } catch (e) {
     console.log('⚠️  Could not submit attestation:', e.message);
   }
@@ -1385,18 +1388,24 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult, signer) 
     }
 
     if (signer.mode === 'broker') {
-      // Broker mode: the dispatcher's host-side executor fetches identity +
-      // UTXOs from its own session, builds + signs + broadcasts the tx with
-      // the WIF (which never enters this container). Returns { txid } on
-      // success, { skipped: true, reason } on no-UTXOs.
-      const result = await signer.executeOnChain('jobCompletionUpdate', {
-        jobRecord, reviewRecord, workspaceAttestation,
-      });
-      if (result.skipped) {
-        console.log(`⚠️  Skipped on-chain update (${result.reason})`);
-      } else {
-        log.info('On-chain identity updated (host-side)', { jobId: JOB_ID, txid: result.txid });
-      }
+      // Broker mode: defer on-chain identity-update to the dispatcher's host
+      // Inbox processor. When the buyer marks the job completed, the platform
+      // queues a `job_record` inbox item for the seller; checkPendingInbox()
+      // on the host picks it up and calls agent.acceptJobRecord(), which (a)
+      // builds + signs + broadcasts the job-completion identity-update tx
+      // with the local WIF, and (b) marks the platform inbox item accepted.
+      //
+      // The container's prior executeOnChain('jobCompletionUpdate') path
+      // raced with the Inbox processor: same VDXF entry, two broadcasts, the
+      // second always rejected by the network (UTXOs already consumed) and
+      // the platform inbox item was left in a half-handled state when the
+      // container path won. Letting the Inbox processor own this end-state
+      // produces a single broadcast and a clean inbox.
+      //
+      // The jobCompletionUpdate broker executor is kept (broker-executors.js)
+      // for callers that still want a container-driven path (e.g., timeout
+      // resolution where no buyer completion exists to queue an inbox item).
+      log.info('On-chain identity update deferred to host Inbox processor (broker mode)', { jobId: JOB_ID });
     } else {
       // Legacy local-WIF path — unchanged from pre-broker behavior.
       const { buildJobCompletionAdditions } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
