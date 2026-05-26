@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.1.15 — 2026-05-26
+
+**Broker file-channel transport — opt-in.** The new `J41_SIGNING_BROKER=1` env var routes all in-container signing through a file-IPC channel to a host-side `SignChannelHost`, keeping the agent WIF on the dispatcher host and out of the job-agent container's filesystem entirely. Default remains off; the legacy `keys.json` bind mount is still the only behaviour you get without the flag. Cuts the in-container blast radius — a fully-compromised job-agent cannot exfiltrate the WIF or forge identity-bearing signatures for other jobs (broker rebuilds canonical accept/deliver/dispute message bytes from authoritative platform state and refuses container-supplied protocol-formatted text).
+
+End-to-end testnet validation pass closed 8/8 runbook gates (see `docs/BROKER-DOCKER-VALIDATION.md`). Five backend bug families surfaced and were fixed in flight during validation; the dispatcher-side fixes in this release:
+
+- **`User: <uid>:<gid>` at the top level of `createContainer`** (was nested under `HostConfig` where the Docker engine silently ignores it — container was falling through to the Dockerfile's `USER j41-agent` and EACCESing on bind-mounted job files).
+- **Poll loop merges `status:in_progress` jobs** (default `getMyJobs({role:'seller'})` excludes them server-side, so jobs paid in another session became invisible).
+- **Post-delivery IPC routes through `_postDeliveryHandler` in Docker mode** (`process.on('message')` never fires under Docker — file-poller messages were sitting in `ipcQueue` unprocessed; container couldn't observe `job.completed`).
+- **`performCleanup` uses `attestDeletion` via `signAttestationWith`** (JCS-canonicalized bytes, not `J41-DELETE-...|...` protocol-formatted — the broker's `assertNotProtocolMessage` signing-oracle guard correctly refused the old raw-`signMessage` call).
+- **Container's on-chain identity-update step deferred to the host Inbox processor in broker mode** (was double-broadcasting the same `job.record` VDXF; host's `acceptJobRecord` is the canonical writer in broker mode).
+- **`deletion-attestation.json` written before submit attempt** (so the on-disk artifact survives a platform-side validation failure unrelated to signing).
+- **Operator env-var gates**: `J41_NO_STATUS_TOGGLE=1` skips startup activate-all + shutdown deactivate-all loops (don't ping-pong agent platform state across restarts; don't fire an on-chain identity-update tx for every managed agent at boot). `J41_DISABLE_BWRAP=1` skips the bubblewrap entrypoint wrapper (the bwrap `--ro-bind /app /app` re-mount can obscure bind-mounted job-dir permissions during debugging).
+- **SDK dep bumped to `@junction41/sovagent-sdk@2.4.0`** (RemoteSigner hook is the container-side counterpart of the broker transport).
+
+Cutover sequence remains as documented in the runbook — this release ships broker as opt-in only. Default-on flip lands once a release cycle of opt-in soak shows no broker-related errors.
+
 ## 2.1.14 — 2026-04-28
 
 **Resilience patch.** Two fixes addressing economic-griefing vectors that bite at scale:
