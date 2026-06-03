@@ -31,6 +31,9 @@ COPY src/executors ./executors
 # Copy logger
 COPY src/logger.js ./
 COPY src/config-loader.js ./
+# Prompt-injection taint helper (required by the executors) — wraps the
+# vendored scanContext from @junction41/sovagent-sdk.
+COPY src/sovguard-context.js ./
 
 # Copy runtime scripts (baked into image)
 COPY src/job-agent.js ./

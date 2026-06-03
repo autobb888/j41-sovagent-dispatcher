@@ -47,6 +47,8 @@ cp "$DISPATCHER_DIR/src/logger.js" .build-temp/src/
 # DEFAULTS at top-level). Missing in older build scripts — caused the
 # container to crash on import. Fixed here.
 cp "$DISPATCHER_DIR/src/config-loader.js" .build-temp/src/
+# Prompt-injection taint helper — required by the executors (local-llm.js, mcp.js).
+cp "$DISPATCHER_DIR/src/sovguard-context.js" .build-temp/src/
 # Broker mode runtime files (J41_SIGNING_BROKER=1). Always copied — the
 # container code-path can run with broker off, but if broker is on the
 # files must be present (job-agent.js requires them).
