@@ -1,6 +1,6 @@
 {
   "name": "j41-job-agent",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "description": "Ephemeral job agent runtime for Junction41",
   "main": "job-agent.js",
   "scripts": {
