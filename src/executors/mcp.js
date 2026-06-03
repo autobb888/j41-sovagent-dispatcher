@@ -102,6 +102,10 @@ class MCPExecutor extends Executor {
   }
 
   async handleMessage(message, meta) {
+    // HOLE 3 — see local-llm.js for rationale. Opt-in via J41_SCAN_BUYER_CHAT=1.
+    if (process.env.J41_SCAN_BUYER_CHAT === '1') {
+      message = await scanUntrusted(message, 'other_agent');
+    }
     this.conversationLog.push({ role: 'user', content: message });
 
     // Cap conversation log

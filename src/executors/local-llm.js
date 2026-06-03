@@ -134,6 +134,20 @@ class LocalLLMExecutor extends Executor {
   }
 
   async handleMessage(message, meta) {
+    // HOLE 3 (post-2.6.0 review): when an operator opts in via
+    // J41_SCAN_BUYER_CHAT=1, scan the buyer's live chat message before
+    // pushing it into conversationLog. The default trust model treats
+    // chat 'user' as trusted (operator-equivalent); operators running a
+    // seller agent against an untrusted marketplace buyer flip this to
+    // make the buyer's mid-session attempts to override / exfiltrate /
+    // jailbreak get caught alongside HOLE 1 (job.description) and HOLE 2
+    // (tool results). The SDK exposes no dedicated 'buyer_chat' source
+    // yet — 'other_agent' is the closest untrusted bucket and produces
+    // identical scanner behavior; the label appears in audit log/notify
+    // only, not in any trust decision.
+    if (process.env.J41_SCAN_BUYER_CHAT === '1') {
+      message = await scanUntrusted(message, 'other_agent');
+    }
     this.conversationLog.push({ role: 'user', content: message });
 
     if (this.conversationLog.length > MAX_CONVERSATION_LOG) {

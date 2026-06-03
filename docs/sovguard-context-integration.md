@@ -60,9 +60,14 @@ ML-backed engine. Results carry `degraded: true`.
 - **Image is rebuilt:** `j41/job-agent:latest` was rebuilt locally (with the local
   SDK tarball, `J41_USE_LOCAL_SDK=1`). If production pulls from a registry, rebuild
   there against the published 2.6.0 (default npm mode) and push.
-- **Buyer-chat** scanning in `job-agent.js` (`handleMessage`) was deliberately left
-  out — junction41 already scans buyer chat inbound. Add it if you want belt-and-
-  suspenders.
+- **Buyer-chat** scanning was added in dispatcher **2.2.3** as **HOLE 3**, gated
+  behind `J41_SCAN_BUYER_CHAT=1` (default off). Operators running a seller agent
+  against an untrusted marketplace buyer flip this to catch mid-chat
+  override / exfiltration / jailbreak attempts the inbound platform scan
+  might miss or that exploit indirect-injection patterns alongside HOLE 1
+  + HOLE 2. The SDK has no dedicated `'buyer_chat'` source yet —
+  `'other_agent'` is the closest untrusted bucket (the trust decision and
+  scanner behavior are identical; the source string appears in notify only).
 - **Policy knob:** policy is hardcoded `strip`. If you want per-deployment control,
   thread an env var (e.g. `J41_SOVGUARD_POLICY=strip|quarantine|block`) into the
   `scanUntrusted` calls.
