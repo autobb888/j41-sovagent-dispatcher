@@ -1,0 +1,38 @@
+# Audit 2026-06-02 M-DISPATCHER-supply-2:
+#   Publish via GitHub Actions OIDC with `npm publish --provenance`. Replaces
+#   the manual-publish-from-developer-machine flow which had no attestation.
+#
+# Required GitHub repository configuration (one-time):
+#   1. npm.com → granular token for @junction41/dispatcher in this repo's
+#      Settings → Secrets → NPM_TOKEN.
+#   2. npmjs.com → require 2FA-for-publish + OIDC publisher = this repo.
+
+name: Publish to npm
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - run: yarn install --frozen-lockfile
+
+      # Dispatcher has no build step (pure CJS); keep the lint check that the
+      # existing test script runs.
+      - run: node --check src/*.js src/executors/*.js
+
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
