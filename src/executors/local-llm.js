@@ -8,6 +8,7 @@
 const crypto = require('crypto');
 const { Executor } = require('./base.js');
 const log = require('../logger.js');
+const { scanUntrusted } = require('../sovguard-context.js');
 
 // ── LLM Provider Presets ──
 const LLM_PRESETS = {
@@ -90,11 +91,14 @@ class LocalLLMExecutor extends Executor {
     this.soulPrompt = soulPrompt;
     this._budgetRequested = false;
 
+    // HOLE 1: scan the untrusted job description before it enters the system prompt.
+    const safeDescription = await scanUntrusted(job.description, 'job_description');
+
     this.systemPrompt = [
       soulPrompt,
       '',
       '--- Job Context ---',
-      `Job: ${job.description}`,
+      `Job: ${safeDescription}`,
       `Buyer: ${job.buyer}`,
       `Payment: ${job.amount} ${job.currency}`,
       '',
@@ -252,11 +256,15 @@ class LocalLLMExecutor extends Executor {
           continue;
         }
         const toolResult = await this.workspaceHandler(toolName, args);
+        const rawToolContent = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult);
+        // HOLE 2: scan untrusted tool output before it re-enters the LLM context (indirect injection).
+        const toolSource = toolName.startsWith('workspace_') ? 'workspace_file' : 'mcp_result';
+        const safeToolContent = await scanUntrusted(rawToolContent, toolSource);
 
         messages.push({
           role: 'tool',
           tool_call_id: toolCall.id,
-          content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
+          content: safeToolContent,
         });
       }
 

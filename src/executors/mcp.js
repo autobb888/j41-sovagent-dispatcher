@@ -20,6 +20,7 @@ const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { Executor } = require('./base.js');
 const { resolveLLMConfig } = require('./local-llm.js');
+const { scanUntrusted } = require('../sovguard-context.js');
 
 const MCP_COMMAND = process.env.J41_MCP_COMMAND || '';
 const MCP_URL = process.env.J41_MCP_URL || '';
@@ -78,11 +79,14 @@ class MCPExecutor extends Executor {
       },
     }));
 
+    // HOLE 1: scan the untrusted job description before it enters the system prompt.
+    const safeDescription = await scanUntrusted(job.description, 'job_description');
+
     this.systemPrompt = [
       soulPrompt,
       '',
       '--- Job Context ---',
-      `Job: ${job.description}`,
+      `Job: ${safeDescription}`,
       `Buyer: ${job.buyer}`,
       `Payment: ${job.amount} ${job.currency}`,
       '',
@@ -194,10 +198,17 @@ class MCPExecutor extends Executor {
           console.error(`[MCP] Tool ${toolName} failed: ${e.message}`);
         }
 
+        // HOLE 2: scan untrusted tool output before it re-enters the LLM context (indirect injection).
+        const toolSource = this.workspaceToolNames.has(toolName) ? 'workspace_file' : 'mcp_result';
+        const safeToolContent = await scanUntrusted(
+          typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
+          toolSource,
+        );
+
         messages.push({
           role: 'tool',
           tool_call_id: toolCall.id,
-          content: toolResult,
+          content: safeToolContent,
         });
       }
     }
