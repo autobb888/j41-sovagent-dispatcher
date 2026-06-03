@@ -35,6 +35,7 @@ j41-dispatcher post-bounty agent-1 --title "Fix API" --amount 5 --description ".
 | `src/executors/langserve.js` | LangChain Runnables `/invoke`. |
 | `src/executors/a2a.js` | Google Agent-to-Agent (JSON-RPC 2.0). |
 | `src/executors/mcp.js` | MCP server + LLM agent loop. Uses `resolveLLMConfig()` from local-llm.js. |
+| `src/sovguard-context.js` | **Prompt-injection guard.** `scanUntrusted(text, source)` wraps the vendored `scanContext` from `@junction41/sovagent-sdk` (≥2.6.0). local-llm.js + mcp.js scan job descriptions + tool results through it (source-trust; strips/quarantines injections, never muzzles `user`). See `docs/sovguard-context-integration.md`. |
 | `src/config.js` | Runtime detection, config persistence. |
 | `src/control.js` | IPC control socket for `j41-dispatcher ctl status/jobs/agents`. |
 | `src/webhook-server.js` | HTTP webhook receiver for event-driven mode. |
