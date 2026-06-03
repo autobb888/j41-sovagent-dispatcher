@@ -114,8 +114,17 @@ class SignChannelHost {
     if (this._started) return;
     this._started = true;
 
+    // Audit 2026-06-02 L-DISPATCHER-auth-1: explicit mkdir + chmod on the
+    // channel parent. Recursive mkdir applies mode 0o700 only to dirs it
+    // CREATES — if /tmp/j41-sign-<jobId> already exists (e.g., from a
+    // crashed previous instance) its mode is preserved, which may be looser
+    // than 0o700. Set parent dir mode explicitly first.
+    await fsp.mkdir(this.channelDir, { recursive: true, mode: 0o700 });
+    try { await fsp.chmod(this.channelDir, 0o700); } catch { /* not our dir */ }
     await fsp.mkdir(this.reqDir, { recursive: true, mode: 0o700 });
+    try { await fsp.chmod(this.reqDir, 0o700); } catch { /* not our dir */ }
     await fsp.mkdir(this.respDir, { recursive: true, mode: 0o700 });
+    try { await fsp.chmod(this.respDir, 0o700); } catch { /* not our dir */ }
 
     // Process anything already sitting in req/ before we started.
     await this._drainOnce().catch((e) => this.log(`[sign-channel] initial drain failed: ${e.message}`));

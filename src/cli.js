@@ -5151,6 +5151,19 @@ function getDispatcherBwrapConfig() {
         'scripts', 'entrypoint-agent.sh'
       );
       if (fs.existsSync(entrypointPath)) {
+        // Audit 2026-06-02 L-DISPATCHER-funds-1 review note: SYS_ADMIN is
+        // unavoidable here — bwrap needs it to call `unshare(CLONE_NEWNS|
+        // CLONE_NEWUSER)`. The mitigating context is the LAYERED defense
+        // around it:
+        //   - Container is non-root (User: <uid>:<gid> in HostConfig)
+        //   - ReadonlyRootfs: true
+        //   - seccomp profile (no network/ptrace/mount syscalls)
+        //   - AppArmor confinement
+        //   - The bwrap-spawned inner namespace drops all caps again
+        // So inside-the-container code that gains SYS_ADMIN sees only its
+        // own bwrap-bounded view — it can't escape to the host. Auditors
+        // should treat the SYS_ADMIN cap as scoped to the bwrap helper
+        // process startup, not the agent process.
         return {
           CapAdd: ['SYS_ADMIN'],
           CapDrop: [], // Override: bwrap needs SYS_ADMIN for unshare

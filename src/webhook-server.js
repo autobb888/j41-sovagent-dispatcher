@@ -72,6 +72,17 @@ async function readBody(req, res) {
  * @returns {http.Server} The running server
  */
 function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
+  // Audit 2026-06-02 L-DISPATCHER-ddos-1: slow-loris hardening. Defaults bound
+  // every connection so a low-rate stream of bytes can't pin server resources.
+  //   - headersTimeout: how long the server waits for request headers
+  //   - requestTimeout: total time allowed for the full request
+  //   - timeout: idle connection timeout
+  //   - maxConnections: hard cap on concurrent TCP connections
+  const HEADERS_TIMEOUT_MS = Number(process.env.J41_WEBHOOK_HEADERS_TIMEOUT_MS || 30_000);
+  const REQUEST_TIMEOUT_MS = Number(process.env.J41_WEBHOOK_REQUEST_TIMEOUT_MS || 60_000);
+  const IDLE_TIMEOUT_MS = Number(process.env.J41_WEBHOOK_IDLE_TIMEOUT_MS || 120_000);
+  const MAX_CONNECTIONS = Number(process.env.J41_WEBHOOK_MAX_CONNECTIONS || 512);
+
   const server = http.createServer(async (req, res) => {
     // Health check
     if (req.method === 'GET' && (req.url === '/health' || req.url === '/j41/health')) {
@@ -301,8 +312,12 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
     }
   });
 
+  server.headersTimeout = HEADERS_TIMEOUT_MS;
+  server.requestTimeout = REQUEST_TIMEOUT_MS;
+  server.timeout = IDLE_TIMEOUT_MS;
+  server.maxConnections = MAX_CONNECTIONS;
   server.listen(port, () => {
-    console.log(`[Webhook] Server listening on port ${port}`);
+    console.log(`[Webhook] Server listening on port ${port} (max ${MAX_CONNECTIONS} conns, ${HEADERS_TIMEOUT_MS}ms headers, ${REQUEST_TIMEOUT_MS}ms request)`);
   });
 
   return server;

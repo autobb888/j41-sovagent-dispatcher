@@ -18,7 +18,11 @@
  */
 const DEFAULT_TTL_MS = 11 * 60_000;        // envelope window + grace
 const SWEEP_INTERVAL_MS = 60_000;
-const MAX_ENTRIES = 100_000;
+// Audit 2026-06-02 L-DISPATCHER-bridge-1: env-overridable. 100k entries × 11min
+// TTL covers any realistic dispatcher load (≈150 nonces/sec sustained for 11
+// min before LRU eviction starts dropping the oldest). Operators with higher
+// throughput tune via env; tests use a much smaller cap to exercise eviction.
+const MAX_ENTRIES = Number(process.env.J41_NONCE_CACHE_MAX_ENTRIES || 100_000);
 
 let _seen = new Map();    // nonce → expiresAtMs
 let _sweepTimer = null;
