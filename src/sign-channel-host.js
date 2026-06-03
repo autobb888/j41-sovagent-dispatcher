@@ -191,6 +191,25 @@ class SignChannelHost {
     this._inflight.add(filename);
     try {
       const reqPath = path.join(this.reqDir, filename);
+      // Audit 2026-06-02 M-DISPATCHER-ddos-2: bound the per-request file size
+      // BEFORE we read it. A misbehaving container can otherwise drop a
+      // 100GB file into /app/sign and OOM the dispatcher. 256 KB is well
+      // above any sensible sign-request payload.
+      const MAX_SIGN_REQ_BYTES = Number(process.env.J41_SIGN_REQ_MAX_BYTES || 256 * 1024);
+      try {
+        const st = await fsp.stat(reqPath);
+        if (st.size > MAX_SIGN_REQ_BYTES) {
+          await this._writeResponse(filename.replace(/\.json$/, ''), {
+            ok: false,
+            error: { code: 'REQ_TOO_LARGE', message: `request exceeds ${MAX_SIGN_REQ_BYTES} bytes (${st.size})` },
+          });
+          await this._removeReq(reqPath);
+          return;
+        }
+      } catch (e) {
+        if (e.code !== 'ENOENT') this.log(`[sign-channel] stat ${filename} failed: ${e.message}`);
+        return;
+      }
       let raw;
       try {
         raw = await fsp.readFile(reqPath, 'utf8');

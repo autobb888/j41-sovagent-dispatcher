@@ -31,10 +31,21 @@ function startControlServer(state, handlers) {
 
   const startedAt = Date.now();
 
+  // Audit 2026-06-02 M-DISPATCHER-ddos-1: bound the per-connection input
+  // buffer. Without this a client could send 1 GB of arbitrary bytes with no
+  // newline and OOM the dispatcher. Default 64 KB is way above the largest
+  // legitimate ctl command (a few hundred bytes max).
+  const MAX_CTL_BUFFER_BYTES = Number(process.env.J41_CTL_MAX_BUFFER_BYTES || 64 * 1024);
+
   const server = net.createServer((conn) => {
     let buf = '';
     conn.on('data', (data) => {
       buf += data.toString();
+      if (buf.length > MAX_CTL_BUFFER_BYTES) {
+        conn.write(JSON.stringify({ error: 'input too large (control protocol is line-delimited JSON)' }) + '\n');
+        conn.destroy();
+        return;
+      }
       // Process newline-delimited messages
       let idx;
       while ((idx = buf.indexOf('\n')) !== -1) {

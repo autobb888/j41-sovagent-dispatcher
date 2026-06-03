@@ -3482,7 +3482,12 @@ program
 
             // Path B: caller specified a buyer — revoke ALL active keys this buyer holds for this seller
             if (buyerVerusId) {
-              const active = listActiveKeys(sellerAgent.id).filter(r => r.buyerVerusId === buyerVerusId);
+              // Audit 2026-06-02 M-DISPATCHER-auth-3 (Family 3): normalize
+              // both forms before comparing so e.g. 'buyer.agentplatform@'
+              // vs 'buyer.agentplatform' match.
+              const _normId = (s) => (typeof s === 'string' ? s.trim().toLowerCase().replace(/@+$/, '') : s);
+              const wantNorm = _normId(buyerVerusId);
+              const active = listActiveKeys(sellerAgent.id).filter(r => _normId(r.buyerVerusId) === wantNorm);
               let count = 0;
               for (const r of active) {
                 if (revokeApiKey(sellerAgent.id, r.key)) count++;
@@ -4309,9 +4314,19 @@ async function pollForJobs(state) {
         agent.client.getMyJobs({ role: 'seller' }),
         agent.client.getMyJobs({ role: 'seller', status: 'in_progress' }),
       ]);
+      // Audit 2026-06-02 M-DISPATCHER-ddos-5: cap response sizes so a
+      // compromised/buggy platform cannot blow memory by returning enormous
+      // arrays (e.g. 100k jobs in one response).
+      const MAX_JOBS_PER_RESPONSE = Number(process.env.J41_MAX_JOBS_PER_POLL || 200);
+      const safeDefault = (defaultRes?.data || []).slice(0, MAX_JOBS_PER_RESPONSE);
+      const safeInProg = (inProgRes?.data || []).slice(0, MAX_JOBS_PER_RESPONSE);
+      if ((defaultRes?.data || []).length > MAX_JOBS_PER_RESPONSE ||
+          (inProgRes?.data || []).length > MAX_JOBS_PER_RESPONSE) {
+        console.error(`[Poll] ${agentInfo.id}: platform returned more than ${MAX_JOBS_PER_RESPONSE} jobs in a single response — truncating. Set J41_MAX_JOBS_PER_POLL to raise.`);
+      }
       const _merged = new Map();
-      for (const j of (defaultRes?.data || [])) _merged.set(j.id, j);
-      for (const j of (inProgRes?.data || [])) _merged.set(j.id, j);
+      for (const j of safeDefault) _merged.set(j.id, j);
+      for (const j of safeInProg) _merged.set(j.id, j);
       const allJobs = [..._merged.values()];
       const jobs = allJobs.filter(j =>
         j.status === 'requested' || j.status === 'accepted' || j.status === 'in_progress'
@@ -5197,8 +5212,17 @@ async function startJobContainer(state, job, agentInfo) {
     // best effort
   }
   
+  // Audit 2026-06-02 M-DISPATCHER-ddos-4: cap platform-supplied job.description
+  // length before writing to disk. A compromised/MITM'd platform could otherwise
+  // ship a 100 GB description and exhaust the operator's disk.
+  const MAX_DESCRIPTION_BYTES = Number(process.env.J41_JOB_DESCRIPTION_MAX_BYTES || 1024 * 1024); // 1 MB
+  const desc = typeof job.description === 'string' ? job.description : '';
+  if (desc.length > MAX_DESCRIPTION_BYTES) {
+    throw new Error(`job.description exceeds ${MAX_DESCRIPTION_BYTES} bytes (${desc.length}); refusing to write`);
+  }
+
   // Write job data
-  fs.writeFileSync(path.join(jobDir, 'description.txt'), job.description);
+  fs.writeFileSync(path.join(jobDir, 'description.txt'), desc);
   fs.writeFileSync(path.join(jobDir, 'buyer.txt'), job.buyerVerusId);
   fs.writeFileSync(path.join(jobDir, 'amount.txt'), String(job.amount));
   fs.writeFileSync(path.join(jobDir, 'currency.txt'), job.currency);
