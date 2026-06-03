@@ -73,6 +73,29 @@ function jobCompletionUpdateExecutor({ getClient }) {
     if (!jobRecord || typeof jobRecord !== 'object') {
       throw new Error('jobCompletionUpdate: jobRecord (object) required');
     }
+    // Audit 2026-06-02 H-DISPATCHER-6: shape-validate container-supplied
+    // records before signing+broadcasting them under the agent's identity.
+    // The full architectural fix (reconstruct from trusted state instead of
+    // accepting container blob) requires SDK + backend coordination on what
+    // counts as authoritative; the shape check stops the simple "container
+    // ships unrelated keys into vdxfAdditions" path immediately.
+    if (jobRecord.timestamp !== undefined && typeof jobRecord.timestamp !== 'number') {
+      throw new Error('jobCompletionUpdate: jobRecord.timestamp must be a number');
+    }
+    if (reviewRecord !== undefined && (typeof reviewRecord !== 'object' || reviewRecord === null)) {
+      throw new Error('jobCompletionUpdate: reviewRecord must be an object if provided');
+    }
+    if (workspaceAttestation !== undefined && (typeof workspaceAttestation !== 'object' || workspaceAttestation === null)) {
+      throw new Error('jobCompletionUpdate: workspaceAttestation must be an object if provided');
+    }
+    // Refuse if any unexpected top-level keys (defensive — drops a future
+    // mistaken expansion of the container surface from making it on-chain).
+    const allowedJobRecordKeys = new Set(['jobHash', 'timestamp', 'completedAt', 'amount', 'currency', 'buyer', 'seller', 'status', 'reviewerSignature']);
+    for (const k of Object.keys(jobRecord)) {
+      if (!allowedJobRecordKeys.has(k)) {
+        throw new Error(`jobCompletionUpdate: jobRecord has unexpected key ${k}; refusing to broadcast`);
+      }
+    }
     // Optional sanity: if jobRecord.jobHash is supplied, make sure it matches
     // the channel's bound job — prevents a runaway container from poisoning
     // the wrong job's identity record. We re-fetch via getJob to get the

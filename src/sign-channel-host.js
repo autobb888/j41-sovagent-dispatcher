@@ -205,7 +205,7 @@ class SignChannelHost {
       try {
         req = JSON.parse(raw);
       } catch (e) {
-        await this._writeResponse(req?.id || filename.replace(/\.json$/, ''), {
+        await this._writeResponse(filename.replace(/\.json$/, ''), {
           ok: false,
           error: { code: 'BAD_JSON', message: e.message },
         });
@@ -213,8 +213,18 @@ class SignChannelHost {
         return;
       }
 
+      // Audit 2026-06-02 H-DISPATCHER-2: validate req.id is a safe filename
+      // before using it as the path component of the response file. A
+      // container-controlled value otherwise enables arbitrary host-side file
+      // write via path traversal (e.g. id = "../../../tmp/pwned" lands at
+      // <respDir>/../../../tmp/pwned.json). Same character class as
+      // REQ_FILENAME_RE, applied to the bare id (no .json suffix).
+      const fallbackId = filename.replace(/\.json$/, '');
+      const candidateId = (typeof req.id === 'string' && req.id.length > 0) ? req.id : fallbackId;
+      const safeId = /^[a-f0-9-]{1,80}$/i.test(candidateId) ? candidateId : fallbackId;
+
       const response = await this._handle(req);
-      await this._writeResponse(req.id || filename.replace(/\.json$/, ''), response);
+      await this._writeResponse(safeId, response);
       await this._removeReq(reqPath);
     } finally {
       this._inflight.delete(filename);

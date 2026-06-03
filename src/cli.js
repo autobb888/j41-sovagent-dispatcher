@@ -5271,7 +5271,12 @@ async function startJobContainer(state, job, agentInfo) {
     tmpKeysPath = path.join(tmpKeysDir, 'keys.json');
     fs.copyFileSync(keysPath, tmpKeysPath);
     try {
-      fs.chmodSync(tmpKeysPath, 0o644); // container process needs read access; mount is :ro
+      // Audit 2026-06-02 H-DISPATCHER-1: tighten WIF temp copy mode from 0o644
+      // → 0o600. The container runs as the dispatcher UID (see User flag in
+      // createContainer body); 0o644 was historical from a non-root container
+      // user that no longer applies. The cleanup (rm tmpKeysDir on every stop
+      // path) lands below in stopJobContainer.
+      fs.chmodSync(tmpKeysPath, 0o600);
     } catch {
       // best effort on systems that don't support chmod
     }
@@ -5443,8 +5448,18 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
     }
   }
 
-  // H3: No need to restore keys.json chmod — original was never modified.
-  // The temp copy in jobDir will be cleaned up below.
+  // Audit 2026-06-02 H-DISPATCHER-1: clean up the per-job WIF temp copy at
+  // os.tmpdir()/j41-keys-<jobId>. Previously this never got rm'd on either
+  // success or failure paths — operators ended up with an accumulating stash
+  // of plaintext WIFs in /tmp. Best-effort; non-fatal if already gone.
+  try {
+    const tmpKeysDir = path.join(os.tmpdir(), `j41-keys-${jobId}`);
+    if (fs.existsSync(tmpKeysDir)) {
+      fs.rmSync(tmpKeysDir, { recursive: true, force: true });
+    }
+  } catch (e) {
+    console.error(`[Cleanup] Failed to remove tmpKeysDir for ${jobId}: ${e.message}`);
+  }
 
   // Tear down the signing broker (broker mode): stop the watcher, run the
   // executor teardown (closes the cached J41Agent inside the executors), and
