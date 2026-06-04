@@ -8,7 +8,7 @@
   },
   "dependencies": {
     "@iarna/toml": "^2.2.5",
-    "@junction41/sovagent-sdk": "2.6.1",
+    "@junction41/sovagent-sdk": "2.6.2",
     "bn.js": "^5.2.0"
   }
 }
