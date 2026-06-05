@@ -22,7 +22,7 @@
     "@bitgo/blake2b-wasm" "^3.0.1"
     nanoassert "^2.0.0"
 
-"@bitgo/utxo-lib@github:VerusCoin/BitGoJS#5e82f4fd":
+"@bitgo/utxo-lib@github:VerusCoin/BitGoJS#5e82f4fda2975ca1af7f2b01590093b4a1439dc9":
   version "1.9.6"
   resolved "https://codeload.github.com/VerusCoin/BitGoJS/tar.gz/5e82f4fda2975ca1af7f2b01590093b4a1439dc9"
   dependencies:
@@ -98,21 +98,22 @@
   resolved "https://registry.yarnpkg.com/@js-sdsl/ordered-map/-/ordered-map-4.4.2.tgz#9299f82874bab9e4c7f9c48d865becbfe8d6907c"
   integrity sha512-iUKgm52T8HOE/makSxjqoWhe95ZJA1/G1sYsGev2JDKUSS14KAgg1LHb+Ba+IPow0xflbnSkOsZcO08C7w1gYw==
 
-"@junction41/secure-setup@>=0.1.0":
-  version "0.1.0"
-  resolved "https://registry.yarnpkg.com/@junction41/secure-setup/-/secure-setup-0.1.0.tgz#7943ef6417a8540527331c1f4e8d2d2389e66090"
-  integrity sha512-9Hc7UnHmYe3f746uhQar4q7uufCh0gJ7vXVxDVWuW17+pdRZuZehFfB2KfjOc7oNNynkf9Zm/0YvDDb/PDo+Ng==
+"@junction41/secure-setup@0.3.0":
+  version "0.3.0"
+  resolved "https://registry.yarnpkg.com/@junction41/secure-setup/-/secure-setup-0.3.0.tgz#3c7ddd9601ae3ec4a7c032b75ff6421ca0c613c1"
+  integrity sha512-M3bX0lxx5gg0PIsVYUH98cK8sdQcfbqzXm8kgEs8t+Z/st7glNbRqfVtiXEGDvurUGkgiJEs3x9its+JIG1syQ==
 
-"@junction41/sovagent-sdk@2.3.1":
-  version "2.3.1"
-  resolved "https://registry.yarnpkg.com/@junction41/sovagent-sdk/-/sovagent-sdk-2.3.1.tgz#bdc7cee0bb5b57f9bfe3820dc7eb75623f198d36"
-  integrity sha512-rBk8ZPr95SaGaSTEQX42eiynx08h14z2d7y7sC9z5sf9yXqyK9XavZH+d5gSOr/0LY/2sBRceaZnkrhhtfiOLA==
+"@junction41/sovagent-sdk@2.6.3":
+  version "2.6.3"
+  resolved "https://registry.yarnpkg.com/@junction41/sovagent-sdk/-/sovagent-sdk-2.6.3.tgz#055b330fc6852ce975d853d722d37ff8cc75dc03"
+  integrity sha512-UZ2mx31MAD2ygqr3a7A4uuM3hGos+2WxPJik1rmneCucCcJjKS9P1214bQUoGkbzsX42j4XufWe9ht/H6kpzOQ==
   dependencies:
-    "@bitgo/utxo-lib" "github:VerusCoin/BitGoJS#5e82f4fd"
+    "@bitgo/utxo-lib" "github:VerusCoin/BitGoJS#5e82f4fda2975ca1af7f2b01590093b4a1439dc9"
+    bn.js "^5.2.0"
     bs58check "2.0.0"
     json-canonicalize "^2.0.0"
     socket.io-client "^4.8.3"
-    verus-typescript-primitives "git+https://github.com/VerusCoin/verus-typescript-primitives.git"
+    verus-typescript-primitives "github:VerusCoin/verus-typescript-primitives#27e6c076def4416c20a568e31e4c406b10612807"
 
 "@noble/curves@1.9.7":
   version "1.9.7"
@@ -328,7 +329,7 @@ blake2b-wasm@^2.4.0:
     blake2b-wasm "^2.4.0"
     nanoassert "^2.0.0"
 
-bn.js@5.2.3:
+bn.js@5.2.3, bn.js@^5.2.0:
   version "5.2.3"
   resolved "https://registry.yarnpkg.com/bn.js/-/bn.js-5.2.3.tgz#16a9e409616b23fef3ccbedb8d42f13bff80295e"
   integrity sha512-EAcmnPkxpntVL+DS7bO1zhcZNvCkxqtkd0ZY53h06GNQ3DEkkGZ/gKgmDv6DdZQGj9BgfSPKtJJ7Dp1GPP8f7w==
@@ -1241,6 +1242,17 @@ varuint-bitcoin@1.0.4:
 "verus-typescript-primitives@git+https://github.com/VerusCoin/verus-typescript-primitives.git":
   version "1.0.0"
   resolved "git+https://github.com/VerusCoin/verus-typescript-primitives.git#38afb27212617866d3cb0945f6b63d08cfeb3da1"
+  dependencies:
+    base64url "3.0.1"
+    bech32 "2.0.0"
+    blake2b "https://github.com/VerusCoin/blake2b"
+    bn.js "5.2.3"
+    bs58check "2.0.0"
+    create-hash "1.2.0"
+
+"verus-typescript-primitives@github:VerusCoin/verus-typescript-primitives#27e6c076def4416c20a568e31e4c406b10612807":
+  version "1.0.0"
+  resolved "https://codeload.github.com/VerusCoin/verus-typescript-primitives/tar.gz/27e6c076def4416c20a568e31e4c406b10612807"
   dependencies:
     base64url "3.0.1"
     bech32 "2.0.0"
