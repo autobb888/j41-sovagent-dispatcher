@@ -89,16 +89,13 @@ function startControlServer(state, handlers) {
   const healthPort = loadDispatcherConfig().runtime.health_port;
   const healthServer = http.createServer((req, res) => {
     if (req.url === '/health' || req.url === '/') {
-      const uptimeMs = Date.now() - startedAt;
+      // WP-D2: the health document is the monitor-room contract. Its field
+      // PATHS are versioned API — spec-8 http-api probes extract dotted
+      // paths (agents.0.status, containers.0.state, summary.containers_unhealthy)
+      // and break silently if a path drifts. Treat a renamed field like a
+      // removed endpoint. See buildHealthDocument().
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        status: 'ok',
-        uptime: uptimeMs,
-        agents: state.agents.length,
-        active: state.active.size,
-        queue: state.queue.length,
-        available: state.available.length,
-      }));
+      res.end(JSON.stringify(buildHealthDocument(state, startedAt)));
     } else if (req.url === '/metrics') {
       // Prometheus-style metrics
       const uptimeMs = Date.now() - startedAt;
@@ -131,64 +128,189 @@ function startControlServer(state, handlers) {
   return server;
 }
 
+// ─────────────────────────────────────────
+// Read-model builders (WP-D1)
+//
+// The single source of truth for the dispatcher's read surface. Both the
+// Unix-socket control plane (handleCommand) and the HTTP control API
+// (src/control-api.js) project state through these, so `ctl status` and
+// `GET /v1/status` can never drift apart.
+// ─────────────────────────────────────────
+
+function buildStatus(state, startedAt) {
+  const uptimeMs = Date.now() - startedAt;
+  const uptimeMin = Math.floor(uptimeMs / 60000);
+  const uptimeHr = Math.floor(uptimeMin / 60);
+  const uptime = uptimeHr > 0 ? `${uptimeHr}h ${uptimeMin % 60}m` : `${uptimeMin}m`;
+  return {
+    uptime,
+    uptimeMs,
+    agents: {
+      total: state.agents.length,
+      available: state.available.length,
+      busy: state.agents.length - state.available.length,
+    },
+    active: state.active.size,
+    queue: state.queue.length,
+    seen: state.seen.size,
+  };
+}
+
+function buildJobs(state) {
+  const jobs = [];
+  for (const [jobId, active] of state.active) {
+    jobs.push({
+      jobId,
+      agentId: active.agentId,
+      pid: active.pid || null,
+      startedAt: active.startedAt,
+      runningFor: `${Math.floor((Date.now() - active.startedAt) / 60000)}m`,
+      paused: active.paused || false,
+      workspace: active.workspaceNotified || false,
+      tokens: active.tokenUsage || null,
+    });
+  }
+  return { active: jobs, queue: state.queue.length };
+}
+
+/** Detail for one active job, or null if it's not running. */
+function buildJob(state, jobId) {
+  const active = state.active.get(jobId);
+  if (!active) return null;
+  return {
+    jobId,
+    agentId: active.agentId,
+    pid: active.pid || null,
+    startedAt: active.startedAt,
+    runningFor: `${Math.floor((Date.now() - active.startedAt) / 60000)}m`,
+    paused: active.paused || false,
+    pauseCount: active.pauseCount || 0,
+    reworkCount: active.reworkCount || 0,
+    workspace: active.workspaceNotified || false,
+    container: active.container?.name || null,
+    jobAmount: active.jobAmount ?? null,
+    currency: active.currency || 'VRSC',
+    tokens: active.tokenUsage || null,
+  };
+}
+
+function buildAgents(state) {
+  const agents = state.agents.map((a) => {
+    const busy = [...state.active.values()].find(v => v.agentId === a.id);
+    const caps = state.capabilities?.get(a.id);
+    return {
+      id: a.id,
+      identity: a.identity,
+      status: busy ? 'busy' : 'available',
+      workspace: caps?.workspace || false,
+      services: caps?.services?.length || 0,
+      currentJob: busy ? [...state.active.entries()].find(([, v]) => v.agentId === a.id)?.[0]?.substring(0, 8) : null,
+    };
+  });
+  return { agents };
+}
+
+async function buildEarnings(state, getAgentSession) {
+  const earnings = { agents: [], total: { jobs: 0, earned: 0, tokenCost: 0 } };
+  for (const agentInfo of state.agents) {
+    try {
+      const agent = await getAgentSession(state, agentInfo);
+      const completed = await agent.client.getMyJobs({ status: 'completed', role: 'seller' });
+      const delivered = await agent.client.getMyJobs({ status: 'delivered', role: 'seller' });
+      const jobs = [...(completed.data || []), ...(delivered.data || [])];
+      let earned = 0;
+      for (const j of jobs) earned += parseFloat(j.amount) || 0;
+      earnings.agents.push({
+        id: agentInfo.id,
+        identity: agentInfo.identity,
+        jobs: jobs.length,
+        earned: Math.round(earned * 1000) / 1000,
+        currency: jobs[0]?.currency || 'VRSC',
+      });
+      earnings.total.jobs += jobs.length;
+      earnings.total.earned += earned;
+    } catch (e) {
+      earnings.agents.push({ id: agentInfo.id, error: e.message });
+    }
+  }
+  earnings.total.earned = Math.round(earnings.total.earned * 1000) / 1000;
+  return earnings;
+}
+
+/**
+ * The health document (WP-D2). Stable dotted paths for the monitor room:
+ *   agents.N.status / agents.N.lastError
+ *   containers.N.name / containers.N.state / containers.N.crashes
+ *   summary.containers_unhealthy (numeric → `above:0` is the canonical
+ *     "tell me when anything is wrong" watch)
+ * Back-compat scalars (active/queue/available) are retained so existing
+ * 200-checks keep working; `agents` is now an array (the intended v1 shape).
+ */
+function buildHealthDocument(state, startedAt) {
+  const uptime = Date.now() - startedAt;
+
+  const agents = state.agents.map((a) => {
+    const busyEntry = [...state.active.entries()].find(([, v]) => v.agentId === a.id);
+    return {
+      id: a.id,
+      identity: a.identity || null,
+      status: busyEntry ? (busyEntry[1].paused ? 'paused' : 'busy') : 'available',
+      currentJob: busyEntry ? busyEntry[0] : null,
+      lastError: state._agentErrors?.get(a.id) || null,
+    };
+  });
+
+  const containers = [...state.active.entries()].map(([jobId, v]) => ({
+    name: v.container?.name || `job-${jobId.substring(0, 8)}`,
+    jobId,
+    agentId: v.agentId || null,
+    state: v.paused ? 'paused' : 'running',
+    startedAt: v.startedAt || null,
+    crashes: state._containerCrashes?.get(v.agentId) || 0,
+  }));
+
+  // Unhealthy = a container that has crashed at least once in this run.
+  const crashTotal = state._containerCrashes
+    ? [...state._containerCrashes.values()].reduce((n, c) => n + (c > 0 ? 1 : 0), 0)
+    : 0;
+  const containersUnhealthy = crashTotal;
+
+  const agentsBusy = agents.filter((a) => a.status !== 'available').length;
+
+  return {
+    status: containersUnhealthy > 0 ? 'degraded' : 'ok',
+    uptime,
+    agents,
+    containers,
+    // back-compat scalars (pre-WP-D2 consumers / Docker healthcheck)
+    active: state.active.size,
+    queue: state.queue.length,
+    available: state.available.length,
+    summary: {
+      agents_total: state.agents.length,
+      agents_busy: agentsBusy,
+      agents_available: state.available.length,
+      containers_total: containers.length,
+      containers_unhealthy: containersUnhealthy,
+      jobs_active: state.active.size,
+      jobs_queued: state.queue.length,
+      jobs_seen: state.seen.size,
+    },
+  };
+}
+
 async function handleCommand(cmd, state, handlers, startedAt) {
   const action = cmd.action || cmd.command || cmd.cmd;
 
   switch (action) {
-    case 'status': {
-      const uptimeMs = Date.now() - startedAt;
-      const uptimeMin = Math.floor(uptimeMs / 60000);
-      const uptimeHr = Math.floor(uptimeMin / 60);
-      const uptime = uptimeHr > 0
-        ? `${uptimeHr}h ${uptimeMin % 60}m`
-        : `${uptimeMin}m`;
+    case 'status':
+      return buildStatus(state, startedAt);
 
-      return {
-        uptime,
-        uptimeMs,
-        agents: {
-          total: state.agents.length,
-          available: state.available.length,
-          busy: state.agents.length - state.available.length,
-        },
-        active: state.active.size,
-        queue: state.queue.length,
-        seen: state.seen.size,
-      };
-    }
+    case 'jobs':
+      return buildJobs(state);
 
-    case 'jobs': {
-      const jobs = [];
-      for (const [jobId, active] of state.active) {
-        jobs.push({
-          jobId,
-          agentId: active.agentId,
-          pid: active.pid || null,
-          startedAt: active.startedAt,
-          runningFor: `${Math.floor((Date.now() - active.startedAt) / 60000)}m`,
-          paused: active.paused || false,
-          workspace: active.workspaceNotified || false,
-          tokens: active.tokenUsage || null,
-        });
-      }
-      return { active: jobs, queue: state.queue.length };
-    }
-
-    case 'agents': {
-      const agents = state.agents.map((a) => {
-        const busy = [...state.active.values()].find(v => v.agentId === a.id);
-        const caps = state.capabilities?.get(a.id);
-        return {
-          id: a.id,
-          identity: a.identity,
-          status: busy ? 'busy' : 'available',
-          workspace: caps?.workspace || false,
-          services: caps?.services?.length || 0,
-          currentJob: busy ? [...state.active.entries()].find(([, v]) => v.agentId === a.id)?.[0]?.substring(0, 8) : null,
-        };
-      });
-      return { agents };
-    }
+    case 'agents':
+      return buildAgents(state);
 
     case 'shutdown': {
       if (handlers.onShutdown) {
@@ -213,32 +335,8 @@ async function handleCommand(cmd, state, handlers, startedAt) {
       }
     }
 
-    case 'earnings': {
-      const earnings = { agents: [], total: { jobs: 0, earned: 0, tokenCost: 0 } };
-      for (const agentInfo of state.agents) {
-        try {
-          const agent = await handlers.getAgentSession(state, agentInfo);
-          const completed = await agent.client.getMyJobs({ status: 'completed', role: 'seller' });
-          const delivered = await agent.client.getMyJobs({ status: 'delivered', role: 'seller' });
-          const jobs = [...(completed.data || []), ...(delivered.data || [])];
-          let earned = 0;
-          for (const j of jobs) earned += parseFloat(j.amount) || 0;
-          earnings.agents.push({
-            id: agentInfo.id,
-            identity: agentInfo.identity,
-            jobs: jobs.length,
-            earned: Math.round(earned * 1000) / 1000,
-            currency: jobs[0]?.currency || 'VRSC',
-          });
-          earnings.total.jobs += jobs.length;
-          earnings.total.earned += earned;
-        } catch (e) {
-          earnings.agents.push({ id: agentInfo.id, error: e.message });
-        }
-      }
-      earnings.total.earned = Math.round(earnings.total.earned * 1000) / 1000;
-      return earnings;
-    }
+    case 'earnings':
+      return buildEarnings(state, handlers.getAgentSession);
 
     case 'resources': {
       const cpus = os.cpus();
@@ -392,4 +490,11 @@ module.exports = {
   startControlServer,
   stopControlServer,
   sendCommand,
+  // Read-model builders — shared with src/control-api.js (WP-D1)
+  buildStatus,
+  buildJobs,
+  buildJob,
+  buildAgents,
+  buildEarnings,
+  buildHealthDocument,
 };

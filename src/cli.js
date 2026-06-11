@@ -3030,6 +3030,8 @@ program
       _lastSentStatus: new Map(), // jobId -> last status sent
       _lastExtensionCheck: new Map(), // jobId -> last extension check timestamp
       _pendingWorkspace: new Map(), // jobId -> workspace connect promise
+      _agentErrors: new Map(), // agentId -> last error string (health document)
+      _containerCrashes: new Map(), // agentId -> unexpected-exit count (health document)
       _devUnsafe, // security: allows local mode when true
     };
 
@@ -3729,6 +3731,23 @@ program
       getAgentSession,
     });
 
+    // ── Start headless control API (WP-D1/D2) ──
+    // Versioned, token-gated HTTP surface on its own port. The event bus is
+    // attached to state so lifecycle points can emit without importing the
+    // module; every call site guards with state.emitEvent?.() so a failed
+    // API start never breaks job processing.
+    const { startControlApi, stopControlApi } = require('./control-api');
+    let controlApi = null;
+    try {
+      controlApi = startControlApi(state, { getAgentSession }, {
+        port: cfg.runtime.control_api_port,
+      });
+      state.emitEvent = (type, data) => controlApi.bus.emit(type, data);
+    } catch (e) {
+      console.error(`[ControlAPI] Failed to start (continuing without it): ${e.message}`);
+      state.emitEvent = () => {};
+    }
+
     // ── Set agents active on-chain + platform ──
     // J41_NO_STATUS_TOGGLE=1: leave platform state alone at startup. Useful for
     // broker-validation runs where the operator pre-activates specific agents
@@ -3746,6 +3765,8 @@ program
           const agent = await getAgentSession(state, agentInfo);
           const result = await agent.activate({ onChain: true });
           console.log(`  ✅ ${agentInfo.id}: active (on-chain txid: ${result.onChainTxid || 'skipped'})`);
+          state._agentErrors.delete(agentInfo.id);
+          state.emitEvent?.('agent.online', { agentId: agentInfo.id, identity: agentInfo.identity });
           // Trigger backend re-index so marketplace reflects active status immediately
           try {
             await agent.client.refreshAgent(agentInfo.iAddress || agentInfo.identity);
@@ -3755,6 +3776,8 @@ program
           }
         } catch (e) {
           console.log(`  ⚠️  ${agentInfo.id}: activation failed (${e.message.slice(0, 60)})`);
+          state._agentErrors.set(agentInfo.id, `activation failed: ${e.message.slice(0, 120)}`);
+          state.emitEvent?.('agent.offline', { agentId: agentInfo.id, error: e.message.slice(0, 120) });
         }
       }
     }
@@ -3813,6 +3836,7 @@ program
         console.log('\n✅ No active jobs. Shutting down.\n');
         persistActiveJobs(state.active);
         stopControlServer(controlServer);
+        stopControlApi(controlApi);
         process.exit(0);
       }
 
@@ -3828,6 +3852,7 @@ program
           state.active.clear();
           persistActiveJobs(state.active);
           stopControlServer(controlServer);
+          stopControlApi(controlApi);
           process.exit(0);
         }
 
@@ -3836,6 +3861,7 @@ program
           console.log(`\n⚠️  Drain timeout (${Math.round(drainTimeoutMs / 60000)}min) — remaining ${state.active.size} job(s) will be refunded on next startup.`);
           // Don't clear active-jobs.json — crash recovery will handle refunds
           stopControlServer(controlServer);
+          stopControlApi(controlApi);
           process.exit(1);
         }
       }, 10000);
@@ -4590,6 +4616,19 @@ async function pollForJobs(state) {
 }
 
 // Handle incoming webhook event (webhook mode)
+// Normalize platform webhook event names to the WP-D2 event vocabulary so
+// the /v1/events feed is stable regardless of platform-side naming.
+const WEBHOOK_EVENT_MAP = {
+  'job.extension_request': 'extension.requested',
+  'job.extension_approved': 'extension.approved',
+  'job.extension_rejected': 'extension.rejected',
+  'job.dispute.filed': 'dispute.filed',
+  'job.disputed': 'dispute.filed',
+  'job.dispute.resolved': 'dispute.resolved',
+  'job.dispute.responded': 'dispute.responded',
+  'job.dispute.rework_accepted': 'dispute.rework_accepted',
+};
+
 async function handleWebhookEvent(state, agentId, payload) {
   const agentInfo = state.agents.find(a => a.id === agentId);
   if (!agentInfo) {
@@ -4600,6 +4639,13 @@ async function handleWebhookEvent(state, agentId, payload) {
   const { event, data } = payload;
   const jobId = data?.jobId || payload.jobId;
   console.log(`[Webhook] ${agentInfo.id}: ${event}${jobId ? ' ' + jobId.substring(0, 8) : ''}`);
+
+  // WP-D2: mirror every inbound platform event into the control-API event
+  // feed, normalized to the documented vocabulary so a polling client
+  // (brainbox 🔔, a monitor, a script) sees one consistent stream. This is
+  // observation only — the switch below still does the actual work.
+  const evType = WEBHOOK_EVENT_MAP[event] || event;
+  state.emitEvent?.(evType, { jobId: jobId || null, agentId: agentInfo.id, ...(data || {}) });
 
   switch (event) {
     case 'job.requested': {
@@ -5437,6 +5483,11 @@ async function startJobContainer(state, job, agentInfo) {
       _signerTeardown: signerTeardown,
     });
 
+    state.emitEvent?.('container.started', {
+      jobId: job.id, agentId: agentInfo.id, container: container?.name || null, runtime: 'docker',
+    });
+    state.emitEvent?.('job.started', { jobId: job.id, agentId: agentInfo.id });
+
     // Mark as seen immediately to avoid duplicate pickup loops while status remains requested
     state.seen.set(job.id, Date.now());
     saveSeenJobs(state.seen);
@@ -5657,9 +5708,17 @@ async function startJobLocal(state, job, agentInfo) {
       });
     });
 
-    child.on('exit', () => {
+    child.on('exit', (code, signal) => {
       logStream.write(`[${new Date().toISOString()}] Job process exited\n`);
       logStream.end();
+      // Unexpected exit (non-zero, not a clean signal) counts as a crash for
+      // the health document's containers_unhealthy rollup.
+      if (code && code !== 0) {
+        const n = (state._containerCrashes.get(agentInfo.id) || 0) + 1;
+        state._containerCrashes.set(agentInfo.id, n);
+        state._agentErrors.set(agentInfo.id, `job process exited with code ${code}${signal ? ` (${signal})` : ''}`);
+        state.emitEvent?.('container.died', { jobId: job.id, agentId: agentInfo.id, code, signal: signal || null });
+      }
     });
 
     // Handle IPC from job-agent
@@ -5685,6 +5744,10 @@ async function startJobLocal(state, job, agentInfo) {
         // count even when the platform webhook doesn't echo estimatedTokens.
         const extInfo = state.active.get(msg.jobId);
         if (extInfo) extInfo.pendingExtensionTokens = msg.estimatedTokens;
+        state.emitEvent?.('extension.requested', {
+          jobId: msg.jobId, amount: msg.amount, currency: msg.currency || 'VRSC',
+          estimatedTokens: msg.estimatedTokens, reason: msg.reason,
+        });
         (async () => {
           try {
             const agent = await getAgentSession(state, agentInfo);
@@ -5730,6 +5793,11 @@ async function startJobLocal(state, job, agentInfo) {
       agentInfoId: agentInfo.id,
       reworkCount: 0,
     });
+
+    state.emitEvent?.('container.started', {
+      jobId: job.id, agentId: agentInfo.id, pid: child.pid, runtime: 'local',
+    });
+    state.emitEvent?.('job.started', { jobId: job.id, agentId: agentInfo.id });
 
     state.seen.set(job.id, Date.now());
     saveSeenJobs(state.seen);

@@ -13,7 +13,8 @@ keep_containers = false
 require_finalize = false
 skip_status_check = false
 allow_local_upstream = false  # SSRF guard — only enable on dev boxes
-health_port = 9842
+health_port = 9842          # open /health + /metrics for monitor-room probes
+control_api_port = 9843     # token-gated headless control API (WP-D1/D2)
 webhook_url = ""            # public URL for event-driven mode (cloudflared etc.)
 
 [logging]
@@ -70,6 +71,16 @@ max_body_bytes = 1048576        # 1 MiB inbound body cap
 
 [retry]
 rate_limit_backoff_multiplier = 3   # multiplier on baseDelayMs for HTTP 429 responses
+
+[budget]
+# Token budget enforcement (WP-D4). Set vrsc_usd_rate — until it's > 0, jobs
+# run on fallback_token_budget and extensions are never auto-priced.
+vrsc_usd_rate = 0               # USD per VRSC (0 = unset → fail closed)
+rate_max_age_ms = 86400000      # a rate older than this counts as missing (24h)
+spend_fraction = 0.6            # share of job value spendable on LLM cost
+fallback_token_budget = 50000   # budget when the job can't be priced
+warning_percent = 80            # budget % that triggers an extension request
+extension_wait_ms = 600000      # exhausted + unapproved this long → deliver partial
 
 [debug]
 chat = false                # enables [chat] event log when true (privacy-sensitive)

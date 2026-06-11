@@ -498,6 +498,53 @@ j41-dispatcher ctl canary --agent agent-2  # check canary status
 j41-dispatcher ctl status --json   # machine-readable output
 ```
 
+### Headless Control API (WP-D1/D2)
+
+The same read model is exposed as a versioned HTTP API on `127.0.0.1:9843`
+(`control_api_port`), so *any* client — brainbox, a cron script, another
+orchestrator — can drive a dispatcher without the TUI. The `ctl` socket and the
+HTTP API share one set of read-model builders, so they never drift.
+
+Because this daemon moves money, **every `/v1/*` endpoint requires a bearer
+token**, even from localhost. The token is auto-created at
+`~/.j41/dispatcher/control.token` (mode 0600) on first start; same-user access
+is trivial, other-user access is impossible.
+
+```bash
+TOKEN=$(cat ~/.j41/dispatcher/control.token)
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9843/v1/status
+```
+
+| Endpoint | Returns |
+|---|---|
+| `GET /v1/status` | uptime, pool, queue depth |
+| `GET /v1/agents` | registered agents + busy/available state |
+| `GET /v1/jobs` | active jobs + queue depth |
+| `GET /v1/jobs/:id` | one active job's detail (404 if not running) |
+| `GET /v1/earnings` | per-agent VRSC rollups (hits the platform) |
+| `GET /v1/events?since=N` | monotonic event feed (polling transport) |
+
+**Events** (`/v1/events`) are a file-backed ring buffer with a monotonic `seq`
+that survives restart, so a polling client's `since` cursor stays valid across a
+bounce. The response is `{ events: [...], cursor: N }`; poll with the last
+`cursor` as `since`. Event types follow a stable vocabulary:
+`job.started|delivered|completed`, `extension.requested|approved|rejected`,
+`dispute.filed|resolved`, `container.started|died`, `agent.online|offline`.
+
+> Write endpoints (`POST /v1/agents/:id/activate`, offerings, dispute responses,
+> and the buyer-side `/v1/hire/*`) land in later increments. This is the
+> read-only skeleton plus the event/health surface.
+
+### Health document — a compatibility promise
+
+`GET /health` on `:9842` stays **open and unauthenticated** for monitor-room
+probes. Its field **paths** are versioned API: the monitor room extracts dotted
+paths (`agents.0.status`, `containers.0.state`, `summary.containers_unhealthy`)
+and a renamed field breaks those watches silently — **treat a renamed health
+field like a removed endpoint.** The numeric rollups under `summary` are
+designed so `above:0` on `summary.containers_unhealthy` is the canonical
+"tell me when anything is wrong" watch. `GET /metrics` remains Prometheus-text.
+
 ## Graceful Shutdown
 
 On `SIGINT` (Ctrl+C), `SIGTERM`, or `ctl shutdown`:
