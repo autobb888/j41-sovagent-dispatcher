@@ -21,6 +21,12 @@ const IDENTITY = process.env.J41_IDENTITY;
 const JOB_ID = process.env.J41_JOB_ID;
 const TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS || '3600000');
 const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '480000'); // idle → pause (8 min, before backend's 10-min auto-deliver)
+// Token budget enforcement (WP-D4): warning threshold for extension asks,
+// and how long an exhausted budget may wait for approval before the session
+// hard-stops and delivers partial work.
+const BUDGET_WARNING_PERCENT = parseInt(process.env.J41_BUDGET_WARNING_PERCENT || '80');
+const BUDGET_EXTENSION_WAIT_MS = parseInt(process.env.J41_BUDGET_EXTENSION_WAIT_MS || '600000');
+const EXTENSION_RETRY_INTERVAL_MS = 60000; // min spacing between failed extension attempts
 const RATE_LIMIT_BACKOFF_MULTIPLIER = parseInt(process.env.J41_RATE_LIMIT_BACKOFF_MULTIPLIER || '3');
 
 const J41_NETWORK = process.env.J41_NETWORK || 'verustest';
@@ -123,6 +129,9 @@ let _sessionEndResolve = null; // global ref so shutdown IPC can resolve the ses
 let _disputePolicy = null;
 let _agentMarkup = 15;
 let _reworkCount = 0;
+// Audit trail of budget extensions this session — included in the job
+// record + attestation sidecar so both sides see the same usage story.
+let _extensionLog = [];
 
 async function main() {
   // Check for required environment variables
@@ -361,6 +370,21 @@ async function main() {
           console.log(`[IPC] extension_request received for job ${msg.jobId}`);
           ipcQueue.push(msg);
           break;
+        case 'budget_increased': {
+          // Handled here (not only post-delivery) so a mid-session approval
+          // unblocks generation immediately. increaseBudget re-arms the
+          // warning/extension flags (audit fix #5).
+          const additional = msg.data?.additionalTokens || 0;
+          console.log(`💰 [IPC] Budget increased by ${additional} tokens`);
+          if (_executor) _executor.increaseBudget(additional);
+          const lastExt = _extensionLog[_extensionLog.length - 1];
+          if (lastExt && !lastExt.granted) {
+            lastExt.granted = true;
+            lastExt.grantedTokens = additional;
+            lastExt.grantedAt = Math.floor(Date.now() / 1000);
+          }
+          break;
+        }
         case 'reconnect':
           console.log(`[IPC] reconnect requested for job ${msg.jobId}`);
           _paused = false;
@@ -441,7 +465,7 @@ async function main() {
 
     // Log token usage summary
     if (_executor?.getTokenUsage) {
-      const usage = _executor.getTokenUsage();
+      const usage = { ..._executor.getTokenUsage(), extensions: _extensionLog };
       log.info('Token usage', { jobId: JOB_ID, ...usage });
       if (process.send) process.send({ type: 'token_usage', jobId: JOB_ID, usage });
     }
@@ -508,6 +532,76 @@ async function main() {
 // Chat-based job processing (M6: Executor pattern)
 // ─────────────────────────────────────────
 
+/**
+ * Request a budget extension — the ONE place a budget overrun turns into a
+ * money ask (WP-D4). Prices from the job's actual model and the session's
+ * observed input:output ratio. Fails closed: with no exchange rate it does
+ * not invent a price — it logs, and the budget watchdog delivers partial
+ * work if no extension arrives.
+ */
+async function requestBudgetExtension(job, agent, executor, usage, budget) {
+  if (executor._extensionRequested) return; // one ask in flight; re-armed when granted
+  const now = Date.now();
+  if (executor._lastExtensionAttemptAt && now - executor._lastExtensionAttemptAt < EXTENSION_RETRY_INTERVAL_MS) return;
+  executor._lastExtensionAttemptAt = now;
+  executor._extensionRequested = true;
+
+  const { priceExtension } = require('./token-budget.js');
+  const { resolveLLMConfig } = require('./executors/local-llm.js');
+  const model = resolveLLMConfig().model;
+  const additionalTokens = Math.max(budget - usage.totalTokens, Math.floor(budget * 0.5));
+  const pct = budget > 0 ? Math.round((usage.totalTokens / budget) * 100) : 0;
+
+  const pricing = priceExtension({ model, usage, additionalTokens, markupPercent: _agentMarkup });
+  if (!pricing || pricing.amountVrsc == null) {
+    console.error('[BUDGET] Cannot price extension — no VRSC/USD rate available. ' +
+      'Set [budget].vrsc_usd_rate in config.toml. Not auto-requesting money; ' +
+      'the session will deliver partial work if the budget stays exhausted.');
+    executor._extensionRequested = false;
+    return;
+  }
+
+  const reason = `Token budget at ${pct}% — need ~${additionalTokens} more tokens`;
+  const breakdown = `${pricing.model}${pricing.assumedModel ? ' (assumed — configured model not in pricing table)' : ''}: ` +
+    `${usage.promptTokens} prompt + ${usage.completionTokens} completion tokens across ${usage.llmCalls} calls`;
+
+  _extensionLog.push({
+    requestedAt: Math.floor(Date.now() / 1000),
+    estimatedTokens: additionalTokens,
+    amountVrsc: pricing.amountVrsc,
+    amountUsd: pricing.amountUsd,
+    model: pricing.model,
+    granted: false,
+  });
+
+  if (process.send) {
+    // Local (fork) mode — the dispatcher host submits the platform request
+    process.send({
+      type: 'extension_needed',
+      jobId: job.id,
+      amount: pricing.amountVrsc,
+      currency: job.currency || 'VRSC',
+      reason,
+      estimatedTokens: additionalTokens,
+    });
+    console.log(`[BUDGET] Extension requested via host: ${pricing.amountVrsc} VRSC for ~${additionalTokens} tokens`);
+  } else {
+    // Docker mode — call the platform directly
+    try {
+      await agent.requestBudget(job.id, {
+        amount: pricing.amountVrsc,
+        currency: job.currency || 'VRSC',
+        reason,
+        breakdown,
+      });
+      console.log(`[BUDGET] Extension requested: ${pricing.amountVrsc} VRSC for ~${additionalTokens} tokens`);
+    } catch (e) {
+      console.warn(`[BUDGET] Extension request failed: ${e.message}`);
+      executor._extensionRequested = false; // allow a retry on the next warning edge
+    }
+  }
+}
+
 async function processJob(job, agent, soulPrompt, executor, registerSessionEndResolve) {
   _lastActivityAt = Date.now();
   _paused = false;
@@ -553,6 +647,30 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
     }
   } catch (e) {
     console.log(`[FILES] Could not check for files: ${e.message}`);
+  }
+
+  // Initial token budget (audit fix #2): derived from the job's payment via
+  // the pricing calculator, set BEFORE init so even the greeting is metered.
+  // Every job runs with a finite budget — when the rate or model is unknown
+  // the conservative fallback applies, never unlimited.
+  {
+    const { initialTokenBudget, DEFAULT_FALLBACK_TOKEN_BUDGET } = require('./token-budget.js');
+    const onBudgetWarning = (usage, budget) => {
+      console.log(`⚠️  Token budget at ${Math.round((usage.totalTokens / budget) * 100)}% — requesting extension`);
+      requestBudgetExtension(job, agent, executor, usage, budget)
+        .catch(e => console.warn(`[BUDGET] Extension request failed: ${e.message}`));
+    };
+    try {
+      const { resolveLLMConfig } = require('./executors/local-llm.js');
+      const model = resolveLLMConfig().model;
+      const { tokens, basis } = initialTokenBudget({ model, amountVrsc: job.amount });
+      executor.setBudget(tokens, BUDGET_WARNING_PERCENT, onBudgetWarning);
+      console.log(`[BUDGET] Initial token budget: ${tokens} tokens (${basis}, model=${model || 'n/a'})`);
+    } catch (e) {
+      // Fail closed — a derivation error still gets a finite budget
+      executor.setBudget(DEFAULT_FALLBACK_TOKEN_BUDGET, BUDGET_WARNING_PERCENT, onBudgetWarning);
+      console.warn(`[BUDGET] Could not derive budget (${e.message}) — using fallback ${DEFAULT_FALLBACK_TOKEN_BUDGET} tokens`);
+    }
   }
 
   // Initialize executor (sends greeting on first connect, skips on reconnect)
@@ -704,9 +822,33 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
     }
   }, 10000);
 
+  // Budget watchdog (audit fix #1): an exhausted budget pauses generation;
+  // if no extension is approved within BUDGET_EXTENSION_WAIT_MS, hard-stop
+  // the session and deliver partial work with an honest status. While
+  // waiting, retry the extension ask if a previous attempt failed to send.
+  const budgetCheck = setInterval(() => {
+    const since = executor.budgetExhaustedSince?.();
+    if (!since || sessionEnded) return;
+    if (!executor._extensionRequested) {
+      requestBudgetExtension(job, agent, executor, executor.getTokenUsage(), executor._budgetTokens)
+        .catch(e => console.warn(`[BUDGET] Extension retry failed: ${e.message}`));
+    }
+    if (Date.now() - since >= BUDGET_EXTENSION_WAIT_MS) {
+      log.warn('Budget exhausted with no approved extension — ending session', {
+        jobId: job.id, waitedMs: Date.now() - since,
+      });
+      try {
+        agent.sendChatMessage(job.id, 'The token budget for this job ran out and no extension was ' +
+          'approved in time. Delivering the work completed so far.');
+      } catch {}
+      resolveSession('budget-exhausted');
+    }
+  }, 10000);
+
   // Wait for session end or idle timeout
   await sessionPromise;
   clearInterval(idleCheck);
+  clearInterval(budgetCheck);
   // NOTE: _ipcPoller is NOT cleared here — it must survive for post-delivery IPC (dispute/rework)
   _wsPollerStopped = true;
   if (_wsPollTimer) clearTimeout(_wsPollTimer);
@@ -1052,34 +1194,14 @@ setTimeout(async () => {
  * state are still alive from the original processJob() call.
  */
 async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndResolve, reworkContext, tokenBudget) {
-  // Set token budget on executor with warning callback for extension requests
+  // Set token budget on executor with warning callback for extension requests.
+  // Pricing goes through requestBudgetExtension — actual model, observed
+  // input:output ratio, real exchange rate (audit fix #4).
   if (tokenBudget && tokenBudget > 0) {
-    executor.setBudget(tokenBudget, 80, (usage, budget) => {
+    executor.setBudget(tokenBudget, BUDGET_WARNING_PERCENT, (usage, budget) => {
       console.log(`⚠️  Token budget at ${Math.round((usage.totalTokens / budget) * 100)}% — requesting extension`);
-      const additionalTokens = Math.max(budget - usage.totalTokens, Math.floor(budget * 0.5));
-
-      if (process.send) {
-        try {
-          const { calculateListedPrice } = require('@junction41/sovagent-sdk/dist/pricing/calculator.js');
-          const model = process.env.J41_LLM_MODEL || 'claude-sonnet-4';
-          const halfTokens = Math.floor(additionalTokens / 2);
-          const pricing = calculateListedPrice({
-            model,
-            inputTokens: halfTokens,
-            outputTokens: halfTokens,
-            markupPercent: _agentMarkup || 15,
-          });
-          process.send({
-            type: 'extension_needed',
-            jobId: job.id,
-            amount: pricing.listedPrice,
-            reason: `Token budget at ${Math.round((usage.totalTokens / budget) * 100)}% — need ${additionalTokens} more tokens`,
-            estimatedTokens: additionalTokens,
-          });
-        } catch (e) {
-          console.error('Failed to calculate extension price:', e.message);
-        }
-      }
+      requestBudgetExtension(job, agent, executor, usage, budget)
+        .catch(e => console.warn(`[BUDGET] Extension request failed: ${e.message}`));
     });
     console.log(`  Token budget for rework: ${tokenBudget} tokens`);
   }
@@ -1216,12 +1338,9 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
           break;
         }
 
-        case 'budget_increased': {
-          const additional = msg.data?.additionalTokens || 0;
-          console.log(`💰 Budget increased by ${additional} tokens`);
-          executor.increaseBudget(additional);
-          break;
-        }
+        // NOTE: 'budget_increased' is handled by handleIpcMessage (which stays
+        // registered for the whole container lifetime) so mid-session AND
+        // post-delivery approvals take the same path — no duplicate handling here.
 
         case 'dispute.rework_accepted': {
           console.log('🔄 Rework accepted — continuing chat session...');
@@ -1252,16 +1371,24 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
               console.log('⚠️  Could not fetch dispute reason:', e.message);
             }
 
-            // Calculate rework token budget
-            // NOTE: fullJob.amount is in VRSC, not USD — token budget is approximate.
-            // Using conservative $0.50/VRSC estimate until live price feed is available.
+            // Calculate rework token budget from the dispute policy's share of
+            // the job value, via the single conversion helper — real exchange
+            // rate, real model id, conservative fallback when either is
+            // unavailable (audit fix #3/#4: no hardcoded $0.50/VRSC, no fake
+            // 'claude-sonnet-4').
             let tokenBudget = null;
             if (_disputePolicy && fullJob.amount) {
-              const budgetUsd = (_disputePolicy.reworkBudgetPercent / 100) * fullJob.amount * 0.5;
               try {
-                const { budgetToTokens } = require('@junction41/sovagent-sdk/dist/pricing/calculator.js');
-                const model = process.env.J41_LLM_MODEL || 'claude-sonnet-4';
-                tokenBudget = budgetToTokens(model, budgetUsd);
+                const { initialTokenBudget } = require('./token-budget.js');
+                const { resolveLLMConfig } = require('./executors/local-llm.js');
+                const shareVrsc = ((_disputePolicy.reworkBudgetPercent || 30) / 100) * fullJob.amount;
+                const derived = initialTokenBudget({
+                  model: resolveLLMConfig().model,
+                  amountVrsc: shareVrsc,
+                  spendFraction: 1, // the policy already sized the share
+                });
+                tokenBudget = derived.tokens;
+                console.log(`  Rework budget basis: ${derived.basis}`);
               } catch (e) {
                 console.log('⚠️  Could not calculate token budget:', e.message);
               }
@@ -1311,6 +1438,15 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
 async function performCleanup(agent, keys, fullJob, postDeliveryResult, signer) {
   log.info('Performing final cleanup', { jobId: JOB_ID, signer: signer?.mode });
 
+  // Cumulative usage story (audit fix #6): recorded in the attestation
+  // sidecar and the on-chain job record so the buyer can audit what the
+  // extension requests were based on. Putting it inside the SIGNED
+  // attestation payload needs the SDK/backend schema change (deferred —
+  // generateAttestationPayload drops unknown fields).
+  const _usageRecord = _executor?.getTokenUsage
+    ? { ..._executor.getTokenUsage(), extensions: _extensionLog }
+    : null;
+
   // Deletion attestation. Build + sign locally using the SDK primitives, write
   // the file BEFORE attempting to submit — that way the local artifact (which
   // contains the broker-signed canonical attestation) is preserved even if
@@ -1344,6 +1480,7 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult, signer) 
       JSON.stringify({
         ...attestation,
         disputeOutcome: postDeliveryResult.disputeOutcome || null,
+        tokenUsage: _usageRecord,
       }, null, 2)
     );
     log.info('Deletion attestation signed', { jobId: JOB_ID, sigLength: attestation.signature?.length });
@@ -1373,6 +1510,16 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult, signer) 
       paymentTxid: fullJob.payment?.txid || '',
       hasWorkspace: !!_workspaceStats,
       hasReview: !!fullJob.review,
+      ...(_usageRecord ? {
+        tokenUsage: {
+          promptTokens: _usageRecord.promptTokens,
+          completionTokens: _usageRecord.completionTokens,
+          totalTokens: _usageRecord.totalTokens,
+          llmCalls: _usageRecord.llmCalls,
+          extensionsRequested: _usageRecord.extensions.length,
+          extensionsGranted: _usageRecord.extensions.filter(x => x.granted).length,
+        },
+      } : {}),
     };
 
     let reviewRecord = undefined;

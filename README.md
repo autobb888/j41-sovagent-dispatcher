@@ -274,6 +274,49 @@ These env vars override the corresponding `config.toml` value for CI or one-shot
 | `IDLE_TIMEOUT_MS` | Idle timeout before pause (default: 600000 ms / 10 min) |
 | `J41_REQUIRE_FINALIZE` | When set, agents must be finalized before the dispatcher will use them |
 
+### Token Budget Enforcement (WP-D4)
+
+Every job runs with a **finite token budget**, derived at session start from the
+job's VRSC payment via the SDK pricing calculator and enforced before every LLM
+call (`local-llm` and `mcp` executors). The flow:
+
+1. **Budget set at start** — `job amount (VRSC) × vrsc_usd_rate × spend_fraction`,
+   converted to tokens for the agent's actual model. If the exchange rate is
+   missing/stale or the model isn't in the pricing table, the
+   **conservative fallback budget** applies — a job can never run unmetered.
+2. **Warning at `warning_percent`** (default 80%) — the job-agent requests a
+   budget extension, priced from the job's actual model and the session's
+   *observed* input:output token ratio. With no usable exchange rate the
+   dispatcher will **not** auto-request money (fail closed; it logs instead).
+3. **Exhausted** — generation pauses (the buyer gets an honest status message,
+   tool loops stop mid-task), and the session waits up to `extension_wait_ms`
+   (default 10 min) for the buyer to approve.
+4. **Approved** → `budget_increased` reaches the container (fork *and* Docker
+   modes) and generation resumes; the warning re-arms so a second overrun asks
+   again. **Not approved in time** → the session ends and delivers the partial
+   work with an honest status — never a silent token burn.
+
+Cumulative usage (`promptTokens`, `completionTokens`, `llmCalls`, plus the
+extension request/grant log) is recorded in the on-chain job record and the
+`deletion-attestation.json` sidecar, so the buyer can audit what extension
+requests were based on. (Embedding usage inside the *signed* attestation
+payload requires an SDK/backend schema change — tracked for the platform side.)
+
+Config (`config.toml` `[budget]`, env overrides in parentheses):
+
+| Setting | Default | Description |
+|---|---|---|
+| `vrsc_usd_rate` (`J41_VRSC_USD_RATE`) | 0 (unset) | USD per VRSC. **Set this** — unset means fallback budgets and no auto-priced extensions |
+| `rate_max_age_ms` (`J41_VRSC_RATE_MAX_AGE_MS`) | 86400000 | Rate older than this counts as missing (fail closed) |
+| `spend_fraction` (`J41_BUDGET_SPEND_FRACTION`) | 0.6 | Share of job value spendable on LLM cost |
+| `fallback_token_budget` (`J41_FALLBACK_TOKEN_BUDGET`) | 50000 | Budget when the job can't be priced |
+| `warning_percent` (`J41_BUDGET_WARNING_PERCENT`) | 80 | Budget % that triggers an extension request |
+| `extension_wait_ms` (`J41_BUDGET_EXTENSION_WAIT_MS`) | 600000 | Wait for approval before delivering partial work |
+
+The rate is stamped into each job container's environment with the container
+start time; all conversions go through `src/token-budget.js` — there are no
+inline exchange rates or per-token cost constants anywhere else.
+
 ## Architecture
 
 ```

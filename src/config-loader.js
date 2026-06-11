@@ -45,6 +45,18 @@ const DEFAULTS = Object.freeze({
   health: { poll_interval_ms: 60000 },
   webhook: { max_body_bytes: 1048576 },
   retry: { rate_limit_backoff_multiplier: 3 },
+  // Token budget enforcement (WP-D4). vrsc_usd_rate is USD per VRSC, set by
+  // the operator (0 = unset). The host stamps the rate + a timestamp into
+  // each job container's env; unset/stale rates fail closed in the container
+  // (jobs run on fallback_token_budget; extensions are never auto-priced).
+  budget: {
+    vrsc_usd_rate: 0,
+    rate_max_age_ms: 86400000,      // rate older than this counts as missing (24h)
+    spend_fraction: 0.6,            // share of job value spendable on LLM cost
+    fallback_token_budget: 50000,   // budget when rate/model can't price the job
+    warning_percent: 80,            // budget % that triggers an extension ask
+    extension_wait_ms: 600000,      // exhausted + unapproved this long → deliver partial
+  },
   debug: { chat: false },
 });
 
@@ -83,6 +95,12 @@ const ENV_OVERRIDES = [
   ['J41_HEALTH_POLL_INTERVAL',  'health.poll_interval_ms',  'int'],
   ['J41_WEBHOOK_MAX_BODY',      'webhook.max_body_bytes',   'int'],
   ['J41_RATE_LIMIT_BACKOFF_MULTIPLIER','retry.rate_limit_backoff_multiplier','int'],
+  ['J41_VRSC_USD_RATE',           'budget.vrsc_usd_rate',         'float'],
+  ['J41_VRSC_RATE_MAX_AGE_MS',    'budget.rate_max_age_ms',       'int'],
+  ['J41_BUDGET_SPEND_FRACTION',   'budget.spend_fraction',        'float'],
+  ['J41_FALLBACK_TOKEN_BUDGET',   'budget.fallback_token_budget', 'int'],
+  ['J41_BUDGET_WARNING_PERCENT',  'budget.warning_percent',       'int'],
+  ['J41_BUDGET_EXTENSION_WAIT_MS','budget.extension_wait_ms',     'int'],
   ['J41_HEALTH_PORT',        'runtime.health_port',      'int'],
   ['J41_WEBHOOK_URL',        'runtime.webhook_url',      'string'],
   ['J41_LOG_LEVEL',          'logging.level',            'string'],
@@ -122,6 +140,7 @@ function applyEnvOverrides(cfg) {
     if (raw === undefined || raw === '') continue;
     let v;
     if (kind === 'int') { v = parseInt(raw); if (Number.isNaN(v)) continue; }
+    else if (kind === 'float') { v = parseFloat(raw); if (Number.isNaN(v)) continue; }
     else if (kind === 'bool1') v = raw === '1';
     else v = raw;
     setPath(cfg, dotted, v);

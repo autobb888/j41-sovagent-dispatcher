@@ -11,6 +11,8 @@ class Executor {
     this._budgetWarningPercent = 80;
     this._budgetWarningFired = false;
     this._onBudgetWarning = null;     // callback(usage, budget)
+    this._exhaustedAt = null;         // ms epoch of crossing into exhaustion
+    this._extensionRequested = false; // an extension ask is in flight (re-armed by increaseBudget)
   }
 
   /** Accumulate token usage from an LLM API response's usage object */
@@ -20,13 +22,19 @@ class Executor {
     this._tokenUsage.completionTokens += usage.completion_tokens || 0;
     this._tokenUsage.totalTokens += usage.total_tokens || 0;
     this._tokenUsage.llmCalls++;
-    // Check budget warning
+    // Check budget warning (edge semantics: fires once per arming;
+    // increaseBudget re-arms so each granted extension can warn again)
     if (this._budgetTokens != null && !this._budgetWarningFired) {
       const percent = (this._tokenUsage.totalTokens / this._budgetTokens) * 100;
       if (percent >= this._budgetWarningPercent && this._onBudgetWarning) {
         this._budgetWarningFired = true;
         this._onBudgetWarning(this._tokenUsage, this._budgetTokens);
       }
+    }
+    // Stamp the moment we cross into exhaustion — the session watchdog
+    // hard-stops after a configurable wait from this point.
+    if (this.isBudgetExhausted() && !this._exhaustedAt) {
+      this._exhaustedAt = Date.now();
     }
   }
 
@@ -40,18 +48,36 @@ class Executor {
     this._budgetWarningPercent = warningPercent;
     this._onBudgetWarning = onWarning;
     this._budgetWarningFired = false;
+    this._exhaustedAt = null;
+    this._extensionRequested = false;
   }
 
   increaseBudget(additionalTokens) {
-    if (this._budgetTokens != null) {
+    if (this._budgetTokens != null && Number.isFinite(additionalTokens) && additionalTokens > 0) {
       this._budgetTokens += additionalTokens;
+      // Re-arm edge-triggered state so a second overrun asks again (audit fix #5)
       this._budgetWarningFired = false;
+      this._extensionRequested = false;
+      if (!this.isBudgetExhausted()) this._exhaustedAt = null;
     }
   }
 
   isBudgetExhausted() {
     if (this._budgetTokens == null) return false;
     return this._tokenUsage.totalTokens >= this._budgetTokens;
+  }
+
+  /** ms epoch when the budget was first exhausted, or null while within budget */
+  budgetExhaustedSince() {
+    return this._exhaustedAt;
+  }
+
+  /** Honest status line for the buyer while generation is paused on budget */
+  budgetExhaustedMessage() {
+    const used = this._tokenUsage.totalTokens;
+    return `I've reached the token budget for this job (${used} tokens used)` +
+      ` and have requested a budget extension. I'll continue as soon as it's approved —` +
+      ` otherwise I'll deliver what I have so far.`;
   }
 
   /**

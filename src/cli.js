@@ -4846,7 +4846,8 @@ async function handleWebhookEvent(state, agentId, payload) {
         if (data?.auto && pauseInfo.reactivationFee === 0) {
           try {
             const agentSession = await getAgentSession(state, pauseInfo.agentInfo);
-            await agentSession.client.requestExtension(jobId, { amount: 0, currency: pauseInfo.currency || 'VRSC', reason: 'Auto-resume (free lifecycle)' });
+            // SDK signature is (jobId, amount, reason) — an object here sent NaN to the platform
+            await agentSession.client.requestExtension(jobId, 0, 'Auto-resume (free lifecycle)');
             console.log(`[Webhook] Auto-extended paused job ${jobId?.substring(0, 8)} (free lifecycle)`);
           } catch (extErr) {
             console.warn(`[Webhook] Auto-extend failed: ${extErr.message}`);
@@ -4905,8 +4906,17 @@ async function handleWebhookEvent(state, agentId, payload) {
     case 'job.extension_approved': {
       console.log(`[Webhook] ✅ Extension approved for job ${jobId?.substring(0, 8)}`);
       const extJob = state.active.get(jobId);
-      if (extJob?.process?.send) {
-        extJob.process.send({ type: 'budget_increased', data: { additionalTokens: data?.estimatedTokens || 5000 } });
+      if (extJob) {
+        // Prefer the platform's echo, fall back to what the job-agent asked
+        // for (recorded on extension_needed). sendToJobAgent reaches Docker
+        // containers too — process.send alone left them budget-locked.
+        const additionalTokens = data?.estimatedTokens || extJob.pendingExtensionTokens || 0;
+        extJob.pendingExtensionTokens = null;
+        if (additionalTokens > 0) {
+          sendToJobAgent(extJob, { type: 'budget_increased', data: { additionalTokens } });
+        } else {
+          console.warn(`[Webhook] Extension approved but token count unknown — job-agent will re-request`);
+        }
       }
       break;
     }
@@ -5057,6 +5067,19 @@ function buildContainerEnv(job, agentInfo, agentCfg, canaryToken, jobDir, keysPa
   // (Docker is its only env channel); without forwarding, the configured value would
   // never reach the container.
   env.J41_RATE_LIMIT_BACKOFF_MULTIPLIER = String(cfg.retry.rate_limit_backoff_multiplier);
+
+  // Token budget enforcement (WP-D4) — same dual-read pattern. The exchange
+  // rate is stamped with the container start time so token-budget.js can
+  // fail closed on staleness; an unset rate (0) is simply not forwarded.
+  if (cfg.budget.vrsc_usd_rate > 0) {
+    env.J41_VRSC_USD_RATE = String(cfg.budget.vrsc_usd_rate);
+    env.J41_VRSC_USD_RATE_AT = String(Date.now());
+  }
+  env.J41_VRSC_RATE_MAX_AGE_MS = String(cfg.budget.rate_max_age_ms);
+  env.J41_BUDGET_SPEND_FRACTION = String(cfg.budget.spend_fraction);
+  env.J41_FALLBACK_TOKEN_BUDGET = String(cfg.budget.fallback_token_budget);
+  env.J41_BUDGET_WARNING_PERCENT = String(cfg.budget.warning_percent);
+  env.J41_BUDGET_EXTENSION_WAIT_MS = String(cfg.budget.extension_wait_ms);
 
   return env;
 }
@@ -5657,7 +5680,11 @@ async function startJobLocal(state, job, agentInfo) {
         }
       }
       if (msg?.type === 'extension_needed') {
-        console.log(`[Extension] Job ${msg.jobId?.substring(0, 8)} requesting extension: $${msg.amount} for ~${msg.estimatedTokens} tokens`);
+        console.log(`[Extension] Job ${msg.jobId?.substring(0, 8)} requesting extension: ${msg.amount} ${msg.currency || 'VRSC'} for ~${msg.estimatedTokens} tokens`);
+        // Remember the ask so extension_approved can grant the right token
+        // count even when the platform webhook doesn't echo estimatedTokens.
+        const extInfo = state.active.get(msg.jobId);
+        if (extInfo) extInfo.pendingExtensionTokens = msg.estimatedTokens;
         (async () => {
           try {
             const agent = await getAgentSession(state, agentInfo);
