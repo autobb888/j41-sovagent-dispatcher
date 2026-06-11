@@ -16,6 +16,14 @@ Each item below states **what exists today** (grounded in the installed SDK
 priority: **P0** unblocks WP-D4 correctness already shipped on the dispatcher;
 **P1** unblocks WP-D3 (the hirer).
 
+> **Status update (2026-06-11).** The **SDK/client halves of P0-1, P0-2, and
+> P1-1 are implemented** in `j41-sovagent-sdk` on branch
+> `dispatcher-v3-budget` (commit `ee43d2c`, +10 tests, build clean) — pending
+> an npm publish. What remains is **platform-server** work plus P1-2's
+> answers. Each item below now marks ✅ what the SDK already does and ⬜ what
+> the server still owes, so you can implement straight against the shapes the
+> client already sends/expects.
+
 ---
 
 ## P0-1 — Signed token-usage in the deletion attestation (WP-D4 finding #6)
@@ -41,52 +49,79 @@ be part of the **canonical, signed** attestation payload.
   the received payload (minus `signature`) and verifies the signature against
   `attestedBy`'s key.
 
-**The change (coordinated SDK + backend — they must agree byte-for-byte).**
-1. **SDK:** extend `generateAttestationPayload` to accept an optional
-   `tokenUsage` object and include it in the canonical payload when present.
-   Because JCS sorts keys, `tokenUsage` slots in deterministically; the inner
-   object must also have a fixed, sorted shape:
-   ```jsonc
-   "tokenUsage": {
-     "completionTokens": 12000,
-     "extensions": [
-       { "amountVrsc": 0.42, "estimatedTokens": 8000, "granted": true, "grantedTokens": 8000 }
-     ],
-     "llmCalls": 7,
-     "promptTokens": 30000,
-     "totalTokens": 42000
-   }
-   ```
-   Add an attestation **schema version** marker (e.g. `schemaVersion: 2`) to the
-   canonical payload so verifiers can branch. v1 attestations (no `tokenUsage`,
-   no `schemaVersion`) must keep verifying unchanged.
-2. **Backend:** when re-canonicalizing for signature verification, include
-   `tokenUsage` + `schemaVersion` exactly as the SDK emits them (same JCS lib,
-   same key order). Store the usage with the job record; surface it on
-   `GET /v1/jobs/:id/deletion-attestation`. Extend the format validator to
-   accept v2 and type-check `tokenUsage` (all counts non-negative integers;
-   `extensions` an array).
-3. **Backend (you own this too):** the dispatcher already writes
-   `jobRecord.tokenUsage` into the **on-chain** VDXF job record (summary
-   counts + `extensionsRequested`/`extensionsGranted`). If the marketplace
-   indexes job records, surface these so a buyer browsing history sees
-   "N tokens, M extensions" per completed job.
+**✅ SDK — DONE (`ee43d2c`).** `generateAttestationPayload` accepts an optional
+`tokenUsage` and, when present, adds it plus `schemaVersion: 2` to the canonical
+payload. Input is **normalized** to a whitelisted, integer-coerced shape (counts
+floored to non-negative ints, unknown keys dropped, `amountVrsc` forced to a
+finite number or `null`) so the signed bytes are deterministic and can't carry
+caller-injected fields. Without `tokenUsage` the payload is byte-identical to
+v1. `verifyAttestationFormat` now validates the usage block and **throws** on
+anything malformed. `verifyAttestationSignature` already covers the new fields
+(it canonicalizes all non-signature keys), so tampering breaks the signature —
+tested. New exports: `AttestationTokenUsage`, `AttestationExtension`,
+`ATTESTATION_SCHEMA_VERSION`.
+
+**The exact canonical shape the SDK now emits (server must match byte-for-byte).**
+JCS sorts keys recursively, so the server just needs the same field set and the
+same JCS lib (`json-canonicalize`). A v2 payload (pre-signature) is:
+```jsonc
+{
+  "attestedBy": "myagent.agentplatform@",
+  "containerId": "container-abc",
+  "createdAt": "2025-01-01T00:00:00.000Z",
+  "dataVolumes": ["/tmp/vol1"],
+  "deletionMethod": "container-destroy+volume-rm",
+  "destroyedAt": "2025-01-01T00:05:00.000Z",
+  "jobId": "job-123",
+  "schemaVersion": 2,
+  "tokenUsage": {
+    "completionTokens": 12000,
+    "extensions": [
+      { "amountVrsc": 0.42, "estimatedTokens": 8000, "granted": true, "grantedTokens": 8000 },
+      { "amountVrsc": null, "estimatedTokens": 5000, "granted": false }
+    ],
+    "llmCalls": 7,
+    "promptTokens": 30000,
+    "totalTokens": 42000
+  }
+}
+```
+Note `grantedTokens` is present only on granted extensions; `amountVrsc` is
+`null` when no rate was available at request time. (The normalizer omits
+`grantedTokens` rather than emitting `null`, so the server must treat it as an
+optional key, not a nullable one.)
+
+**⬜ Backend — still owed.**
+1. When re-canonicalizing the received attestation for signature verification,
+   include `tokenUsage` + `schemaVersion` (don't strip unknown keys before
+   hashing) — use the same JCS lib. v1 attestations (no `tokenUsage`, no
+   `schemaVersion`) must keep verifying unchanged.
+2. Persist the usage with the job record; surface it on
+   `GET /v1/jobs/:id/deletion-attestation`. Mirror the SDK's format validation
+   (counts non-negative integers; `extensions` an array of
+   `{estimatedTokens:int, granted:bool, amountVrsc:number|null, grantedTokens?:int}`).
+3. The dispatcher also writes `jobRecord.tokenUsage` into the **on-chain** VDXF
+   job record (summary counts + `extensionsRequested`/`extensionsGranted`). If
+   the marketplace indexes job records, surface these so a buyer browsing
+   history sees "N tokens, M extensions" per completed job.
 
 **Fail-closed rule.** A v2 attestation whose `tokenUsage` is malformed or whose
 signature doesn't cover it must be **rejected** (treated as an invalid
 attestation), never accepted-and-ignored. Silent acceptance would let a seller
 forge usage.
 
-**Acceptance check.** Sign a v2 attestation in the SDK with a known WIF; submit
-it; the backend verifies the signature **including** `tokenUsage`. Mutating any
-byte of `tokenUsage` post-signature fails verification. A v1 attestation (no
-usage) still verifies.
+**Acceptance check.** The SDK test `test/attestation-usage.test.ts` already
+proves: a v2 attestation verifies with a known WIF; mutating any byte of
+`tokenUsage` (a count or an extension flag) fails `verifyAttestationSignature`;
+a v1 attestation still verifies. The server side passes when it reaches the same
+verdicts on those same payloads.
 
-**Dispatcher follow-up (I'll do once SDK lands).** Switch
+**Dispatcher follow-up (I'll do once the SDK is published/linked).** Switch
 `performCleanup()` in `src/job-agent.js` from writing `tokenUsage` into the
 sidecar JSON to passing it into `generateAttestationPayload({ …, tokenUsage })`
 so it's inside the signed bytes. (Search `_usageRecord` in job-agent.js — the
-data is already assembled; only the plumbing target changes.)
+data is already assembled; only the plumbing target changes.) This needs no
+backend change to *produce*; the backend only needs item ⬜1 to *verify* it.
 
 ---
 
@@ -105,20 +140,23 @@ fail-closed."
 `GET /v1/pricing/recommend` **take** `vrscUsdRate` as an *input* param — nothing
 *provides* it. Confirmed: no rate endpoint in the SDK client.
 
-**The change (backend + small SDK method).**
-- **Backend:** add `GET /v1/pricing/vrsc-rate` →
-  ```jsonc
-  {
-    "usdPerVrsc": 0.47,          // USD value of 1 VRSC
-    "asOf": "2026-06-11T09:00:00Z",
-    "source": "coingecko|internal-oracle|manual",
-    "ttlSeconds": 300            // how long the dispatcher may cache before re-fetching
-  }
-  ```
-  Source can be whatever you already trust (an exchange feed, an internal
-  oracle, or a manually-set value to start). The contract is just: a number,
-  a timestamp, and a TTL.
-- **SDK:** add `client.getVrscUsdRate()` hitting that route.
+**✅ SDK — DONE (`ee43d2c`).** `client.getVrscUsdRate()` calls
+`GET /v1/pricing/vrsc-rate` and returns the typed `VrscUsdRate`
+(`{ usdPerVrsc, asOf, source?, ttlSeconds? }`).
+
+**⬜ Backend — still owed.** Implement `GET /v1/pricing/vrsc-rate` →
+```jsonc
+{
+  "usdPerVrsc": 0.47,          // USD value of 1 VRSC
+  "asOf": "2026-06-11T09:00:00Z", // ISO-8601; the dispatcher fails closed on staleness
+  "source": "coingecko|internal-oracle|manual",
+  "ttlSeconds": 300            // suggested cache life before re-fetch
+}
+```
+Source can be whatever you already trust (an exchange feed, an internal oracle,
+or a manually-set value to start). The contract is just: a number, a timestamp,
+and a TTL. `usdPerVrsc` must be `> 0` and finite; `asOf` must be present (the
+dispatcher treats a missing/old `asOf` as "no rate").
 
 **Fail-closed rule (dispatcher side, already implemented for the env path —
 mirror it for the endpoint).** If the endpoint is unreachable, returns a
@@ -147,23 +185,19 @@ that many** tokens. Today the platform never learns the count, so the approval
 webhook can't echo it and the dispatcher has to guess / hold it in memory
 (lost on restart).
 
-**What exists today.**
-- `client.requestExtension(jobId, amount, reason)` →
-  `POST /v1/jobs/:id/extensions` with body `{ amount, reason }` — **no token
-  count**.
-- Approve/reject: `POST /v1/jobs/:id/extensions/:extId/approve|reject`.
-- Webhook `job.extension_approved` fires to the seller. (The dispatcher
-  currently reads `data.estimatedTokens` if present, else falls back to a
-  value it stashed at request time, else re-requests.)
+**✅ SDK — DONE (`ee43d2c`).** `client.requestExtension(jobId, amount, reason,
+estimatedTokens?)` now sends `estimatedTokens` in the POST body when supplied
+(omitted otherwise — backward-compatible). `JobExtension` gains an optional
+`estimatedTokens` field so it round-trips through `GET …/extensions`.
 
-**The change.**
-1. Accept an optional `estimatedTokens` (non-negative integer) on the extension
-   request body; persist it on the extension record.
+**⬜ Backend — still owed.**
+1. Accept the optional `estimatedTokens` (non-negative integer) on
+   `POST /v1/jobs/:id/extensions`; persist it on the extension record.
 2. Echo it back on:
    - the extension record (`GET /v1/jobs/:id/extensions`), and
-   - the `job.extension_approved` webhook payload as
-     `data.estimatedTokens` (and, if the approved amount can differ from the
-     requested, an explicit `data.grantedTokens`).
+   - the `job.extension_approved` webhook payload as `data.estimatedTokens`
+     (and, if the approved amount can differ from the requested, an explicit
+     `data.grantedTokens`).
 
 **Fail-closed rule.** If `estimatedTokens` is absent on approval, the
 dispatcher keeps its current conservative fallback (re-derive from the granted
@@ -250,13 +284,16 @@ authenticates by signature/bearer like the seller side.
 
 ## Summary checklist
 
-| # | Change | Repo(s) | Blocks |
+| # | Change | SDK/client (✅ done `ee43d2c`) | Server still owes |
 |---|---|---|---|
-| P0-1 | `tokenUsage` in **signed** attestation payload (+schema v2) | SDK + backend | WP-D4 #6 (trustable usage) |
-| P0-2 | `GET /v1/pricing/vrsc-rate` + `client.getVrscUsdRate()` | backend + SDK | WP-D4 #3 (real budgets) |
-| P1-1 | `estimatedTokens` round-trip on extensions + approval webhook | backend | extension grant correctness |
-| P1-2 | Answer 4 buyer-flow questions (esp. buyer-identity onboarding) | backend (answers) | WP-D3 scoping |
+| P0-1 | `tokenUsage` in **signed** attestation (+schema v2) | ✅ payload + validation + types + tests | ⬜ re-canonicalize incl. `tokenUsage` on verify; persist + surface; mirror validation |
+| P0-2 | VRSC/USD rate | ✅ `client.getVrscUsdRate()` + `VrscUsdRate` type | ⬜ implement `GET /v1/pricing/vrsc-rate` value |
+| P1-1 | `estimatedTokens` round-trip | ✅ `requestExtension(…, estimatedTokens?)` + field | ⬜ accept/persist/echo on record + `extension_approved` webhook |
+| P1-2 | WP-D3 buyer-flow | n/a (mostly dispatcher glue) | ⬜ answer 4 questions (esp. buyer-identity onboarding) |
 
-Once P0-1 and P0-2 land, I'll wire the two dispatcher follow-ups noted above and
-the WP-D4 budget path is fully closed end-to-end. P1-2's answers determine how
+**Net for you:** publish the SDK branch (so the dispatcher can consume it), then
+the four ⬜ server items above. Once the SDK is published/linked I wire the two
+dispatcher follow-ups (sign `tokenUsage` into the attestation; add the
+VRSC-rate poller) — both degrade closed if the matching server item isn't live
+yet, so they're safe to land ahead of the platform. P1-2's answers determine how
 much WP-D3 there is to build.
