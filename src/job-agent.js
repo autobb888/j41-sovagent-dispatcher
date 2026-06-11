@@ -1439,10 +1439,11 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult, signer) 
   log.info('Performing final cleanup', { jobId: JOB_ID, signer: signer?.mode });
 
   // Cumulative usage story (audit fix #6): recorded in the attestation
-  // sidecar and the on-chain job record so the buyer can audit what the
-  // extension requests were based on. Putting it inside the SIGNED
-  // attestation payload needs the SDK/backend schema change (deferred —
-  // generateAttestationPayload drops unknown fields).
+  // sidecar AND the on-chain job record so the buyer can audit what the
+  // extension requests were based on. As of SDK 2.7.0 it is also folded into
+  // the SIGNED attestation payload (schema v2) below — the SDK normalizes it
+  // to a whitelisted shape, so the richer sidecar copy (timestamps, model,
+  // amountUsd) is kept here for readers that want the full story.
   const _usageRecord = _executor?.getTokenUsage
     ? { ..._executor.getTokenUsage(), extensions: _extensionLog }
     : null;
@@ -1472,15 +1473,22 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult, signer) 
       destroyedAt: now,
       dataVolumes: [JOB_DIR],
       attestedBy: agent.identityName,
+      // WP-D4 #6: usage is now inside the signed bytes (attestation schema v2).
+      ...(_usageRecord ? { tokenUsage: _usageRecord } : {}),
     });
     const attestation = await signAttestationWith(payload, (msg) => signer.signMessage(msg));
 
+    // The spread keeps the SIGNED, normalized tokenUsage from `attestation`
+    // intact — do NOT overwrite it with _usageRecord, or the file's signature
+    // would no longer verify against its own tokenUsage. The richer,
+    // unsigned detail (model, amountUsd, timestamps the SDK normalizer drops)
+    // is filed separately under tokenUsageDetail for local audit only.
     fs.writeFileSync(
       path.join(JOB_DIR, 'deletion-attestation.json'),
       JSON.stringify({
         ...attestation,
         disputeOutcome: postDeliveryResult.disputeOutcome || null,
-        tokenUsage: _usageRecord,
+        ...(_usageRecord ? { tokenUsageDetail: _usageRecord } : {}),
       }, null, 2)
     );
     log.info('Deletion attestation signed', { jobId: JOB_ID, sigLength: attestation.signature?.length });

@@ -3748,6 +3748,9 @@ program
       state.emitEvent = () => {};
     }
 
+    // ── Start VRSC/USD rate poller (WP-D4 P0-2) ──
+    startVrscRatePoller();
+
     // ── Set agents active on-chain + platform ──
     // J41_NO_STATUS_TOGGLE=1: leave platform state alone at startup. Useful for
     // broker-validation runs where the operator pre-activates specific agents
@@ -3837,6 +3840,7 @@ program
         persistActiveJobs(state.active);
         stopControlServer(controlServer);
         stopControlApi(controlApi);
+        stopVrscRatePoller();
         process.exit(0);
       }
 
@@ -3853,6 +3857,7 @@ program
           persistActiveJobs(state.active);
           stopControlServer(controlServer);
           stopControlApi(controlApi);
+          stopVrscRatePoller();
           process.exit(0);
         }
 
@@ -3862,6 +3867,7 @@ program
           // Don't clear active-jobs.json — crash recovery will handle refunds
           stopControlServer(controlServer);
           stopControlApi(controlApi);
+          stopVrscRatePoller();
           process.exit(1);
         }
       }, 10000);
@@ -4071,6 +4077,52 @@ program
 // Get or create a cached authenticated J41Agent session.
 // Sessions are reused for 10 minutes before re-authenticating.
 const SESSION_TTL_MS = 10 * 60 * 1000; // 10 min
+
+// ── VRSC/USD rate poller (WP-D4 P0-2) ──
+// Polls the platform's rate endpoint and caches the latest value. buildContainerEnv
+// stamps it into job containers as the DEFAULT rate source (operator config still
+// overrides). Fails closed: until a real rate is fetched, _polledVrscRate stays
+// null and the container falls back to fallback_token_budget — never an unlimited
+// budget. Dormant-but-safe until the backend ships GET /v1/pricing/vrsc-rate.
+let _polledVrscRate = null; // { usdPerVrsc, at: ms-epoch }
+let _vrscRateWarned = false;
+let _vrscRateTimer = null;
+
+function startVrscRatePoller() {
+  // Operator-set rate wins outright — don't bother polling.
+  if (cfg.budget.vrsc_usd_rate > 0) {
+    console.log('[Rate] Using operator-set vrsc_usd_rate from config; rate poller idle.');
+    return;
+  }
+  const { J41Client } = require('@junction41/sovagent-sdk/dist/index.js');
+  const client = new J41Client({ apiUrl: J41_API_URL });
+
+  async function poll() {
+    let nextMs = 300000; // default 5m between polls
+    try {
+      const rate = await client.getVrscUsdRate();
+      if (rate && Number.isFinite(rate.usdPerVrsc) && rate.usdPerVrsc > 0) {
+        _polledVrscRate = { usdPerVrsc: rate.usdPerVrsc, at: Date.now() };
+        _vrscRateWarned = false;
+        if (rate.ttlSeconds && rate.ttlSeconds > 0) nextMs = rate.ttlSeconds * 1000;
+        console.log(`[Rate] VRSC/USD = ${rate.usdPerVrsc} (source: ${rate.source || 'platform'})`);
+      }
+    } catch (e) {
+      // Endpoint missing (404) or unreachable → stay fail-closed, warn once.
+      if (!_vrscRateWarned) {
+        console.log(`[Rate] No platform VRSC rate yet (${e.message?.slice(0, 60)}). ` +
+          'Jobs use fallback budgets until a rate is available or [budget].vrsc_usd_rate is set.');
+        _vrscRateWarned = true;
+      }
+    }
+    _vrscRateTimer = setTimeout(poll, nextMs);
+  }
+  poll();
+}
+
+function stopVrscRatePoller() {
+  if (_vrscRateTimer) { clearTimeout(_vrscRateTimer); _vrscRateTimer = null; }
+}
 
 async function getAgentSession(state, agentInfo) {
   const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
@@ -5115,11 +5167,16 @@ function buildContainerEnv(job, agentInfo, agentCfg, canaryToken, jobDir, keysPa
   env.J41_RATE_LIMIT_BACKOFF_MULTIPLIER = String(cfg.retry.rate_limit_backoff_multiplier);
 
   // Token budget enforcement (WP-D4) — same dual-read pattern. The exchange
-  // rate is stamped with the container start time so token-budget.js can
-  // fail closed on staleness; an unset rate (0) is simply not forwarded.
+  // rate is stamped with a timestamp so token-budget.js can fail closed on
+  // staleness. Operator-set config wins; otherwise the polled platform rate
+  // (P0-2) is the default source; if neither exists nothing is forwarded and
+  // the container falls back to fallback_token_budget.
   if (cfg.budget.vrsc_usd_rate > 0) {
     env.J41_VRSC_USD_RATE = String(cfg.budget.vrsc_usd_rate);
     env.J41_VRSC_USD_RATE_AT = String(Date.now());
+  } else if (_polledVrscRate && _polledVrscRate.usdPerVrsc > 0) {
+    env.J41_VRSC_USD_RATE = String(_polledVrscRate.usdPerVrsc);
+    env.J41_VRSC_USD_RATE_AT = String(_polledVrscRate.at);
   }
   env.J41_VRSC_RATE_MAX_AGE_MS = String(cfg.budget.rate_max_age_ms);
   env.J41_BUDGET_SPEND_FRACTION = String(cfg.budget.spend_fraction);
@@ -5751,7 +5808,9 @@ async function startJobLocal(state, job, agentInfo) {
         (async () => {
           try {
             const agent = await getAgentSession(state, agentInfo);
-            await agent.client.requestExtension(msg.jobId, msg.amount, msg.reason);
+            // Pass estimatedTokens (SDK 2.7.0) so the platform can echo it on
+            // approval and we grant exactly the requested amount (WP-D4 P1-1).
+            await agent.client.requestExtension(msg.jobId, msg.amount, msg.reason, msg.estimatedTokens);
             console.log(`[Extension] Submitted to platform for buyer approval`);
           } catch (e) {
             console.error(`[Extension] Failed to submit: ${e.message}`);
