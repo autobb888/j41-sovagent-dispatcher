@@ -1594,7 +1594,10 @@ async function configureServicesScreen(inquirer) {
 
       try {
         const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
-        const canonicalize = require('json-canonicalize');
+        // json-canonicalize exports { canonicalize }, not a callable default — the
+        // bare `require(...)` made canonicalize(payload) throw "not a function",
+        // breaking this review-submit signing path (same bug fixed in deposit-watcher).
+        const { canonicalize } = require('json-canonicalize');
         const timestamp = Date.now();
         const sessionId = `api-session-${agentId}-${buyerVerusId}`;
         const payload = {
