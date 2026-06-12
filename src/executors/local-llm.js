@@ -89,7 +89,6 @@ class LocalLLMExecutor extends Executor {
     this.job = job;
     this.agent = agent;
     this.soulPrompt = soulPrompt;
-    this._budgetRequested = false;
 
     // HOLE 1: scan the untrusted job description before it enters the system prompt.
     const safeDescription = await scanUntrusted(job.description, 'job_description');
@@ -162,6 +161,15 @@ class LocalLLMExecutor extends Executor {
 
     let response;
     if (LLM_CONFIG.apiKey) {
+      // Budget gate (audit fix #1): no LLM call ever goes out over budget.
+      // The extension ask is handled by the setBudget warning callback;
+      // here we pause generation and tell the buyer honestly.
+      if (this.isBudgetExhausted()) {
+        console.log(`[BUDGET] Generation paused — token budget exhausted (${this.getTokenUsage().totalTokens} tokens)`);
+        response = this.budgetExhaustedMessage();
+        this.conversationLog.push({ role: 'assistant', content: response });
+        return response;
+      }
       this.llmBusy = true;
       try {
         if (this.workspaceTools.length > 0 && this.workspaceHandler) {
@@ -179,7 +187,6 @@ class LocalLLMExecutor extends Executor {
     }
 
     this.conversationLog.push({ role: 'assistant', content: response });
-    this._checkBudget().catch(() => {}); // fire-and-forget
     return response;
   }
 
@@ -204,38 +211,20 @@ class LocalLLMExecutor extends Executor {
     this.workspaceHandler = null;
   }
 
-  /** Check if token usage warrants requesting more budget from the buyer */
-  async _checkBudget() {
-    if (this._budgetRequested || !this.agent?.requestBudget || !this.job) return;
-    const usage = this.getTokenUsage();
-    const jobAmount = parseFloat(this.job.amount) || 0;
-    // Rough cost: $0.001 per 1K tokens (conservative across providers)
-    const estimatedCostUsd = usage.totalTokens * 0.001 / 1000;
-    // If we've used significant tokens and cost approaches job payment, request more
-    // Trigger at 50% of job value consumed (rough heuristic)
-    if (usage.totalTokens > 10000 && estimatedCostUsd > jobAmount * 0.3 && jobAmount < 5) {
-      this._budgetRequested = true;
-      try {
-        const additionalAmount = Math.max(jobAmount, 0.5);
-        await this.agent.requestBudget(this.job.id, {
-          amount: additionalAmount,
-          currency: this.job.currency || 'VRSC',
-          reason: `Extended session — ${usage.totalTokens} tokens used across ${usage.llmCalls} calls`,
-          breakdown: `${LLM_CONFIG.model}: ${usage.promptTokens} prompt + ${usage.completionTokens} completion tokens`,
-        });
-        console.log(`[BUDGET] Requested additional ${additionalAmount} ${this.job.currency} (${usage.totalTokens} tokens used)`);
-      } catch (e) {
-        console.warn(`[BUDGET] Request failed: ${e.message}`);
-      }
-    }
-  }
-
   async _agentLoop() {
     const messages = [...this.conversationLog];
     let totalToolCalls = 0;
     const MAX_TOTAL_CALLS = 15;
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      // Budget gate (audit fix #1): re-checked before every LLM round, so a
+      // long tool loop can't keep burning past exhaustion mid-message.
+      if (this.isBudgetExhausted()) {
+        console.log(`[BUDGET] Agent loop paused mid-task — token budget exhausted`);
+        return 'I had to pause mid-task: the token budget for this job is exhausted and an ' +
+          'extension has been requested. Here is my progress so far — I\'ll continue once ' +
+          'the extension is approved.';
+      }
       const llmResponse = await callLLMWithTools(this.systemPrompt, messages, this.workspaceTools);
       this._trackUsage(llmResponse._usage);
 
@@ -284,6 +273,10 @@ class LocalLLMExecutor extends Executor {
 
       // If we hit the total call limit, force one more LLM round to get a text response
       if (totalToolCalls >= MAX_TOTAL_CALLS) {
+        if (this.isBudgetExhausted()) {
+          return 'I reached the tool-call limit and the token budget is exhausted. ' +
+            'I\'ve requested a budget extension and will summarize my findings once it\'s approved.';
+        }
         const finalResponse = await callLLMWithTools(this.systemPrompt, messages, []);
         this._trackUsage(finalResponse._usage);
         return finalResponse.content || 'I explored the project structure. What would you like me to focus on?';

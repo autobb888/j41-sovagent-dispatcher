@@ -103,10 +103,10 @@
   resolved "https://registry.yarnpkg.com/@junction41/secure-setup/-/secure-setup-0.3.0.tgz#3c7ddd9601ae3ec4a7c032b75ff6421ca0c613c1"
   integrity sha512-M3bX0lxx5gg0PIsVYUH98cK8sdQcfbqzXm8kgEs8t+Z/st7glNbRqfVtiXEGDvurUGkgiJEs3x9its+JIG1syQ==
 
-"@junction41/sovagent-sdk@2.6.3":
-  version "2.6.3"
-  resolved "https://registry.yarnpkg.com/@junction41/sovagent-sdk/-/sovagent-sdk-2.6.3.tgz#055b330fc6852ce975d853d722d37ff8cc75dc03"
-  integrity sha512-UZ2mx31MAD2ygqr3a7A4uuM3hGos+2WxPJik1rmneCucCcJjKS9P1214bQUoGkbzsX42j4XufWe9ht/H6kpzOQ==
+"@junction41/sovagent-sdk@2.7.0":
+  version "2.7.0"
+  resolved "https://registry.yarnpkg.com/@junction41/sovagent-sdk/-/sovagent-sdk-2.7.0.tgz#cfb4b1719079a948e43c12bdd5c8136e38f5ce86"
+  integrity sha512-RluOfsVeNJageFHgbv4kNuraUPmmZyWEsRp39718g/mgJNjV1l3jjUXcOb50yW8GZ3cS1VuQj5VsH3jSikulNQ==
   dependencies:
     "@bitgo/utxo-lib" "github:VerusCoin/BitGoJS#5e82f4fda2975ca1af7f2b01590093b4a1439dc9"
     bn.js "^5.2.0"

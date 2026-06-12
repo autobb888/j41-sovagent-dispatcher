@@ -35,7 +35,7 @@
   ],
   "dependencies": {
     "@iarna/toml": "^2.2.5",
-    "@junction41/sovagent-sdk": "2.6.3",
+    "@junction41/sovagent-sdk": "2.7.0",
     "commander": "^11.0.0",
     "dockerode": "5",
     "inquirer": "^9"

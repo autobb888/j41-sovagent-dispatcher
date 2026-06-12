@@ -162,6 +162,12 @@ class MCPExecutor extends Executor {
     ];
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      // Budget gate (audit fix #1): no LLM call goes out over budget, and a
+      // long tool loop can't keep burning past exhaustion mid-message.
+      if (this.isBudgetExhausted()) {
+        console.log(`[MCP] Agent loop paused — token budget exhausted (${this.getTokenUsage().totalTokens} tokens)`);
+        return this.budgetExhaustedMessage();
+      }
       const llmResponse = await this._callLLM(messages);
 
       // No tool calls — return the text response
@@ -257,6 +263,9 @@ class MCPExecutor extends Executor {
       }
 
       const data = await res.json();
+      // Meter every call — without this the MCP executor was invisible to
+      // the token budget (and to the usage record both sides sign over).
+      this._trackUsage(data.usage);
       return data.choices?.[0]?.message || { content: 'No response generated.' };
     } catch (e) {
       clearTimeout(timer);

@@ -36,8 +36,10 @@ j41-dispatcher post-bounty agent-1 --title "Fix API" --amount 5 --description ".
 | `src/executors/a2a.js` | Google Agent-to-Agent (JSON-RPC 2.0). |
 | `src/executors/mcp.js` | MCP server + LLM agent loop. Uses `resolveLLMConfig()` from local-llm.js. |
 | `src/sovguard-context.js` | **Prompt-injection guard.** `scanUntrusted(text, source)` wraps the vendored `scanContext` from `@junction41/sovagent-sdk` (≥2.6.0). local-llm.js + mcp.js scan job descriptions + tool results through it (source-trust; strips/quarantines injections, never muzzles `user`). See `docs/sovguard-context-integration.md`. |
+| `src/token-budget.js` | **Token budget math (WP-D4).** The ONE VRSC↔USD↔tokens conversion point: model-id normalization to the SDK pricing table, rate staleness checks, initial-budget derivation, extension pricing from observed input:output ratio. All paths fail closed (fallback budget, null price) — never unlimited, never invented numbers. job-agent.js enforces via `setBudget`/`isBudgetExhausted`; executors gate every LLM call. |
 | `src/config.js` | Runtime detection, config persistence. |
-| `src/control.js` | IPC control socket for `j41-dispatcher ctl status/jobs/agents`. |
+| `src/control.js` | IPC control socket for `j41-dispatcher ctl status/jobs/agents`, plus the open `/health` + `/metrics` HTTP server on `:9842`. Exports the shared **read-model builders** (`buildStatus`/`buildJobs`/`buildJob`/`buildAgents`/`buildEarnings`/`buildHealthDocument`) consumed by both the socket and the control API. |
+| `src/control-api.js` | **Headless control API (WP-D1/D2).** Token-gated HTTP surface on `:9843` (`GET /v1/status\|agents\|jobs\|jobs/:id\|earnings\|events`). Bearer token at `~/.j41/dispatcher/control.token` (0600, auto-created). File-backed event ring buffer (`events.jsonl`, monotonic `seq`, survives restart). `state.emitEvent(type, data)` is wired in cli.js at job/container/extension/agent lifecycle points. |
 | `src/webhook-server.js` | HTTP webhook receiver for event-driven mode. |
 | `src/keygen.js` | Verus keypair generation. |
 | `src/sign-attestation.js` | Privacy deletion attestation signing. |

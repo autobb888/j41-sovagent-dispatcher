@@ -3030,6 +3030,8 @@ program
       _lastSentStatus: new Map(), // jobId -> last status sent
       _lastExtensionCheck: new Map(), // jobId -> last extension check timestamp
       _pendingWorkspace: new Map(), // jobId -> workspace connect promise
+      _agentErrors: new Map(), // agentId -> last error string (health document)
+      _containerCrashes: new Map(), // agentId -> unexpected-exit count (health document)
       _devUnsafe, // security: allows local mode when true
     };
 
@@ -3729,6 +3731,26 @@ program
       getAgentSession,
     });
 
+    // ── Start headless control API (WP-D1/D2) ──
+    // Versioned, token-gated HTTP surface on its own port. The event bus is
+    // attached to state so lifecycle points can emit without importing the
+    // module; every call site guards with state.emitEvent?.() so a failed
+    // API start never breaks job processing.
+    const { startControlApi, stopControlApi } = require('./control-api');
+    let controlApi = null;
+    try {
+      controlApi = startControlApi(state, { getAgentSession }, {
+        port: cfg.runtime.control_api_port,
+      });
+      state.emitEvent = (type, data) => controlApi.bus.emit(type, data);
+    } catch (e) {
+      console.error(`[ControlAPI] Failed to start (continuing without it): ${e.message}`);
+      state.emitEvent = () => {};
+    }
+
+    // ── Start VRSC/USD rate poller (WP-D4 P0-2) ──
+    startVrscRatePoller();
+
     // ── Set agents active on-chain + platform ──
     // J41_NO_STATUS_TOGGLE=1: leave platform state alone at startup. Useful for
     // broker-validation runs where the operator pre-activates specific agents
@@ -3746,6 +3768,8 @@ program
           const agent = await getAgentSession(state, agentInfo);
           const result = await agent.activate({ onChain: true });
           console.log(`  ✅ ${agentInfo.id}: active (on-chain txid: ${result.onChainTxid || 'skipped'})`);
+          state._agentErrors.delete(agentInfo.id);
+          state.emitEvent?.('agent.online', { agentId: agentInfo.id, identity: agentInfo.identity });
           // Trigger backend re-index so marketplace reflects active status immediately
           try {
             await agent.client.refreshAgent(agentInfo.iAddress || agentInfo.identity);
@@ -3755,6 +3779,8 @@ program
           }
         } catch (e) {
           console.log(`  ⚠️  ${agentInfo.id}: activation failed (${e.message.slice(0, 60)})`);
+          state._agentErrors.set(agentInfo.id, `activation failed: ${e.message.slice(0, 120)}`);
+          state.emitEvent?.('agent.offline', { agentId: agentInfo.id, error: e.message.slice(0, 120) });
         }
       }
     }
@@ -3813,6 +3839,8 @@ program
         console.log('\n✅ No active jobs. Shutting down.\n');
         persistActiveJobs(state.active);
         stopControlServer(controlServer);
+        stopControlApi(controlApi);
+        stopVrscRatePoller();
         process.exit(0);
       }
 
@@ -3828,6 +3856,8 @@ program
           state.active.clear();
           persistActiveJobs(state.active);
           stopControlServer(controlServer);
+          stopControlApi(controlApi);
+          stopVrscRatePoller();
           process.exit(0);
         }
 
@@ -3836,6 +3866,8 @@ program
           console.log(`\n⚠️  Drain timeout (${Math.round(drainTimeoutMs / 60000)}min) — remaining ${state.active.size} job(s) will be refunded on next startup.`);
           // Don't clear active-jobs.json — crash recovery will handle refunds
           stopControlServer(controlServer);
+          stopControlApi(controlApi);
+          stopVrscRatePoller();
           process.exit(1);
         }
       }, 10000);
@@ -4045,6 +4077,52 @@ program
 // Get or create a cached authenticated J41Agent session.
 // Sessions are reused for 10 minutes before re-authenticating.
 const SESSION_TTL_MS = 10 * 60 * 1000; // 10 min
+
+// ── VRSC/USD rate poller (WP-D4 P0-2) ──
+// Polls the platform's rate endpoint and caches the latest value. buildContainerEnv
+// stamps it into job containers as the DEFAULT rate source (operator config still
+// overrides). Fails closed: until a real rate is fetched, _polledVrscRate stays
+// null and the container falls back to fallback_token_budget — never an unlimited
+// budget. Dormant-but-safe until the backend ships GET /v1/pricing/vrsc-rate.
+let _polledVrscRate = null; // { usdPerVrsc, at: ms-epoch }
+let _vrscRateWarned = false;
+let _vrscRateTimer = null;
+
+function startVrscRatePoller() {
+  // Operator-set rate wins outright — don't bother polling.
+  if (cfg.budget.vrsc_usd_rate > 0) {
+    console.log('[Rate] Using operator-set vrsc_usd_rate from config; rate poller idle.');
+    return;
+  }
+  const { J41Client } = require('@junction41/sovagent-sdk/dist/index.js');
+  const client = new J41Client({ apiUrl: J41_API_URL });
+
+  async function poll() {
+    let nextMs = 300000; // default 5m between polls
+    try {
+      const rate = await client.getVrscUsdRate();
+      if (rate && Number.isFinite(rate.usdPerVrsc) && rate.usdPerVrsc > 0) {
+        _polledVrscRate = { usdPerVrsc: rate.usdPerVrsc, at: Date.now() };
+        _vrscRateWarned = false;
+        if (rate.ttlSeconds && rate.ttlSeconds > 0) nextMs = rate.ttlSeconds * 1000;
+        console.log(`[Rate] VRSC/USD = ${rate.usdPerVrsc} (source: ${rate.source || 'platform'})`);
+      }
+    } catch (e) {
+      // Endpoint missing (404) or unreachable → stay fail-closed, warn once.
+      if (!_vrscRateWarned) {
+        console.log(`[Rate] No platform VRSC rate yet (${e.message?.slice(0, 60)}). ` +
+          'Jobs use fallback budgets until a rate is available or [budget].vrsc_usd_rate is set.');
+        _vrscRateWarned = true;
+      }
+    }
+    _vrscRateTimer = setTimeout(poll, nextMs);
+  }
+  poll();
+}
+
+function stopVrscRatePoller() {
+  if (_vrscRateTimer) { clearTimeout(_vrscRateTimer); _vrscRateTimer = null; }
+}
 
 async function getAgentSession(state, agentInfo) {
   const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
@@ -4603,6 +4681,19 @@ async function pollForJobs(state) {
 }
 
 // Handle incoming webhook event (webhook mode)
+// Normalize platform webhook event names to the WP-D2 event vocabulary so
+// the /v1/events feed is stable regardless of platform-side naming.
+const WEBHOOK_EVENT_MAP = {
+  'job.extension_request': 'extension.requested',
+  'job.extension_approved': 'extension.approved',
+  'job.extension_rejected': 'extension.rejected',
+  'job.dispute.filed': 'dispute.filed',
+  'job.disputed': 'dispute.filed',
+  'job.dispute.resolved': 'dispute.resolved',
+  'job.dispute.responded': 'dispute.responded',
+  'job.dispute.rework_accepted': 'dispute.rework_accepted',
+};
+
 async function handleWebhookEvent(state, agentId, payload) {
   const agentInfo = state.agents.find(a => a.id === agentId);
   if (!agentInfo) {
@@ -4613,6 +4704,13 @@ async function handleWebhookEvent(state, agentId, payload) {
   const { event, data } = payload;
   const jobId = data?.jobId || payload.jobId;
   console.log(`[Webhook] ${agentInfo.id}: ${event}${jobId ? ' ' + jobId.substring(0, 8) : ''}`);
+
+  // WP-D2: mirror every inbound platform event into the control-API event
+  // feed, normalized to the documented vocabulary so a polling client
+  // (brainbox 🔔, a monitor, a script) sees one consistent stream. This is
+  // observation only — the switch below still does the actual work.
+  const evType = WEBHOOK_EVENT_MAP[event] || event;
+  state.emitEvent?.(evType, { jobId: jobId || null, agentId: agentInfo.id, ...(data || {}) });
 
   switch (event) {
     case 'job.requested': {
@@ -4859,7 +4957,8 @@ async function handleWebhookEvent(state, agentId, payload) {
         if (data?.auto && pauseInfo.reactivationFee === 0) {
           try {
             const agentSession = await getAgentSession(state, pauseInfo.agentInfo);
-            await agentSession.client.requestExtension(jobId, { amount: 0, currency: pauseInfo.currency || 'VRSC', reason: 'Auto-resume (free lifecycle)' });
+            // SDK signature is (jobId, amount, reason) — an object here sent NaN to the platform
+            await agentSession.client.requestExtension(jobId, 0, 'Auto-resume (free lifecycle)');
             console.log(`[Webhook] Auto-extended paused job ${jobId?.substring(0, 8)} (free lifecycle)`);
           } catch (extErr) {
             console.warn(`[Webhook] Auto-extend failed: ${extErr.message}`);
@@ -4918,8 +5017,17 @@ async function handleWebhookEvent(state, agentId, payload) {
     case 'job.extension_approved': {
       console.log(`[Webhook] ✅ Extension approved for job ${jobId?.substring(0, 8)}`);
       const extJob = state.active.get(jobId);
-      if (extJob?.process?.send) {
-        extJob.process.send({ type: 'budget_increased', data: { additionalTokens: data?.estimatedTokens || 5000 } });
+      if (extJob) {
+        // Prefer the platform's echo, fall back to what the job-agent asked
+        // for (recorded on extension_needed). sendToJobAgent reaches Docker
+        // containers too — process.send alone left them budget-locked.
+        const additionalTokens = data?.estimatedTokens || extJob.pendingExtensionTokens || 0;
+        extJob.pendingExtensionTokens = null;
+        if (additionalTokens > 0) {
+          sendToJobAgent(extJob, { type: 'budget_increased', data: { additionalTokens } });
+        } else {
+          console.warn(`[Webhook] Extension approved but token count unknown — job-agent will re-request`);
+        }
       }
       break;
     }
@@ -5077,6 +5185,24 @@ function buildContainerEnv(job, agentInfo, agentCfg, canaryToken, jobDir, keysPa
   // (Docker is its only env channel); without forwarding, the configured value would
   // never reach the container.
   env.J41_RATE_LIMIT_BACKOFF_MULTIPLIER = String(cfg.retry.rate_limit_backoff_multiplier);
+
+  // Token budget enforcement (WP-D4) — same dual-read pattern. The exchange
+  // rate is stamped with a timestamp so token-budget.js can fail closed on
+  // staleness. Operator-set config wins; otherwise the polled platform rate
+  // (P0-2) is the default source; if neither exists nothing is forwarded and
+  // the container falls back to fallback_token_budget.
+  if (cfg.budget.vrsc_usd_rate > 0) {
+    env.J41_VRSC_USD_RATE = String(cfg.budget.vrsc_usd_rate);
+    env.J41_VRSC_USD_RATE_AT = String(Date.now());
+  } else if (_polledVrscRate && _polledVrscRate.usdPerVrsc > 0) {
+    env.J41_VRSC_USD_RATE = String(_polledVrscRate.usdPerVrsc);
+    env.J41_VRSC_USD_RATE_AT = String(_polledVrscRate.at);
+  }
+  env.J41_VRSC_RATE_MAX_AGE_MS = String(cfg.budget.rate_max_age_ms);
+  env.J41_BUDGET_SPEND_FRACTION = String(cfg.budget.spend_fraction);
+  env.J41_FALLBACK_TOKEN_BUDGET = String(cfg.budget.fallback_token_budget);
+  env.J41_BUDGET_WARNING_PERCENT = String(cfg.budget.warning_percent);
+  env.J41_BUDGET_EXTENSION_WAIT_MS = String(cfg.budget.extension_wait_ms);
 
   return env;
 }
@@ -5434,6 +5560,11 @@ async function startJobContainer(state, job, agentInfo) {
       _signerTeardown: signerTeardown,
     });
 
+    state.emitEvent?.('container.started', {
+      jobId: job.id, agentId: agentInfo.id, container: container?.name || null, runtime: 'docker',
+    });
+    state.emitEvent?.('job.started', { jobId: job.id, agentId: agentInfo.id });
+
     // Mark as seen immediately to avoid duplicate pickup loops while status remains requested
     state.seen.set(job.id, Date.now());
     saveSeenJobs(state.seen);
@@ -5654,9 +5785,17 @@ async function startJobLocal(state, job, agentInfo) {
       });
     });
 
-    child.on('exit', () => {
+    child.on('exit', (code, signal) => {
       logStream.write(`[${new Date().toISOString()}] Job process exited\n`);
       logStream.end();
+      // Unexpected exit (non-zero, not a clean signal) counts as a crash for
+      // the health document's containers_unhealthy rollup.
+      if (code && code !== 0) {
+        const n = (state._containerCrashes.get(agentInfo.id) || 0) + 1;
+        state._containerCrashes.set(agentInfo.id, n);
+        state._agentErrors.set(agentInfo.id, `job process exited with code ${code}${signal ? ` (${signal})` : ''}`);
+        state.emitEvent?.('container.died', { jobId: job.id, agentId: agentInfo.id, code, signal: signal || null });
+      }
     });
 
     // Handle IPC from job-agent
@@ -5677,11 +5816,21 @@ async function startJobLocal(state, job, agentInfo) {
         }
       }
       if (msg?.type === 'extension_needed') {
-        console.log(`[Extension] Job ${msg.jobId?.substring(0, 8)} requesting extension: $${msg.amount} for ~${msg.estimatedTokens} tokens`);
+        console.log(`[Extension] Job ${msg.jobId?.substring(0, 8)} requesting extension: ${msg.amount} ${msg.currency || 'VRSC'} for ~${msg.estimatedTokens} tokens`);
+        // Remember the ask so extension_approved can grant the right token
+        // count even when the platform webhook doesn't echo estimatedTokens.
+        const extInfo = state.active.get(msg.jobId);
+        if (extInfo) extInfo.pendingExtensionTokens = msg.estimatedTokens;
+        state.emitEvent?.('extension.requested', {
+          jobId: msg.jobId, amount: msg.amount, currency: msg.currency || 'VRSC',
+          estimatedTokens: msg.estimatedTokens, reason: msg.reason,
+        });
         (async () => {
           try {
             const agent = await getAgentSession(state, agentInfo);
-            await agent.client.requestExtension(msg.jobId, msg.amount, msg.reason);
+            // Pass estimatedTokens (SDK 2.7.0) so the platform can echo it on
+            // approval and we grant exactly the requested amount (WP-D4 P1-1).
+            await agent.client.requestExtension(msg.jobId, msg.amount, msg.reason, msg.estimatedTokens);
             console.log(`[Extension] Submitted to platform for buyer approval`);
           } catch (e) {
             console.error(`[Extension] Failed to submit: ${e.message}`);
@@ -5723,6 +5872,11 @@ async function startJobLocal(state, job, agentInfo) {
       agentInfoId: agentInfo.id,
       reworkCount: 0,
     });
+
+    state.emitEvent?.('container.started', {
+      jobId: job.id, agentId: agentInfo.id, pid: child.pid, runtime: 'local',
+    });
+    state.emitEvent?.('job.started', { jobId: job.id, agentId: agentInfo.id });
 
     state.seen.set(job.id, Date.now());
     saveSeenJobs(state.seen);

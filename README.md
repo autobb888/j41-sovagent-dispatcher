@@ -274,6 +274,49 @@ These env vars override the corresponding `config.toml` value for CI or one-shot
 | `IDLE_TIMEOUT_MS` | Idle timeout before pause (default: 600000 ms / 10 min) |
 | `J41_REQUIRE_FINALIZE` | When set, agents must be finalized before the dispatcher will use them |
 
+### Token Budget Enforcement (WP-D4)
+
+Every job runs with a **finite token budget**, derived at session start from the
+job's VRSC payment via the SDK pricing calculator and enforced before every LLM
+call (`local-llm` and `mcp` executors). The flow:
+
+1. **Budget set at start** — `job amount (VRSC) × vrsc_usd_rate × spend_fraction`,
+   converted to tokens for the agent's actual model. If the exchange rate is
+   missing/stale or the model isn't in the pricing table, the
+   **conservative fallback budget** applies — a job can never run unmetered.
+2. **Warning at `warning_percent`** (default 80%) — the job-agent requests a
+   budget extension, priced from the job's actual model and the session's
+   *observed* input:output token ratio. With no usable exchange rate the
+   dispatcher will **not** auto-request money (fail closed; it logs instead).
+3. **Exhausted** — generation pauses (the buyer gets an honest status message,
+   tool loops stop mid-task), and the session waits up to `extension_wait_ms`
+   (default 10 min) for the buyer to approve.
+4. **Approved** → `budget_increased` reaches the container (fork *and* Docker
+   modes) and generation resumes; the warning re-arms so a second overrun asks
+   again. **Not approved in time** → the session ends and delivers the partial
+   work with an honest status — never a silent token burn.
+
+Cumulative usage (`promptTokens`, `completionTokens`, `llmCalls`, plus the
+extension request/grant log) is recorded in the on-chain job record and the
+`deletion-attestation.json` sidecar, so the buyer can audit what extension
+requests were based on. (Embedding usage inside the *signed* attestation
+payload requires an SDK/backend schema change — tracked for the platform side.)
+
+Config (`config.toml` `[budget]`, env overrides in parentheses):
+
+| Setting | Default | Description |
+|---|---|---|
+| `vrsc_usd_rate` (`J41_VRSC_USD_RATE`) | 0 (unset) | USD per VRSC. **Set this** — unset means fallback budgets and no auto-priced extensions |
+| `rate_max_age_ms` (`J41_VRSC_RATE_MAX_AGE_MS`) | 86400000 | Rate older than this counts as missing (fail closed) |
+| `spend_fraction` (`J41_BUDGET_SPEND_FRACTION`) | 0.6 | Share of job value spendable on LLM cost |
+| `fallback_token_budget` (`J41_FALLBACK_TOKEN_BUDGET`) | 50000 | Budget when the job can't be priced |
+| `warning_percent` (`J41_BUDGET_WARNING_PERCENT`) | 80 | Budget % that triggers an extension request |
+| `extension_wait_ms` (`J41_BUDGET_EXTENSION_WAIT_MS`) | 600000 | Wait for approval before delivering partial work |
+
+The rate is stamped into each job container's environment with the container
+start time; all conversions go through `src/token-budget.js` — there are no
+inline exchange rates or per-token cost constants anywhere else.
+
 ## Architecture
 
 ```
@@ -454,6 +497,53 @@ j41-dispatcher ctl shutdown        # graceful shutdown
 j41-dispatcher ctl canary --agent agent-2  # check canary status
 j41-dispatcher ctl status --json   # machine-readable output
 ```
+
+### Headless Control API (WP-D1/D2)
+
+The same read model is exposed as a versioned HTTP API on `127.0.0.1:9843`
+(`control_api_port`), so *any* client — brainbox, a cron script, another
+orchestrator — can drive a dispatcher without the TUI. The `ctl` socket and the
+HTTP API share one set of read-model builders, so they never drift.
+
+Because this daemon moves money, **every `/v1/*` endpoint requires a bearer
+token**, even from localhost. The token is auto-created at
+`~/.j41/dispatcher/control.token` (mode 0600) on first start; same-user access
+is trivial, other-user access is impossible.
+
+```bash
+TOKEN=$(cat ~/.j41/dispatcher/control.token)
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9843/v1/status
+```
+
+| Endpoint | Returns |
+|---|---|
+| `GET /v1/status` | uptime, pool, queue depth |
+| `GET /v1/agents` | registered agents + busy/available state |
+| `GET /v1/jobs` | active jobs + queue depth |
+| `GET /v1/jobs/:id` | one active job's detail (404 if not running) |
+| `GET /v1/earnings` | per-agent VRSC rollups (hits the platform) |
+| `GET /v1/events?since=N` | monotonic event feed (polling transport) |
+
+**Events** (`/v1/events`) are a file-backed ring buffer with a monotonic `seq`
+that survives restart, so a polling client's `since` cursor stays valid across a
+bounce. The response is `{ events: [...], cursor: N }`; poll with the last
+`cursor` as `since`. Event types follow a stable vocabulary:
+`job.started|delivered|completed`, `extension.requested|approved|rejected`,
+`dispute.filed|resolved`, `container.started|died`, `agent.online|offline`.
+
+> Write endpoints (`POST /v1/agents/:id/activate`, offerings, dispute responses,
+> and the buyer-side `/v1/hire/*`) land in later increments. This is the
+> read-only skeleton plus the event/health surface.
+
+### Health document — a compatibility promise
+
+`GET /health` on `:9842` stays **open and unauthenticated** for monitor-room
+probes. Its field **paths** are versioned API: the monitor room extracts dotted
+paths (`agents.0.status`, `containers.0.state`, `summary.containers_unhealthy`)
+and a renamed field breaks those watches silently — **treat a renamed health
+field like a removed endpoint.** The numeric rollups under `summary` are
+designed so `above:0` on `summary.containers_unhealthy` is the canonical
+"tell me when anything is wrong" watch. `GET /metrics` remains Prometheus-text.
 
 ## Graceful Shutdown
 
