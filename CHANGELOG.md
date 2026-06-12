@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+- **sovcompute credit-low notify (edge-triggered).** The proxy now fires a
+  one-time, **signed** `POST /v1/webhooks/dispatcher/credit-low` to J41 the
+  moment a buyer's prepaid balance crosses **below** the threshold after a
+  request (edge-triggered — debounced so a buyer parked under the line doesn't
+  re-notify every call). Threshold is `[proxy] credit_low_threshold_vrsc`
+  (`J41_PROXY_CREDIT_LOW_THRESHOLD`); `null` falls back to
+  `suggested_topup_vrsc`. Body is RFC-8785 canonicalized and seller-signed,
+  matching the deposit-confirmed signing pattern. Best-effort / non-fatal — a
+  notify failure never blocks the proxy response.
+
+- **fix: `notifyJ41DepositConfirmed` deposit-confirmed notifies had never
+  fired.** The json-canonicalize import was `const canonicalize =
+  require('json-canonicalize')` — but the module exports `{ canonicalize }` (an
+  object, not a callable). Calling `canonicalize(payload)` threw "canonicalize
+  is not a function", which the surrounding best-effort `try/catch` swallowed
+  silently — so **every deposit-confirmed J41 notify had been a no-op**. Now
+  `const { canonicalize } = require('json-canonicalize')`. Both the
+  deposit-confirmed notify and the new credit-low notify produce correct
+  canonical signed bodies and actually reach J41.
+
+- **jailbox parked (default-off).** The "agent works inside the buyer's
+  environment" sandbox (legacy `workspace.*`, aka jailbox) is parked in favour
+  of deliver-and-review and now defaults **OFF** behind the new
+  `jailbox.enabled` config flag (`JAILBOX_ENABLED=1` to re-enable). The
+  dispatcher refuses to start a jailbox session — clear `[JAILBOX]` log, no
+  `workspace_ready` forwarded — gated at the single dispatcher choke point
+  (`checkWorkspaceCapability`) and the single in-container funnel
+  (`connectWorkspace`, flag forwarded via `buildContainerEnv`). **Not deleted,
+  re-enablable, and the hash-chained signed audit-log / attestation machinery is
+  retained intact** as proof-of-process. See `JAILBOX_PARKED.md` and docs spec
+  `2026-06-12-vdxf-v2-schema-design` §3b. When the flag is on, behaviour is
+  unchanged.
+
 ## 2.1.15 — 2026-05-26
 
 **Broker file-channel transport — opt-in.** The new `J41_SIGNING_BROKER=1` env var routes all in-container signing through a file-IPC channel to a host-side `SignChannelHost`, keeping the agent WIF on the dispatcher host and out of the job-agent container's filesystem entirely. Default remains off; the legacy `keys.json` bind mount is still the only behaviour you get without the flag. Cuts the in-container blast radius — a fully-compromised job-agent cannot exfiltrate the WIF or forge identity-bearing signatures for other jobs (broker rebuilds canonical accept/deliver/dispute message bytes from authoritative platform state and refuses container-supplied protocol-formatted text).

@@ -4091,8 +4091,21 @@ function sendToJobAgent(activeInfo, msg) {
 /**
  * VDXF Policy Check: verify agent has workspace.capability on-chain before
  * forwarding workspace_ready to job-agent. Returns true if allowed.
+ *
+ * Jailbox park gate: the "agent works inside the buyer's environment" sandbox
+ * (legacy "workspace", aka jailbox) is PARKED by default in favour of
+ * deliver-and-review (see JAILBOX_PARKED.md and docs spec
+ * 2026-06-12-vdxf-v2-schema-design §3b). When cfg.jailbox.enabled is false the
+ * dispatcher refuses to start a jailbox session — clear log, no workspace_ready
+ * forwarded. Set JAILBOX_ENABLED=1 to re-enable; behaviour is then unchanged.
+ * This gates ONLY the session entry — the audit-log / attestation machinery is
+ * left fully intact.
  */
 function checkWorkspaceCapability(state, agentId) {
+  if (!cfg.jailbox.enabled) {
+    console.warn(`[JAILBOX] ${agentId}: jailbox parked — set JAILBOX_ENABLED=true to re-enable (refusing to start jailbox session)`);
+    return false;
+  }
   const caps = state.capabilities.get(agentId);
   if (!caps) {
     console.warn(`[VDXF-POLICY] ${agentId}: no capability data — blocking workspace`);
@@ -5052,6 +5065,13 @@ function buildContainerEnv(job, agentInfo, agentCfg, canaryToken, jobDir, keysPa
   if (cfg.executor.url)         env.J41_EXECUTOR_URL = cfg.executor.url;
 
   if (cfg.debug.chat) env.J41_DEBUG_CHAT = '1';
+
+  // Jailbox park gate forwarded into the container. In Docker mode the job-agent's
+  // workspace poller talks to the platform directly (bypassing the dispatcher's
+  // checkWorkspaceCapability gate), so connectWorkspace() re-checks JAILBOX_ENABLED
+  // from process.env — its only env channel — and refuses unless opted in.
+  // Parked by default: only forward when an operator has explicitly re-enabled it.
+  if (cfg.jailbox.enabled) env.JAILBOX_ENABLED = '1';
 
   // Container-side retry tuning. job-agent.js reads this from process.env directly
   // (Docker is its only env channel); without forwarding, the configured value would

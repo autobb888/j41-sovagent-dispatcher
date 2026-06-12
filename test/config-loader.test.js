@@ -173,6 +173,23 @@ test('extended schema sections load with defaults', withTmpHome(async () => {
   assert.strictEqual(cfg.retry.rate_limit_backoff_multiplier, 3);
 }));
 
+test('jailbox.enabled defaults to false (parked)', withTmpHome(async () => {
+  const { loadDispatcherConfig } = require('../src/config-loader.js');
+  const cfg = loadDispatcherConfig({ skipMigration: true });
+  assert.strictEqual(cfg.jailbox.enabled, false);
+}));
+
+test('JAILBOX_ENABLED=1 re-enables jailbox via env override', withTmpHome(async () => {
+  const { loadDispatcherConfig } = require('../src/config-loader.js');
+  process.env.JAILBOX_ENABLED = '1';
+  try {
+    const cfg = loadDispatcherConfig({ skipMigration: true });
+    assert.strictEqual(cfg.jailbox.enabled, true);
+  } finally {
+    delete process.env.JAILBOX_ENABLED;
+  }
+}));
+
 test('saveDispatcherConfig recovers from a stale lock file', withTmpHome(async () => {
   const { saveDispatcherConfig, CONFIG_FILE, _resetMigrationState } = require('../src/config-loader.js');
   _resetMigrationState();

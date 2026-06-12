@@ -44,3 +44,36 @@ test('buildContainerEnv sources provider key from cfg, not process.env', withTmp
   assert.strictEqual(env.J41_LLM_PROVIDER, 'openai');
   assert.strictEqual(process.env.OPENAI_API_KEY, undefined, 'dispatcher process.env stays clean');
 }));
+
+test('buildContainerEnv omits JAILBOX_ENABLED when jailbox is parked (default)', withTmpHome(async () => {
+  const { saveDispatcherConfig, _resetMigrationState } = require('../src/config-loader.js');
+  _resetMigrationState();
+  saveDispatcherConfig({ platform: { api_url: 'https://api.test', network: 'verus' } });
+  delete process.env.JAILBOX_ENABLED;
+  delete require.cache[require.resolve('../src/cli.js')];
+  const { buildContainerEnv } = require('../src/cli.js');
+  const env = buildContainerEnv(
+    { id: 'job-1', lifecycle: {} },
+    { id: 'agent-1', identity: 'test@' },
+    null, 'canary-token-xxx', '/tmp/jobdir', '/tmp/keys.json'
+  );
+  assert.strictEqual(env.JAILBOX_ENABLED, undefined, 'parked: flag NOT forwarded into container');
+}));
+
+test('buildContainerEnv forwards JAILBOX_ENABLED=1 when jailbox is re-enabled', withTmpHome(async () => {
+  const { saveDispatcherConfig, _resetMigrationState } = require('../src/config-loader.js');
+  _resetMigrationState();
+  saveDispatcherConfig({
+    platform: { api_url: 'https://api.test', network: 'verus' },
+    jailbox: { enabled: true },
+  });
+  delete process.env.JAILBOX_ENABLED;
+  delete require.cache[require.resolve('../src/cli.js')];
+  const { buildContainerEnv } = require('../src/cli.js');
+  const env = buildContainerEnv(
+    { id: 'job-1', lifecycle: {} },
+    { id: 'agent-1', identity: 'test@' },
+    null, 'canary-token-xxx', '/tmp/jobdir', '/tmp/keys.json'
+  );
+  assert.strictEqual(env.JAILBOX_ENABLED, '1', 're-enabled: flag forwarded into container');
+}));

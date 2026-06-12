@@ -50,6 +50,13 @@ const DEFAULTS = Object.freeze({
   webhook: { max_body_bytes: 1048576 },
   retry: { rate_limit_backoff_multiplier: 3 },
   debug: { chat: false },
+  // Jailbox (legacy "workspace") — admitting an agent into the buyer's
+  // environment. PARKED in favour of deliver-and-review (see JAILBOX_PARKED.md
+  // and docs spec 2026-06-12-vdxf-v2-schema-design §3b). Default OFF: the
+  // dispatcher refuses to start a jailbox session unless an operator explicitly
+  // opts back in with JAILBOX_ENABLED=1. The audit-log / attestation machinery
+  // is retained intact regardless of this flag.
+  jailbox: { enabled: false },
 });
 
 function deepClone(o) { return JSON.parse(JSON.stringify(o)); }
@@ -109,6 +116,12 @@ const ENV_OVERRIDES = [
   // reads process.env.J41_DEBUG_CHAT directly inside the container, since
   // process.env is the only Docker→process channel. Both reads are correct.
   ['J41_DEBUG_CHAT',         'debug.chat',               'bool1'],
+  // Jailbox parked: default-off. Set JAILBOX_ENABLED=1 to re-enable the
+  // "agent works inside the buyer's environment" sandbox. Like J41_DEBUG_CHAT,
+  // this is read here via cfg.jailbox.enabled (dispatcher gate) AND forwarded
+  // into the job-agent container env (buildContainerEnv) so the in-container
+  // connectWorkspace() funnel honours it in Docker mode too.
+  ['JAILBOX_ENABLED',        'jailbox.enabled',          'bool1'],
 ];
 
 function setPath(obj, dotted, value) {

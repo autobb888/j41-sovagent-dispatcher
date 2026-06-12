@@ -718,6 +718,20 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
 let _workspaceConnecting = false;
 let _wsPingInterval = null;
 async function connectWorkspace(jobId, permissions, mode) {
+  // Jailbox park gate. The "agent works inside the buyer's environment" sandbox
+  // (legacy "workspace", aka jailbox) is PARKED by default in favour of
+  // deliver-and-review (see JAILBOX_PARKED.md and docs spec
+  // 2026-06-12-vdxf-v2-schema-design §3b). This is the single funnel every start
+  // path (IPC workspace_ready, the Docker poller, re-entry) passes through.
+  // Docker is the container's only env channel, so the flag is read here from
+  // process.env directly (the dispatcher forwards JAILBOX_ENABLED via
+  // buildContainerEnv). When unset, refuse to start — clear log, no connect —
+  // while leaving every downstream attestation/audit-log code path intact.
+  // Set JAILBOX_ENABLED=1 to re-enable; behaviour is then unchanged.
+  if (process.env.JAILBOX_ENABLED !== '1') {
+    console.warn('[JAILBOX] jailbox parked — set JAILBOX_ENABLED=true to re-enable (refusing to start jailbox session)');
+    return;
+  }
   if (_workspaceConnected || _workspaceConnecting) return;
   _workspaceConnecting = true;
   _workspaceMode = mode || 'supervised';
