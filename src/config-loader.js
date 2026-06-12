@@ -34,6 +34,10 @@ const DEFAULTS = Object.freeze({
     estimated_input_tokens: 4000,
     estimated_output_tokens: 2000,
     suggested_topup_vrsc: 10,
+    // Credit-low notify threshold (VRSC). When a buyer's balance crosses BELOW
+    // this after a request, the dispatcher fires a one-time signed credit-low
+    // notify to J41. null = fall back to suggested_topup_vrsc at read time.
+    credit_low_threshold_vrsc: null,
     // NEW (2.1.14):
     rate_limit_rps: 10,             // tokens-per-second per buyer
     rate_limit_burst: 30,           // max bucket size per buyer
@@ -74,6 +78,7 @@ const ENV_OVERRIDES = [
   ['J41_PROXY_ESTIMATED_INPUT', 'proxy.estimated_input_tokens','int'],
   ['J41_PROXY_ESTIMATED_OUTPUT','proxy.estimated_output_tokens','int'],
   ['J41_PROXY_SUGGESTED_TOPUP', 'proxy.suggested_topup_vrsc','int'],
+  ['J41_PROXY_CREDIT_LOW_THRESHOLD', 'proxy.credit_low_threshold_vrsc','float'],
   ['J41_PROXY_RATE_LIMIT_RPS',         'proxy.rate_limit_rps',         'int'],
   ['J41_PROXY_RATE_LIMIT_BURST',       'proxy.rate_limit_burst',       'int'],
   ['J41_PROXY_RATE_LIMIT_MAX_BUCKETS', 'proxy.rate_limit_max_buckets', 'int'],
@@ -122,6 +127,7 @@ function applyEnvOverrides(cfg) {
     if (raw === undefined || raw === '') continue;
     let v;
     if (kind === 'int') { v = parseInt(raw); if (Number.isNaN(v)) continue; }
+    else if (kind === 'float') { v = parseFloat(raw); if (!Number.isFinite(v)) continue; }
     else if (kind === 'bool1') v = raw === '1';
     else v = raw;
     setPath(cfg, dotted, v);

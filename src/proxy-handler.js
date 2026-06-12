@@ -10,8 +10,51 @@ const crypto = require('crypto');
 const dns = require('dns').promises;
 const net = require('net');
 const { findKeyOwner, recordUsage } = require('./api-key-manager');
-const { reserveCredit, adjustCredit, refundReservation } = require('./credit-meter');
+const { reserveCredit, adjustCredit, refundReservation, checkAndFlagLow } = require('./credit-meter');
 const { loadDispatcherConfig } = require('./config-loader.js');
+
+/**
+ * Resolve the seller-configured credit-low notify threshold (VRSC).
+ * Defaults to suggested_topup_vrsc when unset (null/non-finite/<=0).
+ */
+function resolveCreditLowThreshold(cfg) {
+  const t = cfg.proxy.credit_low_threshold_vrsc;
+  if (Number.isFinite(t) && t > 0) return t;
+  return cfg.proxy.suggested_topup_vrsc;
+}
+
+/**
+ * Edge-triggered, debounced credit-low notify. Called from the post-request
+ * settle path after adjustCredit. If `remaining` crossed below the threshold
+ * and the buyer isn't already flagged, fires ONE seller-signed notify to J41.
+ * Best-effort: never throws, never blocks the proxy response.
+ */
+function maybeNotifyCreditLow(agentId, buyerVerusId, remaining, cfg, config) {
+  try {
+    const threshold = resolveCreditLowThreshold(cfg);
+    if (!checkAndFlagLow(agentId, buyerVerusId, remaining, threshold)) return;
+
+    const { getNotifyContext, notifyJ41CreditLow } = require('./deposit-watcher.js');
+    const ctx = getNotifyContext(agentId);
+    if (!ctx) {
+      // No signer context wired for this agent — can't sign the notify. The
+      // flag is already set (debounced); re-arms on next deposit. Don't spam.
+      return;
+    }
+    notifyJ41CreditLow(
+      ctx.sellerWif,
+      ctx.sellerVerusId,
+      buyerVerusId,
+      remaining,
+      threshold,
+      cfg.proxy.suggested_topup_vrsc,
+      config.payAddress || '',
+      ctx.network,
+    ).catch(() => {});
+  } catch {
+    // Never let credit-low alerting break the proxy response.
+  }
+}
 
 function isPrivateIp(ip) {
   if (!ip) return false;
@@ -286,6 +329,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
           deducted = true;
           const result = adjustCredit(agentId, record.buyerVerusId, model, inputTok, outputTok, creditCheck.reserved, config.modelPricing || []);
           recordUsage(agentId, key, inputTok, outputTok);
+          maybeNotifyCreditLow(agentId, record.buyerVerusId, result.remaining, cfg, config);
           console.log(`[PROXY] ${agentId} ${model} ${inputTok}+${outputTok} tok, cost ${result.cost.toFixed(6)} VRSC, remaining ${result.remaining.toFixed(4)}`);
         }
       });
@@ -331,6 +375,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         res.writeHead(proxyRes.statusCode, { ...safeHeaders, ...j41Headers });
         res.end(responseBody);
 
+        maybeNotifyCreditLow(agentId, record.buyerVerusId, result.remaining, cfg, config);
         console.log(`[PROXY] ${agentId} ${model} ${inputTok}+${outputTok} tok, cost ${result.cost.toFixed(6)} VRSC, remaining ${result.remaining.toFixed(4)}`);
       });
     }
@@ -356,4 +401,4 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   proxyReq.end();
 }
 
-module.exports = { handleProxyRequest };
+module.exports = { handleProxyRequest, maybeNotifyCreditLow, resolveCreditLowThreshold };

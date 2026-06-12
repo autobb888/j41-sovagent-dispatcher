@@ -361,7 +361,11 @@ async function notifyJ41DepositConfirmed(sellerWif, sellerVerusId, buyerVerusId,
   const J41_API_URL = loadDispatcherConfig().platform.api_url;
   try {
     const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
-    const canonicalize = require('json-canonicalize');
+    // json-canonicalize exports { canonicalize }, not a callable default.
+    // The previous `const canonicalize = require(...)` made canonicalize(payload)
+    // throw "canonicalize is not a function", which the try/catch silently
+    // swallowed — deposit-confirmed notifies never actually reached J41.
+    const { canonicalize } = require('json-canonicalize');
 
     const nonce = crypto.randomBytes(16).toString('hex');
     const confirmedAt = new Date().toISOString();
@@ -402,4 +406,74 @@ async function notifyJ41DepositConfirmed(sellerWif, sellerVerusId, buyerVerusId,
   }
 }
 
-module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
+/**
+ * Notify J41 that a buyer's prepaid balance crossed BELOW the credit-low
+ * threshold. POST /v1/webhooks/dispatcher/credit-low with a seller-signed
+ * canonical body (mirrors notifyJ41DepositConfirmed). Best-effort / non-fatal:
+ * the caller (proxy settle path) must never break a proxy response on failure.
+ *
+ * Canonical signed bytes (spec §2a, must match J41 verbatim):
+ *   canonicalize({ action: 'dispatcher.credit-low', sellerVerusId, buyerVerusId,
+ *                  balance, threshold, suggestedTopup, payAddress, observedAt, nonce })
+ * with balance/threshold/suggestedTopup as strings and observedAt unix seconds.
+ *
+ * @param sellerWif - Seller's WIF for signing
+ * @param sellerVerusId - Seller's VerusID
+ * @param buyerVerusId - Buyer whose balance crossed low
+ * @param balance - VRSC remaining (number)
+ * @param threshold - The crossing threshold in VRSC (number)
+ * @param suggestedTopup - Suggested top-up in VRSC (number)
+ * @param payAddress - Seller's deposit address (R-address)
+ * @param network - 'verus' or 'verustest'
+ */
+async function notifyJ41CreditLow(sellerWif, sellerVerusId, buyerVerusId, balance, threshold, suggestedTopup, payAddress, network) {
+  const J41_API_URL = loadDispatcherConfig().platform.api_url;
+  try {
+    const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
+    const { canonicalize } = require('json-canonicalize');
+
+    const nonce = crypto.randomBytes(16).toString('hex');
+    const observedAt = Math.floor(Date.now() / 1000);
+
+    // Field ORDER here is irrelevant (json-canonicalize sorts keys), but the
+    // field NAMES, value types (balance/threshold/suggestedTopup as strings,
+    // observedAt as a unix-seconds integer) and the action string must match
+    // the J41 handler's canonical exactly or the signature won't verify.
+    const payload = {
+      action: 'dispatcher.credit-low',
+      sellerVerusId,
+      buyerVerusId,
+      balance: String(balance),
+      threshold: String(threshold),
+      suggestedTopup: String(suggestedTopup),
+      payAddress: payAddress || '',
+      observedAt,
+      nonce,
+    };
+    const canonical = canonicalize(payload);
+    const dispatcherSig = signMessage(sellerWif, canonical, network);
+
+    const body = JSON.stringify({ ...payload, dispatcherSig });
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+
+    const res = await fetch(`${J41_API_URL}/v1/webhooks/dispatcher/credit-low`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'j41-dispatcher/2.0' },
+      body,
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    if (res.ok) {
+      console.log(`[Proxy] J41 notified: credit-low for ${buyerVerusId} (balance ${String(balance)} < ${String(threshold)} VRSC)`);
+    } else {
+      console.warn(`[Proxy] J41 credit-low notification failed: ${res.status} ${await res.text().catch(() => '')}`);
+    }
+  } catch (e) {
+    console.warn(`[Proxy] J41 credit-low notification failed (non-fatal): ${e.message}`);
+  }
+}
+
+module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };

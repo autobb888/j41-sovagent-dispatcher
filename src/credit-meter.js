@@ -138,8 +138,45 @@ function creditDeposit(agentId, buyerVerusId, amount, txid) {
   buyer.totalDeposited += amount;
   buyer.lastActivity = new Date().toISOString();
   if (txid) buyer.lastDepositTxid = txid;
+  // Re-arm the credit-low notify: a deposit means the next downward crossing
+  // should fire again. (Edge-triggered debounce, see checkAndFlagLow.)
+  delete buyer.lowNotifiedAt;
   saveMeters(agentId, data);
   return { newBalance: buyer.balance };
+}
+
+/**
+ * Edge-triggered, debounced credit-low detection.
+ *
+ * Returns true exactly ONCE per downward threshold crossing — when `balance`
+ * is strictly below `threshold` AND the buyer is not already flagged. On a true
+ * return it stamps `lowNotifiedAt` so subsequent sub-threshold calls return
+ * false (no per-request spam). `creditDeposit` clears the flag to re-arm.
+ *
+ * A non-positive / non-finite threshold disables the feature (returns false).
+ *
+ * @returns {boolean} true if the caller should fire the credit-low notify now.
+ */
+function checkAndFlagLow(agentId, buyerVerusId, balance, threshold) {
+  if (!Number.isFinite(threshold) || threshold <= 0) return false;
+  if (!(balance < threshold)) return false; // strict less-than; >= threshold is healthy
+
+  const data = loadMeters(agentId);
+  const buyer = ensureBuyer(data, buyerVerusId);
+  if (buyer.lowNotifiedAt) return false; // already flagged this crossing — debounce
+
+  buyer.lowNotifiedAt = new Date().toISOString();
+  saveMeters(agentId, data);
+  return true;
+}
+
+/**
+ * Get a buyer's raw meter record (or undefined). Used by the proxy settle path
+ * for the credit-low flag and by tests.
+ */
+function getMeter(agentId, buyerVerusId) {
+  const data = loadMeters(agentId);
+  return data.buyers[buyerVerusId];
 }
 
 /**
@@ -159,4 +196,4 @@ function getMetrics(agentId) {
   return data.buyers;
 }
 
-module.exports = { reserveCredit, adjustCredit, refundReservation, creditDeposit, getBalance, getMetrics, calculateCost };
+module.exports = { reserveCredit, adjustCredit, refundReservation, creditDeposit, getBalance, getMetrics, calculateCost, checkAndFlagLow, getMeter };
