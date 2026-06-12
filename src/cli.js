@@ -4106,6 +4106,14 @@ function startVrscRatePoller() {
         _vrscRateWarned = false;
         if (rate.ttlSeconds && rate.ttlSeconds > 0) nextMs = rate.ttlSeconds * 1000;
         console.log(`[Rate] VRSC/USD = ${rate.usdPerVrsc} (source: ${rate.source || 'platform'})`);
+      } else if (!_vrscRateWarned) {
+        // The call succeeded but returned an empty/malformed rate (e.g. an
+        // envelope-shape mismatch). Don't fail SILENTLY — warn once, then stay
+        // fail-closed on fallback budgets. This is the signal that would have
+        // surfaced the 2026-06-12 {data} envelope bug immediately.
+        console.log(`[Rate] Endpoint returned an empty/malformed rate — staying on fallback budgets. ` +
+          `Got: ${JSON.stringify(rate)?.slice(0, 80)}`);
+        _vrscRateWarned = true;
       }
     } catch (e) {
       // Endpoint missing (404) or unreachable → stay fail-closed, warn once.
