@@ -5412,6 +5412,23 @@ async function startJobContainer(state, job, agentInfo) {
   let signerTeardown = null;        // broker mode only
   const hostKeys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
 
+  // Audit C3: the legacy WIF mount puts the agent's private key inside a
+  // prompt-injectable job container that has network egress — readable by
+  // untrusted in-container code despite the :ro flag (ro blocks writes, not
+  // reads). It must NEVER be the silent default. Require an explicit choice:
+  // broker mode (secure — WIF stays on host) OR an explicit insecure ack.
+  // Fail closed otherwise so an operator can't unknowingly ship the WIF.
+  const ALLOW_INSECURE_WIF = process.env.J41_ALLOW_INSECURE_WIF_MOUNT === '1';
+  if (!SIGNING_BROKER_ENABLED && !ALLOW_INSECURE_WIF) {
+    throw new Error(
+      'Refusing to mount the agent WIF into the job container (audit C3): the private key would be ' +
+      'readable by untrusted, prompt-injectable in-container code that has network egress, letting it ' +
+      'sign arbitrary messages and spend the key. Set J41_SIGNING_BROKER=1 to sign via the host-side ' +
+      'broker (recommended; required for mainnet), or set J41_ALLOW_INSECURE_WIF_MOUNT=1 to explicitly ' +
+      'accept the risk (dev / testnet only).',
+    );
+  }
+
   if (SIGNING_BROKER_ENABLED) {
     signerChannelDir = path.join(os.tmpdir(), `j41-sign-${job.id}`);
     const { executors, teardown } = defaultExecutors({
