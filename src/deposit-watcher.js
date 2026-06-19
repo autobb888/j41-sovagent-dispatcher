@@ -116,6 +116,40 @@ function depositsPath(agentId) {
   return path.join(AGENTS_DIR, agentId, 'deposits.json');
 }
 
+// ── Audit M4: per-(agent,txid) atomic credit claim ──────────────────────────
+// The per-report nonce only dedups IDENTICAL reports. Two differently-nonced
+// reports for the SAME txid — or a report racing the poller — both load
+// deposits, both pass the `processed.some(d=>d.txid===txid)` check, both await
+// verifyPayment/getTxStatus, and both creditDeposit → double-credit.
+//
+// txid is the real idempotency key. We claim it SYNCHRONOUSLY (before any await)
+// against both the in-memory in-progress set AND the persisted `processed` list.
+// Node is single-threaded, so a synchronous check-and-set is atomic: no two
+// concurrent code paths can both win the claim. The claim is held across the
+// awaits and released only after `processed` is durably written (so a retry
+// sees it via the persisted check) or on a failure path (so it can be retried).
+const _claimsInProgress = new Set(); // key: `${agentId}\0${txid}`
+
+function _claimKey(agentId, txid) { return `${String(agentId).length}:${agentId}\0${txid}`; }
+
+/**
+ * Atomically claim (agentId, txid) for crediting. Returns false if it's already
+ * claimed in-process OR already in the persisted `processed` list. MUST be
+ * called synchronously (no await) between loadDeposits and the first await.
+ * @param {object} deposits - the freshly-loaded deposits.json contents
+ */
+function claimTxid(agentId, txid, deposits) {
+  const k = _claimKey(agentId, txid);
+  if (_claimsInProgress.has(k)) return false;
+  if (deposits && deposits.processed && deposits.processed.some((d) => d.txid === txid)) return false;
+  _claimsInProgress.add(k);
+  return true;
+}
+
+function releaseTxid(agentId, txid) {
+  _claimsInProgress.delete(_claimKey(agentId, txid));
+}
+
 function loadDeposits(agentId) {
   const p = depositsPath(agentId);
   try {
@@ -153,14 +187,20 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
   const { buyerVerusId, txid } = report;
   const expectedAmount = Number(report.amount);
 
-  // Check if already processed
+  // ── Audit M4: claim the txid ATOMICALLY (synchronously) before any await ──
+  // claimTxid checks both the in-process set and the persisted `processed` list.
+  // If it fails, this txid is already being (or has been) credited — refuse.
   const deposits = loadDeposits(agentId);
-  if (deposits.processed.some(d => d.txid === txid)) {
+  if (!claimTxid(agentId, txid, deposits)) {
     return { credited: false, message: 'Deposit already processed' };
   }
 
-  // Verify on-chain
+  // `committed` flips true only once `processed` is durably written; the finally
+  // releases the in-process claim unless committed (then the persisted check in
+  // claimTxid covers future attempts).
+  let committed = false;
   try {
+    // Verify on-chain
     const verification = await client.verifyPayment({
       txid,
       expectedAddress: payAddress,
@@ -236,7 +276,17 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
       return { credited: false, message: `Waiting for ${required - txStatus.confirmations} more confirmation(s) (${txStatus.confirmations}/${required})` };
     }
 
-    // Confirmed — credit the meter
+    // Confirmed — credit the meter. RE-LOAD deposits fresh here (audit M4): the
+    // `deposits` snapshot above predates the awaits, so the poller or another
+    // path may have written `processed` for OTHER txids in the meantime; persist
+    // against the latest state to avoid clobbering it. Our in-process claim
+    // guarantees no concurrent path is crediting THIS txid, and we re-check the
+    // persisted `processed` one last time as belt-and-suspenders.
+    const fresh = loadDeposits(agentId);
+    if (fresh.processed.some(d => d.txid === txid)) {
+      // Persisted by someone else after we claimed (e.g. a crash-recovery edge).
+      return { credited: false, message: 'Deposit already processed' };
+    }
     const result = creditDeposit(agentId, buyerVerusId, expectedAmount, txid);
 
     // Notify J41 platform (non-blocking, non-fatal) — uses per-agent context
@@ -245,8 +295,8 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
       notifyJ41DepositConfirmed(ctx.sellerWif, ctx.sellerVerusId, buyerVerusId, expectedAmount, txid, ctx.network).catch(() => {});
     }
 
-    // Mark as processed
-    deposits.processed.push({
+    // Mark as processed (on the fresh snapshot)
+    fresh.processed.push({
       txid,
       buyerVerusId,
       amount: expectedAmount,
@@ -254,14 +304,19 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
       creditedAt: new Date().toISOString(),
     });
     // Remove from pending if it was there
-    deposits.pending = deposits.pending.filter(d => d.txid !== txid);
+    fresh.pending = fresh.pending.filter(d => d.txid !== txid);
     // Keep only last 1000 processed (prevent unbounded growth)
-    if (deposits.processed.length > 1000) deposits.processed = deposits.processed.slice(-1000);
-    saveDeposits(agentId, deposits);
+    if (fresh.processed.length > 1000) fresh.processed = fresh.processed.slice(-1000);
+    saveDeposits(agentId, fresh);
+    committed = true; // durably persisted — the persisted check now covers this txid
 
     return { credited: true, message: 'Deposit confirmed and credited', balance: result.newBalance };
   } catch (e) {
     return { credited: false, message: `Verification failed: ${e.message}` };
+  } finally {
+    // Release the in-process claim unless we durably committed `processed`
+    // (in which case the persisted check in claimTxid covers future attempts).
+    if (!committed) releaseTxid(agentId, txid);
   }
 }
 
@@ -277,19 +332,38 @@ async function pollPendingDeposits(agentId, client) {
   if (deposits.pending.length === 0) return;
 
   let credited = 0;
-  const stillPending = [];
+  let stillPendingCount = 0;
 
   for (const dep of deposits.pending) {
+    // ── Audit M4: claim the txid atomically (synchronously) before the await ──
+    // Skips it if another path (a concurrent report, or already-processed) holds
+    // it. A skipped claim means someone else is crediting it — don't touch it.
+    const fresh0 = loadDeposits(agentId);
+    if (!claimTxid(agentId, dep.txid, fresh0)) {
+      // Already claimed/processed elsewhere — drop from our pending view.
+      continue;
+    }
+    let committed = false;
     try {
       const txStatus = await client.getTxStatus(dep.txid);
       if (txStatus.confirmations >= dep.requiredConfirmations) {
-        // Confirmed — credit
+        // Confirmed — credit. RE-LOAD fresh and re-check persisted `processed`
+        // before crediting/persisting so we never double-credit or clobber a
+        // concurrent writer's state (audit M4).
+        const fresh = loadDeposits(agentId);
+        if (fresh.processed.some(d => d.txid === dep.txid)) {
+          continue; // already credited by another path
+        }
         creditDeposit(agentId, dep.buyerVerusId, dep.amount, dep.txid);
-        deposits.processed.push({
+        fresh.processed.push({
           ...dep,
           confirmations: txStatus.confirmations,
           creditedAt: new Date().toISOString(),
         });
+        fresh.pending = fresh.pending.filter(d => d.txid !== dep.txid);
+        if (fresh.processed.length > 1000) fresh.processed = fresh.processed.slice(-1000);
+        saveDeposits(agentId, fresh);
+        committed = true;
         credited++;
         console.log(`[Deposits] ${agentId}: credited ${dep.amount} VRSC from ${dep.buyerVerusId} (${dep.txid.substring(0, 12)}...)`);
         // Notify J41 — uses per-agent context
@@ -298,21 +372,19 @@ async function pollPendingDeposits(agentId, client) {
           notifyJ41DepositConfirmed(pollCtx.sellerWif, pollCtx.sellerVerusId, dep.buyerVerusId, dep.amount, dep.txid, pollCtx.network).catch(() => {});
         }
       } else {
-        stillPending.push(dep);
+        stillPendingCount++;
       }
     } catch (e) {
       // Keep in pending on error — retry next poll
-      stillPending.push(dep);
+      stillPendingCount++;
       console.warn(`[Deposits] ${agentId}: check failed for ${dep.txid.substring(0, 12)}: ${e.message}`);
+    } finally {
+      if (!committed) releaseTxid(agentId, dep.txid);
     }
   }
 
-  deposits.pending = stillPending;
-  if (deposits.processed.length > 1000) deposits.processed = deposits.processed.slice(-1000);
-  saveDeposits(agentId, deposits);
-
   if (credited > 0) {
-    console.log(`[Deposits] ${agentId}: ${credited} deposit(s) confirmed, ${stillPending.length} still pending`);
+    console.log(`[Deposits] ${agentId}: ${credited} deposit(s) confirmed, ${stillPendingCount} still pending`);
   }
 }
 

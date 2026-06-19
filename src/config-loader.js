@@ -34,6 +34,17 @@ const DEFAULTS = Object.freeze({
     upstream_timeout_ms: 60000,
     estimated_input_tokens: 4000,
     estimated_output_tokens: 2000,
+    // Worst-case reservation (audit H3): the buyer is admitted only if their
+    // balance covers the MAX they could consume — estimated_input + the larger
+    // of estimated_output and the request's declared max_tokens. A malicious
+    // huge max_tokens is bounded by this ceiling so it can't deny service by
+    // demanding an absurd reservation; the actual settle refunds back down to
+    // real usage.
+    max_output_tokens_cap: 200000,
+    // Per-buyer in-flight concurrency cap (audit H3): N concurrent requests
+    // can't collectively over-commit a thin balance past the single-request
+    // worst-case reservation. Exceeding this returns 429.
+    max_inflight_per_buyer: 4,
     suggested_topup_vrsc: 10,
     // Credit-low notify threshold (VRSC). When a buyer's balance crosses BELOW
     // this after a request, the dispatcher fires a one-time signed credit-low
@@ -97,6 +108,8 @@ const ENV_OVERRIDES = [
   ['J41_PROXY_UPSTREAM_TIMEOUT','proxy.upstream_timeout_ms','int'],
   ['J41_PROXY_ESTIMATED_INPUT', 'proxy.estimated_input_tokens','int'],
   ['J41_PROXY_ESTIMATED_OUTPUT','proxy.estimated_output_tokens','int'],
+  ['J41_PROXY_MAX_OUTPUT_TOKENS_CAP','proxy.max_output_tokens_cap','int'],
+  ['J41_PROXY_MAX_INFLIGHT_PER_BUYER','proxy.max_inflight_per_buyer','int'],
   ['J41_PROXY_SUGGESTED_TOPUP', 'proxy.suggested_topup_vrsc','int'],
   ['J41_PROXY_CREDIT_LOW_THRESHOLD', 'proxy.credit_low_threshold_vrsc','float'],
   ['J41_PROXY_RATE_LIMIT_RPS',         'proxy.rate_limit_rps',         'int'],

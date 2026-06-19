@@ -11,7 +11,31 @@ const dns = require('dns').promises;
 const net = require('net');
 const { findKeyOwner, recordUsage } = require('./api-key-manager');
 const { reserveCredit, adjustCredit, refundReservation, checkAndFlagLow } = require('./credit-meter');
+const { acquire: acquireInflight, release: releaseInflight } = require('./proxy-inflight.js');
 const { loadDispatcherConfig } = require('./config-loader.js');
+
+/**
+ * Resolve the worst-case output tokens to RESERVE for a request (audit H3).
+ *
+ * The buyer must have balance covering the MAX they could consume, not a flat
+ * 2000-token estimate. We take the larger of the configured output estimate and
+ * the request's declared max_tokens, then bound a malicious huge max_tokens at
+ * proxy.max_output_tokens_cap so it can't be used to demand an absurd
+ * reservation (DoS) — the actual settle refunds back down to real usage anyway.
+ *
+ * @returns {number} output-token count to reserve against.
+ */
+function worstCaseOutputTokens(parsedBody, cfg) {
+  const estOut = cfg.proxy.estimated_output_tokens;
+  const cap = Number.isFinite(cfg.proxy.max_output_tokens_cap) && cfg.proxy.max_output_tokens_cap > 0
+    ? cfg.proxy.max_output_tokens_cap
+    : 200000;
+  const raw = Number(parsedBody && parsedBody.max_tokens);
+  // No / invalid max_tokens declared → fall back to the flat estimate (the buyer
+  // didn't ask for more than the default). A declared value is bounded by cap.
+  if (!Number.isFinite(raw) || raw <= 0) return estOut;
+  return Math.max(estOut, Math.min(raw, cap));
+}
 
 /**
  * Resolve the seller-configured credit-low notify threshold (VRSC).
@@ -221,11 +245,38 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     }
   }
 
-  // Reserve credit atomically (deducts upfront, adjusted after response)
+  // Per-buyer in-flight concurrency cap (audit H3). The worst-case reservation
+  // below only protects a SINGLE request; without a concurrency bound N parallel
+  // requests each pass the balance check against the current balance and can
+  // collectively over-commit, settling deeply negative. Acquire a slot now and
+  // release it on EVERY terminal path via releaseOnce().
+  const inflightCap = cfg.proxy.max_inflight_per_buyer;
+  if (!acquireInflight(agentId, record.buyerVerusId, inflightCap)) {
+    res.writeHead(429, {
+      'Content-Type': 'application/json',
+      'Retry-After': '1',
+      'X-J41-Inflight-Limit': String(inflightCap),
+    });
+    res.end(JSON.stringify({ error: 'Too many concurrent requests', maxInflight: inflightCap }));
+    return;
+  }
+  let _inflightReleased = false;
+  const releaseOnce = () => {
+    if (_inflightReleased) return;
+    _inflightReleased = true;
+    releaseInflight(agentId, record.buyerVerusId);
+  };
+
+  // Reserve credit atomically (deducts upfront, adjusted after response).
+  // Audit H3: reserve the WORST CASE — the buyer must have balance covering the
+  // max output they could consume (declared max_tokens, bounded by the cap),
+  // not a flat 2000-token estimate. adjustCredit refunds down to actual usage.
   const estimatedInput = cfg.proxy.estimated_input_tokens;
   const estimatedOutput = cfg.proxy.estimated_output_tokens;
-  const creditCheck = reserveCredit(agentId, record.buyerVerusId, model, estimatedInput, estimatedOutput, config.modelPricing || []);
+  const reserveOutput = worstCaseOutputTokens(parsedBody, cfg);
+  const creditCheck = reserveCredit(agentId, record.buyerVerusId, model, estimatedInput, reserveOutput, config.modelPricing || []);
   if (!creditCheck.allowed) {
+    releaseOnce();
     res.writeHead(402, {
       'Content-Type': 'application/json',
       'X-J41-Credit-Remaining': '0',
@@ -247,6 +298,8 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   try {
     upstreamUrl = new URL(upstreamPath, config.endpointUrl);
   } catch {
+    refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
+    releaseOnce();
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Invalid request path' }));
     return;
@@ -255,6 +308,8 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   // SSRF check: resolved hostname must match configured endpoint
   const configuredHost = new URL(config.endpointUrl).hostname;
   if (upstreamUrl.hostname !== configuredHost) {
+    refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
+    releaseOnce();
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Request path resolves to unauthorized host' }));
     return;
@@ -264,9 +319,24 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   const safety = await checkUpstreamHostSafe(upstreamUrl.hostname, cfg);
   if (!safety.safe) {
     refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
+    releaseOnce();
     res.writeHead(502, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: `Upstream blocked: ${safety.reason}` }));
     return;
+  }
+
+  // Audit H2 — streaming under-billing. The upstream emits a final usage frame
+  // only when stream_options.include_usage:true is set. If the buyer omits it,
+  // no usage frame arrives and the settle keeps the flat estimate → a huge
+  // completion is billed at 2000 output tokens. Force-inject include_usage for
+  // every stream:true request before forwarding. forwardBody is what we send
+  // upstream (the original `body` is left intact for callers/logging).
+  let forwardBody = body;
+  if (isStreaming) {
+    const so = (parsedBody.stream_options && typeof parsedBody.stream_options === 'object')
+      ? { ...parsedBody.stream_options, include_usage: true }
+      : { include_usage: true };
+    forwardBody = JSON.stringify({ ...parsedBody, stream_options: so });
   }
 
   // Forward request to seller's backend
@@ -309,6 +379,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         // so nested objects like completion_tokens_details survive (the old regex broke on them).
         let inputTok = estimatedInput;
         let outputTok = estimatedOutput;
+        let sawUsage = false;
         for (const line of fullResponse.split(/\r?\n/)) {
           if (!line.startsWith('data:')) continue;
           const json = line.slice(5).trim();
@@ -316,19 +387,31 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
           try {
             const frame = JSON.parse(json);
             if (frame && frame.usage && typeof frame.usage === 'object') {
-              if (Number.isFinite(frame.usage.prompt_tokens)) inputTok = frame.usage.prompt_tokens;
-              if (Number.isFinite(frame.usage.completion_tokens)) outputTok = frame.usage.completion_tokens;
+              if (Number.isFinite(frame.usage.prompt_tokens)) { inputTok = frame.usage.prompt_tokens; sawUsage = true; }
+              if (Number.isFinite(frame.usage.completion_tokens)) { outputTok = frame.usage.completion_tokens; sawUsage = true; }
             }
           } catch {
             // Malformed frame — skip. Upstream may send keep-alive comments starting with `:` too.
           }
         }
 
-        // Adjust reservation with actual token counts (or estimates if usage absent)
+        // Audit H2 — defensive settle. We forced stream_options.include_usage=true,
+        // but an upstream that IGNORES it produces no usage frame. Falling back to
+        // the flat estimate here would let such an upstream serve a huge completion
+        // for the price of 2000 output tokens. Instead settle against the WORST
+        // CASE the buyer declared (max_tokens, bounded by the cap = the same value
+        // we reserved) so a non-compliant upstream can't be exploited for free
+        // output. Input falls back to the estimate (no per-stream input signal).
+        if (!sawUsage) {
+          outputTok = reserveOutput;
+        }
+
+        // Adjust reservation with actual token counts (or worst case if usage absent)
         if (!deducted) {
           deducted = true;
           const result = adjustCredit(agentId, record.buyerVerusId, model, inputTok, outputTok, creditCheck.reserved, config.modelPricing || []);
           recordUsage(agentId, key, inputTok, outputTok);
+          releaseOnce();
           maybeNotifyCreditLow(agentId, record.buyerVerusId, result.remaining, cfg, config);
           console.log(`[PROXY] ${agentId} ${model} ${inputTok}+${outputTok} tok, cost ${result.cost.toFixed(6)} VRSC, remaining ${result.remaining.toFixed(4)}`);
         }
@@ -336,20 +419,35 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
 
       proxyRes.on('error', () => {
         if (!res.writableEnded) res.end();
+        // Settle defensively at the worst case so a mid-stream abort after the
+        // upstream already served output can't escape billing. Guard with
+        // `deducted` so we don't double-settle if 'end' also fires.
+        if (!deducted) {
+          deducted = true;
+          adjustCredit(agentId, record.buyerVerusId, model, estimatedInput, reserveOutput, creditCheck.reserved, config.modelPricing || []);
+          releaseOnce();
+        }
       });
     } else {
       // Non-streaming: read full response, adjust reservation, then send
       let chunks = [];
       proxyRes.on('data', (chunk) => chunks.push(chunk));
+      let settled = false;
       proxyRes.on('error', (err) => {
         console.error(`[PROXY] Upstream response error: ${err.message}`);
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
           res.end(JSON.stringify({ error: 'Upstream response interrupted' }));
         }
-        refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
+        if (!settled) {
+          settled = true;
+          refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
+          releaseOnce();
+        }
       });
       proxyRes.on('end', () => {
+        if (settled) return;
+        settled = true;
         const responseBody = Buffer.concat(chunks);
         let inputTok = estimatedInput;
         let outputTok = estimatedOutput;
@@ -364,6 +462,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
 
         const result = adjustCredit(agentId, record.buyerVerusId, model, inputTok, outputTok, creditCheck.reserved, config.modelPricing || []);
         recordUsage(agentId, key, inputTok, outputTok);
+        releaseOnce();
 
         j41Headers['X-J41-Credit-Remaining'] = result.remaining.toFixed(4);
         if (result.remaining < 1) {
@@ -382,22 +481,27 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   });
 
   proxyReq.on('error', (err) => {
-    if (res.headersSent || res.writableEnded) return;
+    // Always free the in-flight slot, even if the response already started
+    // streaming (releaseOnce is idempotent). Only refund/respond when the
+    // request never produced a (billable) response.
+    if (res.headersSent || res.writableEnded) { releaseOnce(); return; }
     console.error(`[PROXY] Upstream error: ${err.message}`);
     refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
+    releaseOnce();
     res.writeHead(502, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
     res.end(JSON.stringify({ error: 'Upstream endpoint unavailable' }));
   });
 
   proxyReq.on('timeout', () => {
     proxyReq.destroy();
-    if (res.headersSent || res.writableEnded) return;
+    if (res.headersSent || res.writableEnded) { releaseOnce(); return; }
     refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
+    releaseOnce();
     res.writeHead(504, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
     res.end(JSON.stringify({ error: 'Upstream endpoint timed out' }));
   });
 
-  proxyReq.write(body);
+  proxyReq.write(forwardBody);
   proxyReq.end();
 }
 
