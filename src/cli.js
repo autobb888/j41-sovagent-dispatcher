@@ -20,15 +20,17 @@ const os = require('os');
 const { spawn } = require('child_process');
 const { getRuntime, persistActiveJobs, loadActiveJobs, saveConfig, loadConfig } = require('./config');
 const log = require('./logger');
-const { loadDispatcherConfig } = require('./config-loader.js');
+const { loadDispatcherConfig, fileConfiguredNetwork } = require('./config-loader.js');
 const { SignChannelHost } = require('./sign-channel-host.js');
 const { defaultExecutors } = require('./broker-executors.js');
+const { findMainnetSecurityViolations, resolveIsMainnet } = require('./mainnet-guard.js');
 
 /** Feature flag: route in-container signing through the host-side broker
- *  instead of mounting the WIF into the container. Default OFF; flip to ON
- *  via env after Docker-validated end-to-end on testnet. See
+ *  instead of mounting the WIF into the container. Default ON; opt out only
+ *  with an explicit J41_SIGNING_BROKER=0 (testnet only — blocked on mainnet
+ *  by the mainnet security gate). See
  *  src/sign-broker.js / src/sign-channel-host.js / src/job-signer.js. */
-const SIGNING_BROKER_ENABLED = process.env.J41_SIGNING_BROKER === '1';
+const SIGNING_BROKER_ENABLED = process.env.J41_SIGNING_BROKER !== '0';
 const cfg = loadDispatcherConfig();
 
 const RUNTIME = getRuntime();
@@ -61,6 +63,7 @@ const FINALIZE_STATE_FILENAME = 'finalize-state.json';
 
 const J41_API_URL = cfg.platform.api_url;
 const J41_NETWORK = cfg.platform.network;
+const IS_MAINNET = resolveIsMainnet(fileConfiguredNetwork(), J41_NETWORK);
 const _cfg = loadConfig();
 const MAX_AGENTS = cfg.runtime.max_concurrent > 0
   ? cfg.runtime.max_concurrent
@@ -2910,6 +2913,24 @@ program
   .action(async (options) => {
     ensureDirs();
 
+    // Mainnet security gate (fail-closed): on network=verus, refuse to start
+    // if any insecure escape hatch is set. IS_MAINNET comes from config, not env.
+    if (IS_MAINNET) {
+      const violations = findMainnetSecurityViolations(process.env, { devUnsafe: !!options.devUnsafe });
+      if (violations.length) {
+        console.error('');
+        console.error('  ══════════════════════════════════════════════════');
+        console.error('  MAINNET SECURITY GATE — refusing to start');
+        console.error('  ══════════════════════════════════════════════════');
+        console.error('  These insecure flags are not allowed on mainnet (network=verus):');
+        for (const msg of violations) console.error(`  - ${msg}`);
+        console.error('');
+        console.error('  Unset them, or run on testnet (network=verustest).');
+        console.error('');
+        process.exit(1);
+      }
+    }
+
     const agents = listRegisteredAgents();
     if (agents.length === 0) {
       console.error('❌ No agents found. Run: j41-dispatcher init');
@@ -5418,7 +5439,9 @@ async function startJobContainer(state, job, agentInfo) {
   // reads). It must NEVER be the silent default. Require an explicit choice:
   // broker mode (secure — WIF stays on host) OR an explicit insecure ack.
   // Fail closed otherwise so an operator can't unknowingly ship the WIF.
-  const ALLOW_INSECURE_WIF = process.env.J41_ALLOW_INSECURE_WIF_MOUNT === '1';
+  // Defense-in-depth: the insecure WIF mount is never honored on mainnet,
+  // even if the startup gate were somehow bypassed.
+  const ALLOW_INSECURE_WIF = process.env.J41_ALLOW_INSECURE_WIF_MOUNT === '1' && !IS_MAINNET;
   if (!SIGNING_BROKER_ENABLED && !ALLOW_INSECURE_WIF) {
     throw new Error(
       'Refusing to mount the agent WIF into the job container (audit C3): the private key would be ' +

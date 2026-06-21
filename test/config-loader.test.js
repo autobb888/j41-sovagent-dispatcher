@@ -206,3 +206,17 @@ test('saveDispatcherConfig recovers from a stale lock file', withTmpHome(async (
   // Lock file is gone after the write
   assert.strictEqual(fs.existsSync(lockFile), false);
 }));
+
+test('fileConfiguredNetwork reads the file and ignores J41_NETWORK env (no mainnet downgrade)', withTmpHome(async () => {
+  const { fileConfiguredNetwork, loadDispatcherConfig, CONFIG_FILE, invalidateConfigCache } = require('../src/config-loader.js');
+  fs.mkdirSync(path.dirname(CONFIG_FILE()), { recursive: true });
+  fs.writeFileSync(CONFIG_FILE(), '[platform]\nnetwork = "verus"\n');
+  process.env.J41_NETWORK = 'verustest';
+  try {
+    assert.strictEqual(fileConfiguredNetwork(), 'verus'); // file value, env ignored
+    invalidateConfigCache();
+    assert.strictEqual(loadDispatcherConfig({ skipMigration: true }).platform.network, 'verustest'); // legit env override still works for effective cfg
+  } finally {
+    delete process.env.J41_NETWORK;
+  }
+}));
