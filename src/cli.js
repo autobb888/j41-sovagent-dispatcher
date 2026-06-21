@@ -4265,7 +4265,10 @@ async function handleCrashRecovery(state) {
         }
       }
 
-      const finishedStatuses = ['completed', 'resolved', 'resolved_rejected', 'cancelled'];
+      // 'delivered' is terminal here: the work was delivered (and payment earned),
+      // so a dispatcher restart must NOT auto-refund it — that would make the
+      // operator eat the compute AND the payout. Disputes handle disagreements.
+      const finishedStatuses = ['completed', 'resolved', 'resolved_rejected', 'cancelled', 'delivered'];
       if (finishedStatuses.includes(currentJob.status)) {
         console.log(`    ✅ Job already ${currentJob.status} — cleaning up`);
         continue;
