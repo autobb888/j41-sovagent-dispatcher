@@ -7,7 +7,6 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { getHealth } = require('./upstream-health');
 
 const REPO_DIR = path.join(__dirname, '..');
 const J41_DIR = path.join(os.homedir(), '.j41');
@@ -16,6 +15,8 @@ const AGENTS_DIR = path.join(DISPATCHER_DIR, 'agents');
 const CONFIG_FILE = path.join(DISPATCHER_DIR, 'config.json');
 
 const { loadDispatcherConfig, saveDispatcherConfig } = require('./config-loader.js');
+const { sendCommand } = require('./control.js');
+const { renderActiveJobs, runLiveScreen } = require('./tui/live-screen.js');
 function loadCfg() { return loadDispatcherConfig(); }
 
 // ── VDXF key → human name mapping ──
@@ -211,6 +212,7 @@ async function mainMenu(inquirer) {
       { name: '[5]  Configure Services', value: 'services' },
       { name: '[6]  Security Setup', value: 'security' },
       new inquirer.Separator('  ── Dispatcher ──'),
+      { name: '⚡ Live Jobs (auto-refresh)', value: 'live_jobs' },
       { name: `[7]  Start Dispatcher ${status.running ? '\x1b[32m(running)\x1b[0m' : ''}`, value: 'start' },
       { name: `[8]  Stop Dispatcher ${status.running ? '' : '\x1b[2m(not running)\x1b[0m'}`, value: 'stop' },
       { name: '[9]  View Logs', value: 'logs' },
@@ -715,8 +717,37 @@ async function jobsScreen(inquirer, keys) {
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
+// Resolve where the dispatcher's log actually is, in priority order.
+// Returns an existing path, or null if logs aren't captured to a file.
+function resolveDispatcherLogPath() {
+  const candidates = [];
+  try {
+    const cfg = loadCfg();
+    if (cfg && cfg.runtime && cfg.runtime.log_file) candidates.push(cfg.runtime.log_file);
+  } catch { /* ignore */ }
+  candidates.push('/tmp/dispatcher.log'); // path used when the dashboard starts it
+  for (const p of candidates) {
+    if (p && fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
 async function statusScreen(inquirer) {
   console.clear();
+  // Live header from the running dispatcher (matches `ctl status`).
+  // buildStatus() returns: { uptime, uptimeMs, agents:{total,available,busy}, active, queue, seen }
+  try {
+    const liveStatus = await sendCommand({ action: 'status' });
+    const ag = liveStatus.agents || {};
+    console.log('  ── Live (dispatcher) ──');
+    console.log(`  Uptime:    ${liveStatus.uptime != null ? liveStatus.uptime : '?'}`);
+    console.log(`  Agents:    ${ag.available != null ? ag.available : '?'} available / ${ag.total != null ? ag.total : '?'} total`);
+    console.log(`  Active:    ${liveStatus.active != null ? liveStatus.active : '?'} job(s)`);
+    console.log(`  Queue:     ${liveStatus.queue != null ? liveStatus.queue : 0} pending\n`);
+  } catch {
+    console.log('  ── Live (dispatcher) ──');
+    console.log('  Dispatcher not running (no control socket).\n');
+  }
   console.log(`\n  ═══ Dispatcher Status & Health ═══\n`);
 
   const status = getDispatcherStatus();
@@ -800,26 +831,13 @@ async function statusScreen(inquirer) {
   if (apiAgents.length > 0) {
     console.log(`\n  ── API Proxy ──`);
     let totalDeposited = 0, totalSpent = 0, totalActiveKeys = 0;
-    const live = status.running;
-    let getHealth = null;
-    if (live) {
-      try { getHealth = require(path.join(REPO_DIR, 'src/upstream-health.js')).getHealth; } catch {}
-    }
     for (const a of apiAgents) {
       const cfg = a._cfg;
       const upstream = cfg.apiEndpointUrl || cfg.endpointUrl;
-      let healthTag = '';
-      if (live && getHealth) {
-        const h = getHealth(a.id);
-        if (h) {
-          const ageS = Math.round((Date.now() - h.lastCheck) / 1000);
-          healthTag = h.healthy
-            ? `  \x1b[32m[healthy ${ageS}s ago]\x1b[0m`
-            : `  \x1b[31m[DOWN — ${h.error || 'status ' + h.status}]\x1b[0m`;
-        } else {
-          healthTag = `  \x1b[2m[no health check yet]\x1b[0m`;
-        }
-      }
+      // Upstream health is tracked in-process by the dispatcher and is not yet
+      // exposed over the control socket (Phase 1.5). Show no tag rather than a
+      // misleading "no health check yet".
+      const healthTag = '';
       console.log(`  ${a.id}  (${a.identity})`);
       console.log(`    Upstream:  ${upstream}${healthTag}`);
       console.log(`    Models:    ${(cfg.modelPricing || []).map(m => m.model).join(', ') || '(none priced)'}`);
@@ -1215,16 +1233,9 @@ async function configureServicesScreen(inquirer) {
       for (let i = 0; i < list.length; i++) {
         const s = list[i];
         const isApi = s.serviceType === 'api-endpoint';
-        let healthTag = '';
-        if (isApi) {
-          const h = getHealth(agentId);
-          if (h) {
-            const age = Math.round((Date.now() - h.lastCheck) / 1000);
-            healthTag = h.healthy ? ` [upstream: healthy ${age}s ago]` : ` [upstream: DOWN — ${h.error || 'status ' + h.status}]`;
-          } else {
-            healthTag = ' [upstream: not checked]';
-          }
-        }
+        // Upstream health isn't exposed over the control socket yet (Phase 1.5);
+        // omit the tag rather than always showing a misleading "not checked".
+        const healthTag = '';
         console.log(`  [${i + 1}] ${s.name}${isApi ? ' [API ENDPOINT]' : ''}${healthTag}`);
         if (isApi) {
           console.log(`      Endpoint: ${s.endpointUrl || '?'}  |  Status: ${s.status || 'active'}  |  Category: ${s.category || '?'}`);
@@ -2951,17 +2962,36 @@ async function main() {
         }
         await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
       }); break;
+      case 'live_jobs': {
+        await runLiveScreen({
+          stdin: process.stdin,
+          intervalMs: 2500,
+          render: renderActiveJobs,
+          fetch: async () => {
+            const [jobs, resources] = await Promise.all([
+              sendCommand({ action: 'jobs' }),
+              sendCommand({ action: 'resources' }).catch(() => null),
+            ]);
+            return { jobs, resources };
+          },
+        });
+        break;
+      }
       case 'logs': {
         console.clear();
         console.log('\n  ═══ Dispatcher Logs ═══\n');
-        if (!fs.existsSync('/tmp/dispatcher.log')) {
-          console.log('  No log file found. Start the dispatcher first.\n');
+        const logPath = resolveDispatcherLogPath();
+        if (!logPath) {
+          console.log('  Logs are not being captured to a file.');
+          console.log('  The dispatcher was started outside the dashboard, so its');
+          console.log('  output went to wherever its stdout was pointed.');
+          console.log('  Start it via [7] to capture logs, or redirect stdout to a file.\n');
           await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
           break;
         }
-        console.log('  Streaming /tmp/dispatcher.log — press Ctrl+C to stop\n');
+        console.log(`  Streaming ${logPath} — press Ctrl+C to stop\n`);
         const { spawn } = require('child_process');
-        const tail = spawn('tail', ['-f', '-n', '40', '/tmp/dispatcher.log'], { stdio: 'inherit' });
+        const tail = spawn('tail', ['-f', '-n', '40', logPath], { stdio: 'inherit' });
         let resolved = false;
         await new Promise((resolve) => {
           const done = () => { if (resolved) return; resolved = true; process.removeListener('SIGINT', handler); resolve(); };
