@@ -20,7 +20,7 @@ The fix scaffolding already exists: `control.js` exports `sendCommand(cmd)` plus
 Read-only, client-side only. **No changes to the dispatcher daemon, no new socket commands, no money/refund paths.**
 
 1. Add a **live, auto-refreshing "Live Jobs" screen** (new top menu item) backed by the control socket.
-2. **Fix `Status & Health`** to pull live numbers from the socket (`status` + `resources`), repairing the cross-process upstream-health display.
+2. **Fix `Status & Health`** to pull live header numbers (uptime/agents/active/queue) from the socket (`status`) so they match `ctl status`, and **stop the misleading upstream-health tag** (the "no health check yet" string can never populate cross-process). NOTE: `resources` does **not** carry upstream-health data and there is no socket/health-doc field for it today, so a *full* upstream-health repair needs a read-model addition in the daemon — that is **deferred to Phase 1.5** (out of this client-side-only phase). Phase 1 removes the false signal rather than faking one.
 3. **Fix `View Logs`** to resolve the dispatcher's log location instead of assuming a single hardcoded path (see resolution order below).
 4. Isolate the non-blocking render loop into a small, **testable** module that can later be lifted into a full-screen TUI.
 
@@ -48,7 +48,7 @@ Isolates the tricky non-blocking render loop, with a **pure render function** se
 Live Jobs screen ─ sendCommand({action:'jobs'})      → buildJobs   → Active Jobs table + queue depth
                  ─ sendCommand({action:'resources'}) → per-job RSS / token usage (drill-down detail)
 Status & Health  ─ sendCommand({action:'status'})    → buildStatus → live uptime/agents/active/queue
-                 ─ sendCommand({action:'resources'}) → upstream health + per-job resources (fixes the bug)
+                 ─ sendCommand({action:'resources'}) → CPU/mem + per-job RSS (NO upstream-health field; see Goals note)
 ```
 
 Drill-down on a single job reuses the data already returned by `jobs` + `resources`; **no new socket command** is added.
