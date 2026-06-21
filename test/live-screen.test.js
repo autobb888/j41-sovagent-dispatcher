@@ -139,3 +139,28 @@ test('runLiveScreen: the interval callback triggers refresh', async () => {
   stdin.emit('data', Buffer.from('q'));
   await p;
 });
+
+test('runLiveScreen: a fetch resolving after quit does not write (no post-teardown paint)', async () => {
+  const stdin = makeStdin();
+  const frames = [];
+  let resolveFetch;
+  let calls = 0;
+  const p = runLiveScreen({
+    stdin, intervalMs: 9999,
+    fetch: () => {
+      calls++;
+      if (calls === 1) return new Promise((r) => { resolveFetch = r; }); // first fetch hangs
+      return Promise.resolve({ jobs: { active: [], queue: 0 } });
+    },
+    render: () => 'frame',
+    write: (s) => frames.push(s), clear: () => {},
+    setInterval: () => 0, clearInterval: () => {},
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(frames.length, 0);           // first refresh still pending → nothing written
+  stdin.emit('data', Buffer.from('q'));     // quit while fetch in flight
+  await p;
+  resolveFetch({ jobs: { active: [], queue: 0 } }); // in-flight fetch now resolves
+  await new Promise((r) => setImmediate(r));
+  assert.equal(frames.length, 0);           // MUST be 0 — no write after teardown
+});

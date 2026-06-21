@@ -83,6 +83,7 @@ function runLiveScreen(io) {
     async function refresh() {
       try { lastData = await fetch(); }
       catch (e) { lastData = { error: e.message }; }
+      if (done) return;
       clear();
       write(render(lastData));
     }
