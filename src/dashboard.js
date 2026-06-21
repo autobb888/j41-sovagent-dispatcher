@@ -16,6 +16,8 @@ const AGENTS_DIR = path.join(DISPATCHER_DIR, 'agents');
 const CONFIG_FILE = path.join(DISPATCHER_DIR, 'config.json');
 
 const { loadDispatcherConfig, saveDispatcherConfig } = require('./config-loader.js');
+const { sendCommand } = require('./control.js');
+const { renderActiveJobs, runLiveScreen } = require('./tui/live-screen.js');
 function loadCfg() { return loadDispatcherConfig(); }
 
 // ── VDXF key → human name mapping ──
@@ -211,6 +213,7 @@ async function mainMenu(inquirer) {
       { name: '[5]  Configure Services', value: 'services' },
       { name: '[6]  Security Setup', value: 'security' },
       new inquirer.Separator('  ── Dispatcher ──'),
+      { name: '⚡ Live Jobs (auto-refresh)', value: 'live_jobs' },
       { name: `[7]  Start Dispatcher ${status.running ? '\x1b[32m(running)\x1b[0m' : ''}`, value: 'start' },
       { name: `[8]  Stop Dispatcher ${status.running ? '' : '\x1b[2m(not running)\x1b[0m'}`, value: 'stop' },
       { name: '[9]  View Logs', value: 'logs' },
@@ -2951,6 +2954,21 @@ async function main() {
         }
         await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
       }); break;
+      case 'live_jobs': {
+        await runLiveScreen({
+          stdin: process.stdin,
+          intervalMs: 2500,
+          render: renderActiveJobs,
+          fetch: async () => {
+            const [jobs, resources] = await Promise.all([
+              sendCommand({ action: 'jobs' }),
+              sendCommand({ action: 'resources' }).catch(() => null),
+            ]);
+            return { jobs, resources };
+          },
+        });
+        break;
+      }
       case 'logs': {
         console.clear();
         console.log('\n  ═══ Dispatcher Logs ═══\n');
