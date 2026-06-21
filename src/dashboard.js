@@ -17,6 +17,7 @@ const CONFIG_FILE = path.join(DISPATCHER_DIR, 'config.json');
 const { loadDispatcherConfig, saveDispatcherConfig } = require('./config-loader.js');
 const { sendCommand } = require('./control.js');
 const { renderActiveJobs, runLiveScreen } = require('./tui/live-screen.js');
+const { formatUpstreamHealthTag } = require('./tui/health-tag.js');
 function loadCfg() { return loadDispatcherConfig(); }
 
 // ── VDXF key → human name mapping ──
@@ -717,6 +718,13 @@ async function jobsScreen(inquirer, keys) {
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
+// Fetch the per-agent upstream-health map from the running dispatcher.
+// Returns {} if the dispatcher isn't running (so callers render no tag).
+async function fetchUpstreamHealth() {
+  try { return await sendCommand({ action: 'upstream_health' }); }
+  catch { return {}; }
+}
+
 // Resolve where the dispatcher's log actually is, in priority order.
 // Returns an existing path, or null if logs aren't captured to a file.
 function resolveDispatcherLogPath() {
@@ -831,13 +839,11 @@ async function statusScreen(inquirer) {
   if (apiAgents.length > 0) {
     console.log(`\n  ── API Proxy ──`);
     let totalDeposited = 0, totalSpent = 0, totalActiveKeys = 0;
+    const healthMap = await fetchUpstreamHealth();
     for (const a of apiAgents) {
       const cfg = a._cfg;
       const upstream = cfg.apiEndpointUrl || cfg.endpointUrl;
-      // Upstream health is tracked in-process by the dispatcher and is not yet
-      // exposed over the control socket (Phase 1.5). Show no tag rather than a
-      // misleading "no health check yet".
-      const healthTag = '';
+      const healthTag = formatUpstreamHealthTag(healthMap[a.id], Date.now());
       console.log(`  ${a.id}  (${a.identity})`);
       console.log(`    Upstream:  ${upstream}${healthTag}`);
       console.log(`    Models:    ${(cfg.modelPricing || []).map(m => m.model).join(', ') || '(none priced)'}`);
@@ -1230,12 +1236,11 @@ async function configureServicesScreen(inquirer) {
     }
 
     if (list.length > 0) {
+      const healthMap = await fetchUpstreamHealth();
       for (let i = 0; i < list.length; i++) {
         const s = list[i];
         const isApi = s.serviceType === 'api-endpoint';
-        // Upstream health isn't exposed over the control socket yet (Phase 1.5);
-        // omit the tag rather than always showing a misleading "not checked".
-        const healthTag = '';
+        const healthTag = isApi ? formatUpstreamHealthTag(healthMap[agentId], Date.now()) : '';
         console.log(`  [${i + 1}] ${s.name}${isApi ? ' [API ENDPOINT]' : ''}${healthTag}`);
         if (isApi) {
           console.log(`      Endpoint: ${s.endpointUrl || '?'}  |  Status: ${s.status || 'active'}  |  Category: ${s.category || '?'}`);
