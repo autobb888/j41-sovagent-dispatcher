@@ -720,6 +720,20 @@ async function jobsScreen(inquirer, keys) {
 
 async function statusScreen(inquirer) {
   console.clear();
+  // Live header from the running dispatcher (matches `ctl status`).
+  // buildStatus() returns: { uptime, uptimeMs, agents:{total,available,busy}, active, queue, seen }
+  try {
+    const liveStatus = await sendCommand({ action: 'status' });
+    const ag = liveStatus.agents || {};
+    console.log('  ── Live (dispatcher) ──');
+    console.log(`  Uptime:    ${liveStatus.uptime != null ? liveStatus.uptime : '?'}`);
+    console.log(`  Agents:    ${ag.available != null ? ag.available : '?'} available / ${ag.total != null ? ag.total : '?'} total`);
+    console.log(`  Active:    ${liveStatus.active != null ? liveStatus.active : '?'} job(s)`);
+    console.log(`  Queue:     ${liveStatus.queue != null ? liveStatus.queue : 0} pending\n`);
+  } catch {
+    console.log('  ── Live (dispatcher) ──');
+    console.log('  Dispatcher not running (no control socket).\n');
+  }
   console.log(`\n  ═══ Dispatcher Status & Health ═══\n`);
 
   const status = getDispatcherStatus();
@@ -803,26 +817,13 @@ async function statusScreen(inquirer) {
   if (apiAgents.length > 0) {
     console.log(`\n  ── API Proxy ──`);
     let totalDeposited = 0, totalSpent = 0, totalActiveKeys = 0;
-    const live = status.running;
-    let getHealth = null;
-    if (live) {
-      try { getHealth = require(path.join(REPO_DIR, 'src/upstream-health.js')).getHealth; } catch {}
-    }
     for (const a of apiAgents) {
       const cfg = a._cfg;
       const upstream = cfg.apiEndpointUrl || cfg.endpointUrl;
-      let healthTag = '';
-      if (live && getHealth) {
-        const h = getHealth(a.id);
-        if (h) {
-          const ageS = Math.round((Date.now() - h.lastCheck) / 1000);
-          healthTag = h.healthy
-            ? `  \x1b[32m[healthy ${ageS}s ago]\x1b[0m`
-            : `  \x1b[31m[DOWN — ${h.error || 'status ' + h.status}]\x1b[0m`;
-        } else {
-          healthTag = `  \x1b[2m[no health check yet]\x1b[0m`;
-        }
-      }
+      // Upstream health is tracked in-process by the dispatcher and is not yet
+      // exposed over the control socket (Phase 1.5). Show no tag rather than a
+      // misleading "no health check yet".
+      const healthTag = '';
       console.log(`  ${a.id}  (${a.identity})`);
       console.log(`    Upstream:  ${upstream}${healthTag}`);
       console.log(`    Models:    ${(cfg.modelPricing || []).map(m => m.model).join(', ') || '(none priced)'}`);
