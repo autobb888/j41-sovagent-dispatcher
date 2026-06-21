@@ -21,4 +21,17 @@ function findMainnetSecurityViolations(env, opts) {
   return v;
 }
 
-module.exports = { findMainnetSecurityViolations };
+/**
+ * Resolve whether we're on mainnet for security purposes. Mainnet is "sticky":
+ * true if EITHER the on-disk config file OR the (possibly env-overridden)
+ * effective network is 'verus'. So J41_NETWORK env can never DOWNGRADE a
+ * mainnet deployment to testnet to disable the security gate.
+ * @param {string|null|undefined} fileNetwork - platform.network from the raw config file
+ * @param {string|null|undefined} effectiveNetwork - cfg.platform.network (after env overrides)
+ * @returns {boolean}
+ */
+function resolveIsMainnet(fileNetwork, effectiveNetwork) {
+  return fileNetwork === 'verus' || effectiveNetwork === 'verus';
+}
+
+module.exports = { findMainnetSecurityViolations, resolveIsMainnet };

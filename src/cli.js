@@ -20,10 +20,10 @@ const os = require('os');
 const { spawn } = require('child_process');
 const { getRuntime, persistActiveJobs, loadActiveJobs, saveConfig, loadConfig } = require('./config');
 const log = require('./logger');
-const { loadDispatcherConfig } = require('./config-loader.js');
+const { loadDispatcherConfig, fileConfiguredNetwork } = require('./config-loader.js');
 const { SignChannelHost } = require('./sign-channel-host.js');
 const { defaultExecutors } = require('./broker-executors.js');
-const { findMainnetSecurityViolations } = require('./mainnet-guard.js');
+const { findMainnetSecurityViolations, resolveIsMainnet } = require('./mainnet-guard.js');
 
 /** Feature flag: route in-container signing through the host-side broker
  *  instead of mounting the WIF into the container. Default ON; opt out only
@@ -63,7 +63,7 @@ const FINALIZE_STATE_FILENAME = 'finalize-state.json';
 
 const J41_API_URL = cfg.platform.api_url;
 const J41_NETWORK = cfg.platform.network;
-const IS_MAINNET = J41_NETWORK === 'verus';
+const IS_MAINNET = resolveIsMainnet(fileConfiguredNetwork(), J41_NETWORK);
 const _cfg = loadConfig();
 const MAX_AGENTS = cfg.runtime.max_concurrent > 0
   ? cfg.runtime.max_concurrent

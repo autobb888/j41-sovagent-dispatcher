@@ -411,4 +411,17 @@ function loadDispatcherConfig(opts = {}) {
   return result;
 }
 
-module.exports = { loadDispatcherConfig, saveDispatcherConfig, migrateLegacyEnv, invalidateConfigCache, CONFIG_FILE, _resetMigrationState };
+/**
+ * Read platform.network straight from the on-disk config file, BYPASSING env
+ * overrides and defaults. Security-sensitive callers (the mainnet gate) use
+ * this so J41_NETWORK env cannot downgrade a mainnet deployment to testnet.
+ * @returns {string|null} the file's platform.network, or null if unset/unreadable
+ */
+function fileConfiguredNetwork() {
+  try {
+    const onDisk = TOML.parse(fs.readFileSync(CONFIG_FILE(), 'utf8'));
+    return (onDisk && onDisk.platform && onDisk.platform.network) || null;
+  } catch { return null; }
+}
+
+module.exports = { loadDispatcherConfig, saveDispatcherConfig, migrateLegacyEnv, invalidateConfigCache, CONFIG_FILE, _resetMigrationState, fileConfiguredNetwork };

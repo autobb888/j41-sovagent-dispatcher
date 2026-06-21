@@ -40,3 +40,19 @@ test('broker not set (undefined) is NOT a violation — only the literal "0" is'
   assert.deepEqual(findMainnetSecurityViolations({}, {}), []);
   assert.deepEqual(findMainnetSecurityViolations({ J41_SIGNING_BROKER: '1' }, {}), []);
 });
+
+const { resolveIsMainnet } = require('../src/mainnet-guard');
+
+test('resolveIsMainnet: file=verus is mainnet even when effective(env) says testnet (no downgrade)', () => {
+  assert.equal(resolveIsMainnet('verus', 'verustest'), true);
+});
+
+test('resolveIsMainnet: both testnet (or null) → false', () => {
+  assert.equal(resolveIsMainnet('verustest', 'verustest'), false);
+  assert.equal(resolveIsMainnet(null, undefined), false);
+});
+
+test('resolveIsMainnet: effective=verus (env upgrade) → true', () => {
+  assert.equal(resolveIsMainnet('verustest', 'verus'), true);
+  assert.equal(resolveIsMainnet(null, 'verus'), true);
+});
