@@ -14,7 +14,7 @@ test('renderActiveJobs: empty list shows "No active jobs" and queue 0', () => {
 
 test('renderActiveJobs: one running job shows id, agent, runtime, tokens', () => {
   const data = {
-    jobs: { active: [{ jobId: '0bf75391-aaaa', agentId: 'agent-5', runningFor: '3m', paused: false, workspace: false, tokens: { total: 1234 } }], queue: 0 },
+    jobs: { active: [{ jobId: '0bf75391-aaaa', agentId: 'agent-5', runningFor: '3m', paused: false, workspace: false, tokens: { totalTokens: 1234, promptTokens: 1000, completionTokens: 234, llmCalls: 2 } }], queue: 0 },
   };
   const out = plain(renderActiveJobs(data));
   assert.match(out, /0bf75391/);
@@ -163,4 +163,12 @@ test('runLiveScreen: a fetch resolving after quit does not write (no post-teardo
   resolveFetch({ jobs: { active: [], queue: 0 } }); // in-flight fetch now resolves
   await new Promise((r) => setImmediate(r));
   assert.equal(frames.length, 0);           // MUST be 0 — no write after teardown
+});
+
+test('renderActiveJobs: handles undefined/empty data without throwing', () => {
+  assert.doesNotThrow(() => renderActiveJobs());
+  assert.doesNotThrow(() => renderActiveJobs({}));
+  const out = plain(renderActiveJobs(undefined));
+  assert.match(out, /No active jobs\./);
+  assert.match(out, /Queue: 0 pending/);
 });

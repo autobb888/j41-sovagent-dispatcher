@@ -38,7 +38,7 @@ function renderActiveJobs(data) {
     lines.push(`  ${DIM}#   JOB       AGENT        RUNTIME  TOKENS    STATE${RESET}`);
     jobs.forEach((j, i) => {
       const short = String(j.jobId || '').substring(0, 8);
-      const tok = j.tokens && j.tokens.total != null ? String(j.tokens.total) : '-';
+      const tok = j.tokens && j.tokens.totalTokens != null ? String(j.tokens.totalTokens) : '-';
       const state = j.paused ? `${YELLOW}paused${RESET}` : `${GREEN}running${RESET}`;
       const ws = j.workspace ? ' [WS]' : '';
       const mem = memByJob[short] != null ? `  ${memByJob[short]}MB` : '';
