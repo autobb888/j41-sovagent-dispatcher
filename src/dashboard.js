@@ -7,7 +7,6 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { getHealth } = require('./upstream-health');
 
 const REPO_DIR = path.join(__dirname, '..');
 const J41_DIR = path.join(os.homedir(), '.j41');
@@ -1219,16 +1218,9 @@ async function configureServicesScreen(inquirer) {
       for (let i = 0; i < list.length; i++) {
         const s = list[i];
         const isApi = s.serviceType === 'api-endpoint';
-        let healthTag = '';
-        if (isApi) {
-          const h = getHealth(agentId);
-          if (h) {
-            const age = Math.round((Date.now() - h.lastCheck) / 1000);
-            healthTag = h.healthy ? ` [upstream: healthy ${age}s ago]` : ` [upstream: DOWN — ${h.error || 'status ' + h.status}]`;
-          } else {
-            healthTag = ' [upstream: not checked]';
-          }
-        }
+        // Upstream health isn't exposed over the control socket yet (Phase 1.5);
+        // omit the tag rather than always showing a misleading "not checked".
+        const healthTag = '';
         console.log(`  [${i + 1}] ${s.name}${isApi ? ' [API ENDPOINT]' : ''}${healthTag}`);
         if (isApi) {
           console.log(`      Endpoint: ${s.endpointUrl || '?'}  |  Status: ${s.status || 'active'}  |  Category: ${s.category || '?'}`);
