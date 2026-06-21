@@ -48,3 +48,94 @@ test('renderActiveJobs: error state shows the message and retry hint', () => {
   assert.match(out, /Dispatcher is not running/);
   assert.match(out, /press q to go back/);
 });
+
+const { runLiveScreen } = require('../src/tui/live-screen');
+const { EventEmitter } = require('node:events');
+
+// A fake stdin that records raw-mode toggles and lets tests emit keys.
+function makeStdin() {
+  const e = new EventEmitter();
+  e.rawModes = [];
+  e.setRawMode = (v) => { e.rawModes.push(v); return e; };
+  e.resume = () => e;
+  e.pause = () => e;
+  return e;
+}
+
+test('runLiveScreen: fetches and renders immediately, then quits on q', async () => {
+  const stdin = makeStdin();
+  const frames = [];
+  let fetchCount = 0;
+  const p = runLiveScreen({
+    stdin,
+    intervalMs: 9999,
+    fetch: async () => { fetchCount++; return { jobs: { active: [], queue: 0 } }; },
+    render: (d) => `frame:${d.error ? 'err' : 'ok'}`,
+    write: (s) => frames.push(s),
+    clear: () => {},
+    setInterval: () => 0,        // no real timer
+    clearInterval: () => {},
+  });
+  // let the immediate refresh() microtasks settle
+  await new Promise((r) => setImmediate(r));
+  assert.equal(fetchCount, 1);
+  assert.deepEqual(frames, ['frame:ok']);
+  assert.equal(stdin.rawModes[0], true); // raw mode turned on
+
+  stdin.emit('data', Buffer.from('q'));
+  const res = await p;
+  assert.ok(res); // resolved
+  assert.equal(stdin.rawModes[stdin.rawModes.length - 1], false); // raw mode restored
+});
+
+test('runLiveScreen: r forces an extra refresh', async () => {
+  const stdin = makeStdin();
+  let fetchCount = 0;
+  const p = runLiveScreen({
+    stdin, intervalMs: 9999,
+    fetch: async () => { fetchCount++; return { jobs: { active: [], queue: 0 } }; },
+    render: () => 'x', write: () => {}, clear: () => {},
+    setInterval: () => 0, clearInterval: () => {},
+  });
+  await new Promise((r) => setImmediate(r));
+  stdin.emit('data', Buffer.from('r'));
+  await new Promise((r) => setImmediate(r));
+  assert.equal(fetchCount, 2);
+  stdin.emit('data', Buffer.from('q'));
+  await p;
+});
+
+test('runLiveScreen: fetch rejection renders an error frame, loop survives', async () => {
+  const stdin = makeStdin();
+  const frames = [];
+  const p = runLiveScreen({
+    stdin, intervalMs: 9999,
+    fetch: async () => { throw new Error('boom'); },
+    render: (d) => (d.error ? `ERR:${d.error}` : 'ok'),
+    write: (s) => frames.push(s), clear: () => {},
+    setInterval: () => 0, clearInterval: () => {},
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(frames, ['ERR:boom']);
+  stdin.emit('data', Buffer.from('q'));
+  await p;
+});
+
+test('runLiveScreen: the interval callback triggers refresh', async () => {
+  const stdin = makeStdin();
+  let intervalFn = null;
+  let fetchCount = 0;
+  const p = runLiveScreen({
+    stdin, intervalMs: 10,
+    fetch: async () => { fetchCount++; return { jobs: { active: [], queue: 0 } }; },
+    render: () => 'x', write: () => {}, clear: () => {},
+    setInterval: (fn) => { intervalFn = fn; return 1; },
+    clearInterval: () => {},
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(fetchCount, 1);
+  await intervalFn();                 // simulate a tick
+  assert.equal(fetchCount, 2);
+  stdin.emit('data', Buffer.from('q'));
+  await p;
+});

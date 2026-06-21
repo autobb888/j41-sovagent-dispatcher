@@ -53,4 +53,63 @@ function renderActiveJobs(data) {
   return lines.join('\n');
 }
 
-module.exports = { renderActiveJobs, pad };
+/**
+ * Run a live, auto-refreshing screen until the user quits. All I/O injected.
+ * @param {object} io
+ * @param {() => Promise<object>} io.fetch        - returns data passed to render()
+ * @param {(data: object) => string} io.render
+ * @param {NodeJS.EventEmitter & {setRawMode?:Function, resume?:Function, pause?:Function}} io.stdin
+ * @param {number} io.intervalMs
+ * @param {(s: string) => void} [io.write]        - default: process.stdout.write
+ * @param {() => void} [io.clear]                 - default: clear screen
+ * @param {(fn:Function, ms:number) => any} [io.setInterval]
+ * @param {(t:any) => void} [io.clearInterval]
+ * @returns {Promise<{lastData: object}>}
+ */
+function runLiveScreen(io) {
+  const fetch = io.fetch;
+  const render = io.render;
+  const stdin = io.stdin;
+  const write = io.write || ((s) => process.stdout.write(s));
+  const clear = io.clear || (() => process.stdout.write('\x1b[2J\x1b[H'));
+  const setI = io.setInterval || setInterval;
+  const clearI = io.clearInterval || clearInterval;
+
+  return new Promise((resolve) => {
+    let timer = null;
+    let lastData = null;
+    let done = false;
+
+    async function refresh() {
+      try { lastData = await fetch(); }
+      catch (e) { lastData = { error: e.message }; }
+      clear();
+      write(render(lastData));
+    }
+
+    function finish() {
+      if (done) return;
+      done = true;
+      if (timer != null) clearI(timer);
+      try { stdin.removeListener('data', onData); } catch { /* ignore */ }
+      try { if (stdin.setRawMode) stdin.setRawMode(false); } catch { /* ignore */ }
+      try { stdin.pause(); } catch { /* ignore */ }
+      resolve({ lastData });
+    }
+
+    function onData(chunk) {
+      const key = chunk.toString();
+      if (key === 'q' || key === '\x1b' || key === '\x03') { finish(); return; } // q / ESC / Ctrl-C
+      if (key === 'r') { refresh(); return; }
+    }
+
+    try { if (stdin.setRawMode) stdin.setRawMode(true); } catch { /* ignore */ }
+    try { stdin.resume(); } catch { /* ignore */ }
+    stdin.on('data', onData);
+
+    refresh();
+    timer = setI(refresh, io.intervalMs);
+  });
+}
+
+module.exports = { renderActiveJobs, runLiveScreen, pad };
