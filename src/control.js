@@ -238,6 +238,21 @@ async function buildEarnings(state, getAgentSession) {
 }
 
 /**
+ * Per-agent upstream-health snapshot for the local control socket.
+ * Reads the in-process poller map (same process). null = never probed.
+ * @param {object} state - dispatcher state with an `agents` array
+ * @returns {Object<string, object|null>} agentId → health entry or null
+ */
+function buildUpstreamHealth(state) {
+  const { getHealth } = require('./upstream-health.js');
+  const out = {};
+  for (const a of state.agents) {
+    out[a.id] = getHealth(a.id) || null;
+  }
+  return out;
+}
+
+/**
  * The health document (WP-D2). Stable dotted paths for the monitor room:
  *   agents.N.status / agents.N.lastError
  *   containers.N.name / containers.N.state / containers.N.crashes
@@ -311,6 +326,9 @@ async function handleCommand(cmd, state, handlers, startedAt) {
 
     case 'agents':
       return buildAgents(state);
+
+    case 'upstream_health':
+      return buildUpstreamHealth(state);
 
     case 'shutdown': {
       if (handlers.onShutdown) {
@@ -495,6 +513,7 @@ module.exports = {
   buildJobs,
   buildJob,
   buildAgents,
+  buildUpstreamHealth,
   buildEarnings,
   buildHealthDocument,
 };
