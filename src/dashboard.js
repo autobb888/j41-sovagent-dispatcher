@@ -718,8 +718,6 @@ async function jobsScreen(inquirer, keys) {
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
-// Resolve where the dispatcher's log actually is, in priority order.
-// Returns an existing path, or null if logs aren't captured to a file.
 // Fetch the per-agent upstream-health map from the running dispatcher.
 // Returns {} if the dispatcher isn't running (so callers render no tag).
 async function fetchUpstreamHealth() {
@@ -727,6 +725,8 @@ async function fetchUpstreamHealth() {
   catch { return {}; }
 }
 
+// Resolve where the dispatcher's log actually is, in priority order.
+// Returns an existing path, or null if logs aren't captured to a file.
 function resolveDispatcherLogPath() {
   const candidates = [];
   try {
