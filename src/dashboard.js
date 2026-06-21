@@ -717,6 +717,21 @@ async function jobsScreen(inquirer, keys) {
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
+// Resolve where the dispatcher's log actually is, in priority order.
+// Returns an existing path, or null if logs aren't captured to a file.
+function resolveDispatcherLogPath() {
+  const candidates = [];
+  try {
+    const cfg = loadCfg();
+    if (cfg && cfg.runtime && cfg.runtime.log_file) candidates.push(cfg.runtime.log_file);
+  } catch { /* ignore */ }
+  candidates.push('/tmp/dispatcher.log'); // path used when the dashboard starts it
+  for (const p of candidates) {
+    if (p && fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
 async function statusScreen(inquirer) {
   console.clear();
   // Live header from the running dispatcher (matches `ctl status`).
@@ -2965,14 +2980,18 @@ async function main() {
       case 'logs': {
         console.clear();
         console.log('\n  ═══ Dispatcher Logs ═══\n');
-        if (!fs.existsSync('/tmp/dispatcher.log')) {
-          console.log('  No log file found. Start the dispatcher first.\n');
+        const logPath = resolveDispatcherLogPath();
+        if (!logPath) {
+          console.log('  Logs are not being captured to a file.');
+          console.log('  The dispatcher was started outside the dashboard, so its');
+          console.log('  output went to wherever its stdout was pointed.');
+          console.log('  Start it via [7] to capture logs, or redirect stdout to a file.\n');
           await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
           break;
         }
-        console.log('  Streaming /tmp/dispatcher.log — press Ctrl+C to stop\n');
+        console.log(`  Streaming ${logPath} — press Ctrl+C to stop\n`);
         const { spawn } = require('child_process');
-        const tail = spawn('tail', ['-f', '-n', '40', '/tmp/dispatcher.log'], { stdio: 'inherit' });
+        const tail = spawn('tail', ['-f', '-n', '40', logPath], { stdio: 'inherit' });
         let resolved = false;
         await new Promise((resolve) => {
           const done = () => { if (resolved) return; resolved = true; process.removeListener('SIGINT', handler); resolve(); };
