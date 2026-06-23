@@ -81,6 +81,7 @@ class MCPExecutor extends Executor {
 
     // HOLE 1: scan the untrusted job description before it enters the system prompt.
     const safeDescription = await scanUntrusted(job.description, 'job_description');
+    this.safeDescription = safeDescription;
     // job.buyer is platform-supplied metadata — treat as untrusted.
     const safeBuyer = await scanUntrusted(job.buyer, 'job_description');
 
@@ -97,7 +98,7 @@ class MCPExecutor extends Executor {
       'Respond helpfully and concisely.',
     ].join('\n');
 
-    const greeting = `Hello! I've accepted your job: "${job.description.substring(0, 100)}". I have ${this.tools.length} tools available to help. How can I assist you?`;
+    const greeting = `Hello! I've accepted your job: "${this.safeDescription.substring(0, 100)}". I have ${this.tools.length} tools available to help. How can I assist you?`;
     agent.sendChatMessage(job.id, greeting);
     this.conversationLog.push({ role: 'assistant', content: greeting });
     console.log(`[MCP] Sent greeting`);

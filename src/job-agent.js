@@ -1387,7 +1387,7 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
             }
             // Scan dispute.reason before it enters the executor context —
             // it's other-agent/platform-supplied text, not a trusted source.
-            reworkContext = await scanUntrusted(reworkContext, 'other_agent');
+            reworkContext = await scanUntrusted(reworkContext, 'other_agent'); // handleMessage will scan again — acceptable (scanUntrusted is idempotent on clean text)
 
             // Calculate rework token budget from the dispute policy's share of
             // the job value, via the single conversion helper — real exchange

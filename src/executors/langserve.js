@@ -33,6 +33,7 @@ class LangServeExecutor extends Executor {
 
     // Scan untrusted job description before forwarding to LangServe backend.
     const safeDescription = await scanUntrusted(job.description, 'job_description');
+    this.safeDescription = safeDescription;
     const safeBuyer = await scanUntrusted(job.buyer, 'job_description');
 
     const response = await this._invoke({
@@ -46,7 +47,7 @@ class LangServeExecutor extends Executor {
       ],
     });
 
-    const greeting = response || `Hello! I've accepted your job: "${job.description.substring(0, 100)}". How can I help you?`;
+    const greeting = response || `Hello! I've accepted your job: "${this.safeDescription.substring(0, 100)}". How can I help you?`;
     agent.sendChatMessage(job.id, greeting);
     this.conversationLog.push({ role: 'assistant', content: greeting });
     console.log(`[LANGSERVE] Sent greeting`);
@@ -64,7 +65,7 @@ class LangServeExecutor extends Executor {
     }
 
     const response = await this._invoke({
-      task: this.job.description,
+      task: this.safeDescription,
       messages: this.conversationLog,
     });
 

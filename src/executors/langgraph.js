@@ -35,6 +35,7 @@ class LangGraphExecutor extends Executor {
 
     // Scan untrusted job description before forwarding to LangGraph backend.
     const safeDescription = await scanUntrusted(job.description, 'job_description');
+    this.safeDescription = safeDescription;
     const safeBuyer = await scanUntrusted(job.buyer, 'job_description');
 
     // Create a thread
@@ -59,15 +60,17 @@ class LangGraphExecutor extends Executor {
       system: soulPrompt,
     });
 
-    const greeting = result || `Hello! I've accepted your job: "${job.description.substring(0, 100)}". How can I help you?`;
+    const greeting = result || `Hello! I've accepted your job: "${this.safeDescription.substring(0, 100)}". How can I help you?`;
     agent.sendChatMessage(job.id, greeting);
     this.conversationLog.push({ role: 'assistant', content: greeting });
     console.log(`[LANGGRAPH] Sent greeting`);
   }
 
   async handleMessage(message, meta) {
-    // Scan untrusted inbound message before forwarding to LangGraph backend.
-    message = await scanUntrusted(message, 'other_agent');
+    // Scan inbound message before forwarding to LangGraph backend — default-on; opt out with J41_SCAN_BUYER_CHAT=0.
+    if (process.env.J41_SCAN_BUYER_CHAT !== '0') {
+      message = await scanUntrusted(message, 'other_agent');
+    }
     this.conversationLog.push({ role: 'user', content: message });
 
     // Cap conversation log to prevent OOM
