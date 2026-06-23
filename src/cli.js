@@ -25,7 +25,7 @@ const { SignChannelHost } = require('./sign-channel-host.js');
 const { defaultExecutors } = require('./broker-executors.js');
 const { findMainnetSecurityViolations, resolveIsMainnet } = require('./mainnet-guard.js');
 const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, liveLogPath, archiveLogPath } = require('./job-log.js');
-const { shouldRefundOrphan } = require('./refund.js');
+const { shouldRefundOrphan, isRefundAlreadyHandled } = require('./refund.js');
 
 /** Feature flag: route in-container signing through the host-side broker
  *  instead of mounting the WIF into the container. Default ON; opt out only
@@ -62,6 +62,7 @@ const QUEUE_DIR = path.join(DISPATCHER_DIR, 'queue');
 const JOBS_DIR = path.join(DISPATCHER_DIR, 'jobs');
 const SEEN_JOBS_PATH = path.join(DISPATCHER_DIR, 'seen-jobs.json');
 const PENDING_REFUNDS_PATH = path.join(DISPATCHER_DIR, 'pending-refunds.json');
+const REFUNDED_JOBS_PATH = path.join(DISPATCHER_DIR, 'refunded-jobs.json');
 const FINALIZE_STATE_FILENAME = 'finalize-state.json';
 
 const J41_API_URL = cfg.platform.api_url;
@@ -4309,23 +4310,68 @@ function loadPendingRefunds() {
   return {};
 }
 
-/** Persist the pending-refunds ledger atomically (mode 0600). */
+/** Persist the pending-refunds ledger atomically (mode 0600).
+ *  Writes to a temp file then renames — rename is atomic on POSIX, so a crash
+ *  mid-write can never leave a corrupted ledger that loadPendingRefunds() would
+ *  silently treat as empty (which would permanently drop owed refunds). */
 function savePendingRefunds(obj) {
   try {
     fs.mkdirSync(DISPATCHER_DIR, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(PENDING_REFUNDS_PATH, JSON.stringify(obj, null, 2), { mode: 0o600 });
+    const tmp = `${PENDING_REFUNDS_PATH}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, PENDING_REFUNDS_PATH);
   } catch (e) {
     console.error(`[refund] Could not save pending-refunds ledger: ${e.message}`);
+  }
+}
+
+/** Load the durable set of jobIds already refunded (de-dup guard). */
+function loadRefundedJobs() {
+  try {
+    if (fs.existsSync(REFUNDED_JOBS_PATH)) {
+      const arr = JSON.parse(fs.readFileSync(REFUNDED_JOBS_PATH, 'utf8'));
+      return new Set(Array.isArray(arr) ? arr : []);
+    }
+  } catch {
+    // corrupted — treat as empty (fail toward not-yet-refunded; pending ledger
+    // still gates against unbounded retries since each entry is removed on send)
+  }
+  return new Set();
+}
+
+/** Durably mark a jobId as refunded so it is never paid twice (atomic). */
+function markJobRefunded(jobId) {
+  try {
+    const refunded = loadRefundedJobs();
+    refunded.add(jobId);
+    fs.mkdirSync(DISPATCHER_DIR, { recursive: true, mode: 0o700 });
+    const tmp = `${REFUNDED_JOBS_PATH}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify([...refunded], null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, REFUNDED_JOBS_PATH);
+  } catch (e) {
+    console.error(`[refund] Could not mark job ${jobId.substring(0, 8)} refunded: ${e.message}`);
   }
 }
 
 /**
  * Attempt a single pending refund entry.  On success, removes the entry from
  * the durable ledger.  On failure, leaves it for the next startup drain.
- * Returns true if the refund was sent successfully.
+ * Returns true if the refund was sent successfully (or should be dropped).
+ *
+ * Idempotency: a jobId in refunded-jobs.json is never paid again, even if the
+ * platform still reports it non-terminal (e.g. submitRefundTxid failed after the
+ * on-chain send). The on-chain send is the point of no return, so it is the
+ * point at which we durably mark the job refunded — BEFORE recording on the
+ * platform — so a crash in between can never trigger a second send.
  */
 async function attemptPendingRefund(state, jobId, entry) {
   const { agentInfoId, orphan, refundAmount, refundPercent, buyerAddress } = entry;
+
+  // Hard de-dup: never re-send a refund for a job already paid.
+  if (loadRefundedJobs().has(jobId)) {
+    console.log(`  [refund] ⏭️  Job ${jobId.substring(0, 8)} already refunded — clearing ledger entry`);
+    return true;
+  }
 
   try {
     const agentInfo = state.agents.find(a => a.id === agentInfoId);
@@ -4346,6 +4392,10 @@ async function attemptPendingRefund(state, jobId, entry) {
 
     console.log(`  [refund] 💸 Sending ${refundPercent}% refund: ${refundAmount} ${orphan.currency || 'VRSC'} to ${buyerAddress} (job ${jobId.substring(0, 8)})`);
     const txid = await agent.sendCurrency(buyerAddress, refundAmount);
+    // Mark refunded immediately after the irreversible on-chain send, BEFORE any
+    // platform-record step that could fail and leave the platform reporting the
+    // job non-terminal. This is what prevents the double-pay interleaving.
+    markJobRefunded(jobId);
     console.log(`  [refund] ✅ Refund TX: ${txid}`);
 
     try {
@@ -4398,12 +4448,30 @@ async function handleCrashRecovery(state) {
 
   console.log(`\n⚠️  Crash recovery: found ${jobIds.length} orphaned job(s)`);
 
+  // Load any refunds already recorded by a prior run / the startup drain.
+  // active-jobs.json is only cleared at Step 4, so a job that drainPendingRefunds
+  // already paid (and removed from the ledger) would otherwise be re-classified
+  // here from active-jobs.json and refunded a SECOND time. Guard against that:
+  // any jobId still in the ledger is mid-flight; any jobId NOT in active-jobs.json
+  // that the drain already cleared simply won't appear in this loop's orphan set,
+  // but to be safe we never re-queue a jobId that is already in the ledger, and we
+  // MERGE (never overwrite) so concurrent ledger entries are preserved.
+  const existingPending = loadPendingRefunds();
+
   // ── Step 1: build the set of jobs that need a refund ────────────────────
   const pendingRefunds = {};
+
+  const alreadyRefunded = loadRefundedJobs();
 
   for (const jobId of jobIds) {
     const orphan = orphanedJobs[jobId];
     console.log(`  Processing ${jobId.substring(0, 8)}...`);
+
+    // Never re-queue a job already paid by a prior run / the startup drain.
+    if (isRefundAlreadyHandled(jobId, alreadyRefunded, existingPending)) {
+      console.log(`    ⏭️  Already refunded or queued — skipping`);
+      continue;
+    }
 
     try {
       // Find the agent session
@@ -4485,12 +4553,15 @@ async function handleCrashRecovery(state) {
   }
 
   // ── Step 2: write pending-refunds BEFORE sending anything (crash-safe) ──
+  // MERGE with any existing ledger entries (e.g. an entry a concurrent/prior
+  // drain left in place) rather than overwriting — never lose an owed refund.
+  const ledger = { ...existingPending, ...pendingRefunds };
   if (Object.keys(pendingRefunds).length > 0) {
-    savePendingRefunds(pendingRefunds);
+    savePendingRefunds(ledger);
   }
 
   // ── Step 3: send each refund; remove from durable ledger on success ──────
-  const remaining = { ...pendingRefunds };
+  const remaining = { ...ledger };
   for (const jobId of Object.keys(pendingRefunds)) {
     const success = await attemptPendingRefund(state, jobId, pendingRefunds[jobId]);
     if (success) {

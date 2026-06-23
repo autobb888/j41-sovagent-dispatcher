@@ -44,7 +44,7 @@ test('M3: amountVrsc at or above FALLBACK_MIN_VRSC gets full DEFAULT_FALLBACK_TO
 });
 
 // ── M4: shouldRefundOrphan predicate ────────────────────────────────────────
-const { shouldRefundOrphan, FINISHED_STATUSES } = require('../src/refund.js');
+const { shouldRefundOrphan, isRefundAlreadyHandled, FINISHED_STATUSES } = require('../src/refund.js');
 test('shouldRefundOrphan: terminal states are not refunded', () => {
   for (const s of ['completed','resolved','resolved_rejected','cancelled','delivered'])
     assert.equal(shouldRefundOrphan({ status: s }), false);
@@ -56,6 +56,21 @@ test('shouldRefundOrphan: non-terminal states are refunded', () => {
 test('shouldRefundOrphan: missing/malformed job not refunded', () => {
   assert.equal(shouldRefundOrphan(null), false);
   assert.equal(shouldRefundOrphan({}), false);
+});
+
+// ── M4: isRefundAlreadyHandled — double-pay guard ───────────────────────────
+test('isRefundAlreadyHandled: already-paid job is handled (no re-send)', () => {
+  assert.equal(isRefundAlreadyHandled('jobA', new Set(['jobA']), {}), true);
+});
+test('isRefundAlreadyHandled: job in pending ledger is handled (no double-queue)', () => {
+  assert.equal(isRefundAlreadyHandled('jobA', new Set(), { jobA: {} }), true);
+});
+test('isRefundAlreadyHandled: fresh job is not handled (safe to queue)', () => {
+  assert.equal(isRefundAlreadyHandled('jobA', new Set(['jobB']), { jobC: {} }), false);
+});
+test('isRefundAlreadyHandled: tolerates null/undefined collections', () => {
+  assert.equal(isRefundAlreadyHandled('jobA', null, null), false);
+  assert.equal(isRefundAlreadyHandled('jobA', undefined, undefined), false);
 });
 
 // ── isPrivateIp — IPv6 loopback + private address coverage ──────────────────
