@@ -27,6 +27,7 @@ const { findMainnetSecurityViolations, resolveIsMainnet } = require('./mainnet-g
 const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, liveLogPath, archiveLogPath } = require('./job-log.js');
 const { shouldRefundOrphan, isRefundAlreadyHandled } = require('./refund.js');
 const { isValidJobId } = require('./job-id.js');
+const { verifyInboxJobRecord } = require('./inbox-job-record.js');
 
 /** Feature flag: route in-container signing through the host-side broker
  *  instead of mounting the WIF into the container. Default ON; opt out only
@@ -5363,6 +5364,26 @@ async function checkPendingInbox(state) {
             console.log(`[Inbox] ✅ Review accepted for ${agentInfo.id}`);
           } else if (item.type === 'job_record') {
             console.log(`[Inbox] Processing job record ${item.id}`);
+
+            // ── Integrity ② — verify platform witness BEFORE writing on-chain ──
+            // Fetch the full inbox item so we can decode vdxfData + resolve jobId.
+            const { verifyWitness } = require('@junction41/sovagent-sdk/dist/index.js');
+            const { data: inboxItemDetail } = await agent.client.getInboxItem(item.id);
+            const network = J41_NETWORK;
+            const gateResult = await verifyInboxJobRecord({
+              inboxItemDetail,
+              getJobWitness: (jobId) => agent.client.getJobWitness(jobId),
+              verifyWitness,
+              client: agent.client,
+              network,
+            });
+
+            if (gateResult && gateResult.skip) {
+              console.log(`[Inbox] ⏭ Skipping job_record ${item.id} (transient): ${gateResult.reason}`);
+              continue;
+            }
+
+            // Verification + cross-check passed — safe to write on-chain.
             await agent.acceptJobRecord(item.id);
             console.log(`[Inbox] ✅ Job record written on-chain for ${agentInfo.id}`);
           }
