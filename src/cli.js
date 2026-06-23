@@ -5711,7 +5711,7 @@ async function startJobContainer(state, job, agentInfo) {
 
     // Mark as seen immediately to avoid duplicate pickup loops while status remains requested
     state.seen.set(job.id, Date.now());
-    saveSeenJobs(state.seen);
+    try { saveSeenJobs(state.seen); } catch (e) { console.error(`[Start] saveSeenJobs failed: ${e.message}`); }
     
     // Remove from available pool
     state.available = state.available.filter(a => a.id !== agentInfo.id);
@@ -5785,6 +5785,11 @@ async function startJobContainer(state, job, agentInfo) {
 
   } catch (e) {
     console.error(`❌ Failed to start container for ${job.id}:`, e.message);
+    // Clean up broker/signer resources that were allocated before the failure
+    // (state.active was never set, so stopJobContainer would early-return)
+    try { if (signerHost) await signerHost.destroy(); } catch {}
+    try { if (signerTeardown) await signerTeardown(); } catch {}
+    try { if (tmpKeysPath) fs.rmSync(path.join(os.tmpdir(), `j41-keys-${job.id}`), { recursive: true, force: true }); } catch {}
     // Return agent to pool
     state.available.push(agentInfo);
   }
@@ -5826,6 +5831,8 @@ function archiveJobLog(jobsDir, jobId, exitInfo) {
 async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   const active = state.active.get(jobId);
   if (!active) return;
+  if (active._stopping) return;
+  active._stopping = true;
 
   try {
     await active.container.stop();
@@ -5883,7 +5890,8 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   const jobDir = path.join(JOBS_DIR, jobId);
   archiveJobLog(JOBS_DIR, jobId, { exitCode: active._exitCode, killed: active._killed });
   if (fs.existsSync(jobDir) && !cfg.runtime.keep_containers) {
-    fs.rmSync(jobDir, { recursive: true });
+    try { fs.rmSync(jobDir, { recursive: true }); }
+    catch (e) { console.error(`[Cleanup] failed to remove ${jobDir}: ${e.message}`); }
   }
 
   // Return agent to pool (unless retrying or already returned during pause)
@@ -5897,6 +5905,7 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   if (active._timeoutTimer) clearTimeout(active._timeoutTimer);
 
   state.active.delete(jobId);
+  persistActiveJobs(state.active);
 
   // Prune per-job tracking Maps to prevent memory leaks
   state._lastSentStatus.delete(jobId);
@@ -6128,6 +6137,8 @@ async function startJobLocal(state, job, agentInfo) {
 async function stopJobLocal(state, jobId, skipReturnAgent = false) {
   const active = state.active.get(jobId);
   if (!active) return;
+  if (active._stopping) return;
+  active._stopping = true;
 
   // Kill the child process
   try {
@@ -6163,7 +6174,8 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
   const jobDir = path.join(JOBS_DIR, jobId);
   archiveJobLog(JOBS_DIR, jobId, { exitCode: active._exitCode, killed: active._killed });
   if (fs.existsSync(jobDir) && !cfg.runtime.keep_containers) {
-    fs.rmSync(jobDir, { recursive: true });
+    try { fs.rmSync(jobDir, { recursive: true }); }
+    catch (e) { console.error(`[Cleanup] failed to remove ${jobDir}: ${e.message}`); }
   }
 
   // Only return agent to pool if not already returned during pause
@@ -6244,6 +6256,7 @@ async function cleanupCompletedJobs(state) {
 
         if (!info.State.Running) {
           const exitCode = info.State.ExitCode;
+          if (active) active._exitCode = info.State.ExitCode;
           console.log(`🗑️  Container for job ${jobId} stopped (exit ${exitCode})`);
 
           if (exitCode !== 0) {
