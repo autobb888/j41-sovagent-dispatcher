@@ -26,6 +26,7 @@ const { defaultExecutors } = require('./broker-executors.js');
 const { findMainnetSecurityViolations, resolveIsMainnet } = require('./mainnet-guard.js');
 const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, liveLogPath, archiveLogPath } = require('./job-log.js');
 const { shouldRefundOrphan, isRefundAlreadyHandled } = require('./refund.js');
+const { isValidJobId } = require('./job-id.js');
 
 /** Feature flag: route in-container signing through the host-side broker
  *  instead of mounting the WIF into the container. Default ON; opt out only
@@ -5523,12 +5524,19 @@ function buildDispatcherSecurityOpt() {
   const opts = ['no-new-privileges:true'];
 
   // Seccomp profile — deployed by @junction41/secure-setup
-  const seccompPath = process.platform === 'linux'
-    ? '/etc/j41/seccomp-agent.json'
-    : path.join(os.homedir(), '.j41', 'seccomp-agent.json');
-
-  if (fs.existsSync(seccompPath)) {
+  // H5: check both /etc/j41 (system) and ~/.j41 (user) — prefer system install.
+  const seccompPathSystem = '/etc/j41/seccomp-agent.json';
+  const seccompPathUser   = path.join(os.homedir(), '.j41', 'seccomp-agent.json');
+  let seccompPath = null;
+  if (fs.existsSync(seccompPathSystem)) {
+    seccompPath = seccompPathSystem;
+  } else if (fs.existsSync(seccompPathUser)) {
+    seccompPath = seccompPathUser;
+  }
+  if (seccompPath) {
     opts.push(`seccomp=${seccompPath}`);
+  } else {
+    console.warn('[security] seccomp profile not found at /etc/j41 or ~/.j41 — container runs WITHOUT syscall filtering');
   }
 
   // AppArmor — Linux only
@@ -5537,6 +5545,8 @@ function buildDispatcherSecurityOpt() {
       const profiles = fs.readFileSync('/sys/kernel/security/apparmor/profiles', 'utf8');
       if (profiles.includes('j41-agent-profile')) {
         opts.push('apparmor=j41-agent-profile');
+      } else {
+        console.warn('[security] AppArmor profile j41-agent-profile not found — container runs WITHOUT AppArmor confinement');
       }
     } catch {
       // AppArmor not available — skip
@@ -5547,12 +5557,20 @@ function buildDispatcherSecurityOpt() {
 }
 
 function getDispatcherNetworkMode() {
-  // Use j41-isolated network if it exists, otherwise default bridge
+  // Use j41-isolated network if it exists, otherwise default bridge.
+  // M10: attempt to create j41-isolated if absent (best-effort); warn if still absent.
   try {
     require('child_process').execSync('docker network inspect j41-isolated', { stdio: 'ignore', timeout: 5000 });
     return 'j41-isolated';
   } catch {
-    return 'bridge';
+    // Network absent — try to create it
+    try {
+      require('child_process').execFileSync('docker', ['network', 'create', '--internal', 'j41-isolated'], { stdio: 'ignore', timeout: 10000 });
+      return 'j41-isolated';
+    } catch {
+      console.warn('[security] j41-isolated network absent — containers use the default bridge with unrestricted egress');
+      return 'bridge';
+    }
   }
 }
 
@@ -5661,15 +5679,16 @@ function readJobFileNoFollow(p, enc = 'utf8') {
 
 // Start a job container
 async function startJobContainer(state, job, agentInfo) {
+  if (!isValidJobId(job.id)) { console.error(`[security] Refusing job with invalid id: ${String(job.id).slice(0,40)}`); return; }
   if (!docker) {
     throw new Error('Docker not available. Switch to local mode: node src/cli.js config --runtime local');
   }
   const jobDir = path.join(JOBS_DIR, job.id);
   fs.mkdirSync(jobDir, { recursive: true });
-  // Ensure writable across rootless/user-namespaced container runtimes
-  // Use 0o755 — NOT 0o777 which lets any host process read/tamper job data
+  // Ensure writable by the dispatcher UID only (container runs as User: <uid>:<gid>
+  // so the bind-mounted jobDir is accessible). 0o700 keeps other host users out.
   try {
-    fs.chmodSync(jobDir, 0o755);
+    fs.chmodSync(jobDir, 0o700);
   } catch {
     // best effort
   }
@@ -5810,6 +5829,38 @@ async function startJobContainer(state, job, agentInfo) {
       ? [`${signerChannelDir}:/app/sign`]                      // rw — container writes req/, reads resp/
       : [`${tmpKeysPath}:/app/keys.json:ro`];
 
+    // M1: build HostConfig as a variable so we can patch CapDrop after the
+    // bwrap spread (which returns CapDrop:[] + CapAdd:['SYS_ADMIN'] and would
+    // otherwise silently wipe the 'ALL' drop).
+    const hostConfig = {
+      Binds: [
+        // job dir must be writable for attestation artifacts (creation/deletion json)
+        `${jobDir}:/app/job`,
+        ...signingBinds,
+        `${path.join(agentDir, 'SOUL.md')}:/app/SOUL.md:ro`,
+      ],
+      AutoRemove: !keepContainers,
+      Memory: 2 * 1024 * 1024 * 1024, // 2GB
+      CpuQuota: 100000, // 1 CPU core
+      ReadonlyRootfs: true,
+      Tmpfs: { '/tmp': 'rw,noexec,nosuid,size=64m' },
+      PidsLimit: 64,
+      CapDrop: ['ALL'],
+      Dns: ['8.8.8.8', '1.1.1.1'], // j41-isolated network can't use host systemd-resolved
+      // --- Security hardening (Plan B) ---
+      SecurityOpt: buildDispatcherSecurityOpt(),
+      NetworkMode: getDispatcherNetworkMode(),
+      ...(supportsStorageOpt() ? { StorageOpt: { size: '1G' } } : {}),
+      OomScoreAdj: 1000,
+      // gVisor runtime (if configured as Docker default)
+      ...(isGvisorAvailable() ? { Runtime: 'runsc' } : {}),
+      ...(getDispatcherBwrapConfig()),
+    };
+    // M1: if bwrap added SYS_ADMIN (CapDrop:[] wipes the 'ALL' drop), restore
+    // a scoped explicit drop-list keeping ONLY SYS_ADMIN.
+    if (hostConfig.CapAdd && hostConfig.CapAdd.includes('SYS_ADMIN')) {
+      hostConfig.CapDrop = ['CHOWN','DAC_OVERRIDE','FOWNER','FSETID','KILL','MKNOD','NET_BIND_SERVICE','NET_RAW','SETGID','SETUID','SETFCAP','SETPCAP','SYS_CHROOT','AUDIT_WRITE'];
+    }
     const container = await docker.createContainer({
       name: containerName,
       Image: 'j41/job-agent:latest',  // PRE-BAKED IMAGE
@@ -5828,30 +5879,7 @@ async function startJobContainer(state, job, agentInfo) {
             .map(([k, v]) => `${k}=${v}`)
             .concat(getExecutorEnvVars(agentInfo).filter(s => !s.startsWith('J41_LLM_')))
             .concat(brokerEnv),
-      HostConfig: {
-        Binds: [
-          // job dir must be writable for attestation artifacts (creation/deletion json)
-          `${jobDir}:/app/job`,
-          ...signingBinds,
-          `${path.join(agentDir, 'SOUL.md')}:/app/SOUL.md:ro`,
-        ],
-        AutoRemove: !keepContainers,
-        Memory: 2 * 1024 * 1024 * 1024, // 2GB
-        CpuQuota: 100000, // 1 CPU core
-        ReadonlyRootfs: true,
-        Tmpfs: { '/tmp': 'rw,noexec,nosuid,size=64m' },
-        PidsLimit: 64,
-        CapDrop: ['ALL'],
-        Dns: ['8.8.8.8', '1.1.1.1'], // j41-isolated network can't use host systemd-resolved
-        // --- Security hardening (Plan B) ---
-        SecurityOpt: buildDispatcherSecurityOpt(),
-        NetworkMode: getDispatcherNetworkMode(),
-        ...(supportsStorageOpt() ? { StorageOpt: { size: '1G' } } : {}),
-        OomScoreAdj: 1000,
-        // gVisor runtime (if configured as Docker default)
-        ...(isGvisorAvailable() ? { Runtime: 'runsc' } : {}),
-        ...(getDispatcherBwrapConfig()),
-      },
+      HostConfig: hostConfig,
       Labels: {
         'j41.job.id': job.id,
         'j41.agent.id': agentInfo.id,
@@ -6105,6 +6133,7 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
 // ─────────────────────────────────────────
 
 async function startJobLocal(state, job, agentInfo) {
+  if (!isValidJobId(job.id)) { console.error(`[security] Refusing job with invalid id: ${String(job.id).slice(0,40)}`); return; }
   // Security gate: block local mode unless --dev-unsafe was passed
   if (!state._devUnsafe) {
     console.error('');

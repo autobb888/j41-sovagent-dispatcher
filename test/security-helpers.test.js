@@ -91,3 +91,18 @@ for (const ip of [
 for (const ip of ['1.1.1.1', '8.8.8.8']) {
   test(`isPrivateIp allows ${ip}`, () => assert.equal(isPrivateIp(ip), false));
 }
+
+// ── W5: isValidJobId — path-traversal guard ─────────────────────────────────
+const { isValidJobId } = require('../src/job-id.js');
+test('isValidJobId accepts hex/uuid-ish ids', () => {
+  assert.equal(isValidJobId('abc123_DEF-456'), true);
+  assert.equal(isValidJobId('a'.repeat(32)), true);
+});
+test('isValidJobId rejects traversal/empty/oob', () => {
+  assert.equal(isValidJobId('../../tmp/evil'), false);
+  assert.equal(isValidJobId('a/b'), false);
+  assert.equal(isValidJobId(''), false);
+  assert.equal(isValidJobId('short'), false);          // <8
+  assert.equal(isValidJobId('a'.repeat(65)), false);   // >64
+  assert.equal(isValidJobId(null), false);
+});
