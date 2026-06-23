@@ -42,6 +42,7 @@ class A2AExecutor extends Executor {
 
     // Scan untrusted job description before forwarding to A2A backend.
     const safeDescription = await scanUntrusted(job.description, 'job_description');
+    const safeBuyer = await scanUntrusted(job.buyer, 'job_description');
 
     // Discover agent capabilities via Agent Card (with timeout)
     const cardController = new AbortController();
@@ -70,7 +71,7 @@ class A2AExecutor extends Executor {
         text: [
           `Job accepted.`,
           `Description: ${safeDescription}`,
-          `Buyer: ${job.buyer}`,
+          `Buyer: ${safeBuyer}`,
           `Payment: ${job.amount} ${job.currency}`,
           ``,
           `Please greet the buyer and begin work.`,

@@ -34,6 +34,7 @@ class WebhookExecutor extends Executor {
 
     // Scan untrusted job description before forwarding to backend.
     const safeDescription = await scanUntrusted(job.description, 'job_description');
+    const safeBuyer = await scanUntrusted(job.buyer, 'job_description');
 
     // POST job init to webhook
     const initPayload = {
@@ -41,7 +42,7 @@ class WebhookExecutor extends Executor {
       job: {
         id: job.id,
         description: safeDescription,
-        buyer: job.buyer,
+        buyer: safeBuyer,
         amount: job.amount,
         currency: job.currency,
       },

@@ -35,10 +35,11 @@ class LangGraphExecutor extends Executor {
 
     // Scan untrusted job description before forwarding to LangGraph backend.
     const safeDescription = await scanUntrusted(job.description, 'job_description');
+    const safeBuyer = await scanUntrusted(job.buyer, 'job_description');
 
     // Create a thread
     const thread = await this._request('POST', '/threads', {
-      metadata: { jobId: job.id, buyer: job.buyer },
+      metadata: { jobId: job.id, buyer: safeBuyer },
     });
     this.threadId = thread.thread_id;
     console.log(`[LANGGRAPH] Created thread: ${this.threadId}`);
@@ -47,7 +48,7 @@ class LangGraphExecutor extends Executor {
     const initMessage = [
       `New job accepted.`,
       `Description: ${safeDescription}`,
-      `Buyer: ${job.buyer}`,
+      `Buyer: ${safeBuyer}`,
       `Payment: ${job.amount} ${job.currency}`,
       ``,
       `Please greet the buyer and confirm acceptance.`,

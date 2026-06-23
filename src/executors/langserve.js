@@ -33,6 +33,7 @@ class LangServeExecutor extends Executor {
 
     // Scan untrusted job description before forwarding to LangServe backend.
     const safeDescription = await scanUntrusted(job.description, 'job_description');
+    const safeBuyer = await scanUntrusted(job.buyer, 'job_description');
 
     const response = await this._invoke({
       task: safeDescription,
@@ -40,7 +41,7 @@ class LangServeExecutor extends Executor {
         { role: 'system', content: soulPrompt },
         {
           role: 'user',
-          content: `New job accepted. Description: ${safeDescription}\nBuyer: ${job.buyer}\nPayment: ${job.amount} ${job.currency}\n\nPlease greet the buyer and confirm acceptance.`,
+          content: `New job accepted. Description: ${safeDescription}\nBuyer: ${safeBuyer}\nPayment: ${job.amount} ${job.currency}\n\nPlease greet the buyer and confirm acceptance.`,
         },
       ],
     });
