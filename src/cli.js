@@ -5383,7 +5383,9 @@ async function checkPendingInbox(state) {
               continue;
             }
 
-            // Verification + cross-check passed — safe to write on-chain.
+            // NOTE: acceptJobRecord re-fetches the inbox item; a platform serving different
+            // bytes between our verify-fetch and that write-fetch is moot — the platform is
+            // the witness signer (already the trust root). See verifyInboxJobRecord.
             await agent.acceptJobRecord(item.id);
             console.log(`[Inbox] ✅ Job record written on-chain for ${agentInfo.id}`);
           }

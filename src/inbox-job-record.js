@@ -56,8 +56,16 @@ function decodeInboxJobRecord(vdxfData) {
     );
   }
 
-  // Take the last entry (updateidentity appends; latest wins).
-  const subDD = entries[entries.length - 1];
+  // Fail-closed: platform must write exactly one entry (buildJobCompletionAdditions
+  // creates a single-element array). If there were >1 entries, earlier ones would
+  // pass through unverified — refuse.
+  if (entries.length > 1) {
+    throw new Error(
+      `decodeInboxJobRecord: job.record has ${entries.length} entries; refusing (platform must write exactly one)`,
+    );
+  }
+
+  const subDD = entries[0];
   if (typeof subDD !== 'object' || subDD === null) {
     throw new Error(`inbox job_record: sub-DD entry is not an object`);
   }
@@ -210,8 +218,11 @@ async function verifyInboxJobRecord({
     authRecord = result.record;
     authWitness = result.witness;
   } catch (e) {
-    // 409 = job not yet in `completed` state → transient, retry next poll
-    if (e && (e.statusCode === 409 || /409|not.*witness|witness.*not|not yet/.test(e.message))) {
+    // 409 = job not yet in `completed` state → transient, retry next poll.
+    // Treat as transient ONLY when the HTTP status is 409 or the backend's
+    // documented error code `NOT_WITNESSABLE` is present. Broad string patterns
+    // (e.g. "not yet") are intentionally excluded to avoid masking real errors.
+    if (e && (e.statusCode === 409 || (typeof e.message === 'string' && e.message.includes('NOT_WITNESSABLE')))) {
       return { skip: true, reason: `getJobWitness 409 (not yet witnessable): ${e.message}` };
     }
     throw e;

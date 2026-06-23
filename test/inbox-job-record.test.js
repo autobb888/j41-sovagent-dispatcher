@@ -120,17 +120,23 @@ test('decodeInboxJobRecord: throws when DataDescriptor key is missing from entry
   );
 });
 
-test('decodeInboxJobRecord: takes LAST entry when multiple are present', () => {
+test('decodeInboxJobRecord: throws when job.record has more than one entry (fail-closed)', () => {
+  // Platform must write exactly one entry; >1 means earlier entries pass through
+  // unverified, so we refuse rather than silently taking the last.
   const first = { ...SAMPLE_INBOX_RECORD, amount: 1 };
-  const last  = { ...SAMPLE_INBOX_RECORD, amount: 99 };
+  const second = { ...SAMPLE_INBOX_RECORD, amount: 99 };
   const vdxfData = {
     [JOB_RECORD_KEY]: [
       makeSubDDEntry(JOB_RECORD_KEY, JSON.stringify(first)),
-      makeSubDDEntry(JOB_RECORD_KEY, JSON.stringify(last)),
+      makeSubDDEntry(JOB_RECORD_KEY, JSON.stringify(second)),
     ],
   };
-  const result = decodeInboxJobRecord(vdxfData);
-  assert.strictEqual(result.amount, 99, 'last entry must win');
+  assert.throws(
+    () => decodeInboxJobRecord(vdxfData),
+    (e) =>
+      /refusing \(platform must write exactly one\)/.test(e.message) &&
+      e.message.includes('2 entries'),
+  );
 });
 
 // ── resolveJobId ──────────────────────────────────────────────────────────────
@@ -257,6 +263,17 @@ test('verifyInboxJobRecord: non-409 error from getJobWitness — propagates as t
   await assert.rejects(
     () => verifyInboxJobRecord(ctx),
     (e) => e.message === 'Network timeout',
+  );
+});
+
+test('verifyInboxJobRecord: generic "not yet synced" error (no statusCode 409, no NOT_WITNESSABLE) — propagates, not skip', async () => {
+  // "not yet" wording must NOT be treated as transient — only statusCode===409
+  // or explicit NOT_WITNESSABLE qualify. A broad regex would mask real errors.
+  const err = new Error('indexer not yet synced');
+  const ctx = makeCtx({ getJobWitnessError: err });
+  await assert.rejects(
+    () => verifyInboxJobRecord(ctx),
+    (e) => e.message === 'indexer not yet synced',
   );
 });
 
