@@ -161,7 +161,7 @@ function initialTokenBudget({ model, amountVrsc, spendFraction }, env = process.
   const entry = getModelCost(model) || mostExpensiveModelCost();
   const knownModel = !!getModelCost(model);
   const blendedPer1k = (entry.inputPer1k + entry.outputPer1k) / 2;
-  if (!(blendedPer1k > 0)) return { tokens: fallback, basis: 'fallback:zero-cost-model' };
+  if (!(blendedPer1k > 0)) return { tokens: fullFallback, basis: 'fallback:zero-cost-model' };
 
   const tokens = Math.max(Math.floor((spendUsd / blendedPer1k) * 1000), MIN_TOKEN_BUDGET);
   return {
