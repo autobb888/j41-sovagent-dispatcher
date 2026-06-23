@@ -3983,9 +3983,15 @@ program
         }
       }
 
-      if (archived.length) {
-        console.log(`\n── Archived Logs (${archived.length}) ──\n`);
-        for (const f of archived.slice(-20)) {
+      // Under keep_containers a job is both retained (live dir) and archived,
+      // so drop archives that already appear in the live section to avoid
+      // listing the same job id twice.
+      const liveIdSet = new Set(jobDirs);
+      const archivedOnly = archived.filter(f => !liveIdSet.has(f.slice(0, -4)));
+
+      if (archivedOnly.length) {
+        console.log(`\n── Archived Logs (${archivedOnly.length}) ──\n`);
+        for (const f of archivedOnly.slice(-20)) {
           const p = path.join(archiveDir, f);
           const stat = fs.statSync(p);
           const size = (stat.size / 1024).toFixed(1);
