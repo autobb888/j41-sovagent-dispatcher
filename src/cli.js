@@ -4844,6 +4844,10 @@ async function handleWebhookEvent(state, agentId, payload) {
       if (!jobId) return;
       if (state.active.has(jobId)) {
         console.log(`[Webhook] Job ${jobId.substring(0, 8)} cancelled — cleaning up`);
+        // Mark cancelled as an abnormal exit so its log is archived under the
+        // default 'errors' retention (deterministic + symmetric with local).
+        const cancelActive = state.active.get(jobId);
+        if (cancelActive) cancelActive._killed = true;
         if (RUNTIME === 'docker') {
           await stopJobContainer(state, jobId);
         } else {
@@ -5681,10 +5685,14 @@ async function startJobContainer(state, job, agentInfo) {
       fileStream.write(`[${new Date().toISOString()}] Container started — agent: ${agentInfo.id}, container: ${containerName}\n`);
       const writeCapped = makeCappedLogWriter(fileStream, cfg.runtime.job_log_max_bytes);
 
+      const activeEntry = state.active.get(job.id);
+
       // Capture the container's exit status for retention decisions at teardown.
+      // Bind to THIS generation's active entry (not a re-fetch by id) so a
+      // late-resolving wait() from a retried same-id container can't stamp its
+      // StatusCode onto the new entry and wrongly archive a clean retry.
       container.wait().then((r) => {
-        const a = state.active.get(job.id);
-        if (a) a._exitCode = r && r.StatusCode;
+        if (activeEntry) activeEntry._exitCode = r && r.StatusCode;
       }).catch(() => {});
 
       logStream.on('data', (chunk) => {
@@ -5703,7 +5711,6 @@ async function startJobContainer(state, job, agentInfo) {
       });
       logStream.on('error', () => { try { fileStream.end(); } catch { /* noop */ } });
 
-      const activeEntry = state.active.get(job.id);
       if (activeEntry) activeEntry._logStream = fileStream;
     } catch (e) {
       // Non-fatal: log streaming is for debugging only
