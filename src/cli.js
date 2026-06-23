@@ -72,6 +72,8 @@ const MAX_AGENTS = cfg.runtime.max_concurrent > 0
 const JOB_TIMEOUT_MS = (_cfg.jobTimeoutMin || 60) * 60 * 1000;
 const MAX_RETRIES = 2;
 const SEEN_JOBS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+// Job statuses that are permanently done — never re-run (H1: terminal-status check on retry).
+const TERMINAL_STATUSES = ['delivered', 'completed', 'cancelled', 'resolved', 'resolved_rejected'];
 
 // ── Financial Allowlist (Plan C) ──
 const ALLOWLIST_PATH = path.join(os.homedir(), '.j41', 'financial-allowlist.json');
@@ -4536,7 +4538,6 @@ async function pollForJobs(state) {
         }
 
         // Skip jobs in terminal states (delivered, completed, cancelled, resolved)
-        const TERMINAL_STATUSES = ['delivered', 'completed', 'cancelled', 'resolved', 'resolved_rejected'];
         if (TERMINAL_STATUSES.includes(job.status)) {
           state.seen.set(job.id, Date.now());
           continue;
@@ -4578,10 +4579,12 @@ async function pollForJobs(state) {
         // accepted + payment.verified = payment confirmed
         // accepted + payment.status === 'confirmed'/'completed' = payment confirmed
         // accepted + no payment object = platform doesn't enforce payment (let it through)
+        const allowUnpriced = process.env.J41_ALLOW_UNPRICED_JOBS === '1';
+        if (allowUnpriced && !job.payment) console.warn(`[Payment] Admitting job ${job.id} with NO payment record (J41_ALLOW_UNPRICED_JOBS=1)`);
         const isPaid = job.status === 'in_progress' ||
           (job.payment && job.payment.verified === true) ||
           (job.payment && (job.payment.status === 'confirmed' || job.payment.status === 'completed')) ||
-          (!job.payment); // platform doesn't populate payment → don't block
+          (allowUnpriced && !job.payment); // explicit opt-in required — bare no-payment no longer trusted (M8)
 
         if (!isPaid) {
           if (!state.pendingPayment.has(job.id)) {
@@ -6240,6 +6243,11 @@ async function cleanupCompletedJobs(state) {
               await stopJobLocal(state, jobId);
               continue;
             }
+            if (job && TERMINAL_STATUSES.includes(job.status)) {
+              console.log(`✅ Job ${jobId} already ${job.status} — skipping retry`);
+              await stopJobLocal(state, jobId);
+              continue;
+            }
             await stopJobLocal(state, jobId, true);
             await startJobLocal(state, job, agentInfo);
             continue;
@@ -6271,6 +6279,11 @@ async function cleanupCompletedJobs(state) {
                 job = await agent.client.getJob(jobId);
               } catch (fetchErr) {
                 console.error(`❌ Could not re-fetch job ${jobId} for retry: ${fetchErr.message}`);
+                await stopJobContainer(state, jobId);
+                continue;
+              }
+              if (job && TERMINAL_STATUSES.includes(job.status)) {
+                console.log(`✅ Job ${jobId} already ${job.status} — skipping retry`);
                 await stopJobContainer(state, jobId);
                 continue;
               }
