@@ -67,6 +67,12 @@ test('applyLogCap writes nothing once already at/over the cap', () => {
   assert.equal(r.data.length, 0);
   assert.equal(r.written, 10);
   assert.equal(r.truncated, false);
+
+  // over-cap: caller owns the tally, written is not clamped down
+  const over = applyLogCap(15, Buffer.from('x'), 10);
+  assert.equal(over.data.length, 0);
+  assert.equal(over.written, 15);
+  assert.equal(over.truncated, false);
 });
 
 test('applyLogCap exact-fit boundary is not truncated', () => {
@@ -90,6 +96,9 @@ test('selectLogsToPrune drops oldest-first when over cap', () => {
   ];
   assert.deepEqual(selectLogsToPrune(entries, 2), ['old']);
   assert.deepEqual(selectLogsToPrune(entries, 1), ['old', 'mid']);
+  // input array is never mutated (sort happens on a copy)
+  assert.equal(entries.length, 3);
+  assert.equal(entries[0].id, 'new');
 });
 
 test('selectLogsToPrune tolerates non-array', () => {
