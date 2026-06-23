@@ -18,6 +18,7 @@ function findMainnetSecurityViolations(env, opts) {
   if (e.J41_ALLOW_LOCAL_UPSTREAM === '1') v.push('J41_ALLOW_LOCAL_UPSTREAM=1 — disables SSRF protection on the proxy');
   if (e.J41_SKIP_STATUS_CHECK === '1') v.push('J41_SKIP_STATUS_CHECK=1 — skips agent platform-status checks');
   if (e.J41_ALLOW_LEGACY_REVOKE === '1') v.push('J41_ALLOW_LEGACY_REVOKE=1 — accepts replayable legacy revoke webhooks');
+  if (e.J41_WITNESS_VERIFY === 'off') v.push('J41_WITNESS_VERIFY=off — disables platform-witness verification of on-chain job records');
   return v;
 }
 

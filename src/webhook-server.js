@@ -337,11 +337,14 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
     }
 
     // Fix 3 — webhook replay nonce.
-    // Prefer the x-j41-event-id header, then body fields nonce/eventId.
+    // Prefer payload.id (signed body, source of truth), then nonce/eventId body fields,
+    // then the x-j41-event-id header as fallback.
     // If an event id is present, check-and-record it; reject replays (409).
     // If no event id is present, proceed as before but note the open window.
-    const bodyId = payload ? (payload.nonce != null ? payload.nonce : (payload.eventId != null ? payload.eventId : null)) : null;
-    const eventId = req.headers['x-j41-event-id'] || (bodyId != null ? String(bodyId) : null);
+    const bodyId = payload && payload.id != null ? payload.id
+                 : (payload && payload.nonce != null ? payload.nonce
+                 : (payload && payload.eventId != null ? payload.eventId : null));
+    const eventId = (bodyId != null ? String(bodyId) : null) || req.headers['x-j41-event-id'] || null;
     if (eventId) {
       const nc = checkAndRecordNonce(String(eventId));
       if (!nc.ok) {
@@ -350,8 +353,8 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
         return;
       }
     }
-    // BACKEND-DEP: platform must send a per-event id to fully close the replay
-    // window — see docs/backend-requests-2026-06-22.md
+    // BACKEND-DEP: platform now sends payload.id (per-event id in signed body) to
+    // close the replay window — see docs/backend-requests-2026-06-22.md
 
     // Respond immediately, process async
     res.writeHead(200, { 'Content-Type': 'application/json' });

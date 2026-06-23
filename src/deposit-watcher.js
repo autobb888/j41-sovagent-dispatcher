@@ -19,6 +19,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { creditDeposit } = require('./credit-meter');
+const { clampCredit } = require('./deposit-credit.js');
 const { loadDispatcherConfig } = require('./config-loader.js');
 const { checkAndRecordNonce } = require('./nonce-cache');
 
@@ -287,19 +288,23 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
       // Persisted by someone else after we claimed (e.g. a crash-recovery edge).
       return { credited: false, message: 'Deposit already processed' };
     }
-    const result = creditDeposit(agentId, buyerVerusId, expectedAmount, txid);
+    const credited = clampCredit(expectedAmount, verification.confirmedAmount);
+    if (credited < expectedAmount) {
+      console.warn(`[deposit] credited ${credited} < reported ${expectedAmount} (confirmedAmount=${verification.confirmedAmount}) for tx ${txid}`);
+    }
+    const result = creditDeposit(agentId, buyerVerusId, credited, txid);
 
     // Notify J41 platform (non-blocking, non-fatal) — uses per-agent context
     const ctx = _notifyContexts.get(agentId);
     if (ctx) {
-      notifyJ41DepositConfirmed(ctx.sellerWif, ctx.sellerVerusId, buyerVerusId, expectedAmount, txid, ctx.network).catch(() => {});
+      notifyJ41DepositConfirmed(ctx.sellerWif, ctx.sellerVerusId, buyerVerusId, credited, txid, ctx.network).catch(() => {});
     }
 
     // Mark as processed (on the fresh snapshot)
     fresh.processed.push({
       txid,
       buyerVerusId,
-      amount: expectedAmount,
+      amount: credited,
       confirmations: txStatus.confirmations,
       creditedAt: new Date().toISOString(),
     });
