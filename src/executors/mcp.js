@@ -81,13 +81,15 @@ class MCPExecutor extends Executor {
 
     // HOLE 1: scan the untrusted job description before it enters the system prompt.
     const safeDescription = await scanUntrusted(job.description, 'job_description');
+    // job.buyer is platform-supplied metadata — treat as untrusted.
+    const safeBuyer = await scanUntrusted(job.buyer, 'job_description');
 
     this.systemPrompt = [
       soulPrompt,
       '',
       '--- Job Context ---',
       `Job: ${safeDescription}`,
-      `Buyer: ${job.buyer}`,
+      `Buyer: ${safeBuyer}`,
       `Payment: ${job.amount} ${job.currency}`,
       '',
       'You are in a live chat session with tools available.',
@@ -102,8 +104,9 @@ class MCPExecutor extends Executor {
   }
 
   async handleMessage(message, meta) {
-    // HOLE 3 — see local-llm.js for rationale. Opt-in via J41_SCAN_BUYER_CHAT=1.
-    if (process.env.J41_SCAN_BUYER_CHAT === '1') {
+    // HOLE 3 — see local-llm.js for rationale.
+    // default-on; opt out with J41_SCAN_BUYER_CHAT=0
+    if (process.env.J41_SCAN_BUYER_CHAT !== '0') {
       message = await scanUntrusted(message, 'other_agent');
     }
     this.conversationLog.push({ role: 'user', content: message });

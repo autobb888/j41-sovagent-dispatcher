@@ -10,6 +10,7 @@
 
 const crypto = require('crypto');
 const { Executor } = require('./base.js');
+const { scanUntrusted } = require('../sovguard-context.js');
 
 const EXECUTOR_URL = process.env.J41_EXECUTOR_URL;
 const EXECUTOR_AUTH = process.env.J41_EXECUTOR_AUTH || '';
@@ -31,12 +32,15 @@ class WebhookExecutor extends Executor {
 
     this.job = job;
 
+    // Scan untrusted job description before forwarding to backend.
+    const safeDescription = await scanUntrusted(job.description, 'job_description');
+
     // POST job init to webhook
     const initPayload = {
       event: 'job_started',
       job: {
         id: job.id,
-        description: job.description,
+        description: safeDescription,
         buyer: job.buyer,
         amount: job.amount,
         currency: job.currency,
@@ -63,6 +67,8 @@ class WebhookExecutor extends Executor {
   }
 
   async handleMessage(message, meta) {
+    // Scan untrusted inbound message before forwarding to backend.
+    message = await scanUntrusted(message, 'other_agent');
     this.conversationLog.push({ role: 'user', content: message });
 
     // Cap conversation log to prevent OOM

@@ -11,6 +11,7 @@
 
 const crypto = require('crypto');
 const { Executor } = require('./base.js');
+const { scanUntrusted } = require('../sovguard-context.js');
 
 const EXECUTOR_URL = process.env.J41_EXECUTOR_URL;
 const EXECUTOR_AUTH = process.env.J41_EXECUTOR_AUTH || '';
@@ -32,6 +33,9 @@ class LangGraphExecutor extends Executor {
     }
     this.job = job;
 
+    // Scan untrusted job description before forwarding to LangGraph backend.
+    const safeDescription = await scanUntrusted(job.description, 'job_description');
+
     // Create a thread
     const thread = await this._request('POST', '/threads', {
       metadata: { jobId: job.id, buyer: job.buyer },
@@ -42,7 +46,7 @@ class LangGraphExecutor extends Executor {
     // Run initial message
     const initMessage = [
       `New job accepted.`,
-      `Description: ${job.description}`,
+      `Description: ${safeDescription}`,
       `Buyer: ${job.buyer}`,
       `Payment: ${job.amount} ${job.currency}`,
       ``,
@@ -61,6 +65,8 @@ class LangGraphExecutor extends Executor {
   }
 
   async handleMessage(message, meta) {
+    // Scan untrusted inbound message before forwarding to LangGraph backend.
+    message = await scanUntrusted(message, 'other_agent');
     this.conversationLog.push({ role: 'user', content: message });
 
     // Cap conversation log to prevent OOM

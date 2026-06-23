@@ -15,12 +15,17 @@
  */
 
 let _scanContext;
+let _scanUnavailableWarned = false;
 function getScanContext() {
   if (_scanContext === undefined) {
     try {
       _scanContext = require('@junction41/sovagent-sdk/dist/safety/context.js').scanContext;
     } catch (_e) {
       _scanContext = null; // SDK/scanner unavailable
+    }
+    if (_scanContext === null && !_scanUnavailableWarned) {
+      _scanUnavailableWarned = true;
+      console.warn('[sovguard] scanner module unavailable — inputs will pass through UNSCANNED');
     }
   }
   return _scanContext;

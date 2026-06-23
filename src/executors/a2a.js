@@ -16,6 +16,7 @@
 
 const crypto = require('crypto');
 const { Executor } = require('./base.js');
+const { scanUntrusted } = require('../sovguard-context.js');
 
 const EXECUTOR_URL = process.env.J41_EXECUTOR_URL;
 const EXECUTOR_AUTH = process.env.J41_EXECUTOR_AUTH || '';
@@ -38,6 +39,9 @@ class A2AExecutor extends Executor {
       throw new Error('J41_EXECUTOR_URL is required for a2a executor');
     }
     this.job = job;
+
+    // Scan untrusted job description before forwarding to A2A backend.
+    const safeDescription = await scanUntrusted(job.description, 'job_description');
 
     // Discover agent capabilities via Agent Card (with timeout)
     const cardController = new AbortController();
@@ -65,7 +69,7 @@ class A2AExecutor extends Executor {
         type: 'text',
         text: [
           `Job accepted.`,
-          `Description: ${job.description}`,
+          `Description: ${safeDescription}`,
           `Buyer: ${job.buyer}`,
           `Payment: ${job.amount} ${job.currency}`,
           ``,
@@ -81,6 +85,8 @@ class A2AExecutor extends Executor {
   }
 
   async handleMessage(message, meta) {
+    // Scan untrusted inbound message before forwarding to A2A backend.
+    message = await scanUntrusted(message, 'other_agent');
     this.conversationLog.push({ role: 'user', content: message });
 
     // Cap conversation log to prevent OOM

@@ -92,13 +92,15 @@ class LocalLLMExecutor extends Executor {
 
     // HOLE 1: scan the untrusted job description before it enters the system prompt.
     const safeDescription = await scanUntrusted(job.description, 'job_description');
+    // job.buyer is platform-supplied metadata — treat as untrusted.
+    const safeBuyer = await scanUntrusted(job.buyer, 'job_description');
 
     this.systemPrompt = [
       soulPrompt,
       '',
       '--- Job Context ---',
       `Job: ${safeDescription}`,
-      `Buyer: ${job.buyer}`,
+      `Buyer: ${safeBuyer}`,
       `Payment: ${job.amount} ${job.currency}`,
       '',
       'You are in a live chat session. Respond helpfully and concisely.',
@@ -133,18 +135,15 @@ class LocalLLMExecutor extends Executor {
   }
 
   async handleMessage(message, meta) {
-    // HOLE 3 (post-2.6.0 review): when an operator opts in via
-    // J41_SCAN_BUYER_CHAT=1, scan the buyer's live chat message before
-    // pushing it into conversationLog. The default trust model treats
-    // chat 'user' as trusted (operator-equivalent); operators running a
-    // seller agent against an untrusted marketplace buyer flip this to
-    // make the buyer's mid-session attempts to override / exfiltrate /
-    // jailbreak get caught alongside HOLE 1 (job.description) and HOLE 2
-    // (tool results). The SDK exposes no dedicated 'buyer_chat' source
-    // yet — 'other_agent' is the closest untrusted bucket and produces
-    // identical scanner behavior; the label appears in audit log/notify
-    // only, not in any trust decision.
-    if (process.env.J41_SCAN_BUYER_CHAT === '1') {
+    // HOLE 3 (post-2.6.0 review): scan the buyer's live chat message before
+    // pushing it into conversationLog. Default-on; operators running a
+    // seller agent who trust their specific buyer population can set
+    // J41_SCAN_BUYER_CHAT=0 to opt out. The SDK exposes no dedicated
+    // 'buyer_chat' source yet — 'other_agent' is the closest untrusted
+    // bucket and produces identical scanner behavior; the label appears in
+    // audit log/notify only, not in any trust decision.
+    // default-on; opt out with J41_SCAN_BUYER_CHAT=0
+    if (process.env.J41_SCAN_BUYER_CHAT !== '0') {
       message = await scanUntrusted(message, 'other_agent');
     }
     this.conversationLog.push({ role: 'user', content: message });
