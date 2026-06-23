@@ -5657,7 +5657,7 @@ async function startJobContainer(state, job, agentInfo) {
       const logPath = path.join(jobDir, 'output.log');
       const fileStream = fs.createWriteStream(logPath, { flags: 'a' });
       fileStream.on('error', () => {}); // disk full / racey rm — non-fatal
-      fileStream.write(`[${new Date().toISOString()}] Container started — agent: ${agentInfo.id}, container: ${container?.name || '?'}\n`);
+      fileStream.write(`[${new Date().toISOString()}] Container started — agent: ${agentInfo.id}, container: ${containerName}\n`);
       const writeCapped = makeCappedLogWriter(fileStream, cfg.runtime.job_log_max_bytes);
 
       // Capture the container's exit status for retention decisions at teardown.
