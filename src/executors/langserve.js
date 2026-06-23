@@ -54,8 +54,10 @@ class LangServeExecutor extends Executor {
   }
 
   async handleMessage(message, meta) {
-    // Scan untrusted inbound message before forwarding to LangServe backend.
-    message = await scanUntrusted(message, 'other_agent');
+    // Scan inbound message before forwarding to LangServe backend — default-on; opt out with J41_SCAN_BUYER_CHAT=0.
+    if (process.env.J41_SCAN_BUYER_CHAT !== '0') {
+      message = await scanUntrusted(message, 'other_agent');
+    }
     this.conversationLog.push({ role: 'user', content: message });
 
     // Cap conversation log to prevent OOM
