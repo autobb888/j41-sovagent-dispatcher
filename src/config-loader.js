@@ -18,6 +18,9 @@ const DEFAULTS = Object.freeze({
     health_port: 9842,
     control_api_port: 9843,
     webhook_url: '',
+    job_log_retention: 'errors',   // 'off' | 'errors' | 'all'
+    job_log_max_bytes: 5242880,    // 5 MB per output.log
+    job_log_max_retained: 50,      // archived logs kept under jobs/_logs/
   },
   logging: { level: 'info', format: 'text' },
   executor: {
@@ -130,6 +133,9 @@ const ENV_OVERRIDES = [
   ['J41_HEALTH_PORT',        'runtime.health_port',      'int'],
   ['J41_CONTROL_API_PORT',   'runtime.control_api_port', 'int'],
   ['J41_WEBHOOK_URL',        'runtime.webhook_url',      'string'],
+  ['J41_JOB_LOG_RETENTION',    'runtime.job_log_retention',    'string'],
+  ['J41_JOB_LOG_MAX_BYTES',    'runtime.job_log_max_bytes',    'int'],
+  ['J41_JOB_LOG_MAX_RETAINED', 'runtime.job_log_max_retained', 'int'],
   ['J41_LOG_LEVEL',          'logging.level',            'string'],
   ['J41_LOG_FORMAT',         'logging.format',           'string'],
   ['J41_EXECUTOR',           'executor.type',            'string'],

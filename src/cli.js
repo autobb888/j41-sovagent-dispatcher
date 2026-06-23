@@ -24,6 +24,7 @@ const { loadDispatcherConfig, fileConfiguredNetwork } = require('./config-loader
 const { SignChannelHost } = require('./sign-channel-host.js');
 const { defaultExecutors } = require('./broker-executors.js');
 const { findMainnetSecurityViolations, resolveIsMainnet } = require('./mainnet-guard.js');
+const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune } = require('./job-log.js');
 
 /** Feature flag: route in-container signing through the host-side broker
  *  instead of mounting the WIF into the container. Default ON; opt out only
@@ -3956,58 +3957,79 @@ program
     ensureDirs();
 
     if (!jobId) {
-      // List all jobs with logs
-      if (!fs.existsSync(JOBS_DIR)) {
-        console.log('No job logs found.');
-        return;
-      }
-      const jobDirs = fs.readdirSync(JOBS_DIR).filter(d => {
-        return fs.existsSync(path.join(JOBS_DIR, d, 'output.log'));
-      });
+      // List all jobs with logs: live job dirs + archived _logs/<id>.log.
+      const jobDirs = fs.existsSync(JOBS_DIR)
+        ? fs.readdirSync(JOBS_DIR).filter(d => d !== '_logs' && fs.existsSync(path.join(JOBS_DIR, d, 'output.log')))
+        : [];
+      const archiveDir = path.join(JOBS_DIR, '_logs');
+      const archived = fs.existsSync(archiveDir)
+        ? fs.readdirSync(archiveDir).filter(f => f.endsWith('.log'))
+        : [];
 
-      if (jobDirs.length === 0) {
+      if (jobDirs.length === 0 && archived.length === 0) {
         console.log('No job logs found. Logs are written when the dispatcher runs jobs.');
         return;
       }
 
-      console.log(`\n── Job Logs (${jobDirs.length}) ──\n`);
-      for (const dir of jobDirs.slice(-20)) { // last 20
-        const logPath = path.join(JOBS_DIR, dir, 'output.log');
-        const stat = fs.statSync(logPath);
-        const agentFile = path.join(JOBS_DIR, dir, 'buyer.txt');
-        const buyer = fs.existsSync(agentFile) ? fs.readFileSync(agentFile, 'utf-8').trim() : '?';
-        const size = (stat.size / 1024).toFixed(1);
-        console.log(`  ${dir.substring(0, 8)}  ${stat.mtime.toISOString().substring(0, 19)}  ${size}KB  buyer: ${buyer}`);
+      if (jobDirs.length) {
+        console.log(`\n── Job Logs (${jobDirs.length}) ──\n`);
+        for (const dir of jobDirs.slice(-20)) { // last 20
+          const logPath = path.join(JOBS_DIR, dir, 'output.log');
+          const stat = fs.statSync(logPath);
+          const agentFile = path.join(JOBS_DIR, dir, 'buyer.txt');
+          const buyer = fs.existsSync(agentFile) ? fs.readFileSync(agentFile, 'utf-8').trim() : '?';
+          const size = (stat.size / 1024).toFixed(1);
+          console.log(`  ${dir.substring(0, 8)}  ${stat.mtime.toISOString().substring(0, 19)}  ${size}KB  buyer: ${buyer}`);
+        }
       }
+
+      // Under keep_containers a job is both retained (live dir) and archived,
+      // so drop archives that already appear in the live section to avoid
+      // listing the same job id twice.
+      const liveIdSet = new Set(jobDirs);
+      const archivedOnly = archived.filter(f => !liveIdSet.has(f.slice(0, -4)));
+
+      if (archivedOnly.length) {
+        console.log(`\n── Archived Logs (${archivedOnly.length}) ──\n`);
+        for (const f of archivedOnly.slice(-20)) {
+          const p = path.join(archiveDir, f);
+          const stat = fs.statSync(p);
+          const size = (stat.size / 1024).toFixed(1);
+          console.log(`  ${f.slice(0, -4).substring(0, 8)}  ${stat.mtime.toISOString().substring(0, 19)}  ${size}KB  [archived]`);
+        }
+      }
+
       console.log(`\n  View: node src/cli.js logs <job-id-prefix>`);
       console.log(`  Tail: node src/cli.js logs <job-id-prefix> -f`);
       return;
     }
 
-    // Find matching job dir (supports prefix match)
-    if (!fs.existsSync(JOBS_DIR)) {
-      console.error(`❌ No jobs directory found.`);
-      process.exit(1);
-    }
-    const matches = fs.readdirSync(JOBS_DIR).filter(d => d.startsWith(jobId));
-    if (matches.length === 0) {
+    // Resolve the job prefix to a live output.log or an archived _logs/<id>.log.
+    const archiveDir = path.join(JOBS_DIR, '_logs');
+    const liveIds = fs.existsSync(JOBS_DIR)
+      ? fs.readdirSync(JOBS_DIR).filter(d => d !== '_logs' && d.startsWith(jobId) && fs.existsSync(path.join(JOBS_DIR, d, 'output.log')))
+      : [];
+    const archivedIds = fs.existsSync(archiveDir)
+      ? fs.readdirSync(archiveDir).filter(f => f.endsWith('.log') && f.slice(0, -4).startsWith(jobId)).map(f => f.slice(0, -4))
+      : [];
+    const matchIds = Array.from(new Set([...liveIds, ...archivedIds]));
+
+    if (matchIds.length === 0) {
       console.error(`❌ No job found matching "${jobId}"`);
       process.exit(1);
     }
-    if (matches.length > 1) {
-      console.error(`❌ Ambiguous prefix "${jobId}" — matches ${matches.length} jobs:`);
-      matches.forEach(m => console.error(`   ${m}`));
+    if (matchIds.length > 1) {
+      console.error(`❌ Ambiguous prefix "${jobId}" — matches ${matchIds.length} jobs:`);
+      matchIds.forEach(m => console.error(`   ${m}`));
       process.exit(1);
     }
 
-    const fullJobId = matches[0];
-    const logPath = path.join(JOBS_DIR, fullJobId, 'output.log');
+    const fullJobId = matchIds[0];
+    const liveLogPath = path.join(JOBS_DIR, fullJobId, 'output.log');
+    const logPath = fs.existsSync(liveLogPath) ? liveLogPath : path.join(archiveDir, `${fullJobId}.log`);
 
     if (!fs.existsSync(logPath)) {
       console.error(`❌ No log file for job ${fullJobId}`);
-      // Show what files exist
-      const files = fs.readdirSync(path.join(JOBS_DIR, fullJobId));
-      console.log(`   Files: ${files.join(', ')}`);
       process.exit(1);
     }
 
@@ -4822,6 +4844,10 @@ async function handleWebhookEvent(state, agentId, payload) {
       if (!jobId) return;
       if (state.active.has(jobId)) {
         console.log(`[Webhook] Job ${jobId.substring(0, 8)} cancelled — cleaning up`);
+        // Mark cancelled as an abnormal exit so its log is archived under the
+        // default 'errors' retention (deterministic + symmetric with local).
+        const cancelActive = state.active.get(jobId);
+        if (cancelActive) cancelActive._killed = true;
         if (RUNTIME === 'docker') {
           await stopJobContainer(state, jobId);
         } else {
@@ -5388,6 +5414,22 @@ function supportsStorageOpt() {
   return _storageOptSupported;
 }
 
+// Returns a write(text) fn that appends to logStream but never lets the file
+// exceed maxBytes; emits a single truncation notice when the cap is first hit.
+function makeCappedLogWriter(logStream, maxBytes) {
+  let written = 0;
+  let noticed = false;
+  return (text) => {
+    const r = applyLogCap(written, Buffer.from(text), maxBytes);
+    written = r.written;
+    if (r.data.length) logStream.write(r.data);
+    if (r.truncated && !noticed) {
+      noticed = true;
+      logStream.write(`\n[output.log truncated at ${maxBytes} bytes]\n`);
+    }
+  };
+}
+
 // Start a job container
 async function startJobContainer(state, job, agentInfo) {
   if (!docker) {
@@ -5626,7 +5668,9 @@ async function startJobContainer(state, job, agentInfo) {
 
     console.log(`✅ Container started for job ${job.id}`);
 
-    // Stream container logs to dispatcher stdout for debugging
+    // Stream container logs to the dispatcher console AND a per-job output.log,
+    // so `logs`/`logs -f`/the TUI tail work for container jobs (parity with the
+    // local-exec path). Best-effort: log failures never affect the job.
     try {
       const logStream = await container.logs({
         follow: true,
@@ -5635,17 +5679,39 @@ async function startJobContainer(state, job, agentInfo) {
         timestamps: false,
       });
       const shortId = job.id.substring(0, 8);
+      const logPath = path.join(jobDir, 'output.log');
+      const fileStream = fs.createWriteStream(logPath, { flags: 'a' });
+      fileStream.on('error', () => {}); // disk full / racey rm — non-fatal
+      fileStream.write(`[${new Date().toISOString()}] Container started — agent: ${agentInfo.id}, container: ${containerName}\n`);
+      const writeCapped = makeCappedLogWriter(fileStream, cfg.runtime.job_log_max_bytes);
+
+      const activeEntry = state.active.get(job.id);
+
+      // Capture the container's exit status for retention decisions at teardown.
+      // Bind to THIS generation's active entry (not a re-fetch by id) so a
+      // late-resolving wait() from a retried same-id container can't stamp its
+      // StatusCode onto the new entry and wrongly archive a clean retry.
+      container.wait().then((r) => {
+        if (activeEntry) activeEntry._exitCode = r && r.StatusCode;
+      }).catch(() => {});
+
       logStream.on('data', (chunk) => {
         // Docker multiplexed stream: first 8 bytes are header, rest is payload
         const lines = chunk.toString('utf8').replace(/[\x00-\x08]/g, '').trim();
         if (lines) {
+          writeCapped(lines + '\n');
           for (const line of lines.split('\n')) {
             const clean = line.trim();
             if (clean) console.log(`  [${shortId}] ${clean}`);
           }
         }
       });
-      logStream.on('error', () => {}); // ignore stream errors when container exits
+      logStream.on('end', () => {
+        try { fileStream.end(`[${new Date().toISOString()}] Container exited\n`); } catch { /* already closed */ }
+      });
+      logStream.on('error', () => { try { fileStream.end(); } catch { /* noop */ } });
+
+      if (activeEntry) activeEntry._logStream = fileStream;
     } catch (e) {
       // Non-fatal: log streaming is for debugging only
     }
@@ -5655,6 +5721,7 @@ async function startJobContainer(state, job, agentInfo) {
     const _timeoutTimer = setTimeout(async () => {
       const active = state.active.get(job.id);
       if (active) {
+        active._killed = true;
         console.log(`⏰ Job ${job.id} timeout, killing container`);
         await stopJobContainer(state, job.id);
       }
@@ -5668,6 +5735,28 @@ async function startJobContainer(state, job, agentInfo) {
     console.error(`❌ Failed to start container for ${job.id}:`, e.message);
     // Return agent to pool
     state.available.push(agentInfo);
+  }
+}
+
+// Archive a finished job's output.log to JOBS_DIR/_logs/<jobId>.log when the
+// retention policy says to keep it, then prune to job_log_max_retained.
+// Best-effort: never throws into the cleanup path.
+function archiveJobLog(jobDir, jobId, exitInfo) {
+  try {
+    const retention = resolveLogRetention(cfg);
+    const logPath = path.join(jobDir, 'output.log');
+    if (!fs.existsSync(logPath) || !shouldArchiveLog(retention, exitInfo)) return;
+    const archiveDir = path.join(JOBS_DIR, '_logs');
+    fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
+    fs.copyFileSync(logPath, path.join(archiveDir, `${jobId}.log`));
+    const entries = fs.readdirSync(archiveDir)
+      .filter(f => f.endsWith('.log'))
+      .map(f => ({ id: f.slice(0, -4), mtimeMs: fs.statSync(path.join(archiveDir, f)).mtimeMs }));
+    for (const id of selectLogsToPrune(entries, cfg.runtime.job_log_max_retained)) {
+      fs.rmSync(path.join(archiveDir, `${id}.log`), { force: true });
+    }
+  } catch (e) {
+    console.error(`[Logs] archive failed for ${jobId}: ${e.message}`);
   }
 }
 
@@ -5715,8 +5804,22 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
     try { await active._signerTeardown(); } catch { /* best-effort */ }
   }
 
-  // Cleanup job dir (retain for debugging if requested)
+  // Drain the per-job log stream before archiving. end() only *initiates* the
+  // flush; we await 'finish' so copyFileSync sees the final buffered bytes
+  // (exit banner + any queued tail) rather than racing them to disk.
+  if (active._logStream) {
+    await new Promise(resolve => {
+      let done = false;
+      const fin = () => { if (!done) { done = true; resolve(); } };
+      try { active._logStream.end(fin); } catch { fin(); /* already closed */ }
+      setTimeout(fin, 1000).unref(); // never block teardown on a wedged/destroyed stream
+    });
+  }
+
+  // Cleanup job dir (retain for debugging if requested). Archive even when
+  // keep_containers is on; the _logs/ copy is independent of the retained dir.
   const jobDir = path.join(JOBS_DIR, jobId);
+  archiveJobLog(jobDir, jobId, { exitCode: active._exitCode, killed: active._killed });
   if (fs.existsSync(jobDir) && !cfg.runtime.keep_containers) {
     fs.rmSync(jobDir, { recursive: true });
   }
@@ -5820,17 +5923,18 @@ async function startJobLocal(state, job, agentInfo) {
     const logPath = path.join(jobDir, 'output.log');
     const logStream = fs.createWriteStream(logPath, { flags: 'a' });
     logStream.write(`[${new Date().toISOString()}] Job started — agent: ${agentInfo.id}, PID: ${child.pid}\n`);
+    const writeCapped = makeCappedLogWriter(logStream, cfg.runtime.job_log_max_bytes);
 
     child.stdout.on('data', (data) => {
       const text = data.toString();
-      logStream.write(text);
+      writeCapped(text);
       text.trim().split('\n').forEach(line => {
         if (line.trim()) console.log(`  [${shortId}] ${line.trim()}`);
       });
     });
     child.stderr.on('data', (data) => {
       const text = data.toString();
-      logStream.write(text);
+      writeCapped(text);
       text.trim().split('\n').forEach(line => {
         if (line.trim()) console.error(`  [${shortId}] ${line.trim()}`);
       });
@@ -5839,6 +5943,8 @@ async function startJobLocal(state, job, agentInfo) {
     child.on('exit', (code, signal) => {
       logStream.write(`[${new Date().toISOString()}] Job process exited\n`);
       logStream.end();
+      const a = state.active.get(job.id);
+      if (a) { a._exitCode = code; a._killed = !!signal; }
       // Unexpected exit (non-zero, not a clean signal) counts as a crash for
       // the health document's containers_unhealthy rollup.
       if (code && code !== 0) {
@@ -5922,6 +6028,7 @@ async function startJobLocal(state, job, agentInfo) {
       currency: job.currency || 'VRSC',
       agentInfoId: agentInfo.id,
       reworkCount: 0,
+      _logStream: logStream,
     });
 
     state.emitEvent?.('container.started', {
@@ -5976,8 +6083,22 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
     // already dead
   }
 
-  // Cleanup job dir
+  // Drain the per-job log stream before archiving. The child's exit handler
+  // calls logStream.end() but that flush is async; await 'finish' so the
+  // archive copy includes the last buffered bytes.
+  if (active._logStream) {
+    await new Promise(resolve => {
+      let done = false;
+      const fin = () => { if (!done) { done = true; resolve(); } };
+      try { active._logStream.end(fin); } catch { fin(); /* already closed */ }
+      setTimeout(fin, 1000).unref(); // never block teardown on a wedged/destroyed stream
+    });
+  }
+
+  // Cleanup job dir. Archive even when keep_containers is on; the _logs/ copy
+  // is independent of the retained dir.
   const jobDir = path.join(JOBS_DIR, jobId);
+  archiveJobLog(jobDir, jobId, { exitCode: active._exitCode, killed: active._killed });
   if (fs.existsSync(jobDir) && !cfg.runtime.keep_containers) {
     fs.rmSync(jobDir, { recursive: true });
   }
