@@ -11,6 +11,7 @@
 
 const crypto = require('crypto');
 const { Executor } = require('./base.js');
+const { scanUntrusted } = require('../sovguard-context.js');
 
 const EXECUTOR_URL = process.env.J41_EXECUTOR_URL;
 const EXECUTOR_AUTH = process.env.J41_EXECUTOR_AUTH || '';
@@ -32,9 +33,14 @@ class LangGraphExecutor extends Executor {
     }
     this.job = job;
 
+    // Scan untrusted job description before forwarding to LangGraph backend.
+    const safeDescription = await scanUntrusted(job.description, 'job_description');
+    this.safeDescription = safeDescription;
+    const safeBuyer = await scanUntrusted(job.buyer, 'job_description');
+
     // Create a thread
     const thread = await this._request('POST', '/threads', {
-      metadata: { jobId: job.id, buyer: job.buyer },
+      metadata: { jobId: job.id, buyer: safeBuyer },
     });
     this.threadId = thread.thread_id;
     console.log(`[LANGGRAPH] Created thread: ${this.threadId}`);
@@ -42,8 +48,8 @@ class LangGraphExecutor extends Executor {
     // Run initial message
     const initMessage = [
       `New job accepted.`,
-      `Description: ${job.description}`,
-      `Buyer: ${job.buyer}`,
+      `Description: ${safeDescription}`,
+      `Buyer: ${safeBuyer}`,
       `Payment: ${job.amount} ${job.currency}`,
       ``,
       `Please greet the buyer and confirm acceptance.`,
@@ -54,13 +60,17 @@ class LangGraphExecutor extends Executor {
       system: soulPrompt,
     });
 
-    const greeting = result || `Hello! I've accepted your job: "${job.description.substring(0, 100)}". How can I help you?`;
+    const greeting = result || `Hello! I've accepted your job: "${this.safeDescription.substring(0, 100)}". How can I help you?`;
     agent.sendChatMessage(job.id, greeting);
     this.conversationLog.push({ role: 'assistant', content: greeting });
     console.log(`[LANGGRAPH] Sent greeting`);
   }
 
   async handleMessage(message, meta) {
+    // Scan inbound message before forwarding to LangGraph backend — default-on; opt out with J41_SCAN_BUYER_CHAT=0.
+    if (process.env.J41_SCAN_BUYER_CHAT !== '0') {
+      message = await scanUntrusted(message, 'other_agent');
+    }
     this.conversationLog.push({ role: 'user', content: message });
 
     // Cap conversation log to prevent OOM

@@ -34,8 +34,39 @@ function verifyInboundWebhook(rawBody, headers, secret, opts = {}) {
 }
 const { reportDeposit } = require('./deposit-watcher.js');
 const { loadDispatcherConfig } = require('./config-loader.js');
+const { checkAndRecordNonce } = require('./nonce-cache.js');
 
 const MAX_BODY_SIZE = loadDispatcherConfig().webhook.max_body_bytes;
+
+// Fix 5 — Per-source-IP token bucket for /j41/discovery/request-access.
+// 10 tokens/sec refill, burst of 30. Keyed by client IP.
+// Pattern reuses the same bucket shape as proxy-rate-limiter.js.
+const _discoveryBuckets = new Map(); // ip → { tokens, lastRefill }
+const DISCOVERY_RPS = 10;
+const DISCOVERY_BURST = 30;
+
+function _checkDiscoveryRate(ip) {
+  const now = Date.now();
+  let b = _discoveryBuckets.get(ip);
+  if (!b) {
+    b = { tokens: DISCOVERY_BURST, lastRefill: now };
+    // Simple LRU evict at 10k entries to bound memory
+    if (_discoveryBuckets.size >= 10_000) {
+      const oldest = _discoveryBuckets.keys().next().value;
+      if (oldest !== undefined) _discoveryBuckets.delete(oldest);
+    }
+    _discoveryBuckets.set(ip, b);
+  } else {
+    const elapsed = (now - b.lastRefill) / 1000;
+    b.tokens = Math.min(DISCOVERY_BURST, b.tokens + elapsed * DISCOVERY_RPS);
+    b.lastRefill = now;
+  }
+  if (b.tokens >= 1) {
+    b.tokens -= 1;
+    return true;
+  }
+  return false;
+}
 
 /** Read request body with size limit. Returns string or null (error already sent). */
 async function readBody(req, res) {
@@ -84,12 +115,11 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
   const MAX_CONNECTIONS = Number(process.env.J41_WEBHOOK_MAX_CONNECTIONS || 512);
 
   const server = http.createServer(async (req, res) => {
-    // Health check
+    // Health check — Fix 6: version field omitted to avoid version disclosure.
     if (req.method === 'GET' && (req.url === '/health' || req.url === '/j41/health')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         service: 'dispatcher',
-        version: require('../package.json').version,
         status: 'ok',
         agents: agentWebhooks.size,
         proxy: !!proxyContext,
@@ -100,7 +130,15 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
     // ── API Proxy Routes ──
 
     // POST /j41/discovery/request-access — ECDH key exchange
+    // Fix 5 — rate-limit: 10 req/sec, burst 30, per source IP before the
+    // outbound getIdentityKeys call to prevent amplification DoS.
     if (req.method === 'POST' && req.url === '/j41/discovery/request-access' && proxyContext?.onAccessRequest) {
+      const clientIp = req.socket?.remoteAddress || 'unknown';
+      if (!_checkDiscoveryRate(clientIp)) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+        res.end(JSON.stringify({ error: 'Rate limit exceeded' }));
+        return;
+      }
       const body = await readBody(req, res);
       if (body === null) return; // readBody already sent error response
       try {
@@ -183,16 +221,14 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
       }
 
       const secret = proxyContext.lookupAgentSecret?.(sellerVerusId);
-      if (!secret) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Seller not found on this dispatcher' }));
-        return;
-      }
+      // Fix 4 — uniform 403: return the SAME status whether the seller is
+      // unknown or the signature is bad.  A distinct 404 would let an
+      // attacker enumerate which sellers are registered on this dispatcher.
       // Revoke is sensitive (knocks a buyer offline) — require the timestamped
       // signature so a captured legacy-signed revoke can't be replayed. Escape
       // hatch J41_ALLOW_LEGACY_REVOKE=1 for the dual-sign rollout window.
       const requireTimestamped = process.env.J41_ALLOW_LEGACY_REVOKE !== '1';
-      if (!verifyInboundWebhook(body, req.headers, secret, { requireTimestamped })) {
+      if (!secret || !verifyInboundWebhook(body, req.headers, secret, { requireTimestamped })) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Invalid or stale signature (timestamped signature required)' }));
         return;
@@ -299,6 +335,23 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
       res.end('Invalid JSON');
       return;
     }
+
+    // Fix 3 — webhook replay nonce.
+    // Prefer the x-j41-event-id header, then body fields nonce/eventId.
+    // If an event id is present, check-and-record it; reject replays (409).
+    // If no event id is present, proceed as before but note the open window.
+    const bodyId = payload ? (payload.nonce != null ? payload.nonce : (payload.eventId != null ? payload.eventId : null)) : null;
+    const eventId = req.headers['x-j41-event-id'] || (bodyId != null ? String(bodyId) : null);
+    if (eventId) {
+      const nc = checkAndRecordNonce(String(eventId));
+      if (!nc.ok) {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Duplicate event', reason: nc.reason }));
+        return;
+      }
+    }
+    // BACKEND-DEP: platform must send a per-event id to fully close the replay
+    // window — see docs/backend-requests-2026-06-22.md
 
     // Respond immediately, process async
     res.writeHead(200, { 'Content-Type': 'application/json' });

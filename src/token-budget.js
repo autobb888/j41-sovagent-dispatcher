@@ -21,6 +21,14 @@
 // early" instead of "cannot respond at all".
 const MIN_TOKEN_BUDGET = 1000;
 
+// Minimum VRSC amount that earns the full DEFAULT_FALLBACK_TOKEN_BUDGET when
+// the exchange rate is unavailable. Jobs paid below this floor receive a
+// proportionally smaller fallback budget so that a near-zero payment cannot
+// silently claim the same session capacity as a normally-priced job (M3 cap).
+// This is purely a safety proportionality floor — it does NOT set a price
+// floor for the marketplace; live-rate jobs are priced via vrscToUsd as usual.
+const FALLBACK_MIN_VRSC = 0.01;
+
 // Defaults for the env-tunable knobs (host forwards config.toml [budget]
 // values as these env vars; see buildContainerEnv in cli.js).
 const DEFAULT_RATE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24h
@@ -122,13 +130,25 @@ function vrscToUsd(amountVrsc, env = process.env) {
  * can never run unmetered (audit fix #2).
  */
 function initialTokenBudget({ model, amountVrsc, spendFraction }, env = process.env) {
-  const fallback = Math.max(
+  const fullFallback = Math.max(
     parseInt(env.J41_FALLBACK_TOKEN_BUDGET) || DEFAULT_FALLBACK_TOKEN_BUDGET,
     MIN_TOKEN_BUDGET
   );
 
   const usd = vrscToUsd(amountVrsc, env);
-  if (usd == null) return { tokens: fallback, basis: 'fallback:no-rate' };
+  if (usd == null) {
+    // Cap the fallback proportionally to the job's payment amount so a
+    // near-zero payment cannot claim the same session capacity as a
+    // normally-priced job when no exchange rate is available (M3 cap).
+    // At or above FALLBACK_MIN_VRSC → full budget; below → scaled down,
+    // never below MIN_TOKEN_BUDGET and never unlimited.
+    const vrsc = parseFloat(amountVrsc);
+    let fallback = fullFallback;
+    if (Number.isFinite(vrsc) && vrsc >= 0 && vrsc < FALLBACK_MIN_VRSC) {
+      fallback = Math.max(Math.floor(fullFallback * vrsc / FALLBACK_MIN_VRSC), MIN_TOKEN_BUDGET);
+    }
+    return { tokens: fallback, basis: 'fallback:no-rate' };
+  }
 
   // Explicit caller fraction (e.g. rework budgets pass 1.0 — the dispute
   // policy already sized the share) wins over the env knob.
@@ -141,7 +161,7 @@ function initialTokenBudget({ model, amountVrsc, spendFraction }, env = process.
   const entry = getModelCost(model) || mostExpensiveModelCost();
   const knownModel = !!getModelCost(model);
   const blendedPer1k = (entry.inputPer1k + entry.outputPer1k) / 2;
-  if (!(blendedPer1k > 0)) return { tokens: fallback, basis: 'fallback:zero-cost-model' };
+  if (!(blendedPer1k > 0)) return { tokens: fullFallback, basis: 'fallback:zero-cost-model' };
 
   const tokens = Math.max(Math.floor((spendUsd / blendedPer1k) * 1000), MIN_TOKEN_BUDGET);
   return {
@@ -212,4 +232,5 @@ module.exports = {
   MIN_TOKEN_BUDGET,
   DEFAULT_FALLBACK_TOKEN_BUDGET,
   DEFAULT_SPEND_FRACTION,
+  FALLBACK_MIN_VRSC,
 };

@@ -204,9 +204,26 @@ class SignChannelHost {
       // BEFORE we read it. A misbehaving container can otherwise drop a
       // 100GB file into /app/sign and OOM the dispatcher. 256 KB is well
       // above any sensible sign-request payload.
+      // Security (B1, 2026-06-23): open with O_NOFOLLOW so a malicious
+      // container cannot plant a symlink in /app/sign/req/ that redirects to
+      // a host path. ELOOP → refuse and log; ENOENT → silent return (race).
+      // fstat on the fd closes the stat→read TOCTOU window.
       const MAX_SIGN_REQ_BYTES = Number(process.env.J41_SIGN_REQ_MAX_BYTES || 256 * 1024);
+      let fh;
       try {
-        const st = await fsp.stat(reqPath);
+        fh = await fsp.open(reqPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      } catch (e) {
+        if (e.code === 'ELOOP') {
+          this.log(`[sign-channel] refusing symlinked request ${filename}`);
+          return;
+        }
+        if (e.code === 'ENOENT') return;
+        this.log(`[sign-channel] open ${filename} failed: ${e.message}`);
+        return;
+      }
+      let raw;
+      try {
+        const st = await fh.stat();
         if (st.size > MAX_SIGN_REQ_BYTES) {
           await this._writeResponse(filename.replace(/\.json$/, ''), {
             ok: false,
@@ -215,18 +232,13 @@ class SignChannelHost {
           await this._removeReq(reqPath);
           return;
         }
+        raw = await fh.readFile('utf8');
       } catch (e) {
-        if (e.code !== 'ENOENT') this.log(`[sign-channel] stat ${filename} failed: ${e.message}`);
-        return;
-      }
-      let raw;
-      try {
-        raw = await fsp.readFile(reqPath, 'utf8');
-      } catch (e) {
-        // Either someone else already consumed it (ENOENT) or transient FS
-        // hiccup — either way we just bail; the polling sweep will retry.
+        // Transient FS hiccup — bail; the polling sweep will retry.
         if (e.code !== 'ENOENT') this.log(`[sign-channel] read ${filename} failed: ${e.message}`);
         return;
+      } finally {
+        await fh.close();
       }
 
       let req;

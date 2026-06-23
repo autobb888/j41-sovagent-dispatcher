@@ -11,6 +11,7 @@
 
 const crypto = require('crypto');
 const { Executor } = require('./base.js');
+const { scanUntrusted } = require('../sovguard-context.js');
 
 const EXECUTOR_URL = process.env.J41_EXECUTOR_URL;
 const EXECUTOR_AUTH = process.env.J41_EXECUTOR_AUTH || '';
@@ -30,24 +31,33 @@ class LangServeExecutor extends Executor {
     }
     this.job = job;
 
+    // Scan untrusted job description before forwarding to LangServe backend.
+    const safeDescription = await scanUntrusted(job.description, 'job_description');
+    this.safeDescription = safeDescription;
+    const safeBuyer = await scanUntrusted(job.buyer, 'job_description');
+
     const response = await this._invoke({
-      task: job.description,
+      task: safeDescription,
       messages: [
         { role: 'system', content: soulPrompt },
         {
           role: 'user',
-          content: `New job accepted. Description: ${job.description}\nBuyer: ${job.buyer}\nPayment: ${job.amount} ${job.currency}\n\nPlease greet the buyer and confirm acceptance.`,
+          content: `New job accepted. Description: ${safeDescription}\nBuyer: ${safeBuyer}\nPayment: ${job.amount} ${job.currency}\n\nPlease greet the buyer and confirm acceptance.`,
         },
       ],
     });
 
-    const greeting = response || `Hello! I've accepted your job: "${job.description.substring(0, 100)}". How can I help you?`;
+    const greeting = response || `Hello! I've accepted your job: "${this.safeDescription.substring(0, 100)}". How can I help you?`;
     agent.sendChatMessage(job.id, greeting);
     this.conversationLog.push({ role: 'assistant', content: greeting });
     console.log(`[LANGSERVE] Sent greeting`);
   }
 
   async handleMessage(message, meta) {
+    // Scan inbound message before forwarding to LangServe backend — default-on; opt out with J41_SCAN_BUYER_CHAT=0.
+    if (process.env.J41_SCAN_BUYER_CHAT !== '0') {
+      message = await scanUntrusted(message, 'other_agent');
+    }
     this.conversationLog.push({ role: 'user', content: message });
 
     // Cap conversation log to prevent OOM
@@ -57,7 +67,7 @@ class LangServeExecutor extends Executor {
     }
 
     const response = await this._invoke({
-      task: this.job.description,
+      task: this.safeDescription,
       messages: this.conversationLog,
     });
 

@@ -14,6 +14,7 @@ const { createExecutor, EXECUTOR_TYPE } = require('./executors/index.js');
 const { createJobSigner } = require('./job-signer.js');
 const { SignChannelClient } = require('./sign-channel-client.js');
 const log = require('./logger.js');
+const { scanUntrusted } = require('./sovguard-context.js');
 
 const API_URL = process.env.J41_API_URL;
 const AGENT_ID = process.env.J41_AGENT_ID;
@@ -1384,6 +1385,9 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
             } catch (e) {
               console.log('⚠️  Could not fetch dispute reason:', e.message);
             }
+            // Scan dispute.reason before it enters the executor context —
+            // it's other-agent/platform-supplied text, not a trusted source.
+            reworkContext = await scanUntrusted(reworkContext, 'other_agent'); // handleMessage will scan again — acceptable (scanUntrusted is idempotent on clean text)
 
             // Calculate rework token budget from the dispute policy's share of
             // the job value, via the single conversion helper — real exchange
@@ -1410,6 +1414,12 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
 
             const reworkResult = await resumeJob(job, agent, soulPrompt, executor, registerSessionEndResolve, reworkContext, tokenBudget);
             console.log('✅ Rework completed — re-delivering...');
+
+            // Strip canary token from rework deliverable content (same as
+            // main delivery path at STEP 3) before sending to platform.
+            if (CANARY_TOKEN && reworkResult.content) {
+              reworkResult.content = reworkResult.content.split(CANARY_TOKEN).join('[redacted]');
+            }
 
             // 'rework' is not a hex SHA-256; hash the sentinel so the
             // broker policy accepts it and both paths agree.

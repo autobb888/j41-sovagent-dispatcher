@@ -24,7 +24,9 @@ const { loadDispatcherConfig, fileConfiguredNetwork } = require('./config-loader
 const { SignChannelHost } = require('./sign-channel-host.js');
 const { defaultExecutors } = require('./broker-executors.js');
 const { findMainnetSecurityViolations, resolveIsMainnet } = require('./mainnet-guard.js');
-const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune } = require('./job-log.js');
+const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, liveLogPath, archiveLogPath } = require('./job-log.js');
+const { shouldRefundOrphan, isRefundAlreadyHandled } = require('./refund.js');
+const { isValidJobId } = require('./job-id.js');
 
 /** Feature flag: route in-container signing through the host-side broker
  *  instead of mounting the WIF into the container. Default ON; opt out only
@@ -60,6 +62,8 @@ const AGENTS_DIR = path.join(DISPATCHER_DIR, 'agents');
 const QUEUE_DIR = path.join(DISPATCHER_DIR, 'queue');
 const JOBS_DIR = path.join(DISPATCHER_DIR, 'jobs');
 const SEEN_JOBS_PATH = path.join(DISPATCHER_DIR, 'seen-jobs.json');
+const PENDING_REFUNDS_PATH = path.join(DISPATCHER_DIR, 'pending-refunds.json');
+const REFUNDED_JOBS_PATH = path.join(DISPATCHER_DIR, 'refunded-jobs.json');
 const FINALIZE_STATE_FILENAME = 'finalize-state.json';
 
 const J41_API_URL = cfg.platform.api_url;
@@ -72,6 +76,8 @@ const MAX_AGENTS = cfg.runtime.max_concurrent > 0
 const JOB_TIMEOUT_MS = (_cfg.jobTimeoutMin || 60) * 60 * 1000;
 const MAX_RETRIES = 2;
 const SEEN_JOBS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+// Job statuses that are permanently done — never re-run (H1: terminal-status check on retry).
+const TERMINAL_STATUSES = ['delivered', 'completed', 'cancelled', 'resolved', 'resolved_rejected'];
 
 // ── Financial Allowlist (Plan C) ──
 const ALLOWLIST_PATH = path.join(os.homedir(), '.j41', 'financial-allowlist.json');
@@ -298,6 +304,11 @@ function ensureDirs() {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
   });
+  // Ensure _live dir (host-only; never bind-mounted). Mode 0o700 — only dispatcher UID.
+  try { fs.mkdirSync(path.join(JOBS_DIR, '_live'), { recursive: true, mode: 0o700 }); } catch {}
+  // Best-effort sweep: remove stale _live/*.log whose job id is not in state.active.
+  // state is not available in ensureDirs scope (called before start), so just ensure dir exists.
+  // Actual stale-log cleanup happens at dispatcher start (see startup sweep below).
   // Defense-in-depth: re-lock any existing agent dirs / keys that older
   // dispatcher versions (or unrelated tools) may have created with looser
   // permissions. Cheap idempotent sweep — runs on every CLI invocation.
@@ -3050,12 +3061,33 @@ program
       agentMarkup: new Map(), // agentId -> markup percentage
       pendingPayment: new Map(), // jobId -> payment info
       _lastSentStatus: new Map(), // jobId -> last status sent
-      _lastExtensionCheck: new Map(), // jobId -> last extension check timestamp
+      _lastExtensionCheck: new Map(), // ext.id -> { ts, jobId } (dedup of dispatched extension requests; pruned by jobId at job teardown)
       _pendingWorkspace: new Map(), // jobId -> workspace connect promise
       _agentErrors: new Map(), // agentId -> last error string (health document)
       _containerCrashes: new Map(), // agentId -> unexpected-exit count (health document)
       _devUnsafe, // security: allows local mode when true
     };
+
+    // ── Startup sweep: remove stale _live/*.log for jobs not in active state ──
+    // Guards against dispatcher crash leaving orphaned live-log files.
+    // IMPORTANT: do NOT delete logs whose job is in active-jobs.json — those are
+    // jobs that were running when the dispatcher crashed. handleCrashRecovery()
+    // (called below) will issue refunds for them, and the operator may need the
+    // logs to diagnose what went wrong.
+    try {
+      const liveDir = path.join(JOBS_DIR, '_live');
+      if (fs.existsSync(liveDir)) {
+        // Load persisted orphan IDs from the same source handleCrashRecovery uses.
+        const orphanIds = new Set(Object.keys(loadActiveJobs()));
+        for (const f of fs.readdirSync(liveDir)) {
+          if (!f.endsWith('.log')) continue;
+          const jobIdFromFile = f.slice(0, -4);
+          if (!state.active.has(jobIdFromFile) && !orphanIds.has(jobIdFromFile)) {
+            try { fs.rmSync(path.join(liveDir, f), { force: true }); } catch {}
+          }
+        }
+      }
+    } catch {}
 
     // ── Task 18: First-run security setup ──────────────────────
     const initMarker = path.join(os.homedir(), '.j41', 'dispatcher-security-initialized');
@@ -3740,6 +3772,9 @@ program
       console.error(`[Dispatcher] Unhandled rejection (non-fatal):`, reason?.message || reason);
     });
 
+    // Drain any pending refunds left over from a previous crash mid-loop
+    await drainPendingRefunds(state);
+
     // Crash recovery — process orphaned jobs before accepting new ones
     await handleCrashRecovery(state);
 
@@ -3957,36 +3992,39 @@ program
     ensureDirs();
 
     if (!jobId) {
-      // List all jobs with logs: live job dirs + archived _logs/<id>.log.
-      const jobDirs = fs.existsSync(JOBS_DIR)
-        ? fs.readdirSync(JOBS_DIR).filter(d => d !== '_logs' && fs.existsSync(path.join(JOBS_DIR, d, 'output.log')))
+      // List all jobs with logs: _live/*.log (active) + _logs/*.log (archived).
+      const liveDir = path.join(JOBS_DIR, '_live');
+      const liveFiles = fs.existsSync(liveDir)
+        ? fs.readdirSync(liveDir).filter(f => f.endsWith('.log') && (() => { try { return !fs.lstatSync(path.join(liveDir, f)).isSymbolicLink(); } catch { return false; } })())
         : [];
       const archiveDir = path.join(JOBS_DIR, '_logs');
       const archived = fs.existsSync(archiveDir)
-        ? fs.readdirSync(archiveDir).filter(f => f.endsWith('.log'))
+        ? fs.readdirSync(archiveDir).filter(f => f.endsWith('.log') && (() => { try { return !fs.lstatSync(path.join(archiveDir, f)).isSymbolicLink(); } catch { return false; } })())
         : [];
 
-      if (jobDirs.length === 0 && archived.length === 0) {
+      if (liveFiles.length === 0 && archived.length === 0) {
         console.log('No job logs found. Logs are written when the dispatcher runs jobs.');
         return;
       }
 
-      if (jobDirs.length) {
-        console.log(`\n── Job Logs (${jobDirs.length}) ──\n`);
-        for (const dir of jobDirs.slice(-20)) { // last 20
-          const logPath = path.join(JOBS_DIR, dir, 'output.log');
-          const stat = fs.statSync(logPath);
-          const agentFile = path.join(JOBS_DIR, dir, 'buyer.txt');
-          const buyer = fs.existsSync(agentFile) ? fs.readFileSync(agentFile, 'utf-8').trim() : '?';
+      if (liveFiles.length) {
+        console.log(`\n── Active Job Logs (${liveFiles.length}) ──\n`);
+        for (const f of liveFiles.slice(-20)) {
+          const p = path.join(liveDir, f);
+          const jobLogId = f.slice(0, -4);
+          const stat = fs.statSync(p);
+          const bf = path.join(JOBS_DIR, jobLogId, 'buyer.txt');
+          // NOFOLLOW guard: refuse symlinks atomically (no TOCTOU vs lstat+read).
+          const buyerRaw = fs.existsSync(bf) ? readJobFileNoFollow(bf) : null;
+          const buyer = buyerRaw !== null ? buyerRaw.trim() : '?';
           const size = (stat.size / 1024).toFixed(1);
-          console.log(`  ${dir.substring(0, 8)}  ${stat.mtime.toISOString().substring(0, 19)}  ${size}KB  buyer: ${buyer}`);
+          console.log(`  ${jobLogId.substring(0, 8)}  ${stat.mtime.toISOString().substring(0, 19)}  ${size}KB  buyer: ${buyer}  [active]`);
         }
       }
 
-      // Under keep_containers a job is both retained (live dir) and archived,
-      // so drop archives that already appear in the live section to avoid
+      // Drop archives that already appear in the live section to avoid
       // listing the same job id twice.
-      const liveIdSet = new Set(jobDirs);
+      const liveIdSet = new Set(liveFiles.map(f => f.slice(0, -4)));
       const archivedOnly = archived.filter(f => !liveIdSet.has(f.slice(0, -4)));
 
       if (archivedOnly.length) {
@@ -4004,10 +4042,11 @@ program
       return;
     }
 
-    // Resolve the job prefix to a live output.log or an archived _logs/<id>.log.
+    // Resolve the job prefix to a _live/<id>.log (active) or _logs/<id>.log (archived).
     const archiveDir = path.join(JOBS_DIR, '_logs');
-    const liveIds = fs.existsSync(JOBS_DIR)
-      ? fs.readdirSync(JOBS_DIR).filter(d => d !== '_logs' && d.startsWith(jobId) && fs.existsSync(path.join(JOBS_DIR, d, 'output.log')))
+    const liveDir = path.join(JOBS_DIR, '_live');
+    const liveIds = fs.existsSync(liveDir)
+      ? fs.readdirSync(liveDir).filter(f => f.endsWith('.log') && f.slice(0, -4).startsWith(jobId)).map(f => f.slice(0, -4))
       : [];
     const archivedIds = fs.existsSync(archiveDir)
       ? fs.readdirSync(archiveDir).filter(f => f.endsWith('.log') && f.slice(0, -4).startsWith(jobId)).map(f => f.slice(0, -4))
@@ -4025,10 +4064,12 @@ program
     }
 
     const fullJobId = matchIds[0];
-    const liveLogPath = path.join(JOBS_DIR, fullJobId, 'output.log');
-    const logPath = fs.existsSync(liveLogPath) ? liveLogPath : path.join(archiveDir, `${fullJobId}.log`);
+    const liveCandidatePath = liveLogPath(JOBS_DIR, fullJobId);
+    // lstat-guard: skip if the resolved path is a symlink
+    const liveExists = fs.existsSync(liveCandidatePath) && !fs.lstatSync(liveCandidatePath).isSymbolicLink();
+    const logPath = liveExists ? liveCandidatePath : archiveLogPath(JOBS_DIR, fullJobId);
 
-    if (!fs.existsSync(logPath)) {
+    if (!fs.existsSync(logPath) || fs.lstatSync(logPath).isSymbolicLink()) {
       console.error(`❌ No log file for job ${fullJobId}`);
       process.exit(1);
     }
@@ -4036,7 +4077,9 @@ program
     if (options.follow) {
       // tail -f mode
       console.log(`── Following ${fullJobId.substring(0, 8)} (Ctrl+C to stop) ──\n`);
-      const content = fs.readFileSync(logPath, 'utf-8');
+      // NOFOLLOW guard: refuse symlinks that may have been planted between the
+      // lstat check above and this read (TOCTOU).
+      const content = readJobFileNoFollow(logPath) ?? '';
       const lines = content.split('\n');
       const n = parseInt(options.lines) || 50;
       const tail = lines.slice(-n);
@@ -4047,12 +4090,15 @@ program
       fs.watchFile(logPath, { interval: 500 }, () => {
         const newSize = fs.statSync(logPath).size;
         if (newSize > pos) {
-          const fd = fs.openSync(logPath, 'r');
-          const buf = Buffer.alloc(newSize - pos);
-          fs.readSync(fd, buf, 0, buf.length, pos);
-          fs.closeSync(fd);
-          process.stdout.write(buf.toString());
-          pos = newSize;
+          let fd;
+          try { fd = fs.openSync(logPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
+          catch { return; } // symlink appeared mid-watch — skip
+          try {
+            const buf = Buffer.alloc(newSize - pos);
+            fs.readSync(fd, buf, 0, buf.length, pos);
+            process.stdout.write(buf.toString());
+            pos = newSize;
+          } finally { fs.closeSync(fd); }
         }
       });
 
@@ -4060,7 +4106,8 @@ program
       await new Promise(() => {});
     } else {
       // Static output
-      const content = fs.readFileSync(logPath, 'utf-8');
+      // NOFOLLOW guard: refuse symlinks (TOCTOU between lstat check and read).
+      const content = readJobFileNoFollow(logPath) ?? '';
       const lines = content.split('\n');
       const n = parseInt(options.lines) || 50;
       const tail = lines.slice(-n);
@@ -4090,7 +4137,9 @@ program
       console.log('Recent attestations:');
       completedJobs.slice(-5).forEach(jobId => {
         const attPath = path.join(JOBS_DIR, jobId, 'deletion-attestation.json');
-        const att = JSON.parse(fs.readFileSync(attPath, 'utf8'));
+        const raw = readJobFileNoFollow(attPath);
+        if (raw === null) return; // skip symlinked attestation (possible exfil attempt)
+        const att = JSON.parse(raw);
         console.log(`  ${jobId.substring(0, 8)}...`);
         console.log(`    Created:  ${att.createdAt}`);
         console.log(`    Deleted:  ${att.destroyedAt}`);
@@ -4248,6 +4297,152 @@ function checkWorkspaceCapability(state, agentId) {
   return true;
 }
 
+// ── Pending-refunds durability helpers ──────────────────────────────────────
+
+/** Load the durable pending-refunds ledger (object keyed by jobId). */
+function loadPendingRefunds() {
+  try {
+    if (fs.existsSync(PENDING_REFUNDS_PATH)) {
+      return JSON.parse(fs.readFileSync(PENDING_REFUNDS_PATH, 'utf8'));
+    }
+  } catch {
+    // corrupted — treat as empty
+  }
+  return {};
+}
+
+/** Persist the pending-refunds ledger atomically (mode 0600).
+ *  Writes to a temp file then renames — rename is atomic on POSIX, so a crash
+ *  mid-write can never leave a corrupted ledger that loadPendingRefunds() would
+ *  silently treat as empty (which would permanently drop owed refunds). */
+function savePendingRefunds(obj) {
+  try {
+    fs.mkdirSync(DISPATCHER_DIR, { recursive: true, mode: 0o700 });
+    const tmp = `${PENDING_REFUNDS_PATH}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, PENDING_REFUNDS_PATH);
+  } catch (e) {
+    console.error(`[refund] Could not save pending-refunds ledger: ${e.message}`);
+  }
+}
+
+/** Load the durable set of jobIds already refunded (de-dup guard). */
+function loadRefundedJobs() {
+  try {
+    if (fs.existsSync(REFUNDED_JOBS_PATH)) {
+      const arr = JSON.parse(fs.readFileSync(REFUNDED_JOBS_PATH, 'utf8'));
+      return new Set(Array.isArray(arr) ? arr : []);
+    }
+  } catch {
+    // corrupted — treat as empty (fail toward not-yet-refunded; pending ledger
+    // still gates against unbounded retries since each entry is removed on send)
+  }
+  return new Set();
+}
+
+/** Durably mark a jobId as refunded so it is never paid twice (atomic). */
+function markJobRefunded(jobId) {
+  try {
+    const refunded = loadRefundedJobs();
+    refunded.add(jobId);
+    fs.mkdirSync(DISPATCHER_DIR, { recursive: true, mode: 0o700 });
+    const tmp = `${REFUNDED_JOBS_PATH}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify([...refunded], null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, REFUNDED_JOBS_PATH);
+  } catch (e) {
+    console.error(`[refund] Could not mark job ${jobId.substring(0, 8)} refunded: ${e.message}`);
+  }
+}
+
+/**
+ * Attempt a single pending refund entry.  On success, removes the entry from
+ * the durable ledger.  On failure, leaves it for the next startup drain.
+ * Returns true if the refund was sent successfully (or should be dropped).
+ *
+ * Idempotency: a jobId in refunded-jobs.json is never paid again, even if the
+ * platform still reports it non-terminal (e.g. submitRefundTxid failed after the
+ * on-chain send). The on-chain send is the point of no return, so it is the
+ * point at which we durably mark the job refunded — BEFORE recording on the
+ * platform — so a crash in between can never trigger a second send.
+ */
+async function attemptPendingRefund(state, jobId, entry) {
+  const { agentInfoId, orphan, refundAmount, refundPercent, buyerAddress } = entry;
+
+  // Hard de-dup: never re-send a refund for a job already paid.
+  if (loadRefundedJobs().has(jobId)) {
+    console.log(`  [refund] ⏭️  Job ${jobId.substring(0, 8)} already refunded — clearing ledger entry`);
+    return true;
+  }
+
+  try {
+    const agentInfo = state.agents.find(a => a.id === agentInfoId);
+    if (!agentInfo) {
+      console.log(`  [refund] Agent ${agentInfoId} not found for ${jobId.substring(0, 8)} — will retry later`);
+      return false;
+    }
+
+    const agent = await getAgentSession(state, agentInfo);
+
+    // ── Allowlist check before refund ──
+    const allowlist = loadFinancialAllowlist();
+    if (!isAddressInAllowlist(allowlist, buyerAddress)) {
+      console.error(`  [refund] ❌ BLOCKED: Refund address ${buyerAddress} not in allowlist — skipping refund for ${jobId.substring(0, 8)}`);
+      // Drop this entry permanently (allowlist block is not a transient failure).
+      return true;
+    }
+
+    console.log(`  [refund] 💸 Sending ${refundPercent}% refund: ${refundAmount} ${orphan.currency || 'VRSC'} to ${buyerAddress} (job ${jobId.substring(0, 8)})`);
+    const txid = await agent.sendCurrency(buyerAddress, refundAmount);
+    // Mark refunded immediately after the irreversible on-chain send, BEFORE any
+    // platform-record step that could fail and leave the platform reporting the
+    // job non-terminal. This is what prevents the double-pay interleaving.
+    // RESIDUAL WINDOW: if markJobRefunded's writeFileSync→renameSync is interrupted
+    // by a disk fault after the send, the job stays in pending-refunds.json and is
+    // retried next startup → possible double send. Strictly smaller than the
+    // original software bug (requires a hardware fault between two syscalls);
+    // unavoidable without a transactional FS / distributed lock.
+    markJobRefunded(jobId);
+    console.log(`  [refund] ✅ Refund TX: ${txid}`);
+
+    try {
+      await agent.client.submitRefundTxid(jobId, txid);
+    } catch (e) {
+      console.log(`  [refund] ⚠️  Could not record refund on platform: ${e.message}`);
+    }
+
+    try {
+      await agent.client.sendChatMessage(jobId, `System failure — ${refundPercent}% refund issued. TX: ${txid}`);
+    } catch (e) {
+      console.log(`  [refund] ⚠️  Could not notify buyer: ${e.message}`);
+    }
+
+    return true;
+  } catch (e) {
+    console.error(`  [refund] ❌ Refund TX failed for ${jobId.substring(0, 8)}: ${e.message} — will retry on next start`);
+    return false;
+  }
+}
+
+/**
+ * Drain any leftover entries in pending-refunds.json.  Called at startup
+ * BEFORE handleCrashRecovery so prior-crash unsent refunds are retried first.
+ */
+async function drainPendingRefunds(state) {
+  const pending = loadPendingRefunds();
+  const jobIds = Object.keys(pending);
+  if (jobIds.length === 0) return;
+
+  console.log(`\n⚠️  Startup drain: ${jobIds.length} pending refund(s) from previous run`);
+  for (const jobId of jobIds) {
+    const success = await attemptPendingRefund(state, jobId, pending[jobId]);
+    if (success) {
+      delete pending[jobId];
+      savePendingRefunds(pending);
+    }
+  }
+  console.log(`✅ Pending-refunds drain complete\n`);
+}
+
 /**
  * Handle crash recovery: detect orphaned jobs from active-jobs.json,
  * issue refunds for interrupted jobs, clean up Docker containers.
@@ -4259,9 +4454,30 @@ async function handleCrashRecovery(state) {
 
   console.log(`\n⚠️  Crash recovery: found ${jobIds.length} orphaned job(s)`);
 
+  // Load any refunds already recorded by a prior run / the startup drain.
+  // active-jobs.json is only cleared at Step 4, so a job that drainPendingRefunds
+  // already paid (and removed from the ledger) would otherwise be re-classified
+  // here from active-jobs.json and refunded a SECOND time. Guard against that:
+  // any jobId still in the ledger is mid-flight; any jobId NOT in active-jobs.json
+  // that the drain already cleared simply won't appear in this loop's orphan set,
+  // but to be safe we never re-queue a jobId that is already in the ledger, and we
+  // MERGE (never overwrite) so concurrent ledger entries are preserved.
+  const existingPending = loadPendingRefunds();
+
+  // ── Step 1: build the set of jobs that need a refund ────────────────────
+  const pendingRefunds = {};
+
+  const alreadyRefunded = loadRefundedJobs();
+
   for (const jobId of jobIds) {
     const orphan = orphanedJobs[jobId];
     console.log(`  Processing ${jobId.substring(0, 8)}...`);
+
+    // Never re-queue a job already paid by a prior run / the startup drain.
+    if (isRefundAlreadyHandled(jobId, alreadyRefunded, existingPending)) {
+      console.log(`    ⏭️  Already refunded or queued — skipping`);
+      continue;
+    }
 
     try {
       // Find the agent session
@@ -4290,13 +4506,12 @@ async function handleCrashRecovery(state) {
       // 'delivered' is terminal here: the work was delivered (and payment earned),
       // so a dispatcher restart must NOT auto-refund it — that would make the
       // operator eat the compute AND the payout. Disputes handle disagreements.
-      const finishedStatuses = ['completed', 'resolved', 'resolved_rejected', 'cancelled', 'delivered'];
-      if (finishedStatuses.includes(currentJob.status)) {
+      if (!shouldRefundOrphan(currentJob)) {
         console.log(`    ✅ Job already ${currentJob.status} — cleaning up`);
         continue;
       }
 
-      // Job was interrupted — issue refund
+      // Job was interrupted — queue for refund
       const policy = state.disputePolicy?.get(agentInfo.id);
       const refundPercent = policy?.systemCrashRefund ?? 100;
       const jobAmount = orphan.jobAmount || currentJob.amount || 0;
@@ -4304,31 +4519,13 @@ async function handleCrashRecovery(state) {
       const buyerAddress = orphan.buyerPayAddress || currentJob.buyerPayAddress;
 
       if (refundAmount > 0 && buyerAddress) {
-        // ── Allowlist check before refund ──
-        const allowlist = loadFinancialAllowlist();
-        if (!isAddressInAllowlist(allowlist, buyerAddress)) {
-          console.error(`    ❌ BLOCKED: Refund address ${buyerAddress} not in allowlist — skipping refund`);
-        } else {
-          console.log(`    💸 Issuing ${refundPercent}% refund: ${refundAmount} ${orphan.currency || 'VRSC'} to ${buyerAddress}`);
-          try {
-            const txid = await agent.sendCurrency(buyerAddress, refundAmount);
-            console.log(`    ✅ Refund TX: ${txid}`);
-
-            try {
-              await agent.client.submitRefundTxid(jobId, txid);
-            } catch (e) {
-              console.log(`    ⚠️  Could not record refund on platform: ${e.message}`);
-            }
-
-            try {
-              await agent.client.sendChatMessage(jobId, `System failure — ${refundPercent}% refund issued. TX: ${txid}`);
-            } catch (e) {
-              console.log(`    ⚠️  Could not notify buyer: ${e.message}`);
-            }
-          } catch (e) {
-            console.error(`    ❌ Refund TX failed: ${e.message}`);
-          }
-        }
+        pendingRefunds[jobId] = {
+          agentInfoId: orphan.agentInfoId,
+          orphan,
+          refundAmount,
+          refundPercent,
+          buyerAddress,
+        };
       } else {
         console.log(`    ⚠️  Cannot issue refund — missing amount (${jobAmount}) or address (${buyerAddress})`);
       }
@@ -4361,7 +4558,28 @@ async function handleCrashRecovery(state) {
     }
   }
 
-  // Clear orphaned jobs file
+  // ── Step 2: write pending-refunds BEFORE sending anything (crash-safe) ──
+  // MERGE with any existing ledger entries (e.g. an entry a concurrent/prior
+  // drain left in place) rather than overwriting — never lose an owed refund.
+  const ledger = { ...existingPending, ...pendingRefunds };
+  if (Object.keys(pendingRefunds).length > 0) {
+    savePendingRefunds(ledger);
+  }
+
+  // ── Step 3: send each refund; remove from durable ledger on success ──────
+  const remaining = { ...ledger };
+  for (const jobId of Object.keys(pendingRefunds)) {
+    const success = await attemptPendingRefund(state, jobId, pendingRefunds[jobId]);
+    if (success) {
+      delete remaining[jobId];
+      savePendingRefunds(remaining);
+    }
+    // On failure: entry stays in remaining / on disk for next-startup drain
+  }
+
+  // ── Step 4: clear the active-jobs ledger (orphans are now handled) ───────
+  // This ONLY clears active-jobs.json. pending-refunds.json retains any unsent
+  // refunds so they survive the next crash without duplication.
   persistActiveJobs(new Map());
   console.log(`✅ Crash recovery complete\n`);
 }
@@ -4496,7 +4714,6 @@ async function pollForJobs(state) {
         }
 
         // Skip jobs in terminal states (delivered, completed, cancelled, resolved)
-        const TERMINAL_STATUSES = ['delivered', 'completed', 'cancelled', 'resolved', 'resolved_rejected'];
         if (TERMINAL_STATUSES.includes(job.status)) {
           state.seen.set(job.id, Date.now());
           continue;
@@ -4538,10 +4755,12 @@ async function pollForJobs(state) {
         // accepted + payment.verified = payment confirmed
         // accepted + payment.status === 'confirmed'/'completed' = payment confirmed
         // accepted + no payment object = platform doesn't enforce payment (let it through)
+        const allowUnpriced = process.env.J41_ALLOW_UNPRICED_JOBS === '1';
+        if (allowUnpriced && !job.payment) console.warn(`[Payment] Admitting job ${job.id} with NO payment record (J41_ALLOW_UNPRICED_JOBS=1)`);
         const isPaid = job.status === 'in_progress' ||
           (job.payment && job.payment.verified === true) ||
           (job.payment && (job.payment.status === 'confirmed' || job.payment.status === 'completed')) ||
-          (!job.payment); // platform doesn't populate payment → don't block
+          (allowUnpriced && !job.payment); // explicit opt-in required — bare no-payment no longer trusted (M8)
 
         if (!isPaid) {
           if (!state.pendingPayment.has(job.id)) {
@@ -4637,7 +4856,7 @@ async function pollForJobs(state) {
       if (pending?.length > 0) {
         for (const ext of pending) {
           if (state._lastExtensionCheck.has(ext.id)) continue;
-          state._lastExtensionCheck.set(ext.id, Date.now());
+          state._lastExtensionCheck.set(ext.id, { ts: Date.now(), jobId });
           await handleExtensionRequest(state, jobId, ext.id, activeInfo.agentInfo);
         }
       }
@@ -5305,12 +5524,19 @@ function buildDispatcherSecurityOpt() {
   const opts = ['no-new-privileges:true'];
 
   // Seccomp profile — deployed by @junction41/secure-setup
-  const seccompPath = process.platform === 'linux'
-    ? '/etc/j41/seccomp-agent.json'
-    : path.join(os.homedir(), '.j41', 'seccomp-agent.json');
-
-  if (fs.existsSync(seccompPath)) {
+  // H5: check both /etc/j41 (system) and ~/.j41 (user) — prefer system install.
+  const seccompPathSystem = '/etc/j41/seccomp-agent.json';
+  const seccompPathUser   = path.join(os.homedir(), '.j41', 'seccomp-agent.json');
+  let seccompPath = null;
+  if (fs.existsSync(seccompPathSystem)) {
+    seccompPath = seccompPathSystem;
+  } else if (fs.existsSync(seccompPathUser)) {
+    seccompPath = seccompPathUser;
+  }
+  if (seccompPath) {
     opts.push(`seccomp=${seccompPath}`);
+  } else {
+    console.warn('[security] seccomp profile not found at /etc/j41 or ~/.j41 — container runs WITHOUT syscall filtering');
   }
 
   // AppArmor — Linux only
@@ -5319,6 +5545,8 @@ function buildDispatcherSecurityOpt() {
       const profiles = fs.readFileSync('/sys/kernel/security/apparmor/profiles', 'utf8');
       if (profiles.includes('j41-agent-profile')) {
         opts.push('apparmor=j41-agent-profile');
+      } else {
+        console.warn('[security] AppArmor profile j41-agent-profile not found — container runs WITHOUT AppArmor confinement');
       }
     } catch {
       // AppArmor not available — skip
@@ -5329,12 +5557,20 @@ function buildDispatcherSecurityOpt() {
 }
 
 function getDispatcherNetworkMode() {
-  // Use j41-isolated network if it exists, otherwise default bridge
+  // Use j41-isolated network if it exists, otherwise default bridge.
+  // M10: attempt to create j41-isolated if absent (best-effort); warn if still absent.
   try {
     require('child_process').execSync('docker network inspect j41-isolated', { stdio: 'ignore', timeout: 5000 });
     return 'j41-isolated';
   } catch {
-    return 'bridge';
+    // Network absent — try to create it
+    try {
+      require('child_process').execFileSync('docker', ['network', 'create', '--internal', 'j41-isolated'], { stdio: 'ignore', timeout: 10000 });
+      return 'j41-isolated';
+    } catch {
+      console.warn('[security] j41-isolated network absent — containers use the default bridge with unrestricted egress');
+      return 'bridge';
+    }
   }
 }
 
@@ -5430,17 +5666,29 @@ function makeCappedLogWriter(logStream, maxBytes) {
   };
 }
 
+// Read a file that may live under a container-writable job dir, refusing to
+// follow symlinks — a malicious container could plant one to exfiltrate a host
+// secret. Returns the content, or null if the path is a symlink (ELOOP) or
+// the file no longer exists (ENOENT — handles concurrent removal safely).
+function readJobFileNoFollow(p, enc = 'utf8') {
+  let fd;
+  try { fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
+  catch (e) { if (e.code === 'ELOOP' || e.code === 'ENOENT') return null; throw e; }
+  try { return fs.readFileSync(fd, enc); } finally { fs.closeSync(fd); }
+}
+
 // Start a job container
 async function startJobContainer(state, job, agentInfo) {
+  if (!isValidJobId(job.id)) { console.error(`[security] Refusing job with invalid id: ${String(job.id).slice(0,40)}`); return; }
   if (!docker) {
     throw new Error('Docker not available. Switch to local mode: node src/cli.js config --runtime local');
   }
   const jobDir = path.join(JOBS_DIR, job.id);
   fs.mkdirSync(jobDir, { recursive: true });
-  // Ensure writable across rootless/user-namespaced container runtimes
-  // Use 0o755 — NOT 0o777 which lets any host process read/tamper job data
+  // Ensure writable by the dispatcher UID only (container runs as User: <uid>:<gid>
+  // so the bind-mounted jobDir is accessible). 0o700 keeps other host users out.
   try {
-    fs.chmodSync(jobDir, 0o755);
+    fs.chmodSync(jobDir, 0o700);
   } catch {
     // best effort
   }
@@ -5581,6 +5829,38 @@ async function startJobContainer(state, job, agentInfo) {
       ? [`${signerChannelDir}:/app/sign`]                      // rw — container writes req/, reads resp/
       : [`${tmpKeysPath}:/app/keys.json:ro`];
 
+    // M1: build HostConfig as a variable so we can patch CapDrop after the
+    // bwrap spread (which returns CapDrop:[] + CapAdd:['SYS_ADMIN'] and would
+    // otherwise silently wipe the 'ALL' drop).
+    const hostConfig = {
+      Binds: [
+        // job dir must be writable for attestation artifacts (creation/deletion json)
+        `${jobDir}:/app/job`,
+        ...signingBinds,
+        `${path.join(agentDir, 'SOUL.md')}:/app/SOUL.md:ro`,
+      ],
+      AutoRemove: !keepContainers,
+      Memory: 2 * 1024 * 1024 * 1024, // 2GB
+      CpuQuota: 100000, // 1 CPU core
+      ReadonlyRootfs: true,
+      Tmpfs: { '/tmp': 'rw,noexec,nosuid,size=64m' },
+      PidsLimit: 64,
+      CapDrop: ['ALL'],
+      Dns: ['8.8.8.8', '1.1.1.1'], // j41-isolated network can't use host systemd-resolved
+      // --- Security hardening (Plan B) ---
+      SecurityOpt: buildDispatcherSecurityOpt(),
+      NetworkMode: getDispatcherNetworkMode(),
+      ...(supportsStorageOpt() ? { StorageOpt: { size: '1G' } } : {}),
+      OomScoreAdj: 1000,
+      // gVisor runtime (if configured as Docker default)
+      ...(isGvisorAvailable() ? { Runtime: 'runsc' } : {}),
+      ...(getDispatcherBwrapConfig()),
+    };
+    // M1: if bwrap added SYS_ADMIN (CapDrop:[] wipes the 'ALL' drop), restore
+    // a scoped explicit drop-list keeping ONLY SYS_ADMIN.
+    if (hostConfig.CapAdd && hostConfig.CapAdd.includes('SYS_ADMIN')) {
+      hostConfig.CapDrop = ['CHOWN','DAC_OVERRIDE','FOWNER','FSETID','KILL','MKNOD','NET_BIND_SERVICE','NET_RAW','SETGID','SETUID','SETFCAP','SETPCAP','SYS_CHROOT','AUDIT_WRITE'];
+    }
     const container = await docker.createContainer({
       name: containerName,
       Image: 'j41/job-agent:latest',  // PRE-BAKED IMAGE
@@ -5599,30 +5879,7 @@ async function startJobContainer(state, job, agentInfo) {
             .map(([k, v]) => `${k}=${v}`)
             .concat(getExecutorEnvVars(agentInfo).filter(s => !s.startsWith('J41_LLM_')))
             .concat(brokerEnv),
-      HostConfig: {
-        Binds: [
-          // job dir must be writable for attestation artifacts (creation/deletion json)
-          `${jobDir}:/app/job`,
-          ...signingBinds,
-          `${path.join(agentDir, 'SOUL.md')}:/app/SOUL.md:ro`,
-        ],
-        AutoRemove: !keepContainers,
-        Memory: 2 * 1024 * 1024 * 1024, // 2GB
-        CpuQuota: 100000, // 1 CPU core
-        ReadonlyRootfs: true,
-        Tmpfs: { '/tmp': 'rw,noexec,nosuid,size=64m' },
-        PidsLimit: 64,
-        CapDrop: ['ALL'],
-        Dns: ['8.8.8.8', '1.1.1.1'], // j41-isolated network can't use host systemd-resolved
-        // --- Security hardening (Plan B) ---
-        SecurityOpt: buildDispatcherSecurityOpt(),
-        NetworkMode: getDispatcherNetworkMode(),
-        ...(supportsStorageOpt() ? { StorageOpt: { size: '1G' } } : {}),
-        OomScoreAdj: 1000,
-        // gVisor runtime (if configured as Docker default)
-        ...(isGvisorAvailable() ? { Runtime: 'runsc' } : {}),
-        ...(getDispatcherBwrapConfig()),
-      },
+      HostConfig: hostConfig,
       Labels: {
         'j41.job.id': job.id,
         'j41.agent.id': agentInfo.id,
@@ -5660,7 +5917,7 @@ async function startJobContainer(state, job, agentInfo) {
 
     // Mark as seen immediately to avoid duplicate pickup loops while status remains requested
     state.seen.set(job.id, Date.now());
-    saveSeenJobs(state.seen);
+    try { saveSeenJobs(state.seen); } catch (e) { console.error(`[Start] saveSeenJobs failed: ${e.message}`); }
     
     // Remove from available pool
     state.available = state.available.filter(a => a.id !== agentInfo.id);
@@ -5679,8 +5936,9 @@ async function startJobContainer(state, job, agentInfo) {
         timestamps: false,
       });
       const shortId = job.id.substring(0, 8);
-      const logPath = path.join(jobDir, 'output.log');
-      const fileStream = fs.createWriteStream(logPath, { flags: 'a' });
+      fs.mkdirSync(path.join(JOBS_DIR, '_live'), { recursive: true, mode: 0o700 });
+      const logPath = liveLogPath(JOBS_DIR, job.id);
+      const fileStream = fs.createWriteStream(logPath, { flags: fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW, mode: 0o600 });
       fileStream.on('error', () => {}); // disk full / racey rm — non-fatal
       fileStream.write(`[${new Date().toISOString()}] Container started — agent: ${agentInfo.id}, container: ${containerName}\n`);
       const writeCapped = makeCappedLogWriter(fileStream, cfg.runtime.job_log_max_bytes);
@@ -5733,30 +5991,55 @@ async function startJobContainer(state, job, agentInfo) {
 
   } catch (e) {
     console.error(`❌ Failed to start container for ${job.id}:`, e.message);
+    // Clean up broker/signer resources that were allocated before the failure
+    // (state.active was never set, so stopJobContainer would early-return)
+    try { if (signerHost) await signerHost.destroy(); } catch {}
+    try { if (signerTeardown) await signerTeardown(); } catch {}
+    try { if (tmpKeysPath) fs.rmSync(path.join(os.tmpdir(), `j41-keys-${job.id}`), { recursive: true, force: true }); } catch {}
     // Return agent to pool
     state.available.push(agentInfo);
   }
 }
 
-// Archive a finished job's output.log to JOBS_DIR/_logs/<jobId>.log when the
-// retention policy says to keep it, then prune to job_log_max_retained.
+// Archive a finished job's live log (_live/<jobId>.log) to _logs/<jobId>.log
+// when the retention policy says to keep it, then prune to job_log_max_retained.
+// Reads and writes via fd with O_NOFOLLOW to refuse symlink attacks.
 // Best-effort: never throws into the cleanup path.
-function archiveJobLog(jobDir, jobId, exitInfo) {
+function archiveJobLog(jobsDir, jobId, exitInfo) {
   try {
-    const retention = resolveLogRetention(cfg);
-    const logPath = path.join(jobDir, 'output.log');
-    if (!fs.existsSync(logPath) || !shouldArchiveLog(retention, exitInfo)) return;
-    const archiveDir = path.join(JOBS_DIR, '_logs');
-    fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
-    fs.copyFileSync(logPath, path.join(archiveDir, `${jobId}.log`));
-    const entries = fs.readdirSync(archiveDir)
-      .filter(f => f.endsWith('.log'))
-      .map(f => ({ id: f.slice(0, -4), mtimeMs: fs.statSync(path.join(archiveDir, f)).mtimeMs }));
-    for (const id of selectLogsToPrune(entries, cfg.runtime.job_log_max_retained)) {
-      fs.rmSync(path.join(archiveDir, `${id}.log`), { force: true });
+    const live = liveLogPath(jobsDir, jobId);
+    let fd;
+    try { fd = fs.openSync(live, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
+    catch (e) {
+      if (e.code === 'ENOENT') return;
+      if (e.code === 'ELOOP') { console.error(`[Logs] refusing symlinked log for ${jobId}`); return; }
+      throw e;
     }
-  } catch (e) {
-    console.error(`[Logs] archive failed for ${jobId}: ${e.message}`);
+    try {
+      const retention = resolveLogRetention(cfg);
+      if (shouldArchiveLog(retention, exitInfo)) {
+        const archiveDir = path.join(jobsDir, '_logs');
+        fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
+        const data = fs.readFileSync(fd);
+        const wfd = fs.openSync(archiveLogPath(jobsDir, jobId), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW, 0o600);
+        try { fs.writeFileSync(wfd, data); } finally { fs.closeSync(wfd); }
+        const entries = fs.readdirSync(archiveDir).filter(f => f.endsWith('.log'))
+          .map(f => ({ id: f.slice(0, -4), mtimeMs: fs.statSync(path.join(archiveDir, f)).mtimeMs }));
+        for (const id of selectLogsToPrune(entries, cfg.runtime.job_log_max_retained))
+          fs.rmSync(path.join(archiveDir, `${id}.log`), { force: true });
+      }
+    } finally { fs.closeSync(fd); }
+    fs.rmSync(live, { force: true });
+  } catch (e) { console.error(`[Logs] archive failed for ${jobId}: ${e.message}`); }
+}
+
+// Prune _lastExtensionCheck entries for a finished job. The map is keyed by
+// ext.id (not jobId), so we can't delete(jobId) — we scan and drop every entry
+// whose stored { ts, jobId } belongs to this job. This keeps the map bounded
+// across many jobs. n is tiny (extension requests for active jobs only).
+function pruneExtensionChecks(state, jobId) {
+  for (const [extId, val] of state._lastExtensionCheck) {
+    if (val && val.jobId === jobId) state._lastExtensionCheck.delete(extId);
   }
 }
 
@@ -5764,6 +6047,8 @@ function archiveJobLog(jobDir, jobId, exitInfo) {
 async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   const active = state.active.get(jobId);
   if (!active) return;
+  if (active._stopping) return;
+  active._stopping = true;
 
   try {
     await active.container.stop();
@@ -5819,9 +6104,10 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   // Cleanup job dir (retain for debugging if requested). Archive even when
   // keep_containers is on; the _logs/ copy is independent of the retained dir.
   const jobDir = path.join(JOBS_DIR, jobId);
-  archiveJobLog(jobDir, jobId, { exitCode: active._exitCode, killed: active._killed });
+  archiveJobLog(JOBS_DIR, jobId, { exitCode: active._exitCode, killed: active._killed });
   if (fs.existsSync(jobDir) && !cfg.runtime.keep_containers) {
-    fs.rmSync(jobDir, { recursive: true });
+    try { fs.rmSync(jobDir, { recursive: true }); }
+    catch (e) { console.error(`[Cleanup] failed to remove ${jobDir}: ${e.message}`); }
   }
 
   // Return agent to pool (unless retrying or already returned during pause)
@@ -5835,10 +6121,11 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   if (active._timeoutTimer) clearTimeout(active._timeoutTimer);
 
   state.active.delete(jobId);
+  persistActiveJobs(state.active);
 
   // Prune per-job tracking Maps to prevent memory leaks
   state._lastSentStatus.delete(jobId);
-  state._lastExtensionCheck.delete(jobId);
+  pruneExtensionChecks(state, jobId);
   state._pendingWorkspace.delete(jobId);
   state.pendingPayment.delete(jobId);
 
@@ -5856,6 +6143,7 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
 // ─────────────────────────────────────────
 
 async function startJobLocal(state, job, agentInfo) {
+  if (!isValidJobId(job.id)) { console.error(`[security] Refusing job with invalid id: ${String(job.id).slice(0,40)}`); return; }
   // Security gate: block local mode unless --dev-unsafe was passed
   if (!state._devUnsafe) {
     console.error('');
@@ -5920,8 +6208,9 @@ async function startJobLocal(state, job, agentInfo) {
     });
 
     const shortId = job.id.substring(0, 8);
-    const logPath = path.join(jobDir, 'output.log');
-    const logStream = fs.createWriteStream(logPath, { flags: 'a' });
+    fs.mkdirSync(path.join(JOBS_DIR, '_live'), { recursive: true, mode: 0o700 });
+    const logPath = liveLogPath(JOBS_DIR, job.id);
+    const logStream = fs.createWriteStream(logPath, { flags: fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW, mode: 0o600 });
     logStream.write(`[${new Date().toISOString()}] Job started — agent: ${agentInfo.id}, PID: ${child.pid}\n`);
     const writeCapped = makeCappedLogWriter(logStream, cfg.runtime.job_log_max_bytes);
 
@@ -6065,6 +6354,8 @@ async function startJobLocal(state, job, agentInfo) {
 async function stopJobLocal(state, jobId, skipReturnAgent = false) {
   const active = state.active.get(jobId);
   if (!active) return;
+  if (active._stopping) return;
+  active._stopping = true;
 
   // Kill the child process
   try {
@@ -6098,9 +6389,10 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
   // Cleanup job dir. Archive even when keep_containers is on; the _logs/ copy
   // is independent of the retained dir.
   const jobDir = path.join(JOBS_DIR, jobId);
-  archiveJobLog(jobDir, jobId, { exitCode: active._exitCode, killed: active._killed });
+  archiveJobLog(JOBS_DIR, jobId, { exitCode: active._exitCode, killed: active._killed });
   if (fs.existsSync(jobDir) && !cfg.runtime.keep_containers) {
-    fs.rmSync(jobDir, { recursive: true });
+    try { fs.rmSync(jobDir, { recursive: true }); }
+    catch (e) { console.error(`[Cleanup] failed to remove ${jobDir}: ${e.message}`); }
   }
 
   // Only return agent to pool if not already returned during pause
@@ -6119,7 +6411,7 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
 
   // Prune per-job tracking Maps to prevent memory leaks
   state._lastSentStatus.delete(jobId);
-  state._lastExtensionCheck.delete(jobId);
+  pruneExtensionChecks(state, jobId);
   state._pendingWorkspace.delete(jobId);
   state.pendingPayment.delete(jobId);
 
@@ -6165,6 +6457,11 @@ async function cleanupCompletedJobs(state) {
               await stopJobLocal(state, jobId);
               continue;
             }
+            if (job && TERMINAL_STATUSES.includes(job.status)) {
+              console.log(`✅ Job ${jobId} already ${job.status} — skipping retry`);
+              await stopJobLocal(state, jobId);
+              continue;
+            }
             await stopJobLocal(state, jobId, true);
             await startJobLocal(state, job, agentInfo);
             continue;
@@ -6181,6 +6478,7 @@ async function cleanupCompletedJobs(state) {
 
         if (!info.State.Running) {
           const exitCode = info.State.ExitCode;
+          if (active) active._exitCode = info.State.ExitCode;
           console.log(`🗑️  Container for job ${jobId} stopped (exit ${exitCode})`);
 
           if (exitCode !== 0) {
@@ -6195,6 +6493,11 @@ async function cleanupCompletedJobs(state) {
                 job = await agent.client.getJob(jobId);
               } catch (fetchErr) {
                 console.error(`❌ Could not re-fetch job ${jobId} for retry: ${fetchErr.message}`);
+                await stopJobContainer(state, jobId);
+                continue;
+              }
+              if (job && TERMINAL_STATUSES.includes(job.status)) {
+                console.log(`✅ Job ${jobId} already ${job.status} — skipping retry`);
                 await stopJobContainer(state, jobId);
                 continue;
               }

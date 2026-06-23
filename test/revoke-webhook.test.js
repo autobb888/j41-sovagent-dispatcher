@@ -60,13 +60,13 @@ test('revoke webhook: 403 when signature invalid', async (t) => {
   assert.match(r.body, /Invalid or stale signature/);
 });
 
-test('revoke webhook: 404 when seller not on this dispatcher', async (t) => {
+test('revoke webhook: 403 when seller not on this dispatcher (uniform 403, no enumeration oracle)', async (t) => {
   const { server, port } = await startServer();
   t.after(() => server.close());
   const body = JSON.stringify({ sellerVerusId: 'iUNKNOWN', buyerVerusId: 'iBUYER' });
   const r = await postJson(port, '/j41/api-access/revoke', body, { 'x-webhook-signature': hmac(body, 'test-secret-1234') });
-  assert.strictEqual(r.status, 404);
-  assert.match(r.body, /Seller not found/);
+  // Fix 4: unknown seller must return 403 (same as bad signature) to prevent enumeration.
+  assert.strictEqual(r.status, 403);
 });
 
 test('revoke webhook: legacy-only signature is REJECTED by default (replay-downgrade guard)', async (t) => {
