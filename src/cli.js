@@ -5776,12 +5776,17 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
     try { await active._signerTeardown(); } catch { /* best-effort */ }
   }
 
-  // Flush the per-job log stream before we archive/remove the dir.
+  // Drain the per-job log stream before archiving. end() only *initiates* the
+  // flush; we await 'finish' so copyFileSync sees the final buffered bytes
+  // (exit banner + any queued tail) rather than racing them to disk.
   if (active._logStream) {
-    try { active._logStream.end(); } catch { /* already closed */ }
+    await new Promise(resolve => {
+      try { active._logStream.end(() => resolve()); } catch { resolve(); /* already closed */ }
+    });
   }
 
-  // Cleanup job dir (retain for debugging if requested)
+  // Cleanup job dir (retain for debugging if requested). Archive even when
+  // keep_containers is on; the _logs/ copy is independent of the retained dir.
   const jobDir = path.join(JOBS_DIR, jobId);
   archiveJobLog(jobDir, jobId, { exitCode: active._exitCode, killed: active._killed });
   if (fs.existsSync(jobDir) && !cfg.runtime.keep_containers) {
@@ -5992,6 +5997,7 @@ async function startJobLocal(state, job, agentInfo) {
       currency: job.currency || 'VRSC',
       agentInfoId: agentInfo.id,
       reworkCount: 0,
+      _logStream: logStream,
     });
 
     state.emitEvent?.('container.started', {
@@ -6046,7 +6052,17 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
     // already dead
   }
 
-  // Cleanup job dir
+  // Drain the per-job log stream before archiving. The child's exit handler
+  // calls logStream.end() but that flush is async; await 'finish' so the
+  // archive copy includes the last buffered bytes.
+  if (active._logStream) {
+    await new Promise(resolve => {
+      try { active._logStream.end(() => resolve()); } catch { resolve(); /* already closed */ }
+    });
+  }
+
+  // Cleanup job dir. Archive even when keep_containers is on; the _logs/ copy
+  // is independent of the retained dir.
   const jobDir = path.join(JOBS_DIR, jobId);
   archiveJobLog(jobDir, jobId, { exitCode: active._exitCode, killed: active._killed });
   if (fs.existsSync(jobDir) && !cfg.runtime.keep_containers) {
