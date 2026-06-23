@@ -220,3 +220,29 @@ test('fileConfiguredNetwork reads the file and ignores J41_NETWORK env (no mainn
     delete process.env.J41_NETWORK;
   }
 }));
+
+test('runtime defaults include job-log knobs', withTmpHome(async () => {
+  const { loadDispatcherConfig } = require('../src/config-loader.js');
+  const cfg = loadDispatcherConfig({ skipMigration: true });
+  assert.strictEqual(cfg.runtime.job_log_retention, 'errors');
+  assert.strictEqual(cfg.runtime.job_log_max_bytes, 5242880);
+  assert.strictEqual(cfg.runtime.job_log_max_retained, 50);
+}));
+
+test('J41_JOB_LOG_* env overrides apply with correct types', withTmpHome(async () => {
+  const { loadDispatcherConfig } = require('../src/config-loader.js');
+  process.env.J41_JOB_LOG_RETENTION = 'all';
+  process.env.J41_JOB_LOG_MAX_BYTES = '1048576';
+  process.env.J41_JOB_LOG_MAX_RETAINED = '10';
+  try {
+    const cfg = loadDispatcherConfig({ skipMigration: true });
+    assert.strictEqual(cfg.runtime.job_log_retention, 'all');
+    assert.strictEqual(cfg.runtime.job_log_max_bytes, 1048576);
+    assert.strictEqual(typeof cfg.runtime.job_log_max_bytes, 'number');
+    assert.strictEqual(cfg.runtime.job_log_max_retained, 10);
+  } finally {
+    delete process.env.J41_JOB_LOG_RETENTION;
+    delete process.env.J41_JOB_LOG_MAX_BYTES;
+    delete process.env.J41_JOB_LOG_MAX_RETAINED;
+  }
+}));
