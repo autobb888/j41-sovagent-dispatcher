@@ -3999,7 +3999,9 @@ program
           const jobLogId = f.slice(0, -4);
           const stat = fs.statSync(p);
           const bf = path.join(JOBS_DIR, jobLogId, 'buyer.txt');
-          const buyer = (fs.existsSync(bf) && !fs.lstatSync(bf).isSymbolicLink()) ? fs.readFileSync(bf, 'utf-8').trim() : '?';
+          // NOFOLLOW guard: refuse symlinks atomically (no TOCTOU vs lstat+read).
+          const buyerRaw = fs.existsSync(bf) ? readJobFileNoFollow(bf) : null;
+          const buyer = buyerRaw !== null ? buyerRaw.trim() : '?';
           const size = (stat.size / 1024).toFixed(1);
           console.log(`  ${jobLogId.substring(0, 8)}  ${stat.mtime.toISOString().substring(0, 19)}  ${size}KB  buyer: ${buyer}  [active]`);
         }
@@ -4060,7 +4062,9 @@ program
     if (options.follow) {
       // tail -f mode
       console.log(`── Following ${fullJobId.substring(0, 8)} (Ctrl+C to stop) ──\n`);
-      const content = fs.readFileSync(logPath, 'utf-8');
+      // NOFOLLOW guard: refuse symlinks that may have been planted between the
+      // lstat check above and this read (TOCTOU).
+      const content = readJobFileNoFollow(logPath) ?? '';
       const lines = content.split('\n');
       const n = parseInt(options.lines) || 50;
       const tail = lines.slice(-n);
@@ -4087,7 +4091,8 @@ program
       await new Promise(() => {});
     } else {
       // Static output
-      const content = fs.readFileSync(logPath, 'utf-8');
+      // NOFOLLOW guard: refuse symlinks (TOCTOU between lstat check and read).
+      const content = readJobFileNoFollow(logPath) ?? '';
       const lines = content.split('\n');
       const n = parseInt(options.lines) || 50;
       const tail = lines.slice(-n);
@@ -4117,7 +4122,9 @@ program
       console.log('Recent attestations:');
       completedJobs.slice(-5).forEach(jobId => {
         const attPath = path.join(JOBS_DIR, jobId, 'deletion-attestation.json');
-        const att = JSON.parse(fs.readFileSync(attPath, 'utf8'));
+        const raw = readJobFileNoFollow(attPath);
+        if (raw === null) return; // skip symlinked attestation (possible exfil attempt)
+        const att = JSON.parse(raw);
         console.log(`  ${jobId.substring(0, 8)}...`);
         console.log(`    Created:  ${att.createdAt}`);
         console.log(`    Deleted:  ${att.destroyedAt}`);
@@ -5455,6 +5462,16 @@ function makeCappedLogWriter(logStream, maxBytes) {
       logStream.write(`\n[output.log truncated at ${maxBytes} bytes]\n`);
     }
   };
+}
+
+// Read a file that may live under a container-writable job dir, refusing to
+// follow symlinks — a malicious container could plant one to exfiltrate a host
+// secret. Returns the content, or null if the path is a symlink (ELOOP).
+function readJobFileNoFollow(p, enc = 'utf8') {
+  let fd;
+  try { fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
+  catch (e) { if (e.code === 'ELOOP') return null; throw e; }
+  try { return fs.readFileSync(fd, enc); } finally { fs.closeSync(fd); }
 }
 
 // Start a job container
