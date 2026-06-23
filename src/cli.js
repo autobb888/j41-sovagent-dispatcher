@@ -24,6 +24,7 @@ const { loadDispatcherConfig, fileConfiguredNetwork } = require('./config-loader
 const { SignChannelHost } = require('./sign-channel-host.js');
 const { defaultExecutors } = require('./broker-executors.js');
 const { findMainnetSecurityViolations, resolveIsMainnet } = require('./mainnet-guard.js');
+const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune } = require('./job-log.js');
 
 /** Feature flag: route in-container signing through the host-side broker
  *  instead of mounting the WIF into the container. Default ON; opt out only
@@ -5388,6 +5389,22 @@ function supportsStorageOpt() {
   return _storageOptSupported;
 }
 
+// Returns a write(text) fn that appends to logStream but never lets the file
+// exceed maxBytes; emits a single truncation notice when the cap is first hit.
+function makeCappedLogWriter(logStream, maxBytes) {
+  let written = 0;
+  let noticed = false;
+  return (text) => {
+    const r = applyLogCap(written, Buffer.from(text), maxBytes);
+    written = r.written;
+    if (r.data.length) logStream.write(r.data);
+    if (r.truncated && !noticed) {
+      noticed = true;
+      logStream.write(`\n[output.log truncated at ${maxBytes} bytes]\n`);
+    }
+  };
+}
+
 // Start a job container
 async function startJobContainer(state, job, agentInfo) {
   if (!docker) {
@@ -5626,7 +5643,9 @@ async function startJobContainer(state, job, agentInfo) {
 
     console.log(`✅ Container started for job ${job.id}`);
 
-    // Stream container logs to dispatcher stdout for debugging
+    // Stream container logs to the dispatcher console AND a per-job output.log,
+    // so `logs`/`logs -f`/the TUI tail work for container jobs (parity with the
+    // local-exec path). Best-effort: log failures never affect the job.
     try {
       const logStream = await container.logs({
         follow: true,
@@ -5635,17 +5654,36 @@ async function startJobContainer(state, job, agentInfo) {
         timestamps: false,
       });
       const shortId = job.id.substring(0, 8);
+      const logPath = path.join(jobDir, 'output.log');
+      const fileStream = fs.createWriteStream(logPath, { flags: 'a' });
+      fileStream.on('error', () => {}); // disk full / racey rm — non-fatal
+      fileStream.write(`[${new Date().toISOString()}] Container started — agent: ${agentInfo.id}, container: ${container?.name || '?'}\n`);
+      const writeCapped = makeCappedLogWriter(fileStream, cfg.runtime.job_log_max_bytes);
+
+      // Capture the container's exit status for retention decisions at teardown.
+      container.wait().then((r) => {
+        const a = state.active.get(job.id);
+        if (a) a._exitCode = r && r.StatusCode;
+      }).catch(() => {});
+
       logStream.on('data', (chunk) => {
         // Docker multiplexed stream: first 8 bytes are header, rest is payload
         const lines = chunk.toString('utf8').replace(/[\x00-\x08]/g, '').trim();
         if (lines) {
+          writeCapped(lines + '\n');
           for (const line of lines.split('\n')) {
             const clean = line.trim();
             if (clean) console.log(`  [${shortId}] ${clean}`);
           }
         }
       });
-      logStream.on('error', () => {}); // ignore stream errors when container exits
+      logStream.on('end', () => {
+        try { fileStream.end(`[${new Date().toISOString()}] Container exited\n`); } catch { /* already closed */ }
+      });
+      logStream.on('error', () => { try { fileStream.end(); } catch { /* noop */ } });
+
+      const activeEntry = state.active.get(job.id);
+      if (activeEntry) activeEntry._logStream = fileStream;
     } catch (e) {
       // Non-fatal: log streaming is for debugging only
     }
