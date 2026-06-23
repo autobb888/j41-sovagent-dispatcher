@@ -3064,13 +3064,19 @@ program
 
     // ── Startup sweep: remove stale _live/*.log for jobs not in active state ──
     // Guards against dispatcher crash leaving orphaned live-log files.
+    // IMPORTANT: do NOT delete logs whose job is in active-jobs.json — those are
+    // jobs that were running when the dispatcher crashed. handleCrashRecovery()
+    // (called below) will issue refunds for them, and the operator may need the
+    // logs to diagnose what went wrong.
     try {
       const liveDir = path.join(JOBS_DIR, '_live');
       if (fs.existsSync(liveDir)) {
+        // Load persisted orphan IDs from the same source handleCrashRecovery uses.
+        const orphanIds = new Set(Object.keys(loadActiveJobs()));
         for (const f of fs.readdirSync(liveDir)) {
           if (!f.endsWith('.log')) continue;
           const jobIdFromFile = f.slice(0, -4);
-          if (!state.active.has(jobIdFromFile)) {
+          if (!state.active.has(jobIdFromFile) && !orphanIds.has(jobIdFromFile)) {
             try { fs.rmSync(path.join(liveDir, f), { force: true }); } catch {}
           }
         }
@@ -5466,11 +5472,12 @@ function makeCappedLogWriter(logStream, maxBytes) {
 
 // Read a file that may live under a container-writable job dir, refusing to
 // follow symlinks — a malicious container could plant one to exfiltrate a host
-// secret. Returns the content, or null if the path is a symlink (ELOOP).
+// secret. Returns the content, or null if the path is a symlink (ELOOP) or
+// the file no longer exists (ENOENT — handles concurrent removal safely).
 function readJobFileNoFollow(p, enc = 'utf8') {
   let fd;
   try { fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
-  catch (e) { if (e.code === 'ELOOP') return null; throw e; }
+  catch (e) { if (e.code === 'ELOOP' || e.code === 'ENOENT') return null; throw e; }
   try { return fs.readFileSync(fd, enc); } finally { fs.closeSync(fd); }
 }
 
@@ -5792,14 +5799,19 @@ function archiveJobLog(jobsDir, jobId, exitInfo) {
     const live = liveLogPath(jobsDir, jobId);
     let fd;
     try { fd = fs.openSync(live, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
-    catch (e) { if (e.code === 'ELOOP') console.error(`[Logs] refusing symlinked log for ${jobId}`); return; }
+    catch (e) {
+      if (e.code === 'ENOENT') return;
+      if (e.code === 'ELOOP') { console.error(`[Logs] refusing symlinked log for ${jobId}`); return; }
+      throw e;
+    }
     try {
       const retention = resolveLogRetention(cfg);
       if (shouldArchiveLog(retention, exitInfo)) {
         const archiveDir = path.join(jobsDir, '_logs');
         fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
         const data = fs.readFileSync(fd);
-        fs.writeFileSync(archiveLogPath(jobsDir, jobId), data, { mode: 0o600 });
+        const wfd = fs.openSync(archiveLogPath(jobsDir, jobId), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW, 0o600);
+        try { fs.writeFileSync(wfd, data); } finally { fs.closeSync(wfd); }
         const entries = fs.readdirSync(archiveDir).filter(f => f.endsWith('.log'))
           .map(f => ({ id: f.slice(0, -4), mtimeMs: fs.statSync(path.join(archiveDir, f)).mtimeMs }));
         for (const id of selectLogsToPrune(entries, cfg.runtime.job_log_max_retained))
