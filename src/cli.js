@@ -25,6 +25,7 @@ const { SignChannelHost } = require('./sign-channel-host.js');
 const { defaultExecutors } = require('./broker-executors.js');
 const { findMainnetSecurityViolations, resolveIsMainnet } = require('./mainnet-guard.js');
 const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, liveLogPath, archiveLogPath } = require('./job-log.js');
+const { shouldRefundOrphan } = require('./refund.js');
 
 /** Feature flag: route in-container signing through the host-side broker
  *  instead of mounting the WIF into the container. Default ON; opt out only
@@ -60,6 +61,7 @@ const AGENTS_DIR = path.join(DISPATCHER_DIR, 'agents');
 const QUEUE_DIR = path.join(DISPATCHER_DIR, 'queue');
 const JOBS_DIR = path.join(DISPATCHER_DIR, 'jobs');
 const SEEN_JOBS_PATH = path.join(DISPATCHER_DIR, 'seen-jobs.json');
+const PENDING_REFUNDS_PATH = path.join(DISPATCHER_DIR, 'pending-refunds.json');
 const FINALIZE_STATE_FILENAME = 'finalize-state.json';
 
 const J41_API_URL = cfg.platform.api_url;
@@ -3768,6 +3770,9 @@ program
       console.error(`[Dispatcher] Unhandled rejection (non-fatal):`, reason?.message || reason);
     });
 
+    // Drain any pending refunds left over from a previous crash mid-loop
+    await drainPendingRefunds(state);
+
     // Crash recovery — process orphaned jobs before accepting new ones
     await handleCrashRecovery(state);
 
@@ -4290,6 +4295,98 @@ function checkWorkspaceCapability(state, agentId) {
   return true;
 }
 
+// ── Pending-refunds durability helpers ──────────────────────────────────────
+
+/** Load the durable pending-refunds ledger (object keyed by jobId). */
+function loadPendingRefunds() {
+  try {
+    if (fs.existsSync(PENDING_REFUNDS_PATH)) {
+      return JSON.parse(fs.readFileSync(PENDING_REFUNDS_PATH, 'utf8'));
+    }
+  } catch {
+    // corrupted — treat as empty
+  }
+  return {};
+}
+
+/** Persist the pending-refunds ledger atomically (mode 0600). */
+function savePendingRefunds(obj) {
+  try {
+    fs.mkdirSync(DISPATCHER_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(PENDING_REFUNDS_PATH, JSON.stringify(obj, null, 2), { mode: 0o600 });
+  } catch (e) {
+    console.error(`[refund] Could not save pending-refunds ledger: ${e.message}`);
+  }
+}
+
+/**
+ * Attempt a single pending refund entry.  On success, removes the entry from
+ * the durable ledger.  On failure, leaves it for the next startup drain.
+ * Returns true if the refund was sent successfully.
+ */
+async function attemptPendingRefund(state, jobId, entry) {
+  const { agentInfoId, orphan, refundAmount, refundPercent, buyerAddress } = entry;
+
+  try {
+    const agentInfo = state.agents.find(a => a.id === agentInfoId);
+    if (!agentInfo) {
+      console.log(`  [refund] Agent ${agentInfoId} not found for ${jobId.substring(0, 8)} — will retry later`);
+      return false;
+    }
+
+    const agent = await getAgentSession(state, agentInfo);
+
+    // ── Allowlist check before refund ──
+    const allowlist = loadFinancialAllowlist();
+    if (!isAddressInAllowlist(allowlist, buyerAddress)) {
+      console.error(`  [refund] ❌ BLOCKED: Refund address ${buyerAddress} not in allowlist — skipping refund for ${jobId.substring(0, 8)}`);
+      // Drop this entry permanently (allowlist block is not a transient failure).
+      return true;
+    }
+
+    console.log(`  [refund] 💸 Sending ${refundPercent}% refund: ${refundAmount} ${orphan.currency || 'VRSC'} to ${buyerAddress} (job ${jobId.substring(0, 8)})`);
+    const txid = await agent.sendCurrency(buyerAddress, refundAmount);
+    console.log(`  [refund] ✅ Refund TX: ${txid}`);
+
+    try {
+      await agent.client.submitRefundTxid(jobId, txid);
+    } catch (e) {
+      console.log(`  [refund] ⚠️  Could not record refund on platform: ${e.message}`);
+    }
+
+    try {
+      await agent.client.sendChatMessage(jobId, `System failure — ${refundPercent}% refund issued. TX: ${txid}`);
+    } catch (e) {
+      console.log(`  [refund] ⚠️  Could not notify buyer: ${e.message}`);
+    }
+
+    return true;
+  } catch (e) {
+    console.error(`  [refund] ❌ Refund TX failed for ${jobId.substring(0, 8)}: ${e.message} — will retry on next start`);
+    return false;
+  }
+}
+
+/**
+ * Drain any leftover entries in pending-refunds.json.  Called at startup
+ * BEFORE handleCrashRecovery so prior-crash unsent refunds are retried first.
+ */
+async function drainPendingRefunds(state) {
+  const pending = loadPendingRefunds();
+  const jobIds = Object.keys(pending);
+  if (jobIds.length === 0) return;
+
+  console.log(`\n⚠️  Startup drain: ${jobIds.length} pending refund(s) from previous run`);
+  for (const jobId of jobIds) {
+    const success = await attemptPendingRefund(state, jobId, pending[jobId]);
+    if (success) {
+      delete pending[jobId];
+      savePendingRefunds(pending);
+    }
+  }
+  console.log(`✅ Pending-refunds drain complete\n`);
+}
+
 /**
  * Handle crash recovery: detect orphaned jobs from active-jobs.json,
  * issue refunds for interrupted jobs, clean up Docker containers.
@@ -4300,6 +4397,9 @@ async function handleCrashRecovery(state) {
   if (jobIds.length === 0) return;
 
   console.log(`\n⚠️  Crash recovery: found ${jobIds.length} orphaned job(s)`);
+
+  // ── Step 1: build the set of jobs that need a refund ────────────────────
+  const pendingRefunds = {};
 
   for (const jobId of jobIds) {
     const orphan = orphanedJobs[jobId];
@@ -4332,13 +4432,12 @@ async function handleCrashRecovery(state) {
       // 'delivered' is terminal here: the work was delivered (and payment earned),
       // so a dispatcher restart must NOT auto-refund it — that would make the
       // operator eat the compute AND the payout. Disputes handle disagreements.
-      const finishedStatuses = ['completed', 'resolved', 'resolved_rejected', 'cancelled', 'delivered'];
-      if (finishedStatuses.includes(currentJob.status)) {
+      if (!shouldRefundOrphan(currentJob)) {
         console.log(`    ✅ Job already ${currentJob.status} — cleaning up`);
         continue;
       }
 
-      // Job was interrupted — issue refund
+      // Job was interrupted — queue for refund
       const policy = state.disputePolicy?.get(agentInfo.id);
       const refundPercent = policy?.systemCrashRefund ?? 100;
       const jobAmount = orphan.jobAmount || currentJob.amount || 0;
@@ -4346,31 +4445,13 @@ async function handleCrashRecovery(state) {
       const buyerAddress = orphan.buyerPayAddress || currentJob.buyerPayAddress;
 
       if (refundAmount > 0 && buyerAddress) {
-        // ── Allowlist check before refund ──
-        const allowlist = loadFinancialAllowlist();
-        if (!isAddressInAllowlist(allowlist, buyerAddress)) {
-          console.error(`    ❌ BLOCKED: Refund address ${buyerAddress} not in allowlist — skipping refund`);
-        } else {
-          console.log(`    💸 Issuing ${refundPercent}% refund: ${refundAmount} ${orphan.currency || 'VRSC'} to ${buyerAddress}`);
-          try {
-            const txid = await agent.sendCurrency(buyerAddress, refundAmount);
-            console.log(`    ✅ Refund TX: ${txid}`);
-
-            try {
-              await agent.client.submitRefundTxid(jobId, txid);
-            } catch (e) {
-              console.log(`    ⚠️  Could not record refund on platform: ${e.message}`);
-            }
-
-            try {
-              await agent.client.sendChatMessage(jobId, `System failure — ${refundPercent}% refund issued. TX: ${txid}`);
-            } catch (e) {
-              console.log(`    ⚠️  Could not notify buyer: ${e.message}`);
-            }
-          } catch (e) {
-            console.error(`    ❌ Refund TX failed: ${e.message}`);
-          }
-        }
+        pendingRefunds[jobId] = {
+          agentInfoId: orphan.agentInfoId,
+          orphan,
+          refundAmount,
+          refundPercent,
+          buyerAddress,
+        };
       } else {
         console.log(`    ⚠️  Cannot issue refund — missing amount (${jobAmount}) or address (${buyerAddress})`);
       }
@@ -4403,7 +4484,25 @@ async function handleCrashRecovery(state) {
     }
   }
 
-  // Clear orphaned jobs file
+  // ── Step 2: write pending-refunds BEFORE sending anything (crash-safe) ──
+  if (Object.keys(pendingRefunds).length > 0) {
+    savePendingRefunds(pendingRefunds);
+  }
+
+  // ── Step 3: send each refund; remove from durable ledger on success ──────
+  const remaining = { ...pendingRefunds };
+  for (const jobId of Object.keys(pendingRefunds)) {
+    const success = await attemptPendingRefund(state, jobId, pendingRefunds[jobId]);
+    if (success) {
+      delete remaining[jobId];
+      savePendingRefunds(remaining);
+    }
+    // On failure: entry stays in remaining / on disk for next-startup drain
+  }
+
+  // ── Step 4: clear the active-jobs ledger (orphans are now handled) ───────
+  // This ONLY clears active-jobs.json. pending-refunds.json retains any unsent
+  // refunds so they survive the next crash without duplication.
   persistActiveJobs(new Map());
   console.log(`✅ Crash recovery complete\n`);
 }

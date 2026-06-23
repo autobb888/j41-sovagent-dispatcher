@@ -43,6 +43,21 @@ test('M3: amountVrsc at or above FALLBACK_MIN_VRSC gets full DEFAULT_FALLBACK_TO
   assert.equal(result.tokens, DEFAULT_FALLBACK_TOKEN_BUDGET);
 });
 
+// ── M4: shouldRefundOrphan predicate ────────────────────────────────────────
+const { shouldRefundOrphan, FINISHED_STATUSES } = require('../src/refund.js');
+test('shouldRefundOrphan: terminal states are not refunded', () => {
+  for (const s of ['completed','resolved','resolved_rejected','cancelled','delivered'])
+    assert.equal(shouldRefundOrphan({ status: s }), false);
+});
+test('shouldRefundOrphan: non-terminal states are refunded', () => {
+  assert.equal(shouldRefundOrphan({ status: 'in_progress' }), true);
+  assert.equal(shouldRefundOrphan({ status: 'accepted' }), true);
+});
+test('shouldRefundOrphan: missing/malformed job not refunded', () => {
+  assert.equal(shouldRefundOrphan(null), false);
+  assert.equal(shouldRefundOrphan({}), false);
+});
+
 // ── isPrivateIp — IPv6 loopback + private address coverage ──────────────────
 const { isPrivateIp } = require('../src/proxy-handler.js');
 for (const ip of [
