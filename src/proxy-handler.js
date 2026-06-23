@@ -99,7 +99,7 @@ function _canonicalizeIPv6(ip) {
     const halves = ip.split('::');
     if (halves.length > 2) return null;
 
-    // Strip "::ffff:" IPv4-mapped prefix for uniform handling below
+    // Expand "::" shorthand into 8 full numeric groups for loopback/zero checks
     const left = halves[0] ? halves[0].split(':') : [];
     const right = halves.length === 2 ? (halves[1] ? halves[1].split(':') : []) : [];
 
@@ -146,6 +146,7 @@ function isPrivateIp(ip) {
     const groups = _canonicalizeIPv6(lo);
     if (groups) {
       // Loopback: all-zeros then 1  (0:0:0:0:0:0:0:1)
+      // Note: deprecated IPv4-compatible ::1.x.x.x forms may over-match here — blocked safe-side (RFC 4291 deprecates them).
       if (groups[0] === 0 && groups[1] === 0 && groups[2] === 0 &&
           groups[3] === 0 && groups[4] === 0 && groups[5] === 0 &&
           groups[6] === 0 && groups[7] === 1) return true;

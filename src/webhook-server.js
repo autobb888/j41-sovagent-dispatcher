@@ -340,9 +340,8 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
     // Prefer the x-j41-event-id header, then body fields nonce/eventId.
     // If an event id is present, check-and-record it; reject replays (409).
     // If no event id is present, proceed as before but note the open window.
-    const eventId = req.headers['x-j41-event-id'] ||
-      (payload && (payload.nonce || payload.eventId)) ||
-      null;
+    const bodyId = payload ? (payload.nonce != null ? payload.nonce : (payload.eventId != null ? payload.eventId : null)) : null;
+    const eventId = req.headers['x-j41-event-id'] || (bodyId != null ? String(bodyId) : null);
     if (eventId) {
       const nc = checkAndRecordNonce(String(eventId));
       if (!nc.ok) {

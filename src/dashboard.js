@@ -889,7 +889,7 @@ async function statusScreen(inquirer) {
         clearTimeout(timer);
         if (res.ok) {
           const b = await res.json();
-          console.log(`  Reachable:  \x1b[32myes\x1b[0m  (echoed version ${b.version}, agents ${b.agents}, proxy ${b.proxy ? 'on' : 'off'})`);
+          console.log(`  Reachable:  \x1b[32myes\x1b[0m  (agents ${b.agents}, proxy ${b.proxy ? 'on' : 'off'})`);
         } else {
           console.log(`  Reachable:  \x1b[31mno\x1b[0m  (HTTP ${res.status})`);
         }
