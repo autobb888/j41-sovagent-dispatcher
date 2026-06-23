@@ -6,4 +6,6 @@ test('clampCredit takes min(expected, confirmed); falls back when confirmed miss
   assert.equal(clampCredit(10, undefined), 10);
   assert.equal(clampCredit(10, NaN), 10);
   assert.equal(clampCredit(10, null), 10);
+  assert.equal(clampCredit(10, -5), 0);   // negative confirmed must never debit
+  assert.equal(clampCredit(10, -0.001), 0);
 });
