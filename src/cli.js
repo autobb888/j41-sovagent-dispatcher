@@ -5557,7 +5557,16 @@ function buildDispatcherSecurityOpt() {
     seccompPath = seccompPathUser;
   }
   if (seccompPath) {
-    opts.push(`seccomp=${seccompPath}`);
+    // The dockerode HostConfig.SecurityOpt API expects the seccomp profile
+    // CONTENT (JSON), not a file path — only the `docker` CLI reads the file.
+    // Passing a path makes the daemon try to JSON-parse "/etc/..." → HTTP 500.
+    try {
+      const profileJson = fs.readFileSync(seccompPath, 'utf8');
+      JSON.parse(profileJson); // validate before handing it to the daemon
+      opts.push(`seccomp=${profileJson}`);
+    } catch (e) {
+      console.warn(`[security] seccomp profile at ${seccompPath} unreadable/invalid JSON (${e.message}) — container runs WITHOUT syscall filtering`);
+    }
   } else {
     console.warn('[security] seccomp profile not found at /etc/j41 or ~/.j41 — container runs WITHOUT syscall filtering');
   }
