@@ -5858,17 +5858,18 @@ async function startJobLocal(state, job, agentInfo) {
     const logPath = path.join(jobDir, 'output.log');
     const logStream = fs.createWriteStream(logPath, { flags: 'a' });
     logStream.write(`[${new Date().toISOString()}] Job started — agent: ${agentInfo.id}, PID: ${child.pid}\n`);
+    const writeCapped = makeCappedLogWriter(logStream, cfg.runtime.job_log_max_bytes);
 
     child.stdout.on('data', (data) => {
       const text = data.toString();
-      logStream.write(text);
+      writeCapped(text);
       text.trim().split('\n').forEach(line => {
         if (line.trim()) console.log(`  [${shortId}] ${line.trim()}`);
       });
     });
     child.stderr.on('data', (data) => {
       const text = data.toString();
-      logStream.write(text);
+      writeCapped(text);
       text.trim().split('\n').forEach(line => {
         if (line.trim()) console.error(`  [${shortId}] ${line.trim()}`);
       });
@@ -5877,6 +5878,8 @@ async function startJobLocal(state, job, agentInfo) {
     child.on('exit', (code, signal) => {
       logStream.write(`[${new Date().toISOString()}] Job process exited\n`);
       logStream.end();
+      const a = state.active.get(job.id);
+      if (a) { a._exitCode = code; a._killed = !!signal; }
       // Unexpected exit (non-zero, not a clean signal) counts as a crash for
       // the health document's containers_unhealthy rollup.
       if (code && code !== 0) {
