@@ -3957,58 +3957,73 @@ program
     ensureDirs();
 
     if (!jobId) {
-      // List all jobs with logs
-      if (!fs.existsSync(JOBS_DIR)) {
-        console.log('No job logs found.');
-        return;
-      }
-      const jobDirs = fs.readdirSync(JOBS_DIR).filter(d => {
-        return fs.existsSync(path.join(JOBS_DIR, d, 'output.log'));
-      });
+      // List all jobs with logs: live job dirs + archived _logs/<id>.log.
+      const jobDirs = fs.existsSync(JOBS_DIR)
+        ? fs.readdirSync(JOBS_DIR).filter(d => d !== '_logs' && fs.existsSync(path.join(JOBS_DIR, d, 'output.log')))
+        : [];
+      const archiveDir = path.join(JOBS_DIR, '_logs');
+      const archived = fs.existsSync(archiveDir)
+        ? fs.readdirSync(archiveDir).filter(f => f.endsWith('.log'))
+        : [];
 
-      if (jobDirs.length === 0) {
+      if (jobDirs.length === 0 && archived.length === 0) {
         console.log('No job logs found. Logs are written when the dispatcher runs jobs.');
         return;
       }
 
-      console.log(`\n── Job Logs (${jobDirs.length}) ──\n`);
-      for (const dir of jobDirs.slice(-20)) { // last 20
-        const logPath = path.join(JOBS_DIR, dir, 'output.log');
-        const stat = fs.statSync(logPath);
-        const agentFile = path.join(JOBS_DIR, dir, 'buyer.txt');
-        const buyer = fs.existsSync(agentFile) ? fs.readFileSync(agentFile, 'utf-8').trim() : '?';
-        const size = (stat.size / 1024).toFixed(1);
-        console.log(`  ${dir.substring(0, 8)}  ${stat.mtime.toISOString().substring(0, 19)}  ${size}KB  buyer: ${buyer}`);
+      if (jobDirs.length) {
+        console.log(`\n── Job Logs (${jobDirs.length}) ──\n`);
+        for (const dir of jobDirs.slice(-20)) { // last 20
+          const logPath = path.join(JOBS_DIR, dir, 'output.log');
+          const stat = fs.statSync(logPath);
+          const agentFile = path.join(JOBS_DIR, dir, 'buyer.txt');
+          const buyer = fs.existsSync(agentFile) ? fs.readFileSync(agentFile, 'utf-8').trim() : '?';
+          const size = (stat.size / 1024).toFixed(1);
+          console.log(`  ${dir.substring(0, 8)}  ${stat.mtime.toISOString().substring(0, 19)}  ${size}KB  buyer: ${buyer}`);
+        }
       }
+
+      if (archived.length) {
+        console.log(`\n── Archived Logs (${archived.length}) ──\n`);
+        for (const f of archived.slice(-20)) {
+          const p = path.join(archiveDir, f);
+          const stat = fs.statSync(p);
+          const size = (stat.size / 1024).toFixed(1);
+          console.log(`  ${f.slice(0, -4).substring(0, 8)}  ${stat.mtime.toISOString().substring(0, 19)}  ${size}KB  [archived]`);
+        }
+      }
+
       console.log(`\n  View: node src/cli.js logs <job-id-prefix>`);
       console.log(`  Tail: node src/cli.js logs <job-id-prefix> -f`);
       return;
     }
 
-    // Find matching job dir (supports prefix match)
-    if (!fs.existsSync(JOBS_DIR)) {
-      console.error(`❌ No jobs directory found.`);
-      process.exit(1);
-    }
-    const matches = fs.readdirSync(JOBS_DIR).filter(d => d.startsWith(jobId));
-    if (matches.length === 0) {
+    // Resolve the job prefix to a live output.log or an archived _logs/<id>.log.
+    const archiveDir = path.join(JOBS_DIR, '_logs');
+    const liveIds = fs.existsSync(JOBS_DIR)
+      ? fs.readdirSync(JOBS_DIR).filter(d => d !== '_logs' && d.startsWith(jobId) && fs.existsSync(path.join(JOBS_DIR, d, 'output.log')))
+      : [];
+    const archivedIds = fs.existsSync(archiveDir)
+      ? fs.readdirSync(archiveDir).filter(f => f.endsWith('.log') && f.slice(0, -4).startsWith(jobId)).map(f => f.slice(0, -4))
+      : [];
+    const matchIds = Array.from(new Set([...liveIds, ...archivedIds]));
+
+    if (matchIds.length === 0) {
       console.error(`❌ No job found matching "${jobId}"`);
       process.exit(1);
     }
-    if (matches.length > 1) {
-      console.error(`❌ Ambiguous prefix "${jobId}" — matches ${matches.length} jobs:`);
-      matches.forEach(m => console.error(`   ${m}`));
+    if (matchIds.length > 1) {
+      console.error(`❌ Ambiguous prefix "${jobId}" — matches ${matchIds.length} jobs:`);
+      matchIds.forEach(m => console.error(`   ${m}`));
       process.exit(1);
     }
 
-    const fullJobId = matches[0];
-    const logPath = path.join(JOBS_DIR, fullJobId, 'output.log');
+    const fullJobId = matchIds[0];
+    const liveLogPath = path.join(JOBS_DIR, fullJobId, 'output.log');
+    const logPath = fs.existsSync(liveLogPath) ? liveLogPath : path.join(archiveDir, `${fullJobId}.log`);
 
     if (!fs.existsSync(logPath)) {
       console.error(`❌ No log file for job ${fullJobId}`);
-      // Show what files exist
-      const files = fs.readdirSync(path.join(JOBS_DIR, fullJobId));
-      console.log(`   Files: ${files.join(', ')}`);
       process.exit(1);
     }
 
