@@ -5781,7 +5781,10 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   // (exit banner + any queued tail) rather than racing them to disk.
   if (active._logStream) {
     await new Promise(resolve => {
-      try { active._logStream.end(() => resolve()); } catch { resolve(); /* already closed */ }
+      let done = false;
+      const fin = () => { if (!done) { done = true; resolve(); } };
+      try { active._logStream.end(fin); } catch { fin(); /* already closed */ }
+      setTimeout(fin, 1000).unref(); // never block teardown on a wedged/destroyed stream
     });
   }
 
@@ -6057,7 +6060,10 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
   // archive copy includes the last buffered bytes.
   if (active._logStream) {
     await new Promise(resolve => {
-      try { active._logStream.end(() => resolve()); } catch { resolve(); /* already closed */ }
+      let done = false;
+      const fin = () => { if (!done) { done = true; resolve(); } };
+      try { active._logStream.end(fin); } catch { fin(); /* already closed */ }
+      setTimeout(fin, 1000).unref(); // never block teardown on a wedged/destroyed stream
     });
   }
 
