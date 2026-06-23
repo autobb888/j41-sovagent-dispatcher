@@ -80,6 +80,41 @@ function maybeNotifyCreditLow(agentId, buyerVerusId, remaining, cfg, config) {
   }
 }
 
+/**
+ * Normalize an IPv6 address string to its canonical compressed form using
+ * Node's net module so we can compare against well-known loopback/private
+ * forms without maintaining a hand-rolled list of string variants.
+ *
+ * Returns null when the input is not a valid IPv6 address.
+ */
+function _canonicalizeIPv6(ip) {
+  // net.isIPv6 accepts the input; Node normalizes via the underlying OS
+  // inet_pton but doesn't expose a standalone normalize.  We use a
+  // quick expand-then-compress approach in pure JS instead:
+  //   1. Expand "::" shorthand to full 8 groups.
+  //   2. Remove leading zeros in each group.
+  //   3. Return the normalized form for comparison.
+  try {
+    // Split on "::" (at most one occurrence in valid v6)
+    const halves = ip.split('::');
+    if (halves.length > 2) return null;
+
+    // Strip "::ffff:" IPv4-mapped prefix for uniform handling below
+    const left = halves[0] ? halves[0].split(':') : [];
+    const right = halves.length === 2 ? (halves[1] ? halves[1].split(':') : []) : [];
+
+    const missing = 8 - left.length - right.length;
+    if (missing < 0) return null; // malformed
+    const full = [...left, ...Array(missing).fill('0'), ...right];
+    if (full.length !== 8) return null;
+
+    // Parse each group as hex (handles leading zeros)
+    return full.map(g => parseInt(g, 16));
+  } catch {
+    return null;
+  }
+}
+
 function isPrivateIp(ip) {
   if (!ip) return false;
   const v = net.isIP(ip);
@@ -95,25 +130,67 @@ function isPrivateIp(ip) {
   }
   if (v === 6) {
     const lo = ip.toLowerCase();
+
+    // Fast-path: already-compressed canonical loopback / unspecified
     if (lo === '::1' || lo === '::') return true;
+
+    // Link-local, ULA (fc00::/7)
     if (lo.startsWith('fe80:') || lo.startsWith('fc') || lo.startsWith('fd')) return true;
-    // IPv4-mapped IPv6 (::ffff:a.b.c.d)
-    const m = lo.match(/^::ffff:([0-9.]+)$/);
-    if (m && isPrivateIp(m[1])) return true;
+
+    // IPv4-mapped IPv6 in DOTTED notation: ::ffff:a.b.c.d
+    const mDotted = lo.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (mDotted) return isPrivateIp(mDotted[1]);
+
+    // IPv4-mapped IPv6 in HEX notation: ::ffff:7f00:1 (= ::ffff:127.0.0.1)
+    // Groups are 0000:ffff followed by two hex groups encoding the IPv4 addr.
+    const groups = _canonicalizeIPv6(lo);
+    if (groups) {
+      // Loopback: all-zeros then 1  (0:0:0:0:0:0:0:1)
+      if (groups[0] === 0 && groups[1] === 0 && groups[2] === 0 &&
+          groups[3] === 0 && groups[4] === 0 && groups[5] === 0 &&
+          groups[6] === 0 && groups[7] === 1) return true;
+
+      // IPv4-mapped: 0:0:0:0:0:ffff:<hi16>:<lo16>
+      if (groups[0] === 0 && groups[1] === 0 && groups[2] === 0 &&
+          groups[3] === 0 && groups[4] === 0 && groups[5] === 0xffff) {
+        // Reconstruct the embedded IPv4 address
+        const hi = groups[6];
+        const lo16 = groups[7];
+        const a4 = (hi >>> 8) & 0xff;
+        const b4 = hi & 0xff;
+        const c4 = (lo16 >>> 8) & 0xff;
+        const d4 = lo16 & 0xff;
+        return isPrivateIp(`${a4}.${b4}.${c4}.${d4}`);
+      }
+
+      // Unspecified address (::)
+      if (groups.every(g => g === 0)) return true;
+    }
+
     return false;
   }
   return false;
 }
 
+/**
+ * Resolve and SSRF-check an upstream hostname.
+ *
+ * Returns { safe: true, resolvedIp: string } on success so the caller can
+ * PIN the http.request `lookup` option to the already-validated address,
+ * closing the DNS-rebind TOCTOU window (Fix 2 — DNS pin).
+ *
+ * When the hostname is already a bare IP literal we skip dns.lookup and
+ * return the literal as resolvedIp.
+ */
 async function checkUpstreamHostSafe(hostname, cfg) {
-  if (cfg.runtime.allow_local_upstream) return { safe: true };
+  if (cfg.runtime.allow_local_upstream) return { safe: true, resolvedIp: null };
   const lc = hostname.toLowerCase();
   if (lc === 'localhost' || lc.endsWith('.localhost') || lc.endsWith('.local') || lc.endsWith('.internal')) {
     return { safe: false, reason: `hostname "${hostname}" is a local/internal name` };
   }
   if (net.isIP(hostname)) {
     if (isPrivateIp(hostname)) return { safe: false, reason: `upstream IP ${hostname} is private/loopback/link-local` };
-    return { safe: true };
+    return { safe: true, resolvedIp: hostname };
   }
   try {
     const addrs = await dns.lookup(hostname, { all: true });
@@ -122,10 +199,13 @@ async function checkUpstreamHostSafe(hostname, cfg) {
         return { safe: false, reason: `hostname ${hostname} resolves to private address ${a.address}` };
       }
     }
+    // Use the first resolved address for the DNS pin so http.request skips
+    // its own re-resolution (DNS-rebind TOCTOU).
+    const pinnedIp = addrs.length > 0 ? addrs[0].address : null;
+    return { safe: true, resolvedIp: pinnedIp };
   } catch (e) {
     return { safe: false, reason: `DNS lookup failed for ${hostname}: ${e.message}` };
   }
-  return { safe: true };
 }
 
 // Safe response headers to forward from upstream (allowlist)
@@ -343,6 +423,17 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   const isHttps = upstreamUrl.protocol === 'https:';
   const transport = isHttps ? https : http;
 
+  // Fix 2 — DNS-rebind pin: supply the already-validated IP as the `lookup`
+  // callback so http.request never re-resolves the hostname via DNS.
+  // This closes the TOCTOU window between our SSRF check (above) and the
+  // actual TCP connect.  When allow_local_upstream is set (dev/test) or the
+  // host was already a bare IP literal, resolvedIp may be null — fall back
+  // to Node's default lookup in those cases only.
+  const pinnedIp = safety.resolvedIp;
+  const pinnedLookup = pinnedIp
+    ? (hostname, opts, cb) => cb(null, pinnedIp, pinnedIp.includes(':') ? 6 : 4)
+    : undefined;
+
   const proxyReq = transport.request(upstreamUrl.href, {
     method: 'POST',
     headers: {
@@ -351,6 +442,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
       ...(config.upstreamAuth ? { 'Authorization': config.upstreamAuth } : {}),
     },
     timeout: cfg.proxy.upstream_timeout_ms,
+    ...(pinnedLookup ? { lookup: pinnedLookup } : {}),
   }, (proxyRes) => {
     const j41Headers = {
       'X-J41-Request-Id': requestId,
@@ -505,4 +597,4 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   proxyReq.end();
 }
 
-module.exports = { handleProxyRequest, maybeNotifyCreditLow, resolveCreditLowThreshold };
+module.exports = { handleProxyRequest, maybeNotifyCreditLow, resolveCreditLowThreshold, isPrivateIp };
