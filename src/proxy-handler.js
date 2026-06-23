@@ -452,7 +452,16 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     };
 
     if (isStreaming) {
-      // Stream response through, count tokens at the end
+      // Stream response through, count tokens at the end.
+      // Emit X-J41-Credit-Remaining now (before the body starts) using the
+      // post-reservation balance (worst-case). adjustCredit at stream end may
+      // refund part of the reservation, so the true final balance can only be
+      // known after EOF — but headers must be sent before the first byte.
+      j41Headers['X-J41-Credit-Remaining'] = creditCheck.balance.toFixed(4);
+      if (creditCheck.balance < 1) {
+        j41Headers['X-J41-Credit-SuggestedTopup'] = String(cfg.proxy.suggested_topup_vrsc);
+        j41Headers['X-J41-Seller-PayAddress'] = config.payAddress || '';
+      }
       const safeHeaders = filterHeaders(proxyRes.headers);
       res.writeHead(proxyRes.statusCode, { ...safeHeaders, ...j41Headers });
 

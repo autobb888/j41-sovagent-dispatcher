@@ -3061,7 +3061,7 @@ program
       agentMarkup: new Map(), // agentId -> markup percentage
       pendingPayment: new Map(), // jobId -> payment info
       _lastSentStatus: new Map(), // jobId -> last status sent
-      _lastExtensionCheck: new Map(), // jobId -> last extension check timestamp
+      _lastExtensionCheck: new Map(), // ext.id -> { ts, jobId } (dedup of dispatched extension requests; pruned by jobId at job teardown)
       _pendingWorkspace: new Map(), // jobId -> workspace connect promise
       _agentErrors: new Map(), // agentId -> last error string (health document)
       _containerCrashes: new Map(), // agentId -> unexpected-exit count (health document)
@@ -4856,7 +4856,7 @@ async function pollForJobs(state) {
       if (pending?.length > 0) {
         for (const ext of pending) {
           if (state._lastExtensionCheck.has(ext.id)) continue;
-          state._lastExtensionCheck.set(ext.id, Date.now());
+          state._lastExtensionCheck.set(ext.id, { ts: Date.now(), jobId });
           await handleExtensionRequest(state, jobId, ext.id, activeInfo.agentInfo);
         }
       }
@@ -6033,6 +6033,16 @@ function archiveJobLog(jobsDir, jobId, exitInfo) {
   } catch (e) { console.error(`[Logs] archive failed for ${jobId}: ${e.message}`); }
 }
 
+// Prune _lastExtensionCheck entries for a finished job. The map is keyed by
+// ext.id (not jobId), so we can't delete(jobId) — we scan and drop every entry
+// whose stored { ts, jobId } belongs to this job. This keeps the map bounded
+// across many jobs. n is tiny (extension requests for active jobs only).
+function pruneExtensionChecks(state, jobId) {
+  for (const [extId, val] of state._lastExtensionCheck) {
+    if (val && val.jobId === jobId) state._lastExtensionCheck.delete(extId);
+  }
+}
+
 // Stop a job container
 async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   const active = state.active.get(jobId);
@@ -6115,7 +6125,7 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
 
   // Prune per-job tracking Maps to prevent memory leaks
   state._lastSentStatus.delete(jobId);
-  state._lastExtensionCheck.delete(jobId);
+  pruneExtensionChecks(state, jobId);
   state._pendingWorkspace.delete(jobId);
   state.pendingPayment.delete(jobId);
 
@@ -6401,7 +6411,7 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
 
   // Prune per-job tracking Maps to prevent memory leaks
   state._lastSentStatus.delete(jobId);
-  state._lastExtensionCheck.delete(jobId);
+  pruneExtensionChecks(state, jobId);
   state._pendingWorkspace.delete(jobId);
   state.pendingPayment.delete(jobId);
 
