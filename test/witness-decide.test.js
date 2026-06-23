@@ -73,7 +73,21 @@ test('decideWitnessWrite: verified=false on testnet without J41_WITNESS_VERIFY �
   }
 });
 
-// ── break-glass: J41_WITNESS_VERIFY=off on testnet only ─────────────────────
+// ── break-glass: J41_WITNESS_VERIFY=off requires explicit verustest ──────────
+
+test('decideWitnessWrite: verified=false network=undefined with J41_WITNESS_VERIFY=off — throws (unknown network cannot enable break-glass)', () => {
+  const prev = process.env.J41_WITNESS_VERIFY;
+  process.env.J41_WITNESS_VERIFY = 'off';
+  try {
+    assert.throws(
+      () => decideWitnessWrite({ verified: false, reason: 'bad_sig' }, { network: undefined, jobId: JOB_ID }),
+      (e) => /witness verification failed/.test(e.message) && e.message.includes(JOB_ID),
+    );
+  } finally {
+    if (prev === undefined) delete process.env.J41_WITNESS_VERIFY;
+    else process.env.J41_WITNESS_VERIFY = prev;
+  }
+});
 
 test('decideWitnessWrite: verified=false on testnet with J41_WITNESS_VERIFY=off — warns but does not throw', () => {
   const prev = process.env.J41_WITNESS_VERIFY;

@@ -38,11 +38,10 @@ const {
  * @param {{ verified: boolean, reason?: string }} v  Result from verifyWitness.
  * @param {{ network: string, jobId: string }} ctx    Execution context.
  * @returns {void} — throws if the write must be refused; logs a warning for
- *   break-glass (J41_WITNESS_VERIFY=off on non-mainnet only).
+ *   break-glass (J41_WITNESS_VERIFY=off on verustest only; unknown/undefined network never enables it).
  */
 function decideWitnessWrite(v, { network, jobId }) {
-  const isMainnet = network === 'verus';
-  const allowOff = process.env.J41_WITNESS_VERIFY === 'off' && !isMainnet;
+  const allowOff = process.env.J41_WITNESS_VERIFY === 'off' && network === 'verustest';
   if (!v.verified && !allowOff) {
     throw new Error(
       `jobCompletionUpdate: witness verification failed (${v.reason}) — refusing record.job write for job ${jobId}`,
@@ -147,7 +146,10 @@ function jobCompletionUpdateExecutor({ getClient }) {
     // directly (SDK already unwraps res.data).
     const client = await getClient();
     const jobId = ctx.jobId;
-    const network = ctx.network || 'verustest';
+    const network = ctx.network;
+    if (network !== 'verus' && network !== 'verustest') {
+      throw new Error(`jobCompletionUpdate: invalid/absent network '${network}' — refusing record.job write`);
+    }
 
     const { record, witness } = await client.getJobWitness(jobId);
 
@@ -160,14 +162,19 @@ function jobCompletionUpdateExecutor({ getClient }) {
     // For each field the authoritative job carries, the witnessed record must
     // agree. Skip fields not present on authoritativeJob (future-proofing).
     const crossCheckFields = ['jobHash', 'buyerVerusId', 'sellerVerusId'];
+    let compared = 0;
     for (const f of crossCheckFields) {
       if (authoritativeJob[f] !== undefined && record[f] !== undefined) {
+        compared += 1;
         if (String(record[f]) !== String(authoritativeJob[f])) {
           throw new Error(
             `jobCompletionUpdate: witness/getJob mismatch on ${f} (witness: ${record[f]}, authoritative: ${authoritativeJob[f]}) for job ${jobId}`,
           );
         }
       }
+    }
+    if (compared === 0) {
+      console.warn(`[witness] cross-check skipped — authoritativeJob carried none of jobHash/buyerVerusId/sellerVerusId for ${jobId}; relying on signature verification alone`);
     }
 
     // ── Build the on-chain record from the verified witness ───────────────────
@@ -197,7 +204,7 @@ function jobCompletionUpdateExecutor({ getClient }) {
       identityData,
       utxos,
       vdxfAdditions: additions,
-      network: ctx.network,
+      network,
     });
     const txResult = await client.broadcast(rawhex);
     const txid = typeof txResult === 'string' ? txResult : txResult.txid || txResult;

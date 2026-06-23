@@ -361,6 +361,54 @@ test('jobCompletionUpdateExecutor: returns skipped on no UTXOs (no throw)', asyn
   }
 });
 
+test('jobCompletionUpdateExecutor: warns when authoritativeJob has none of the cross-check fields (compared===0)', async () => {
+  const { jobCompletionUpdateExecutor } = require('../src/broker-executors.js');
+  // Use a job override that strips all cross-check fields so compared stays 0.
+  const ctx = await setup({ jobOverrides: { jobHash: undefined, buyerVerusId: undefined, sellerVerusId: undefined } });
+  const prevEnv = process.env.J41_WITNESS_VERIFY;
+  process.env.J41_WITNESS_VERIFY = 'off';
+  const warnings = [];
+  const origWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+  try {
+    const fakeClient = {
+      async getJobWitness() {
+        return {
+          record: { amount: 5, currency: 'VRSCTEST', status: 'completed', schemaVersion: 1, serviceId: null },
+          witness: { schemaVersion: 1, signedBy: 'iTest', signedByName: 'agentplatform@', signature: 'AAAAAA==', signatureHeight: 100, algorithm: 'verusid-signdata-sha256' },
+        };
+      },
+      async getIdentityKeys(idOrName) {
+        return { iaddress: 'iTest', name: idOrName, primaryAddresses: [], minimumSignatures: 1 };
+      },
+      async getIdentityRaw() {
+        return { data: { identity: {}, prevOutput: { txid: 'a'.repeat(64), vout: 0 } } };
+      },
+      async getUtxos() { return { utxos: [] }; },
+    };
+    const executor = jobCompletionUpdateExecutor({ getClient: async () => fakeClient });
+    ctx.host.executors.jobCompletionUpdate = executor;
+
+    const result = await ctx.client.executeOnChain('jobCompletionUpdate', {
+      jobRecord: { amount: 5 },
+    });
+    assert.deepStrictEqual(result, { skipped: true, reason: 'no-utxos' });
+    assert.ok(
+      warnings.some((w) => w.includes('cross-check skipped')),
+      'must emit cross-check skipped warning when authoritativeJob has no cross-check fields',
+    );
+    assert.ok(
+      warnings.some((w) => w.includes(ctx.jobId)),
+      'cross-check warning must include jobId',
+    );
+  } finally {
+    console.warn = origWarn;
+    if (prevEnv === undefined) delete process.env.J41_WITNESS_VERIFY;
+    else process.env.J41_WITNESS_VERIFY = prevEnv;
+    await teardown(ctx);
+  }
+});
+
 test('end-to-end: J41Agent constructed with the client routes accept through the broker', async () => {
   // This is the integration touchpoint that step 4 will rely on: the agent's
   // checkForJobs() accept path uses signer.signBrokered, which goes over the

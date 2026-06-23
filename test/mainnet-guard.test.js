@@ -20,6 +20,7 @@ test('each hatch individually produces exactly one violation naming the flag', (
     [{ J41_ALLOW_LOCAL_UPSTREAM: '1' }, {}, /J41_ALLOW_LOCAL_UPSTREAM=1/],
     [{ J41_SKIP_STATUS_CHECK: '1' }, {}, /J41_SKIP_STATUS_CHECK=1/],
     [{ J41_ALLOW_LEGACY_REVOKE: '1' }, {}, /J41_ALLOW_LEGACY_REVOKE=1/],
+    [{ J41_WITNESS_VERIFY: 'off' }, {}, /J41_WITNESS_VERIFY=off/],
   ];
   for (const [env, opts, re] of cases) {
     const v = findMainnetSecurityViolations(env, opts);
