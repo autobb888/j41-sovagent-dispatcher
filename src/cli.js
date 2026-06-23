@@ -5693,6 +5693,7 @@ async function startJobContainer(state, job, agentInfo) {
     const _timeoutTimer = setTimeout(async () => {
       const active = state.active.get(job.id);
       if (active) {
+        active._killed = true;
         console.log(`⏰ Job ${job.id} timeout, killing container`);
         await stopJobContainer(state, job.id);
       }
@@ -5706,6 +5707,28 @@ async function startJobContainer(state, job, agentInfo) {
     console.error(`❌ Failed to start container for ${job.id}:`, e.message);
     // Return agent to pool
     state.available.push(agentInfo);
+  }
+}
+
+// Archive a finished job's output.log to JOBS_DIR/_logs/<jobId>.log when the
+// retention policy says to keep it, then prune to job_log_max_retained.
+// Best-effort: never throws into the cleanup path.
+function archiveJobLog(jobDir, jobId, exitInfo) {
+  try {
+    const retention = resolveLogRetention(cfg);
+    const logPath = path.join(jobDir, 'output.log');
+    if (!fs.existsSync(logPath) || !shouldArchiveLog(retention, exitInfo)) return;
+    const archiveDir = path.join(JOBS_DIR, '_logs');
+    fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
+    fs.copyFileSync(logPath, path.join(archiveDir, `${jobId}.log`));
+    const entries = fs.readdirSync(archiveDir)
+      .filter(f => f.endsWith('.log'))
+      .map(f => ({ id: f.slice(0, -4), mtimeMs: fs.statSync(path.join(archiveDir, f)).mtimeMs }));
+    for (const id of selectLogsToPrune(entries, cfg.runtime.job_log_max_retained)) {
+      fs.rmSync(path.join(archiveDir, `${id}.log`), { force: true });
+    }
+  } catch (e) {
+    console.error(`[Logs] archive failed for ${jobId}: ${e.message}`);
   }
 }
 
@@ -5753,8 +5776,14 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
     try { await active._signerTeardown(); } catch { /* best-effort */ }
   }
 
+  // Flush the per-job log stream before we archive/remove the dir.
+  if (active._logStream) {
+    try { active._logStream.end(); } catch { /* already closed */ }
+  }
+
   // Cleanup job dir (retain for debugging if requested)
   const jobDir = path.join(JOBS_DIR, jobId);
+  archiveJobLog(jobDir, jobId, { exitCode: active._exitCode, killed: active._killed });
   if (fs.existsSync(jobDir) && !cfg.runtime.keep_containers) {
     fs.rmSync(jobDir, { recursive: true });
   }
@@ -6019,6 +6048,7 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
 
   // Cleanup job dir
   const jobDir = path.join(JOBS_DIR, jobId);
+  archiveJobLog(jobDir, jobId, { exitCode: active._exitCode, killed: active._killed });
   if (fs.existsSync(jobDir) && !cfg.runtime.keep_containers) {
     fs.rmSync(jobDir, { recursive: true });
   }
