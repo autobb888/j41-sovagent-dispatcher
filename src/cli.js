@@ -4395,6 +4395,11 @@ async function attemptPendingRefund(state, jobId, entry) {
     // Mark refunded immediately after the irreversible on-chain send, BEFORE any
     // platform-record step that could fail and leave the platform reporting the
     // job non-terminal. This is what prevents the double-pay interleaving.
+    // RESIDUAL WINDOW: if markJobRefunded's writeFileSync→renameSync is interrupted
+    // by a disk fault after the send, the job stays in pending-refunds.json and is
+    // retried next startup → possible double send. Strictly smaller than the
+    // original software bug (requires a hardware fault between two syscalls);
+    // unavoidable without a transactional FS / distributed lock.
     markJobRefunded(jobId);
     console.log(`  [refund] ✅ Refund TX: ${txid}`);
 
