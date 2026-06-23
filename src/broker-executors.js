@@ -25,6 +25,33 @@ const {
 const {
   buildIdentityUpdateTx,
 } = require('@junction41/sovagent-sdk/dist/identity/update.js');
+const {
+  verifyWitness,
+} = require('@junction41/sovagent-sdk/dist/index.js');
+
+/**
+ * Integrity ②: decide whether to proceed with writing a witness-sourced
+ * record on-chain, or throw fail-closed.
+ *
+ * Exported so it can be unit-tested independently of the full executor.
+ *
+ * @param {{ verified: boolean, reason?: string }} v  Result from verifyWitness.
+ * @param {{ network: string, jobId: string }} ctx    Execution context.
+ * @returns {void} — throws if the write must be refused; logs a warning for
+ *   break-glass (J41_WITNESS_VERIFY=off on non-mainnet only).
+ */
+function decideWitnessWrite(v, { network, jobId }) {
+  const isMainnet = network === 'verus';
+  const allowOff = process.env.J41_WITNESS_VERIFY === 'off' && !isMainnet;
+  if (!v.verified && !allowOff) {
+    throw new Error(
+      `jobCompletionUpdate: witness verification failed (${v.reason}) — refusing record.job write for job ${jobId}`,
+    );
+  }
+  if (!v.verified && allowOff) {
+    console.warn(`[witness] J41_WITNESS_VERIFY=off — writing UNVERIFIED record.job for ${jobId}`);
+  }
+}
 
 /**
  * Build a `J41Client` factory that the dispatcher can pass into the executors.
@@ -59,26 +86,28 @@ function makeClientFactory(cfg) {
  * site at the end of a job (writes jobRecord + reviewRecord + workspace
  * attestation onto the agent's identity on-chain).
  *
- * The container provides the *content* (jobRecord etc.), which today's path
- * already trusts it to author (the on-chain entries are self-reported job
- * history). The dispatcher provides the *signing*: re-fetches identity +
- * UTXOs from its own session, builds the tx with the WIF, broadcasts.
+ * Integrity ②: the on-chain VDXF record.job is sourced from the **platform
+ * witness** (cryptographically verified via `verifyWitness`, offline), NOT
+ * from the container-supplied `jobRecord`. The container's `jobRecord` is
+ * accepted only as a soft pre-check (shape + early jobHash sanity gate) and
+ * is NOT written on-chain. `reviewRecord` and `workspaceAttestation` remain
+ * legitimately container-authored and are passed through unchanged.
  *
  * Returns `{ txid }` on success, `{ skipped: true, reason }` if there are no
- * UTXOs (same fail-soft behavior the in-container path had).
+ * UTXOs (same fail-soft behavior the in-container path had). A 409 from
+ * `getJobWitness` (job not yet `completed`) propagates as a throw so the
+ * completion flow retries.
  */
 function jobCompletionUpdateExecutor({ getClient }) {
   return async (params, ctx) => {
     const { jobRecord, reviewRecord, workspaceAttestation } = params || {};
+
+    // ── Soft pre-check on container-supplied jobRecord (shape only) ──────────
+    // These checks guard against obviously malformed container payloads but do
+    // NOT determine what gets written on-chain — the platform witness does.
     if (!jobRecord || typeof jobRecord !== 'object') {
       throw new Error('jobCompletionUpdate: jobRecord (object) required');
     }
-    // Audit 2026-06-02 H-DISPATCHER-6: shape-validate container-supplied
-    // records before signing+broadcasting them under the agent's identity.
-    // The full architectural fix (reconstruct from trusted state instead of
-    // accepting container blob) requires SDK + backend coordination on what
-    // counts as authoritative; the shape check stops the simple "container
-    // ships unrelated keys into vdxfAdditions" path immediately.
     if (jobRecord.timestamp !== undefined && typeof jobRecord.timestamp !== 'number') {
       throw new Error('jobCompletionUpdate: jobRecord.timestamp must be a number');
     }
@@ -88,31 +117,66 @@ function jobCompletionUpdateExecutor({ getClient }) {
     if (workspaceAttestation !== undefined && (typeof workspaceAttestation !== 'object' || workspaceAttestation === null)) {
       throw new Error('jobCompletionUpdate: workspaceAttestation must be an object if provided');
     }
-    // Refuse if any unexpected top-level keys (defensive — drops a future
-    // mistaken expansion of the container surface from making it on-chain).
     const allowedJobRecordKeys = new Set(['jobHash', 'timestamp', 'completedAt', 'amount', 'currency', 'buyer', 'seller', 'status', 'reviewerSignature']);
     for (const k of Object.keys(jobRecord)) {
       if (!allowedJobRecordKeys.has(k)) {
         throw new Error(`jobCompletionUpdate: jobRecord has unexpected key ${k}; refusing to broadcast`);
       }
     }
-    // Optional sanity: if jobRecord.jobHash is supplied, make sure it matches
-    // the channel's bound job — prevents a runaway container from poisoning
-    // the wrong job's identity record. We re-fetch via getJob to get the
-    // authoritative jobHash, comparing against what the container supplied.
+
+    // ── Authoritative job fetch (belt-and-suspenders source) ────────────────
     let authoritativeJob;
     try {
       authoritativeJob = await ctx.getJob();
     } catch (e) {
       throw new Error(`jobCompletionUpdate: failed to fetch authoritative job: ${e.message}`);
     }
+
+    // Early soft gate: container jobHash must not contradict the authoritative
+    // one. If the witness cross-check below is the hard gate, this is the fast
+    // path that avoids a network round-trip for obviously wrong containers.
     if (jobRecord.jobHash && authoritativeJob?.jobHash && jobRecord.jobHash !== authoritativeJob.jobHash) {
       throw new Error(
         `jobCompletionUpdate: jobRecord.jobHash mismatch (got ${jobRecord.jobHash}, authoritative ${authoritativeJob.jobHash})`,
       );
     }
 
+    // ── Platform witness: fetch + cryptographic verification ─────────────────
+    // Integrity ②: the job record written on-chain MUST come from the platform
+    // witness, not the container. getJobWitness returns { record, witness }
+    // directly (SDK already unwraps res.data).
     const client = await getClient();
+    const jobId = ctx.jobId;
+    const network = ctx.network || 'verustest';
+
+    const { record, witness } = await client.getJobWitness(jobId);
+
+    const v = await verifyWitness(record, witness, client, network);
+
+    // Fail-closed gate — throws on mainnet or when break-glass env is absent.
+    decideWitnessWrite(v, { network, jobId });
+
+    // ── Belt-and-suspenders cross-check: witness record vs authoritative getJob
+    // For each field the authoritative job carries, the witnessed record must
+    // agree. Skip fields not present on authoritativeJob (future-proofing).
+    const crossCheckFields = ['jobHash', 'buyerVerusId', 'sellerVerusId'];
+    for (const f of crossCheckFields) {
+      if (authoritativeJob[f] !== undefined && record[f] !== undefined) {
+        if (String(record[f]) !== String(authoritativeJob[f])) {
+          throw new Error(
+            `jobCompletionUpdate: witness/getJob mismatch on ${f} (witness: ${record[f]}, authoritative: ${authoritativeJob[f]}) for job ${jobId}`,
+          );
+        }
+      }
+    }
+
+    // ── Build the on-chain record from the verified witness ───────────────────
+    // The container's jobRecord is NOT the on-chain source. The witnessed record
+    // is the authoritative job history entry; the witness block is embedded so
+    // the on-chain entry is self-proving.
+    const jobRecordToWrite = { ...record, witness };
+
+    // ── Identity fetch + UTXO check ──────────────────────────────────────────
     const identityRawResp = await client.getIdentityRaw();
     const identityData = identityRawResp.data || identityRawResp;
     const utxoResp = await client.getUtxos();
@@ -121,8 +185,9 @@ function jobCompletionUpdateExecutor({ getClient }) {
       return { skipped: true, reason: 'no-utxos' };
     }
 
+    // reviewRecord and workspaceAttestation remain legitimately container-authored.
     const additions = buildJobCompletionAdditions({
-      jobRecord,
+      jobRecord: jobRecordToWrite,
       reviewRecord,
       workspaceAttestation,
     });
@@ -166,4 +231,5 @@ module.exports = {
   makeClientFactory,
   jobCompletionUpdateExecutor,
   defaultExecutors,
+  decideWitnessWrite,
 };

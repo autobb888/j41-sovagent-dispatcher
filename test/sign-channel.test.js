@@ -306,8 +306,42 @@ test('jobCompletionUpdateExecutor: rejects when jobRecord.jobHash mismatches aut
 test('jobCompletionUpdateExecutor: returns skipped on no UTXOs (no throw)', async () => {
   const { jobCompletionUpdateExecutor } = require('../src/broker-executors.js');
   const ctx = await setup();
+  // Use break-glass env so the test doesn't need a real platform key for
+  // verifyWitness — network is 'verustest' so J41_WITNESS_VERIFY=off is
+  // permitted (never allowed on mainnet).
+  const prevEnv = process.env.J41_WITNESS_VERIFY;
+  process.env.J41_WITNESS_VERIFY = 'off';
   try {
     const fakeClient = {
+      async getJobWitness(jobId) {
+        // Return a minimal plausible witness response for the testnet path.
+        return {
+          record: {
+            jobHash: ctx.job.jobHash,
+            buyerVerusId: ctx.job.buyerVerusId,
+            sellerVerusId: 'seller.agentplatform@',
+            amount: 5,
+            currency: 'VRSCTEST',
+            status: 'completed',
+            completedAt: new Date().toISOString(),
+            schemaVersion: 1,
+            serviceId: null,
+          },
+          witness: {
+            schemaVersion: 1,
+            signedBy: 'iTest',
+            signedByName: 'agentplatform@',
+            signature: 'AAAAAA==',
+            signatureHeight: 100,
+            algorithm: 'verusid-signdata-sha256',
+          },
+        };
+      },
+      async getIdentityKeys(idOrName) {
+        // verifyWitness will fail (wrong key), but J41_WITNESS_VERIFY=off on
+        // testnet lets the write proceed anyway (break-glass path).
+        return { iaddress: 'iTest', name: idOrName, primaryAddresses: [], minimumSignatures: 1 };
+      },
       async getIdentityRaw() {
         return { data: { identity: {}, prevOutput: { txid: 'a'.repeat(64), vout: 0 } } };
       },
@@ -321,6 +355,8 @@ test('jobCompletionUpdateExecutor: returns skipped on no UTXOs (no throw)', asyn
     });
     assert.deepStrictEqual(result, { skipped: true, reason: 'no-utxos' });
   } finally {
+    if (prevEnv === undefined) delete process.env.J41_WITNESS_VERIFY;
+    else process.env.J41_WITNESS_VERIFY = prevEnv;
     await teardown(ctx);
   }
 });
