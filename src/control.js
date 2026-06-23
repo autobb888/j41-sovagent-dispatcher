@@ -408,22 +408,41 @@ async function handleCommand(cmd, state, handlers, startedAt) {
     }
 
     case 'history': {
-      // Recent completed jobs from disk
+      // Recent completed jobs from disk — read from _live (active) and _logs (archived)
       const JOBS_DIR = path.join(os.homedir(), '.j41', 'dispatcher', 'jobs');
       const jobs = [];
       try {
-        const dirs = fs.readdirSync(JOBS_DIR).sort().reverse().slice(0, cmd.limit || 20);
-        for (const dir of dirs) {
-          const logPath = path.join(JOBS_DIR, dir, 'output.log');
-          if (!fs.existsSync(logPath)) continue;
-          const log = fs.readFileSync(logPath, 'utf8');
+        // Collect job ids from both _live and _logs dirs, deduplicated, newest-first
+        const liveDir = path.join(JOBS_DIR, '_live');
+        const archiveDir = path.join(JOBS_DIR, '_logs');
+        const liveIds = fs.existsSync(liveDir)
+          ? fs.readdirSync(liveDir).filter(f => f.endsWith('.log')).map(f => f.slice(0, -4))
+          : [];
+        const archiveIds = fs.existsSync(archiveDir)
+          ? fs.readdirSync(archiveDir).filter(f => f.endsWith('.log')).map(f => f.slice(0, -4))
+          : [];
+        const allIds = Array.from(new Set([...liveIds, ...archiveIds])).sort().reverse().slice(0, cmd.limit || 20);
+        for (const jobId of allIds) {
+          // Prefer _live, fall back to _logs
+          const livePath = path.join(liveDir, `${jobId}.log`);
+          const archivePath = path.join(archiveDir, `${jobId}.log`);
+          let logPath = null;
+          // lstat-guard: skip symlinks
+          if (fs.existsSync(livePath) && !fs.lstatSync(livePath).isSymbolicLink()) logPath = livePath;
+          else if (fs.existsSync(archivePath) && !fs.lstatSync(archivePath).isSymbolicLink()) logPath = archivePath;
+          if (!logPath) continue;
+          let fd;
+          try { fd = fs.openSync(logPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
+          catch { continue; }
+          let log;
+          try { log = fs.readFileSync(fd, 'utf8'); } finally { fs.closeSync(fd); }
           const tokenMatch = log.match(/\[TOKENS\] Session: (\d+) calls, (\d+) in, (\d+) out, (\d+) total/);
           const agentMatch = log.match(/Job started — agent: (agent-\d+)/);
           jobs.push({
-            jobId: dir.substring(0, 8),
+            jobId: jobId.substring(0, 8),
             agent: agentMatch?.[1] || 'unknown',
             tokens: tokenMatch ? { calls: +tokenMatch[1], promptTokens: +tokenMatch[2], completionTokens: +tokenMatch[3], totalTokens: +tokenMatch[4] } : null,
-            hasAttestation: fs.existsSync(path.join(JOBS_DIR, dir, 'deletion-attestation.json')),
+            hasAttestation: fs.existsSync(path.join(JOBS_DIR, jobId, 'deletion-attestation.json')),
           });
         }
       } catch {}

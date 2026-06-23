@@ -1,5 +1,7 @@
 'use strict';
 
+const path = require('path');
+
 const VALID_RETENTION = ['off', 'errors', 'all'];
 
 /** Resolve retention mode from config; invalid/missing → 'errors'. */
@@ -52,7 +54,10 @@ function selectLogsToPrune(entries, maxRetained) {
   return sorted.slice(0, sorted.length - maxRetained).map(e => e.id);
 }
 
+function liveLogPath(jobsDir, jobId) { return path.join(jobsDir, '_live', `${jobId}.log`); }
+function archiveLogPath(jobsDir, jobId) { return path.join(jobsDir, '_logs', `${jobId}.log`); }
+
 module.exports = {
   resolveLogRetention, isAbnormalExit, shouldArchiveLog, applyLogCap,
-  selectLogsToPrune, VALID_RETENTION,
+  selectLogsToPrune, VALID_RETENTION, liveLogPath, archiveLogPath,
 };

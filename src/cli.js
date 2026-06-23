@@ -24,7 +24,7 @@ const { loadDispatcherConfig, fileConfiguredNetwork } = require('./config-loader
 const { SignChannelHost } = require('./sign-channel-host.js');
 const { defaultExecutors } = require('./broker-executors.js');
 const { findMainnetSecurityViolations, resolveIsMainnet } = require('./mainnet-guard.js');
-const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune } = require('./job-log.js');
+const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, liveLogPath, archiveLogPath } = require('./job-log.js');
 
 /** Feature flag: route in-container signing through the host-side broker
  *  instead of mounting the WIF into the container. Default ON; opt out only
@@ -298,6 +298,11 @@ function ensureDirs() {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
   });
+  // Ensure _live dir (host-only; never bind-mounted). Mode 0o700 — only dispatcher UID.
+  try { fs.mkdirSync(path.join(JOBS_DIR, '_live'), { recursive: true, mode: 0o700 }); } catch {}
+  // Best-effort sweep: remove stale _live/*.log whose job id is not in state.active.
+  // state is not available in ensureDirs scope (called before start), so just ensure dir exists.
+  // Actual stale-log cleanup happens at dispatcher start (see startup sweep below).
   // Defense-in-depth: re-lock any existing agent dirs / keys that older
   // dispatcher versions (or unrelated tools) may have created with looser
   // permissions. Cheap idempotent sweep — runs on every CLI invocation.
@@ -3057,6 +3062,21 @@ program
       _devUnsafe, // security: allows local mode when true
     };
 
+    // ── Startup sweep: remove stale _live/*.log for jobs not in active state ──
+    // Guards against dispatcher crash leaving orphaned live-log files.
+    try {
+      const liveDir = path.join(JOBS_DIR, '_live');
+      if (fs.existsSync(liveDir)) {
+        for (const f of fs.readdirSync(liveDir)) {
+          if (!f.endsWith('.log')) continue;
+          const jobIdFromFile = f.slice(0, -4);
+          if (!state.active.has(jobIdFromFile)) {
+            try { fs.rmSync(path.join(liveDir, f), { force: true }); } catch {}
+          }
+        }
+      }
+    } catch {}
+
     // ── Task 18: First-run security setup ──────────────────────
     const initMarker = path.join(os.homedir(), '.j41', 'dispatcher-security-initialized');
     if (!fs.existsSync(initMarker)) {
@@ -3957,36 +3977,37 @@ program
     ensureDirs();
 
     if (!jobId) {
-      // List all jobs with logs: live job dirs + archived _logs/<id>.log.
-      const jobDirs = fs.existsSync(JOBS_DIR)
-        ? fs.readdirSync(JOBS_DIR).filter(d => d !== '_logs' && fs.existsSync(path.join(JOBS_DIR, d, 'output.log')))
+      // List all jobs with logs: _live/*.log (active) + _logs/*.log (archived).
+      const liveDir = path.join(JOBS_DIR, '_live');
+      const liveFiles = fs.existsSync(liveDir)
+        ? fs.readdirSync(liveDir).filter(f => f.endsWith('.log') && (() => { try { return !fs.lstatSync(path.join(liveDir, f)).isSymbolicLink(); } catch { return false; } })())
         : [];
       const archiveDir = path.join(JOBS_DIR, '_logs');
       const archived = fs.existsSync(archiveDir)
-        ? fs.readdirSync(archiveDir).filter(f => f.endsWith('.log'))
+        ? fs.readdirSync(archiveDir).filter(f => f.endsWith('.log') && (() => { try { return !fs.lstatSync(path.join(archiveDir, f)).isSymbolicLink(); } catch { return false; } })())
         : [];
 
-      if (jobDirs.length === 0 && archived.length === 0) {
+      if (liveFiles.length === 0 && archived.length === 0) {
         console.log('No job logs found. Logs are written when the dispatcher runs jobs.');
         return;
       }
 
-      if (jobDirs.length) {
-        console.log(`\n── Job Logs (${jobDirs.length}) ──\n`);
-        for (const dir of jobDirs.slice(-20)) { // last 20
-          const logPath = path.join(JOBS_DIR, dir, 'output.log');
-          const stat = fs.statSync(logPath);
-          const agentFile = path.join(JOBS_DIR, dir, 'buyer.txt');
-          const buyer = fs.existsSync(agentFile) ? fs.readFileSync(agentFile, 'utf-8').trim() : '?';
+      if (liveFiles.length) {
+        console.log(`\n── Active Job Logs (${liveFiles.length}) ──\n`);
+        for (const f of liveFiles.slice(-20)) {
+          const p = path.join(liveDir, f);
+          const jobLogId = f.slice(0, -4);
+          const stat = fs.statSync(p);
+          const bf = path.join(JOBS_DIR, jobLogId, 'buyer.txt');
+          const buyer = (fs.existsSync(bf) && !fs.lstatSync(bf).isSymbolicLink()) ? fs.readFileSync(bf, 'utf-8').trim() : '?';
           const size = (stat.size / 1024).toFixed(1);
-          console.log(`  ${dir.substring(0, 8)}  ${stat.mtime.toISOString().substring(0, 19)}  ${size}KB  buyer: ${buyer}`);
+          console.log(`  ${jobLogId.substring(0, 8)}  ${stat.mtime.toISOString().substring(0, 19)}  ${size}KB  buyer: ${buyer}  [active]`);
         }
       }
 
-      // Under keep_containers a job is both retained (live dir) and archived,
-      // so drop archives that already appear in the live section to avoid
+      // Drop archives that already appear in the live section to avoid
       // listing the same job id twice.
-      const liveIdSet = new Set(jobDirs);
+      const liveIdSet = new Set(liveFiles.map(f => f.slice(0, -4)));
       const archivedOnly = archived.filter(f => !liveIdSet.has(f.slice(0, -4)));
 
       if (archivedOnly.length) {
@@ -4004,10 +4025,11 @@ program
       return;
     }
 
-    // Resolve the job prefix to a live output.log or an archived _logs/<id>.log.
+    // Resolve the job prefix to a _live/<id>.log (active) or _logs/<id>.log (archived).
     const archiveDir = path.join(JOBS_DIR, '_logs');
-    const liveIds = fs.existsSync(JOBS_DIR)
-      ? fs.readdirSync(JOBS_DIR).filter(d => d !== '_logs' && d.startsWith(jobId) && fs.existsSync(path.join(JOBS_DIR, d, 'output.log')))
+    const liveDir = path.join(JOBS_DIR, '_live');
+    const liveIds = fs.existsSync(liveDir)
+      ? fs.readdirSync(liveDir).filter(f => f.endsWith('.log') && f.slice(0, -4).startsWith(jobId)).map(f => f.slice(0, -4))
       : [];
     const archivedIds = fs.existsSync(archiveDir)
       ? fs.readdirSync(archiveDir).filter(f => f.endsWith('.log') && f.slice(0, -4).startsWith(jobId)).map(f => f.slice(0, -4))
@@ -4025,10 +4047,12 @@ program
     }
 
     const fullJobId = matchIds[0];
-    const liveLogPath = path.join(JOBS_DIR, fullJobId, 'output.log');
-    const logPath = fs.existsSync(liveLogPath) ? liveLogPath : path.join(archiveDir, `${fullJobId}.log`);
+    const liveCandidatePath = liveLogPath(JOBS_DIR, fullJobId);
+    // lstat-guard: skip if the resolved path is a symlink
+    const liveExists = fs.existsSync(liveCandidatePath) && !fs.lstatSync(liveCandidatePath).isSymbolicLink();
+    const logPath = liveExists ? liveCandidatePath : archiveLogPath(JOBS_DIR, fullJobId);
 
-    if (!fs.existsSync(logPath)) {
+    if (!fs.existsSync(logPath) || fs.lstatSync(logPath).isSymbolicLink()) {
       console.error(`❌ No log file for job ${fullJobId}`);
       process.exit(1);
     }
@@ -4047,12 +4071,15 @@ program
       fs.watchFile(logPath, { interval: 500 }, () => {
         const newSize = fs.statSync(logPath).size;
         if (newSize > pos) {
-          const fd = fs.openSync(logPath, 'r');
-          const buf = Buffer.alloc(newSize - pos);
-          fs.readSync(fd, buf, 0, buf.length, pos);
-          fs.closeSync(fd);
-          process.stdout.write(buf.toString());
-          pos = newSize;
+          let fd;
+          try { fd = fs.openSync(logPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
+          catch { return; } // symlink appeared mid-watch — skip
+          try {
+            const buf = Buffer.alloc(newSize - pos);
+            fs.readSync(fd, buf, 0, buf.length, pos);
+            process.stdout.write(buf.toString());
+            pos = newSize;
+          } finally { fs.closeSync(fd); }
         }
       });
 
@@ -5679,8 +5706,9 @@ async function startJobContainer(state, job, agentInfo) {
         timestamps: false,
       });
       const shortId = job.id.substring(0, 8);
-      const logPath = path.join(jobDir, 'output.log');
-      const fileStream = fs.createWriteStream(logPath, { flags: 'a' });
+      fs.mkdirSync(path.join(JOBS_DIR, '_live'), { recursive: true, mode: 0o700 });
+      const logPath = liveLogPath(JOBS_DIR, job.id);
+      const fileStream = fs.createWriteStream(logPath, { flags: fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW, mode: 0o600 });
       fileStream.on('error', () => {}); // disk full / racey rm — non-fatal
       fileStream.write(`[${new Date().toISOString()}] Container started — agent: ${agentInfo.id}, container: ${containerName}\n`);
       const writeCapped = makeCappedLogWriter(fileStream, cfg.runtime.job_log_max_bytes);
@@ -5738,26 +5766,31 @@ async function startJobContainer(state, job, agentInfo) {
   }
 }
 
-// Archive a finished job's output.log to JOBS_DIR/_logs/<jobId>.log when the
-// retention policy says to keep it, then prune to job_log_max_retained.
+// Archive a finished job's live log (_live/<jobId>.log) to _logs/<jobId>.log
+// when the retention policy says to keep it, then prune to job_log_max_retained.
+// Reads and writes via fd with O_NOFOLLOW to refuse symlink attacks.
 // Best-effort: never throws into the cleanup path.
-function archiveJobLog(jobDir, jobId, exitInfo) {
+function archiveJobLog(jobsDir, jobId, exitInfo) {
   try {
-    const retention = resolveLogRetention(cfg);
-    const logPath = path.join(jobDir, 'output.log');
-    if (!fs.existsSync(logPath) || !shouldArchiveLog(retention, exitInfo)) return;
-    const archiveDir = path.join(JOBS_DIR, '_logs');
-    fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
-    fs.copyFileSync(logPath, path.join(archiveDir, `${jobId}.log`));
-    const entries = fs.readdirSync(archiveDir)
-      .filter(f => f.endsWith('.log'))
-      .map(f => ({ id: f.slice(0, -4), mtimeMs: fs.statSync(path.join(archiveDir, f)).mtimeMs }));
-    for (const id of selectLogsToPrune(entries, cfg.runtime.job_log_max_retained)) {
-      fs.rmSync(path.join(archiveDir, `${id}.log`), { force: true });
-    }
-  } catch (e) {
-    console.error(`[Logs] archive failed for ${jobId}: ${e.message}`);
-  }
+    const live = liveLogPath(jobsDir, jobId);
+    let fd;
+    try { fd = fs.openSync(live, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
+    catch (e) { if (e.code === 'ELOOP') console.error(`[Logs] refusing symlinked log for ${jobId}`); return; }
+    try {
+      const retention = resolveLogRetention(cfg);
+      if (shouldArchiveLog(retention, exitInfo)) {
+        const archiveDir = path.join(jobsDir, '_logs');
+        fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
+        const data = fs.readFileSync(fd);
+        fs.writeFileSync(archiveLogPath(jobsDir, jobId), data, { mode: 0o600 });
+        const entries = fs.readdirSync(archiveDir).filter(f => f.endsWith('.log'))
+          .map(f => ({ id: f.slice(0, -4), mtimeMs: fs.statSync(path.join(archiveDir, f)).mtimeMs }));
+        for (const id of selectLogsToPrune(entries, cfg.runtime.job_log_max_retained))
+          fs.rmSync(path.join(archiveDir, `${id}.log`), { force: true });
+      }
+    } finally { fs.closeSync(fd); }
+    fs.rmSync(live, { force: true });
+  } catch (e) { console.error(`[Logs] archive failed for ${jobId}: ${e.message}`); }
 }
 
 // Stop a job container
@@ -5819,7 +5852,7 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   // Cleanup job dir (retain for debugging if requested). Archive even when
   // keep_containers is on; the _logs/ copy is independent of the retained dir.
   const jobDir = path.join(JOBS_DIR, jobId);
-  archiveJobLog(jobDir, jobId, { exitCode: active._exitCode, killed: active._killed });
+  archiveJobLog(JOBS_DIR, jobId, { exitCode: active._exitCode, killed: active._killed });
   if (fs.existsSync(jobDir) && !cfg.runtime.keep_containers) {
     fs.rmSync(jobDir, { recursive: true });
   }
@@ -5920,8 +5953,9 @@ async function startJobLocal(state, job, agentInfo) {
     });
 
     const shortId = job.id.substring(0, 8);
-    const logPath = path.join(jobDir, 'output.log');
-    const logStream = fs.createWriteStream(logPath, { flags: 'a' });
+    fs.mkdirSync(path.join(JOBS_DIR, '_live'), { recursive: true, mode: 0o700 });
+    const logPath = liveLogPath(JOBS_DIR, job.id);
+    const logStream = fs.createWriteStream(logPath, { flags: fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW, mode: 0o600 });
     logStream.write(`[${new Date().toISOString()}] Job started — agent: ${agentInfo.id}, PID: ${child.pid}\n`);
     const writeCapped = makeCappedLogWriter(logStream, cfg.runtime.job_log_max_bytes);
 
@@ -6098,7 +6132,7 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
   // Cleanup job dir. Archive even when keep_containers is on; the _logs/ copy
   // is independent of the retained dir.
   const jobDir = path.join(JOBS_DIR, jobId);
-  archiveJobLog(jobDir, jobId, { exitCode: active._exitCode, killed: active._killed });
+  archiveJobLog(JOBS_DIR, jobId, { exitCode: active._exitCode, killed: active._killed });
   if (fs.existsSync(jobDir) && !cfg.runtime.keep_containers) {
     fs.rmSync(jobDir, { recursive: true });
   }
