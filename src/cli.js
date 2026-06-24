@@ -5589,20 +5589,16 @@ function buildDispatcherSecurityOpt() {
 }
 
 function getDispatcherNetworkMode() {
-  // Use j41-isolated network if it exists, otherwise default bridge.
-  // M10: attempt to create j41-isolated if absent (best-effort); warn if still absent.
+  // Use the j41-isolated network only if the operator's secure-setup created it.
+  // It MUST be egress-capable — the job agent has to reach the platform API + the
+  // LLM endpoint. Do NOT auto-create it here: a dispatcher-created `--internal`
+  // network has no external DNS/egress and silently breaks every job (M10 regression).
   try {
     require('child_process').execSync('docker network inspect j41-isolated', { stdio: 'ignore', timeout: 5000 });
     return 'j41-isolated';
   } catch {
-    // Network absent — try to create it
-    try {
-      require('child_process').execFileSync('docker', ['network', 'create', '--internal', 'j41-isolated'], { stdio: 'ignore', timeout: 10000 });
-      return 'j41-isolated';
-    } catch {
-      console.warn('[security] j41-isolated network absent — containers use the default bridge with unrestricted egress');
-      return 'bridge';
-    }
+    console.warn('[security] j41-isolated network absent — using the default bridge (egress works; less network isolation). Run @junction41/secure-setup to provision an egress-capable j41-isolated.');
+    return 'bridge';
   }
 }
 
