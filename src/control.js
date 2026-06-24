@@ -195,9 +195,23 @@ function buildJob(state, jobId) {
 }
 
 function buildAgents(state) {
+  const { diagnoseAgent } = require('./agent-status.js');
   const agents = state.agents.map((a) => {
     const busy = [...state.active.values()].find(v => v.agentId === a.id);
-    const caps = state.capabilities?.get(a.id);
+    const caps = state.capabilities && state.capabilities.get(a.id);
+
+    // REAL platform status cache (id -> { status, at }) maintained by the
+    // platform-status poller. When it's missing (e.g. a fail-open agent whose
+    // startup status read failed and was never re-seeded), the hireability
+    // verdict MUST stay null ('?') — never a false verdict derived from the
+    // job-occupancy `status` field above.
+    const ps = state.platformStatus && state.platformStatus.get(a.id);
+    const svcs = (caps && caps.services) || [];
+    const isApiEndpoint = svcs.some(s => s && (s.serviceType === 'api-endpoint' || s.endpointUrl || s._isApiEndpoint));
+    const diag = ps
+      ? diagnoseAgent({ platformStatus: ps.status, network: state.network, services: svcs, isApiEndpoint, refresh: undefined })
+      : null;
+
     return {
       id: a.id,
       identity: a.identity,
@@ -205,6 +219,11 @@ function buildAgents(state) {
       workspace: caps?.workspace || false,
       services: caps?.services?.length || 0,
       currentJob: busy ? [...state.active.entries()].find(([, v]) => v.agentId === a.id)?.[0]?.substring(0, 8) : null,
+      platformStatus: ps ? ps.status : null,
+      statusAge: ps ? (Date.now() - ps.at) : null,
+      hireable: diag ? diag.hireable : null,
+      reason: (diag && diag.blockers[0]) ? diag.blockers[0].code : null,
+      activeServices: svcs.filter(s => s && s.status === 'active').length,
     };
   });
   return { agents };

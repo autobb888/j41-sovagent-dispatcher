@@ -28,7 +28,7 @@ const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, l
 const { shouldRefundOrphan, isRefundAlreadyHandled } = require('./refund.js');
 const { isValidJobId } = require('./job-id.js');
 const { verifyInboxJobRecord } = require('./inbox-job-record.js');
-const { interpretActivation, needsActivation, diagnoseAgent, formatDoctorReport } = require('./agent-status.js');
+const { interpretActivation, needsActivation, diagnoseAgent, formatDoctorReport, hireCell } = require('./agent-status.js');
 
 /** Feature flag: route in-container signing through the host-side broker
  *  instead of mounting the WIF into the container. Default ON; opt out only
@@ -3355,6 +3355,7 @@ program
       disputePolicy: new Map(), // agentId -> policy object
       agentMarkup: new Map(), // agentId -> markup percentage
       platformStatus, // agentId -> { status, at } real platform status cache (seeded at startup check, refreshed by status poller)
+      network: J41_NETWORK, // 'verus' | 'verustest' — read by control.js buildAgents for currency-aware diagnosis
       pendingPayment: new Map(), // jobId -> payment info
       _lastSentStatus: new Map(), // jobId -> last status sent
       _lastExtensionCheck: new Map(), // ext.id -> { ts, jobId } (dedup of dispatched extension requests; pruned by jobId at job teardown)
@@ -4104,6 +4105,9 @@ program
     // ── Start VRSC/USD rate poller (WP-D4 P0-2) ──
     startVrscRatePoller();
 
+    // ── Start platform-status poller (feeds ctl-agents hireability verdict) ──
+    startPlatformStatusPoller(state);
+
     // ── Set agents active on-chain + platform ──
     // J41_NO_STATUS_TOGGLE=1: leave platform state alone at startup. Useful for
     // broker-validation runs where the operator pre-activates specific agents
@@ -4227,6 +4231,7 @@ program
         stopControlServer(controlServer);
         stopControlApi(controlApi);
         stopVrscRatePoller();
+        stopPlatformStatusPoller();
         process.exit(0);
       }
 
@@ -4244,6 +4249,7 @@ program
           stopControlServer(controlServer);
           stopControlApi(controlApi);
           stopVrscRatePoller();
+          stopPlatformStatusPoller();
           process.exit(0);
         }
 
@@ -4254,6 +4260,7 @@ program
           stopControlServer(controlServer);
           stopControlApi(controlApi);
           stopVrscRatePoller();
+          stopPlatformStatusPoller();
           process.exit(1);
         }
       }, 10000);
@@ -4508,6 +4515,7 @@ const SESSION_TTL_MS = 10 * 60 * 1000; // 10 min
 let _polledVrscRate = null; // { usdPerVrsc, at: ms-epoch }
 let _vrscRateWarned = false;
 let _vrscRateTimer = null;
+let _platformStatusTimer = null;
 
 function startVrscRatePoller() {
   // Operator-set rate wins outright — don't bother polling.
@@ -4551,6 +4559,49 @@ function startVrscRatePoller() {
 
 function stopVrscRatePoller() {
   if (_vrscRateTimer) { clearTimeout(_vrscRateTimer); _vrscRateTimer = null; }
+}
+
+// ── Platform-status poller ────────────────────────────────────────────────────
+// Periodically refreshes each agent's REAL platform status into
+// state.platformStatus (id -> { status, at }). This is the on-chain/indexer
+// agent status (active/inactive/revoked/pending/...) — NOT the job-occupancy
+// busy/available `status` field. The ctl-agents hireability verdict in
+// control.js#buildAgents is derived strictly from this cache, so an agent whose
+// status we could not read stays absent (→ hireable:null → '?'), never a false
+// verdict.
+//
+// Uses the CHEAP getAgent read (30/min limit), NOT refreshAgent. Each agent is
+// wrapped in its own try/catch so one failing agent can never kill the poller,
+// and reads are staggered to stay well under the rate limit.
+function startPlatformStatusPoller(state) {
+  const intervalMs = Number(process.env.J41_STATUS_POLL_MS) || 120000;
+
+  async function poll() {
+    for (let i = 0; i < state.agents.length; i++) {
+      const agentInfo = state.agents[i];
+      // Stagger per-agent reads ~1.5s apart to stay well under the 30/min cap.
+      if (i > 0) await new Promise((r) => setTimeout(r, 1500));
+      try {
+        const agent = await getAgentSession(state, agentInfo);
+        const client = agent.client || agent._client;
+        const detail = await client.getAgent(agentInfo.iAddress || agentInfo.identity);
+        if (detail && detail.status) {
+          state.platformStatus.set(agentInfo.id, { status: detail.status, at: Date.now() });
+        }
+      } catch (e) {
+        // Fail-open: leave the prior cache entry (if any) untouched. Never throw.
+        console.log(`[Status] ${agentInfo.id}: could not refresh platform status (${e.message?.slice(0, 60)})`);
+      }
+    }
+    _platformStatusTimer = setTimeout(poll, intervalMs);
+  }
+
+  // First pass after one interval — startup seeding already populated the cache.
+  _platformStatusTimer = setTimeout(poll, intervalMs);
+}
+
+function stopPlatformStatusPoller() {
+  if (_platformStatusTimer) { clearTimeout(_platformStatusTimer); _platformStatusTimer = null; }
 }
 
 async function getAgentSession(state, agentInfo) {
@@ -6972,7 +7023,9 @@ program
           for (const a of (result.agents || [])) {
             const statusIcon = a.status === 'available' ? '🟢' : '🔴';
             const wsIcon = a.workspace ? ' [WS]' : '';
-            console.log(`  ${statusIcon} ${a.id}  ${a.identity}  ${a.status}${wsIcon}  svc=${a.services}${a.currentJob ? `  job=${a.currentJob}` : ''}`);
+            const hire = hireCell(a);
+            const age = (a.statusAge != null) ? ` (@${Math.round(a.statusAge / 60000)}m)` : '';
+            console.log(`  ${statusIcon} ${a.id}  ${a.identity}  ${a.status}${wsIcon}  hire=${hire}${age}  svc=${a.activeServices ?? a.services}${a.currentJob ? `  job=${a.currentJob}` : ''}`);
           }
           console.log('');
           break;
