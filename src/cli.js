@@ -28,7 +28,7 @@ const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, l
 const { shouldRefundOrphan, isRefundAlreadyHandled } = require('./refund.js');
 const { isValidJobId } = require('./job-id.js');
 const { verifyInboxJobRecord } = require('./inbox-job-record.js');
-const { interpretActivation, diagnoseAgent, formatDoctorReport } = require('./agent-status.js');
+const { interpretActivation, needsActivation, diagnoseAgent, formatDoctorReport } = require('./agent-status.js');
 
 /** Feature flag: route in-container signing through the host-side broker
  *  instead of mounting the WIF into the container. Default ON; opt out only
@@ -3292,6 +3292,10 @@ program
     const enforceFinalize = cfg.runtime.require_finalize;
     const skipStatusCheck = cfg.runtime.skip_status_check;
     const readyAgents = [];
+    // Cache of each agent's real platform status (id -> { status, at }), seeded
+    // here from the startup status check and attached to `state` below. Used to
+    // make boot activation idempotent (don't re-activate already-active agents).
+    const platformStatus = new Map();
     for (const agentId of agents) {
       const keys = loadAgentKeys(agentId);
       if (!keys?.identity) {
@@ -3313,9 +3317,13 @@ program
           const profile = await tmpAgent._client.getAgent(keys.iAddress || keys.identity);
           tmpAgent.stop();
           if (profile.status === 'inactive' || profile.status === 'disabled') {
-            console.log(`⏸  ${agentId} (${keys.identity}): ${profile.status} on platform — skipping`);
+            console.log(`⏸  ${agentId} (${keys.identity}): ${profile.status} on platform — skipping. Fix: node src/cli.js doctor ${agentId}`);
+            platformStatus.set(agentId, { status: profile.status, at: Date.now() });
             continue;
           }
+          platformStatus.set(agentId, { status: profile.status, at: Date.now() });
+          readyAgents.push({ id: agentId, ...keys, platformStatus: profile.status });
+          continue;
         } catch (e) {
           // If we can't check, include the agent anyway (fail-open for polling)
           console.log(`⚠️  ${agentId}: could not check platform status (${e.message}) — including`);
@@ -3346,6 +3354,7 @@ program
       capabilities: new Map(), // agentId -> { workspace: bool, services: [] }
       disputePolicy: new Map(), // agentId -> policy object
       agentMarkup: new Map(), // agentId -> markup percentage
+      platformStatus, // agentId -> { status, at } real platform status cache (seeded at startup check, refreshed by status poller)
       pendingPayment: new Map(), // jobId -> payment info
       _lastSentStatus: new Map(), // jobId -> last status sent
       _lastExtensionCheck: new Map(), // ext.id -> { ts, jobId } (dedup of dispatched extension requests; pruned by jobId at job teardown)
@@ -4109,11 +4118,44 @@ program
         // Stagger activation — 1s between agents to avoid rate limits at scale
         if (i > 0) await new Promise(r => setTimeout(r, 1000));
         try {
+          // Idempotent boot: if the agent is ALREADY active on-chain, do NOT fire
+          // a redundant activation tx (that per-boot churn is what strands agents).
+          // Nudge the backend re-index, but submit no transaction.
+          if (!needsActivation(agentInfo.platformStatus)) {
+            console.log(`  ↳ ${agentInfo.id}: already active on-chain — skipping activate (no tx)`);
+            state._agentErrors.delete(agentInfo.id);
+            state.emitEvent?.('agent.online', { agentId: agentInfo.id, identity: agentInfo.identity });
+            try {
+              const agent = await getAgentSession(state, agentInfo);
+              await agent.client.refreshAgent(agentInfo.iAddress || agentInfo.identity);
+            } catch { /* best-effort nudge; status poller will reconcile */ }
+            state.platformStatus.set(agentInfo.id, { status: agentInfo.platformStatus, at: Date.now() });
+            continue;
+          }
+
           const agent = await getAgentSession(state, agentInfo);
           const result = await agent.activate({ onChain: true });
-          console.log(`  ✅ ${agentInfo.id}: active (on-chain txid: ${result.onChainTxid || 'skipped'})`);
-          state._agentErrors.delete(agentInfo.id);
-          state.emitEvent?.('agent.online', { agentId: agentInfo.id, identity: agentInfo.identity });
+          // Classify the IMMEDIATE result only — boot stays fast, so NO long
+          // confirm poll here (getAgentStatus left undefined). The `activate`
+          // command and `doctor` own full block-confirmation.
+          const verdict = interpretActivation({
+            expected: 'active',
+            onChainTxid: result.onChainTxid,
+            getAgentStatus: undefined,
+            canSignOnChain: !!agentInfo.wif,
+          });
+          if (verdict.state === 'failed') {
+            console.log(`  ⚠️  ${agentInfo.id}: ${verdict.reason}`);
+            state._agentErrors.set(agentInfo.id, `activation failed: ${verdict.reason.slice(0, 120)}`);
+            state.emitEvent?.('agent.offline', { agentId: agentInfo.id, error: verdict.reason.slice(0, 120) });
+            // Do NOT cache an optimistic 'active' for a failed activation — leave
+            // the real pre-activate status; the status poller will refresh it.
+          } else {
+            // confirmed | pending — tx was submitted (best-effort; boot continues)
+            console.log(`  ✅ ${agentInfo.id}: activation submitted (txid: ${result.onChainTxid || 'none'})`);
+            state._agentErrors.delete(agentInfo.id);
+            state.emitEvent?.('agent.online', { agentId: agentInfo.id, identity: agentInfo.identity });
+          }
           // Trigger backend re-index so marketplace reflects active status immediately
           try {
             await agent.client.refreshAgent(agentInfo.iAddress || agentInfo.identity);
