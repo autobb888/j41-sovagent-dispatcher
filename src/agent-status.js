@@ -59,7 +59,11 @@ function servicePayable(service, netCur) {
   }
   return Array.isArray(service.acceptedCurrencies)
     ? service.acceptedCurrencies.some(
-        (a) => currencyMatches(a.currency, netCur) === true && Number(a.price) > 0,
+        (a) =>
+          a &&
+          typeof a === 'object' &&
+          currencyMatches(a.currency, netCur) === true &&
+          Number(a.price) > 0,
       )
     : false;
 }
@@ -113,6 +117,14 @@ function diagnoseAgent(input) {
       problem: 'agent onboarding is still pending and is not yet live',
       fix: `finalize onboarding: node src/cli.js finalize ${agentId}`,
     });
+  } else if (platformStatus !== 'active') {
+    // Catch-all: any present status that is neither 'active' nor a specifically
+    // handled value (inactive/disabled/revoked/pending) must still block.
+    blockers.push({
+      code: 'agent_not_active',
+      problem: `agent status is '${platformStatus}' (not active) — buyers cannot hire it`,
+      fix: 'investigate the on-chain status; run: node src/cli.js doctor <agent-id> --refresh',
+    });
   }
 
   // ── service blockers ──
@@ -148,7 +160,10 @@ function diagnoseAgent(input) {
     if (currencyMatches(s.currency, netCur) !== null) return true;
     return (
       Array.isArray(s.acceptedCurrencies) &&
-      s.acceptedCurrencies.some((a) => currencyMatches(a.currency, netCur) !== null)
+      s.acceptedCurrencies.some(
+        (a) =>
+          a && typeof a === 'object' && currencyMatches(a.currency, netCur) !== null,
+      )
     );
   };
   const determinable = activeServices.filter(currencyDeterminable);
@@ -163,7 +178,11 @@ function diagnoseAgent(input) {
         const acceptedZero =
           Array.isArray(s.acceptedCurrencies) &&
           s.acceptedCurrencies.some(
-            (a) => currencyMatches(a.currency, netCur) === true && Number(a.price) === 0,
+            (a) =>
+              a &&
+              typeof a === 'object' &&
+              currencyMatches(a.currency, netCur) === true &&
+              Number(a.price) === 0,
           );
         return primZero || acceptedZero;
       });
@@ -219,7 +238,7 @@ function interpretActivation(opts) {
     };
   }
 
-  if (getAgentStatus === expected) {
+  if (expected != null && getAgentStatus === expected) {
     return { state: 'confirmed', reason: 'activation confirmed on-chain' };
   }
 

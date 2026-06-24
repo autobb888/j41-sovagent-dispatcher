@@ -95,6 +95,16 @@ test('servicePayable: wrong currency → false', () => {
   );
 });
 
+test('servicePayable: null element in acceptedCurrencies → false, no throw', () => {
+  assert.strictEqual(
+    servicePayable(
+      { status: 'active', currency: 'VRSC', price: 0.5, acceptedCurrencies: [null] },
+      'VRSCTEST',
+    ),
+    false,
+  );
+});
+
 // ── diagnoseAgent ─────────────────────────────────────────────────────────────
 
 const okRefresh = { agent: true, services: true };
@@ -252,6 +262,46 @@ test('diagnoseAgent: low funding → funds warning, no blocker', () => {
   assert.ok(d.warnings.some((w) => /fund/i.test(w)));
 });
 
+test('diagnoseAgent: null/non-object element in acceptedCurrencies → no throw', () => {
+  assert.doesNotThrow(() =>
+    diagnoseAgent({
+      platformStatus: 'active',
+      network: 'verustest',
+      services: [
+        {
+          status: 'active',
+          currency: 'VRSC',
+          price: 0.5,
+          acceptedCurrencies: [null, {}],
+        },
+      ],
+      refresh: { agent: true, services: true },
+    }),
+  );
+});
+
+test('diagnoseAgent: unknown non-active status (suspended) → not hireable, agent_not_active blocker', () => {
+  const d = diagnoseAgent({
+    platformStatus: 'suspended',
+    network: 'verustest',
+    services: [{ status: 'active', currency: 'VRSCTEST', price: 0.5 }],
+    refresh: { agent: true, services: true },
+  });
+  assert.strictEqual(d.hireable, false);
+  assert.ok(d.blockers.some((b) => b.code === 'agent_not_active'));
+});
+
+test('diagnoseAgent: active + good service stays hireable (regression guard for catch-all)', () => {
+  const d = diagnoseAgent({
+    platformStatus: 'active',
+    network: 'verustest',
+    services: [{ status: 'active', currency: 'VRSCTEST', price: 0.5 }],
+    refresh: { agent: true, services: true },
+  });
+  assert.strictEqual(d.hireable, true);
+  assert.strictEqual(d.blockers.length, 0);
+});
+
 test('diagnoseAgent: i-address currency service is not flagged as unpriced (null never warns)', () => {
   const d = diagnoseAgent({
     platformStatus: 'active',
@@ -302,6 +352,16 @@ test('interpretActivation: txid + status matches expected → confirmed', () => 
     canSignOnChain: true,
   });
   assert.strictEqual(r.state, 'confirmed');
+});
+
+test('interpretActivation: undefined expected + undefined status → pending (no false-confirm)', () => {
+  const r = interpretActivation({
+    expected: undefined,
+    onChainTxid: 'ab12',
+    getAgentStatus: undefined,
+    canSignOnChain: true,
+  });
+  assert.strictEqual(r.state, 'pending');
 });
 
 test('interpretActivation: txid + stale/undefined status → pending (lag, never failed)', () => {
