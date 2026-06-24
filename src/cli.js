@@ -28,7 +28,7 @@ const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, l
 const { shouldRefundOrphan, isRefundAlreadyHandled } = require('./refund.js');
 const { isValidJobId } = require('./job-id.js');
 const { verifyInboxJobRecord } = require('./inbox-job-record.js');
-const { interpretActivation } = require('./agent-status.js');
+const { interpretActivation, diagnoseAgent, formatDoctorReport } = require('./agent-status.js');
 
 /** Feature flag: route in-container signing through the host-side broker
  *  instead of mounting the WIF into the container. Default ON; opt out only
@@ -2664,6 +2664,155 @@ program
     }
 
     console.log('');
+  });
+
+// ── doctor helper: gather the (cheap by default) snapshot diagnoseAgent consumes ──
+// Reads the platform status + services for one agent. The on-chain `refreshAgent`
+// is OPT-IN (opts.refresh) because POST /v1/agents/:id/refresh is rate-limited to
+// 5/60s per IP — the default diagnosis path must never side-effect.
+async function gatherAgentSnapshot(keys, opts = {}) {
+  const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+  const agent = new J41Agent({
+    apiUrl: J41_API_URL,
+    wif: keys.wif,
+    identityName: keys.identity,
+    iAddress: keys.iAddress,
+  });
+
+  const lookupId = keys.iAddress || keys.identity;
+  try {
+    await agent.authenticate();
+
+    const detail = await agent._client.getAgent(lookupId).catch(() => ({}));
+    const platformStatus = detail && detail.status;
+
+    const svcResp = await agent._client.getAgentServices(lookupId).catch(() => ({ data: [] }));
+    const services = svcResp.data || [];
+
+    // api-endpoint detection — same signals start/inspect use: a platform service
+    // declared serviceType='api-endpoint' (or the _isApiEndpoint flag the start
+    // path stamps on), or an on-chain api-provider profile type / endpoints.
+    const isApiEndpoint = services.some(
+      (s) => s && (s.serviceType === 'api-endpoint' || s._isApiEndpoint),
+    );
+
+    // Opt-in on-chain refresh. A 429 (or any error) is "unknown, not a failure":
+    // leave `refresh` undefined so diagnoseAgent never treats a throttle as
+    // services:false. Only a successful {agent,services} result is passed through.
+    let refresh;
+    if (opts.refresh) {
+      const r = await agent._client
+        .refreshAgent(keys.iAddress)
+        .catch((e) => ({
+          _error:
+            e && (e.status === 429 || /429/.test((e && e.message) || '')) ? 429 : true,
+        }));
+      if (r && !r._error) refresh = r;
+    }
+
+    return { platformStatus, network: J41_NETWORK, services, isApiEndpoint, refresh };
+  } finally {
+    try { agent.stop(); } catch {}
+  }
+}
+
+// Doctor command — diagnose why each agent is/isn't hireable
+program
+  .command('doctor [agent-id]')
+  .description('Diagnose why each agent is/isn\'t hireable (decision logic in agent-status.js)')
+  .option('--refresh', 'Force an on-chain re-read (rate-limited; spaced ≥12s/agent)', false)
+  .option('--json', 'Output raw JSON instead of formatted text')
+  .action(async (agentId, options) => {
+    ensureDirs();
+
+    // Resolve the target agents — one if named, else every registered agent
+    // (same filter `start` uses: has keys.json + on-chain identity).
+    let targets;
+    if (agentId) {
+      const keys = loadAgentKeys(agentId);
+      if (!keys) {
+        console.error(`❌ Agent ${agentId} not found.`);
+        process.exit(1);
+      }
+      targets = [{ id: agentId, keys }];
+    } else {
+      targets = listRegisteredAgents()
+        .map((id) => ({ id, keys: loadAgentKeys(id) }))
+        .filter((t) => t.keys && t.keys.identity);
+    }
+
+    if (targets.length === 0) {
+      console.error('❌ No registered agents found. Run: j41-dispatcher register <agent> <name>');
+      process.exit(1);
+    }
+
+    const rowFor = (t, snapshotOrErr) => {
+      const identity = (t.keys && t.keys.identity) || null;
+      if (snapshotOrErr && snapshotOrErr._gatherError) {
+        // A gather failure for one agent must not crash the command — surface it
+        // as a blocker row so the report (and exit code) reflect it.
+        return {
+          id: t.id,
+          identity,
+          diagnosis: {
+            hireable: false,
+            blockers: [
+              {
+                code: 'diagnosis_failed',
+                problem: `could not read agent state: ${snapshotOrErr._gatherError}`,
+                fix: 'check network/auth and retry: node src/cli.js doctor ' + t.id,
+              },
+            ],
+            warnings: [],
+          },
+        };
+      }
+      return { id: t.id, identity, diagnosis: diagnoseAgent(snapshotOrErr) };
+    };
+
+    const rows = [];
+
+    if (options.refresh) {
+      // --refresh side-effects via the rate-limited POST /refresh (5/60s per IP).
+      // Gather SEQUENTIALLY with a 12s gap between agents to stay ≤5/min.
+      for (let i = 0; i < targets.length; i++) {
+        if (i > 0) await new Promise((r) => setTimeout(r, 12_000));
+        const t = targets[i];
+        try {
+          const snap = await gatherAgentSnapshot(t.keys, { refresh: true });
+          rows.push(rowFor(t, snap));
+        } catch (e) {
+          rows.push(rowFor(t, { _gatherError: (e && e.message) || String(e) }));
+        }
+      }
+    } else {
+      // Cheap reads only (getAgent/getAgentServices) — run concurrently.
+      const settled = await Promise.allSettled(
+        targets.map((t) => gatherAgentSnapshot(t.keys, { refresh: false })),
+      );
+      settled.forEach((res, i) => {
+        const t = targets[i];
+        if (res.status === 'fulfilled') {
+          rows.push(rowFor(t, res.value));
+        } else {
+          const e = res.reason;
+          rows.push(rowFor(t, { _gatherError: (e && e.message) || String(e) }));
+        }
+      });
+    }
+
+    const anyBlocked = rows.some(
+      (r) => r.diagnosis && Array.isArray(r.diagnosis.blockers) && r.diagnosis.blockers.length > 0,
+    );
+
+    if (options.json) {
+      console.log(JSON.stringify(rows, null, 2));
+    } else {
+      const report = formatDoctorReport(rows, { refreshed: !!options.refresh });
+      report.lines.forEach((l) => console.log(l));
+    }
+
+    process.exit(anyBlocked ? 1 : 0);
   });
 
 // Setup command — one-command agent onboarding
