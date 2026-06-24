@@ -2690,10 +2690,10 @@ async function gatherAgentSnapshot(keys, opts = {}) {
     const services = svcResp.data || [];
 
     // api-endpoint detection — same signals start/inspect use: a platform service
-    // declared serviceType='api-endpoint' (or the _isApiEndpoint flag the start
-    // path stamps on), or an on-chain api-provider profile type / endpoints.
+    // declared serviceType='api-endpoint', carrying an endpointUrl, or the
+    // _isApiEndpoint flag the start path stamps on at runtime.
     const isApiEndpoint = services.some(
-      (s) => s && (s.serviceType === 'api-endpoint' || s._isApiEndpoint),
+      (s) => s && (s.serviceType === 'api-endpoint' || s.endpointUrl || s._isApiEndpoint),
     );
 
     // Opt-in on-chain refresh. A 429 (or any error) is "unknown, not a failure":
