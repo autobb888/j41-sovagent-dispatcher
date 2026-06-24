@@ -219,6 +219,11 @@ function diagnoseAgent(input) {
  *     or a throttled 429 read — a lagging/throttled read is NEVER failed).
  */
 function interpretActivation(opts) {
+  // NOTE: call sites also pass `refresh`/`refreshError` (e.g. a throttled 429
+  // read), but they are intentionally NOT destructured/used here — forward-compat
+  // only. The verdict is driven solely by null-txid and status-vs-expected; a
+  // throttled/lagging read is NOT special-cased and simply falls through to
+  // 'pending'. Do not assume 429 is handled separately.
   const { expected, onChainTxid, getAgentStatus, canSignOnChain } = opts || {};
 
   if (onChainTxid == null) {
