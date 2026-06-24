@@ -2222,21 +2222,33 @@ program
 
     const settled = await Promise.allSettled(pending.map(confirmOne));
     for (const s of settled) {
-      if (s.status !== 'fulfilled') { failed++; continue; }
+      if (s.status !== 'fulfilled') {
+        // A rejected confirm promise is currently impossible (confirmOne
+        // swallows its own errors), but if one ever escapes, surface it.
+        console.log(`  ❌ confirm error: ${s.reason && s.reason.message ? s.reason.message : s.reason}`);
+        continue;
+      }
       const { p, verdict } = s.value;
       const label = `${p.agentId} (${p.keys.identity})`;
       if (verdict.state === 'confirmed') {
         console.log(`  ✅ ${label} — on-chain status confirmed${p.result.onChainTxid ? ' tx:' + p.result.onChainTxid.substring(0, 12) + '...' : ''}`);
-        succeeded++;
       } else if (verdict.state === 'failed') {
         console.log(`  ❌ ${label} — failed [${verdict.code || 'unknown'}]: ${verdict.reason}`);
-        failed++;
       } else {
         console.log(`  ⚠️  ${label} — submitted but not yet confirmed (run: node src/cli.js doctor ${p.agentId})`);
       }
     }
 
-    const pendingCount = pending.length - succeeded - settled.filter((s) => s.status === 'fulfilled' && s.value.verdict.state === 'failed').length;
+    // Derive the confirm tally DIRECTLY from settled results — no subtraction,
+    // so a rejected confirm promise can't be double-counted as both failed and
+    // pending. A rejection counts as failed; a fulfilled verdict maps 1:1.
+    // `failed` already carries any Phase-1 broadcast failures (agents that never
+    // entered `pending`), so we ADD the confirm-phase outcomes onto it.
+    const stateOf = (s) =>
+      s.status !== 'fulfilled' ? 'failed' : s.value.verdict.state;
+    succeeded += settled.filter((s) => stateOf(s) === 'confirmed').length;
+    failed += settled.filter((s) => stateOf(s) === 'failed').length;
+    const pendingCount = settled.filter((s) => stateOf(s) === 'pending').length;
     console.log(`\n✅ Done: ${succeeded} confirmed, ${pendingCount > 0 ? pendingCount + ' pending, ' : ''}${failed} failed`);
   });
 

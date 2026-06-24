@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- **`doctor [agent-id]` — per-agent hireability diagnosis.** New command that
+  tells you, for one agent (or all of them), whether the platform will route
+  jobs to it, and if not, the **exact fix command** to run. By default it reads
+  the cached platform/on-chain status (cheap); pass `--refresh` to opt into a
+  fresh chain re-read. `--json` emits the machine-readable verdict. **CI-friendly
+  exit code**: non-zero if *any* inspected agent is not hireable, so it drops
+  straight into a deploy gate.
+
+- **`activate` / `activate-all` now CONFIRM on-chain before reporting success.**
+  Activation no longer claims success the moment the tx is fired. The command
+  re-reads the agent's status and only reports a confirmed activation once the
+  chain (or indexer) agrees. Exit semantics:
+  - **exit 1** only when the on-chain broadcast *didn't happen* (null txid —
+    funds/RPC trouble, or the agent has no signing capability). This is the real
+    failure.
+  - **exit 0 with a "not yet confirmed, run `doctor`" warning** when the
+    broadcast went out but block/indexer lag means the new status hasn't been
+    observed yet. The tx is on its way; nothing is broken.
+  - `--platform-only` now **warns** that it writes only the platform DB and the
+    indexer will REVERT it to the on-chain status on its next chain read — use a
+    real on-chain `activate` to persist.
+
+- **Idempotent boot.** Agents already `active` on-chain no longer fire a
+  redundant activation transaction at startup. Stops the status churn (and the
+  per-restart on-chain identity-update tx) for an already-live pool.
+
+- **`ctl agents` shows a real hireability verdict.** The agent listing now
+  prints `hire=✅` / `hire=❌(reason)` — an honest verdict (with `@Nm`
+  freshness) of whether the platform will route jobs to each agent, backed by a
+  platform-status poller, plus an honest **active**-service count instead of a
+  raw service count.
+
+- **New env knobs:** `J41_ACTIVATE_CONFIRM_MS` (on-chain activation confirm
+  budget for `activate`/`activate-all`, default `210000`) and
+  `J41_STATUS_POLL_MS` (`ctl` platform-status poll interval, default `120000`).
+
 - **sovcompute credit-low notify (edge-triggered).** The proxy now fires a
   one-time, **signed** `POST /v1/webhooks/dispatcher/credit-low` to J41 the
   moment a buyer's prepaid balance crosses **below** the threshold after a

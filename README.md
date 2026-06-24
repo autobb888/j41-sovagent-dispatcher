@@ -155,8 +155,9 @@ All commands are also available directly for scripted/headless use:
 | `setup <agent-id> <name>` | One-command pipeline: init + register + finalize (interactive if no `--profile-name` or `-i`) |
 | `inspect <agent-id>` | Show full agent state: local config, on-chain identity, platform profile, services, reputation |
 | `recover <agent-id>` | Recover an agent stuck in a timed-out registration |
-| `activate <agent-id>` | Reactivate an agent (on-chain + platform) |
+| `activate <agent-id>` | Reactivate an agent (on-chain + platform); confirms the on-chain status before reporting success |
 | `deactivate <agent-id>` | Deactivate an agent, remove its services, and update on-chain status |
+| `doctor [agent-id]` | Diagnose why an agent is/isn't hireable, with the exact fix command. `--refresh` re-reads the chain, `--json` for scripts. Non-zero exit if any agent is not hireable (CI-friendly) |
 | `start` | Start the dispatcher in poll mode |
 | `start --webhook-url <url>` | Start the dispatcher in webhook mode |
 | `status` | Show the dispatcher pool status (active workers, queued jobs) |
@@ -164,7 +165,7 @@ All commands are also available directly for scripted/headless use:
 | `config` | View/change dispatcher settings (max-concurrent, timeouts, extension thresholds) |
 | `ctl status` | Live status from running dispatcher (uptime, active, queue, agents) |
 | `ctl jobs` | List active jobs with PID, duration, workspace status |
-| `ctl agents` | List agents with workspace capability and service count |
+| `ctl agents` | List agents with a real `hire=✅/❌(reason)` verdict (with `@Nm` freshness, backed by a status poller) and an active-service count |
 | `ctl shutdown` | Trigger graceful shutdown from another terminal |
 | `ctl canary --agent <id>` | Check canary leak status for an agent |
 | `ctl earnings` | Per-agent earnings summary (jobs + VRSC) |
@@ -177,6 +178,11 @@ All commands are also available directly for scripted/headless use:
 | `respond-dispute <jobId>` | Respond to a buyer dispute (refund/rework/rejected) |
 
 Use `--json` with `ctl` commands for machine-readable output.
+
+> **`activate --platform-only` does NOT persist.** It writes only the platform
+> DB; the indexer reverts the agent to its on-chain status on its next chain
+> read. Use a real on-chain `activate` to make a reactivation stick. Run
+> `j41-dispatcher doctor <agent-id>` any time to check hireability.
 
 Health endpoint: `http://127.0.0.1:9842/health` (JSON) and `/metrics` (Prometheus format) — available whenever the dispatcher is running.
 
