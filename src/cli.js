@@ -28,6 +28,7 @@ const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, l
 const { shouldRefundOrphan, isRefundAlreadyHandled } = require('./refund.js');
 const { isValidJobId } = require('./job-id.js');
 const { verifyInboxJobRecord } = require('./inbox-job-record.js');
+const { interpretActivation } = require('./agent-status.js');
 
 /** Feature flag: route in-container signing through the host-side broker
  *  instead of mounting the WIF into the container. Default ON; opt out only
@@ -2007,16 +2008,6 @@ program
         }
       } catch {}
 
-      // Tell J41 to re-read identity from chain
-      try { await agent._client.refreshAgent(keys.iAddress); } catch {}
-
-      console.log(`\n✅ Agent activated`);
-      console.log(`   Platform status: ${result.status}`);
-      if (svcCount > 0) console.log(`   Services reactivated: ${svcCount}`);
-      if (result.onChainTxid) {
-        console.log(`   On-chain txid: ${result.onChainTxid}`);
-      }
-
       // Update local finalize state
       const agentDir = path.join(AGENTS_DIR, agentId);
       const finalizePath = path.join(agentDir, FINALIZE_STATE_FILENAME);
@@ -2029,7 +2020,81 @@ program
         fs.writeFileSync(finalizePath, JSON.stringify(state, null, 2));
       }
 
-      console.log(`\n   Start dispatcher: node src/cli.js start`);
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+      if (options.platformOnly) {
+        // Platform-only writes the indexer flag but NOT the chain. The indexer
+        // reverts this on its next chain read unless the chain already reads active.
+        console.log(`\n⚠️  --platform-only: wrote ONLY the platform DB (no on-chain status update).`);
+        console.log(`   The indexer will REVERT this to its on-chain status on its next chain read,`);
+        console.log(`   unless the chain already reads 'active'. Run a real on-chain activate to make it stick.`);
+        console.log(`\n✅ Agent activated (platform DB)`);
+        console.log(`   Platform status: ${result.status}`);
+        if (svcCount > 0) console.log(`   Services reactivated: ${svcCount}`);
+        console.log(`\n   Start dispatcher: node src/cli.js start`);
+        return;
+      }
+
+      // Real on-chain attempt — confirm the chain actually reflects 'active'.
+      // refreshAgent is rate-limited (5/60s/IP), so call it EXACTLY ONCE here and
+      // NEVER inside the poll loop. getAgent is 30/min and is what we poll.
+      let refreshError;
+      try {
+        await agent._client.refreshAgent(keys.iAddress);
+      } catch (e) {
+        const is429 = e && (e.status === 429 || /429/.test(e.message || ''));
+        if (is429) refreshError = 429;
+        // do not rethrow — a throttled/failed refresh is not itself a failure
+      }
+
+      const budgetMs = Number(process.env.J41_ACTIVATE_CONFIRM_MS) || 210000;
+      const deadline = Date.now() + budgetMs;
+      let verdict;
+      const delays = [5000, 20000, 30000, 45000, 45000, 45000]; // ~6 attempts within budget
+      for (let i = 0; i < delays.length; i++) {
+        const wait = Math.min(delays[i], Math.max(0, deadline - Date.now()));
+        if (wait > 0) await sleep(wait);
+        const detail = await agent._client.getAgent(keys.iAddress || keys.identity).catch(() => ({}));
+        verdict = interpretActivation({
+          expected: 'active',
+          onChainTxid: result.onChainTxid,
+          getAgentStatus: detail && detail.status,
+          refresh: { agent: !refreshError },
+          refreshError,
+          canSignOnChain: !!keys.wif,
+        });
+        if (verdict.state === 'confirmed') break;
+        if (Date.now() >= deadline) break;
+      }
+      verdict = verdict || { state: 'pending', reason: 'no confirmation read performed' };
+
+      if (verdict.state === 'confirmed') {
+        console.log(`\n✅ Agent activated (on-chain status confirmed)`);
+        console.log(`   Platform status: ${result.status}`);
+        if (svcCount > 0) console.log(`   Services reactivated: ${svcCount}`);
+        if (result.onChainTxid) console.log(`   On-chain txid: ${result.onChainTxid}`);
+        console.log(`\n   Start dispatcher: node src/cli.js start`);
+        return;
+      }
+
+      if (verdict.state === 'failed') {
+        if (verdict.code === 'broadcast_failed') {
+          console.error(`\n❌ on-chain broadcast did not happen (check funds/RPC)`);
+        } else if (verdict.code === 'no_signing_capability') {
+          console.error(`\n❌ no local signing capability — this agent has no WIF and the signing broker is not wired for status updates`);
+        } else {
+          console.error(`\n❌ activation failed: ${verdict.reason}`);
+        }
+        // Re-sync platform DB so it stops showing a stale-optimistic 'active'.
+        await agent._client.refreshAgent(keys.iAddress).catch(() => {});
+        process.exit(1);
+      }
+
+      // pending — re-sync platform DB, then warn (non-fatal).
+      await agent._client.refreshAgent(keys.iAddress).catch(() => {});
+      console.log(`\n⚠️  activation submitted but not confirmed within ${Math.round(budgetMs / 1000)}s — run: node src/cli.js doctor ${agentId} in a few minutes`);
+      console.log(`   Platform status (optimistic): ${result.status}`);
+      if (result.onChainTxid) console.log(`   On-chain txid: ${result.onChainTxid}`);
     } catch (e) {
       console.error(`\n❌ Activation failed: ${e.message}`);
       process.exit(1);
@@ -2060,10 +2125,15 @@ program
     console.log(`\n→ Activating ${agents.length} agent(s)...\n`);
 
     const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     let succeeded = 0;
     let failed = 0;
 
-    for (const agentId of agents) {
+    // Phase 1 — fire activate for each agent (1s stagger). Collect the ones that
+    // broadcast so we can confirm them on-chain afterwards.
+    const pending = []; // { agentId, keys, agent, result }
+    for (let i = 0; i < agents.length; i++) {
+      const agentId = agents[i];
       const keys = loadAgentKeys(agentId);
       try {
         const agent = new J41Agent({
@@ -2080,8 +2150,7 @@ program
             if (svc.status !== 'active') try { await agent._client.updateService(svc.id, { status: 'active' }); } catch {}
           }
         } catch {}
-        try { await agent._client.refreshAgent(keys.iAddress); } catch {}
-        console.log(`  ✓ ${agentId} (${keys.identity}) — ${result.status}${result.onChainTxid ? ' tx:' + result.onChainTxid.substring(0, 12) + '...' : ''}`);
+        console.log(`  → ${agentId} (${keys.identity}) — submitted ${result.status}${result.onChainTxid ? ' tx:' + result.onChainTxid.substring(0, 12) + '...' : ''}`);
 
         // Update finalize state
         const finalizePath = path.join(AGENTS_DIR, agentId, FINALIZE_STATE_FILENAME);
@@ -2093,14 +2162,82 @@ program
           state.notes.push(`${new Date().toISOString()} Batch activated (on-chain: ${!options.platformOnly})`);
           fs.writeFileSync(finalizePath, JSON.stringify(state, null, 2));
         }
-        succeeded++;
+        pending.push({ agentId, keys, agent, result });
       } catch (e) {
         console.log(`  ✗ ${agentId} (${keys?.identity || '?'}) — ${e.message}`);
         failed++;
       }
+      if (i < agents.length - 1) await sleep(1000); // 1s stagger
     }
 
-    console.log(`\n✅ Done: ${succeeded} activated, ${failed} failed`);
+    if (options.platformOnly) {
+      console.log(`\n⚠️  --platform-only: wrote ONLY the platform DB. The indexer will REVERT each`);
+      console.log(`   to its on-chain status on its next chain read unless the chain already reads 'active'.`);
+      succeeded = pending.length;
+      console.log(`\n✅ Done: ${succeeded} submitted (platform DB), ${failed} failed`);
+      return;
+    }
+
+    // Phase 2 — a SINGLE spaced refresh round (refreshAgent is 5/60s/IP), ~12s
+    // apart to stay ≤5/min. 429 just means "skip — will show pending".
+    if (pending.length > 0) {
+      console.log(`\n→ Re-reading chain for ${pending.length} agent(s) (spaced)...`);
+    }
+    for (let i = 0; i < pending.length; i++) {
+      const p = pending[i];
+      try {
+        await p.agent._client.refreshAgent(p.keys.iAddress);
+        p.refreshError = undefined;
+      } catch (e) {
+        const is429 = e && (e.status === 429 || /429/.test(e.message || ''));
+        p.refreshError = is429 ? 429 : undefined;
+      }
+      if (i < pending.length - 1) await sleep(12000); // ≤5/min
+    }
+
+    // Phase 3 — poll getAgent CONCURRENTLY against one shared deadline.
+    const budgetMs = Number(process.env.J41_ACTIVATE_CONFIRM_MS) || 210000;
+    const deadline = Date.now() + budgetMs;
+    const delays = [5000, 20000, 30000, 45000, 45000, 45000];
+
+    const confirmOne = async (p) => {
+      let verdict;
+      for (let i = 0; i < delays.length; i++) {
+        const wait = Math.min(delays[i], Math.max(0, deadline - Date.now()));
+        if (wait > 0) await sleep(wait);
+        const detail = await p.agent._client.getAgent(p.keys.iAddress || p.keys.identity).catch(() => ({}));
+        verdict = interpretActivation({
+          expected: 'active',
+          onChainTxid: p.result.onChainTxid,
+          getAgentStatus: detail && detail.status,
+          refresh: { agent: !p.refreshError },
+          refreshError: p.refreshError,
+          canSignOnChain: !!p.keys.wif,
+        });
+        if (verdict.state === 'confirmed') break;
+        if (Date.now() >= deadline) break;
+      }
+      return { p, verdict: verdict || { state: 'pending', reason: 'no read' } };
+    };
+
+    const settled = await Promise.allSettled(pending.map(confirmOne));
+    for (const s of settled) {
+      if (s.status !== 'fulfilled') { failed++; continue; }
+      const { p, verdict } = s.value;
+      const label = `${p.agentId} (${p.keys.identity})`;
+      if (verdict.state === 'confirmed') {
+        console.log(`  ✅ ${label} — on-chain status confirmed${p.result.onChainTxid ? ' tx:' + p.result.onChainTxid.substring(0, 12) + '...' : ''}`);
+        succeeded++;
+      } else if (verdict.state === 'failed') {
+        console.log(`  ❌ ${label} — failed [${verdict.code || 'unknown'}]: ${verdict.reason}`);
+        failed++;
+      } else {
+        console.log(`  ⚠️  ${label} — submitted but not yet confirmed (run: node src/cli.js doctor ${p.agentId})`);
+      }
+    }
+
+    const pendingCount = pending.length - succeeded - settled.filter((s) => s.status === 'fulfilled' && s.value.verdict.state === 'failed').length;
+    console.log(`\n✅ Done: ${succeeded} confirmed, ${pendingCount > 0 ? pendingCount + ' pending, ' : ''}${failed} failed`);
   });
 
 // Deactivate all agents at once
