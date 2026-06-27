@@ -15,6 +15,7 @@ const AGENTS_DIR = path.join(DISPATCHER_DIR, 'agents');
 const CONFIG_FILE = path.join(DISPATCHER_DIR, 'config.json');
 
 const { loadDispatcherConfig, saveDispatcherConfig } = require('./config-loader.js');
+const { writeKeysFile } = require('./keys-file.js');
 const { sendCommand } = require('./control.js');
 const { renderActiveJobs, runLiveScreen } = require('./tui/live-screen.js');
 const { formatUpstreamHealthTag } = require('./tui/health-tag.js');
@@ -1966,7 +1967,7 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
 
     keysData.identity = identityName.includes('@') ? identityName : identityName + '.agentplatform@';
     keysData.registrationStatus = 'timeout';
-    fs.writeFileSync(keysPath, JSON.stringify(keysData, null, 2));
+    writeKeysFile(keysPath, keysData);
 
     console.log(`\n  Recovering ${keysData.identity}...\n`);
     const exitCode = await runCommandAsync('node', ['src/cli.js', 'recover', agentId], REPO_DIR);
@@ -1987,7 +1988,7 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
     delete keysData.lastOnboardStatus;
     delete keysData.pendingName;
     delete keysData.registrationTimestamp;
-    fs.writeFileSync(keysPath, JSON.stringify(keysData, null, 2));
+    writeKeysFile(keysPath, keysData);
     console.log('\n  ✅ Stale registration state cleared.\n');
 
     const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'Identity name:', default: previousName ? previousName.replace('.agentplatform@', '') : '' }]);
@@ -1998,7 +1999,7 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
     if (!confirm) return;
 
     keysData.pendingName = identityName;
-    fs.writeFileSync(keysPath, JSON.stringify(keysData, null, 2));
+    writeKeysFile(keysPath, keysData);
 
     console.log('');
     console.log('  ℹ️  Registration waits for block confirmations (can take 5-20 min).');
@@ -2028,7 +2029,7 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
     delete keysData.pendingName;
     delete keysData.registrationTimestamp;
     keysData.pendingName = identityName;
-    fs.writeFileSync(keysPath, JSON.stringify(keysData, null, 2));
+    writeKeysFile(keysPath, keysData);
 
     const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${identityName}.agentplatform@ on-chain?`, default: true }]);
     if (!confirm) return;

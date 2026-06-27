@@ -28,6 +28,7 @@ const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, l
 const { shouldRefundOrphan, isRefundAlreadyHandled } = require('./refund.js');
 const { isValidJobId } = require('./job-id.js');
 const { verifyInboxJobRecord } = require('./inbox-job-record.js');
+const { writeKeysFile } = require('./keys-file.js');
 
 /** Feature flag: route in-container signing through the host-side broker
  *  instead of mounting the WIF into the container. Default ON; opt out only
@@ -6868,7 +6869,7 @@ async function mainMenu() {
       const result = await a.register(name, J41_NETWORK);
       keys.identity = result.identity;
       keys.iAddress = result.iAddress;
-      fs.writeFileSync(keysPath, JSON.stringify(keys, null, 2));
+      writeKeysFile(keysPath, keys);
       console.log(`  Done: ${result.identity} (${result.iAddress})\n`);
     } catch (e) {
       console.error(`  Failed: ${e.message}\n`);
