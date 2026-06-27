@@ -14,7 +14,6 @@ test('unrelated env var → no violations', () => {
 test('each hatch individually produces exactly one violation naming the flag', () => {
   const cases = [
     [{ J41_SIGNING_BROKER: '0' }, {}, /J41_SIGNING_BROKER=0/],
-    [{ J41_ALLOW_INSECURE_WIF_MOUNT: '1' }, {}, /J41_ALLOW_INSECURE_WIF_MOUNT=1/],
     [{}, { devUnsafe: true }, /--dev-unsafe/],
     [{ J41_DISABLE_BWRAP: '1' }, {}, /J41_DISABLE_BWRAP=1/],
     [{ J41_ALLOW_LOCAL_UPSTREAM: '1' }, {}, /J41_ALLOW_LOCAL_UPSTREAM=1/],
@@ -40,6 +39,16 @@ test('multiple hatches → multiple violations', () => {
 test('broker not set (undefined) is NOT a violation — only the literal "0" is', () => {
   assert.deepEqual(findMainnetSecurityViolations({}, {}), []);
   assert.deepEqual(findMainnetSecurityViolations({ J41_SIGNING_BROKER: '1' }, {}), []);
+});
+
+test('broker disabled is always a security violation', () => {
+  const v = findMainnetSecurityViolations({ J41_SIGNING_BROKER: '0' }, { devUnsafe: false });
+  assert.ok(v.some(s => /SIGNING_BROKER/.test(s)));
+});
+
+test('J41_ALLOW_INSECURE_WIF_MOUNT is no longer a recognized knob', () => {
+  const v = findMainnetSecurityViolations({ J41_ALLOW_INSECURE_WIF_MOUNT: '1' }, { devUnsafe: false });
+  assert.ok(!v.some(s => /ALLOW_INSECURE_WIF_MOUNT/.test(s)));
 });
 
 const { resolveIsMainnet } = require('../src/mainnet-guard');

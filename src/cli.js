@@ -5745,37 +5745,28 @@ async function startJobContainer(state, job, agentInfo) {
   const agentDir = path.join(AGENTS_DIR, agentInfo.id);
   const keysPath = path.join(agentDir, 'keys.json');
 
-  // Two mutually-exclusive paths:
-  //  - BROKER MODE: WIF stays on host inside a SignChannelHost closure; the
-  //    container only sees the bind-mounted JSON channel at /app/sign.
-  //  - LEGACY MODE: copy keys.json to a temp file, mount it :ro at
-  //    /app/keys.json (the pre-2.4 behavior).
-  let tmpKeysPath = null;           // legacy mode only
-  let signerChannelDir = null;      // broker mode only
-  let signerHost = null;            // broker mode only
-  let signerTeardown = null;        // broker mode only
+  // BROKER MODE (mandatory): the WIF stays on host inside a SignChannelHost
+  // closure; the container only ever sees the bind-mounted JSON channel at
+  // /app/sign. The legacy path that copied keys.json into the (prompt-
+  // injectable, network-egress) job container has been removed entirely.
+  let signerChannelDir = null;
+  let signerHost = null;
+  let signerTeardown = null;
   const hostKeys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
 
-  // Audit C3: the legacy WIF mount puts the agent's private key inside a
-  // prompt-injectable job container that has network egress — readable by
-  // untrusted in-container code despite the :ro flag (ro blocks writes, not
-  // reads). It must NEVER be the silent default. Require an explicit choice:
-  // broker mode (secure — WIF stays on host) OR an explicit insecure ack.
-  // Fail closed otherwise so an operator can't unknowingly ship the WIF.
-  // Defense-in-depth: the insecure WIF mount is never honored on mainnet,
-  // even if the startup gate were somehow bypassed.
-  const ALLOW_INSECURE_WIF = process.env.J41_ALLOW_INSECURE_WIF_MOUNT === '1' && !IS_MAINNET;
-  if (!SIGNING_BROKER_ENABLED && !ALLOW_INSECURE_WIF) {
+  // Audit C3: mounting the agent's private key inside a prompt-injectable job
+  // container that has network egress let untrusted in-container code read it
+  // (the :ro flag blocks writes, not reads) and sign/spend arbitrarily. The
+  // host-side signing broker fully supersedes that path, so broker signing is
+  // now MANDATORY on every network. Fail closed if it is disabled.
+  if (!SIGNING_BROKER_ENABLED) {
     throw new Error(
-      'Refusing to mount the agent WIF into the job container (audit C3): the private key would be ' +
-      'readable by untrusted, prompt-injectable in-container code that has network egress, letting it ' +
-      'sign arbitrary messages and spend the key. Set J41_SIGNING_BROKER=1 to sign via the host-side ' +
-      'broker (recommended; required for mainnet), or set J41_ALLOW_INSECURE_WIF_MOUNT=1 to explicitly ' +
-      'accept the risk (dev / testnet only).',
+      'Refusing to launch a job with J41_SIGNING_BROKER=0: the host-side signing broker is required ' +
+      'so the agent WIF never enters the prompt-injectable job container. Remove J41_SIGNING_BROKER=0.',
     );
   }
 
-  if (SIGNING_BROKER_ENABLED) {
+  {
     signerChannelDir = path.join(os.tmpdir(), `j41-sign-${job.id}`);
     const { executors, teardown } = defaultExecutors({
       apiUrl: cfg.platform.api_url,
@@ -5817,23 +5808,6 @@ async function startJobContainer(state, job, agentInfo) {
     });
     await signerHost.start();
     console.log(`  🔒 Signing broker active for ${job.id} (channel: ${signerChannelDir})`);
-  } else {
-    // Copy keys to a temp file OUTSIDE the writable job dir to avoid double-exposing the WIF.
-    // The job dir is mounted rw (/app/job), so keys must not be inside it.
-    const tmpKeysDir = path.join(os.tmpdir(), `j41-keys-${job.id}`);
-    fs.mkdirSync(tmpKeysDir, { recursive: true, mode: 0o700 });
-    tmpKeysPath = path.join(tmpKeysDir, 'keys.json');
-    fs.copyFileSync(keysPath, tmpKeysPath);
-    try {
-      // Audit 2026-06-02 H-DISPATCHER-1: tighten WIF temp copy mode from 0o644
-      // → 0o600. The container runs as the dispatcher UID (see User flag in
-      // createContainer body); 0o644 was historical from a non-root container
-      // user that no longer applies. The cleanup (rm tmpKeysDir on every stop
-      // path) lands below in stopJobContainer.
-      fs.chmodSync(tmpKeysPath, 0o600);
-    } catch {
-      // best effort on systems that don't support chmod
-    }
   }
 
   try {
@@ -5846,18 +5820,14 @@ async function startJobContainer(state, job, agentInfo) {
       console.log(`  ♻️  Removed stale container ${containerName}`);
     } catch {}
 
-    // Extra env vars under broker mode: tell job-agent.js to use the channel
-    // and pass the iAddress (we no longer have keys.json inside the container
-    // to read it from). The defensive guard in job-agent.js refuses to start
-    // if J41_SIGNING_BROKER=1 and /app/keys.json *also* exists.
-    const brokerEnv = SIGNING_BROKER_ENABLED
-      ? [`J41_SIGNING_BROKER=1`, `J41_SIGNING_CHANNEL_DIR=/app/sign`, `J41_IADDRESS=${hostKeys.iAddress}`]
-      : [];
+    // Broker env: tell job-agent.js to use the channel and pass the iAddress
+    // (there is no keys.json inside the container to read it from). The
+    // defensive guard in job-agent.js refuses to start if J41_SIGNING_BROKER=1
+    // and /app/keys.json *also* exists.
+    const brokerEnv = [`J41_SIGNING_BROKER=1`, `J41_SIGNING_CHANNEL_DIR=/app/sign`, `J41_IADDRESS=${hostKeys.iAddress}`];
 
-    // Bind mounts differ by mode: legacy mounts the WIF; broker mounts the channel.
-    const signingBinds = SIGNING_BROKER_ENABLED
-      ? [`${signerChannelDir}:/app/sign`]                      // rw — container writes req/, reads resp/
-      : [`${tmpKeysPath}:/app/keys.json:ro`];
+    // The container only ever sees the bind-mounted JSON signing channel — never the WIF.
+    const signingBinds = [`${signerChannelDir}:/app/sign`]; // rw — container writes req/, reads resp/
 
     // M1: build HostConfig as a variable so we can patch CapDrop after the
     // bwrap spread (which returns CapDrop:[] + CapAdd:['SYS_ADMIN'] and would
@@ -5900,10 +5870,10 @@ async function startJobContainer(state, job, agentInfo) {
       // Dockerfile's USER j41-agent (UID ~999) and EACCES on bind-mounted
       // files written by the host user.
       User: `${process.getuid()}:${process.getgid()}`,
-      // Docker bind-mounts SOUL.md/job (and keys.json OR /app/sign) into /app/* —
+      // Docker bind-mounts SOUL.md/job (and the /app/sign channel) into /app/* —
       // strip the host-path env vars buildContainerEnv emits (they're host paths and
       // would override the in-container defaults the job-agent expects).
-      Env: Object.entries(buildContainerEnv(job, agentInfo, loadAgentConfig(agentInfo.id), canaryToken, jobDir, tmpKeysPath || keysPath))
+      Env: Object.entries(buildContainerEnv(job, agentInfo, loadAgentConfig(agentInfo.id), canaryToken, jobDir, keysPath))
             .filter(([k, v]) => v !== undefined && v !== '' &&
               k !== 'J41_KEYS_FILE' && k !== 'J41_SOUL_FILE' && k !== 'J41_JOB_DIR')
             .map(([k, v]) => `${k}=${v}`)
@@ -6025,7 +5995,6 @@ async function startJobContainer(state, job, agentInfo) {
     // (state.active was never set, so stopJobContainer would early-return)
     try { if (signerHost) await signerHost.destroy(); } catch {}
     try { if (signerTeardown) await signerTeardown(); } catch {}
-    try { if (tmpKeysPath) fs.rmSync(path.join(os.tmpdir(), `j41-keys-${job.id}`), { recursive: true, force: true }); } catch {}
     // Return agent to pool
     state.available.push(agentInfo);
   }
@@ -6089,19 +6058,6 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
     } else {
       console.error(`[Cleanup] Error stopping ${jobId}:`, e.message);
     }
-  }
-
-  // Audit 2026-06-02 H-DISPATCHER-1: clean up the per-job WIF temp copy at
-  // os.tmpdir()/j41-keys-<jobId>. Previously this never got rm'd on either
-  // success or failure paths — operators ended up with an accumulating stash
-  // of plaintext WIFs in /tmp. Best-effort; non-fatal if already gone.
-  try {
-    const tmpKeysDir = path.join(os.tmpdir(), `j41-keys-${jobId}`);
-    if (fs.existsSync(tmpKeysDir)) {
-      fs.rmSync(tmpKeysDir, { recursive: true, force: true });
-    }
-  } catch (e) {
-    console.error(`[Cleanup] Failed to remove tmpKeysDir for ${jobId}: ${e.message}`);
   }
 
   // Tear down the signing broker (broker mode): stop the watcher, run the

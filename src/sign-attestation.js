@@ -8,25 +8,20 @@
  *   node sign-attestation.js creation
  *   node sign-attestation.js deletion
  *
- * Broker mode (J41_SIGNING_BROKER !== '0', the default):
- *   The WIF is NOT present in the container. Signing is routed through the
+ * Signing is ALWAYS routed through the host-side broker:
+ *   The WIF is NOT present in the container. Signing goes through the
  *   file-channel client (SignChannelClient) which writes a sign request to
  *   /app/sign/req/ and polls /app/sign/resp/ for the dispatcher's response.
- *   The container never sees the agent WIF in this mode.
- *
- * Legacy mode (J41_SIGNING_BROKER=0):
- *   Reads the WIF from /app/keys.json and signs locally via signChallenge.
+ *   The container never sees the agent WIF. The legacy path that read a
+ *   WIF from /app/keys.json and signed locally has been removed.
  */
 
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const KEYS_FILE = '/app/keys.json';
 const JOB_DIR = '/app/job';
 
-/** True when broker mode is active (default). Flip to '0' for legacy local signing. */
-const SIGNING_BROKER_ENABLED = process.env.J41_SIGNING_BROKER !== '0';
 const SIGNING_BROKER_CHANNEL_DIR = process.env.J41_SIGNING_CHANNEL_DIR || '/app/sign';
 
 const JOB_ID = process.env.J41_JOB_ID || 'unknown';
@@ -42,36 +37,21 @@ if (!mode || (mode !== 'creation' && mode !== 'deletion')) {
 }
 
 /**
- * Unified sign helper. In broker mode uses SignChannelClient so the WIF never
- * enters the container. In legacy mode calls signChallenge with the local WIF.
+ * Sign helper. Routes through SignChannelClient so the WIF never enters the
+ * container; the channel directory is bind-mounted by the dispatcher.
  *
  * @param {string} message  The message string to sign.
- * @param {object} [keys]   Parsed keys.json (only required in legacy mode).
  * @returns {Promise<string>} The signature string.
  */
-async function signMessage(message, keys) {
-  if (SIGNING_BROKER_ENABLED) {
-    // Broker mode: route through the dispatcher's file-channel signing broker.
-    // The channel directory is bind-mounted by the dispatcher when it launches
-    // this container with broker mode enabled.
-    const { SignChannelClient } = require('./sign-channel-client.js');
-    const client = new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR });
-    return client.signMessage(message);
-  }
-  // Legacy mode: sign locally with the WIF from /app/keys.json.
-  const { signChallenge } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
-  return signChallenge(keys.wif, message, keys.iAddress, process.env.J41_NETWORK || 'verustest');
+async function signMessage(message) {
+  const { SignChannelClient } = require('./sign-channel-client.js');
+  const client = new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR });
+  return client.signMessage(message);
 }
 
 (async () => {
 try {
-  // In broker mode the WIF is never in the container; skip reading keys.json.
-  // In legacy mode read it now so errors surface before we build the attestation.
-  let keys = null;
-  if (!SIGNING_BROKER_ENABLED) {
-    keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
-  }
-
+  // The WIF is never in the container; signing is brokered via /app/sign.
   if (mode === 'creation') {
     const creationTime = new Date().toISOString();
 
@@ -112,7 +92,7 @@ try {
     };
 
     const message = JSON.stringify(attestation);
-    attestation.signature = await signMessage(message, keys);
+    attestation.signature = await signMessage(message);
 
     fs.writeFileSync(
       path.join(JOB_DIR, 'creation-attestation.json'),
@@ -154,7 +134,7 @@ try {
     };
 
     const message = JSON.stringify(attestation);
-    attestation.signature = await signMessage(message, keys);
+    attestation.signature = await signMessage(message);
 
     fs.writeFileSync(
       path.join(JOB_DIR, 'deletion-attestation.json'),

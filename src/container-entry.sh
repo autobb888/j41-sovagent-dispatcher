@@ -14,8 +14,9 @@ echo "║     OpenClaw Gateway + Attestation        ║"
 echo "╚══════════════════════════════════════════╝"
 echo ""
 
-# Sign creation attestation (if keys and job data available)
-if [ -f /app/keys.json ] && [ -d /app/job ]; then
+# Sign creation attestation via the host-side signing broker (the WIF is never
+# in the container; signing is brokered through the /app/sign channel).
+if [ -d /app/job ]; then
   echo "→ Signing creation attestation..."
   node /app/sign-attestation.js creation || echo "⚠️ Creation attestation failed (non-fatal)"
   echo ""
@@ -25,7 +26,7 @@ fi
 cleanup() {
   echo ""
   echo "→ Container stopping, signing deletion attestation..."
-  if [ -f /app/keys.json ] && [ -d /app/job ]; then
+  if [ -d /app/job ]; then
     node /app/sign-attestation.js deletion || echo "⚠️ Deletion attestation failed (non-fatal)"
   fi
   echo "🏁 Container shutdown complete."
