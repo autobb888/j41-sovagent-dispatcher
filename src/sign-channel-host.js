@@ -232,7 +232,12 @@ class SignChannelHost {
           await this._removeReq(reqPath);
           return;
         }
-        raw = await fh.readFile('utf8');
+        // Security: bounded positional read — cap the read at MAX_SIGN_REQ_BYTES
+        // even if the file grows between fstat and read (post-stat append).
+        // fh.readFile() has no size cap and would read the full grown file.
+        const buf = Buffer.alloc(Math.min(st.size, MAX_SIGN_REQ_BYTES));
+        const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+        raw = buf.subarray(0, bytesRead).toString('utf8');
       } catch (e) {
         // Transient FS hiccup — bail; the polling sweep will retry.
         if (e.code !== 'ENOENT') this.log(`[sign-channel] read ${filename} failed: ${e.message}`);
@@ -296,7 +301,10 @@ class SignChannelHost {
       // the ONLY way the container reaches host-side code; we don't allow
       // arbitrary function names.
       const kind = params.kind;
-      if (typeof kind !== 'string' || !this.executors[kind]) {
+      // Security: use own-property check so prototype-inherited names like
+      // 'constructor', 'hasOwnProperty', 'toString', 'valueOf' cannot bypass
+      // the default-deny registry and resolve to a callable host function.
+      if (typeof kind !== 'string' || !Object.prototype.hasOwnProperty.call(this.executors, kind)) {
         return {
           ok: false,
           error: { code: 'UNKNOWN_EXECUTOR', message: `no executor registered for kind: ${kind}` },

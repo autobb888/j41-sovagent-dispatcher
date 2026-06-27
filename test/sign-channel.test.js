@@ -409,6 +409,25 @@ test('jobCompletionUpdateExecutor: warns when authoritativeJob has none of the c
   }
 });
 
+test('executeOnChain rejects prototype-chain method names', async () => {
+  // RED guard: existing check `!this.executors[kind]` lets prototype-inherited
+  // names like 'constructor' resolve to a truthy callable and bypass UNKNOWN_EXECUTOR.
+  const host = new SignChannelHost({
+    channelDir: '/tmp/j41-sign-proto-test-' + crypto.randomBytes(4).toString('hex'),
+    wif: 'U0000000000000000000000000000000000000000000000000000000',
+    network: NET,
+    jobId: 'job-abc',
+    executors: {},
+    getJob: async () => ({}),
+  });
+  // Call _handle directly — no I/O needed; this is a pure policy test.
+  for (const kind of ['constructor', 'hasOwnProperty', 'toString', 'valueOf']) {
+    const res = await host._handle({ id: 'aaaaaaaa', method: 'executeOnChain', params: { kind } });
+    assert.equal(res.ok, false, `expected ok=false for proto name "${kind}"`);
+    assert.equal(res.error.code, 'UNKNOWN_EXECUTOR', `expected UNKNOWN_EXECUTOR for "${kind}"`);
+  }
+});
+
 test('end-to-end: J41Agent constructed with the client routes accept through the broker', async () => {
   // This is the integration touchpoint that step 4 will rely on: the agent's
   // checkForJobs() accept path uses signer.signBrokered, which goes over the
