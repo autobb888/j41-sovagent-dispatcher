@@ -30,6 +30,44 @@ const {
 } = require('@junction41/sovagent-sdk/dist/index.js');
 
 /**
+ * Maximum JSON byte size allowed for a container-supplied on-chain record.
+ * Prevents a prompt-injected container from bloating the VDXF additions.
+ */
+const MAX_CONTAINER_RECORD_BYTES = 8192;
+
+/**
+ * Validate a container-authored record before it is written onto the agent's
+ * own identity VDXF.  Fail closed on every bad input.
+ *
+ * Rules:
+ *  - `null` / `undefined` passthrough (field is optional).
+ *  - Must be a plain, non-Array object.
+ *  - JSON representation must be ≤ MAX_CONTAINER_RECORD_BYTES bytes (UTF-8).
+ *  - If `rec.jobId` is present it must equal the host's authoritative `jobId`.
+ *
+ * Exported so the test suite can exercise it independently.
+ *
+ * @param {unknown} rec    The container-supplied record.
+ * @param {string}  jobId  The host's authoritative job ID.
+ * @returns {object|null|undefined} The record unchanged if valid.
+ * @throws {Error} On any validation failure.
+ */
+function validateContainerRecord(rec, jobId) {
+  if (rec == null) return rec;
+  if (typeof rec !== 'object' || Array.isArray(rec)) {
+    throw new Error('container record must be a plain object');
+  }
+  const bytes = Buffer.byteLength(JSON.stringify(rec), 'utf8');
+  if (bytes > MAX_CONTAINER_RECORD_BYTES) {
+    throw new Error(`container record too large (${bytes} > ${MAX_CONTAINER_RECORD_BYTES})`);
+  }
+  if (rec.jobId != null && rec.jobId !== jobId) {
+    throw new Error(`container record jobId ${rec.jobId} != ${jobId}`);
+  }
+  return rec;
+}
+
+/**
  * Integrity ②: decide whether to proceed with writing a witness-sourced
  * record on-chain, or throw fail-closed.
  *
@@ -110,12 +148,12 @@ function jobCompletionUpdateExecutor({ getClient }) {
     if (jobRecord.timestamp !== undefined && typeof jobRecord.timestamp !== 'number') {
       throw new Error('jobCompletionUpdate: jobRecord.timestamp must be a number');
     }
-    if (reviewRecord !== undefined && (typeof reviewRecord !== 'object' || reviewRecord === null)) {
-      throw new Error('jobCompletionUpdate: reviewRecord must be an object if provided');
-    }
-    if (workspaceAttestation !== undefined && (typeof workspaceAttestation !== 'object' || workspaceAttestation === null)) {
-      throw new Error('jobCompletionUpdate: workspaceAttestation must be an object if provided');
-    }
+    // validateContainerRecord enforces: plain object, byte budget ≤ 8192,
+    // and jobId field (if present) must match the host's authoritative jobId.
+    // This replaces the previous loose type-only checks and adds the size +
+    // jobId-binding guards mandated by the WIF-lifecycle security review.
+    const safeReview = validateContainerRecord(reviewRecord, ctx.jobId);
+    const safeWorkspace = validateContainerRecord(workspaceAttestation, ctx.jobId);
     const allowedJobRecordKeys = new Set(['jobHash', 'timestamp', 'completedAt', 'amount', 'currency', 'buyer', 'seller', 'status', 'reviewerSignature']);
     for (const k of Object.keys(jobRecord)) {
       if (!allowedJobRecordKeys.has(k)) {
@@ -192,11 +230,12 @@ function jobCompletionUpdateExecutor({ getClient }) {
       return { skipped: true, reason: 'no-utxos' };
     }
 
-    // reviewRecord and workspaceAttestation remain legitimately container-authored.
+    // reviewRecord and workspaceAttestation are legitimately container-authored
+    // but must pass validateContainerRecord (called above) before reaching here.
     const additions = buildJobCompletionAdditions({
       jobRecord: jobRecordToWrite,
-      reviewRecord,
-      workspaceAttestation,
+      reviewRecord: safeReview,
+      workspaceAttestation: safeWorkspace,
     });
 
     const rawhex = buildIdentityUpdateTx({
@@ -239,4 +278,5 @@ module.exports = {
   jobCompletionUpdateExecutor,
   defaultExecutors,
   decideWitnessWrite,
+  validateContainerRecord,
 };
