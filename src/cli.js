@@ -22,7 +22,7 @@ const { getRuntime, persistActiveJobs, loadActiveJobs, saveConfig, loadConfig } 
 const log = require('./logger');
 const { loadDispatcherConfig, fileConfiguredNetwork } = require('./config-loader.js');
 const { SignChannelHost } = require('./sign-channel-host.js');
-const { defaultExecutors } = require('./broker-executors.js');
+const { defaultExecutors, expiryForIdentity } = require('./broker-executors.js');
 const { findMainnetSecurityViolations, resolveIsMainnet } = require('./mainnet-guard.js');
 const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, liveLogPath, archiveLogPath } = require('./job-log.js');
 const { shouldRefundOrphan, isRefundAlreadyHandled } = require('./refund.js');
@@ -982,6 +982,7 @@ function createFinalizeHooks(agentId, identityName, profile, services = [], disp
         return;
       }
 
+      const _ci = await agent.client.getChainInfo();
       // Build and sign the transaction offline
       const rawhex = buildIdentityUpdateTx({
         wif: keys.wif,
@@ -989,6 +990,7 @@ function createFinalizeHooks(agentId, identityName, profile, services = [], disp
         utxos,
         vdxfAdditions,
         network: J41_NETWORK,
+        expiryHeight: expiryForIdentity(_ci.blockHeight),
       });
       console.log(`   ↳ Transaction signed (${rawhex.length / 2} bytes)`);
 
@@ -6946,10 +6948,12 @@ async function mainMenu() {
 
       if (!utxos.length) { console.log('\n  No UTXOs — fund the agent first.\n'); return; }
 
+      const _ci = await a.client.getChainInfo();
       const newCmm = buildAgentContentMultimap(profile, services || [], disputePolicy);
       const rawhex = buildIdentityUpdateTx({
         wif: keys.wif, identityData, utxos, vdxfAdditions: newCmm,
         network: J41_NETWORK, clearContentmultimap: true,
+        expiryHeight: expiryForIdentity(_ci.blockHeight),
       });
 
       const result = await a.client.broadcast(rawhex);

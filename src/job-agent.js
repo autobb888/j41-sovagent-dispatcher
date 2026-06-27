@@ -1615,14 +1615,17 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult, signer) 
       const identityData = identityRawResp.data || identityRawResp;
       const utxoResp = await agent.client.getUtxos();
       const utxos = utxoResp.utxos || utxoResp;
+      const _ci = await agent.client.getChainInfo();
 
       if (utxos.length > 0) {
+        const { expiryForIdentity } = require('./broker-executors.js');
         const rawhex = buildIdentityUpdateTx({
           wif: keys.wif,
           identityData,
           utxos,
           vdxfAdditions: additions,
           network: J41_NETWORK,
+          expiryHeight: expiryForIdentity(_ci.blockHeight),
         });
         const txResult = await agent.client.broadcast(rawhex);
         log.info('On-chain identity updated', { jobId: JOB_ID, txid: txResult.txid || txResult });

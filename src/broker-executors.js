@@ -229,6 +229,7 @@ function jobCompletionUpdateExecutor({ getClient }) {
     if (utxos.length === 0) {
       return { skipped: true, reason: 'no-utxos' };
     }
+    const ci = await client.getChainInfo();
 
     // reviewRecord and workspaceAttestation are legitimately container-authored
     // but must pass validateContainerRecord (called above) before reaching here.
@@ -244,6 +245,7 @@ function jobCompletionUpdateExecutor({ getClient }) {
       utxos,
       vdxfAdditions: additions,
       network,
+      expiryHeight: expiryForIdentity(ci.blockHeight),
     });
     const txResult = await client.broadcast(rawhex);
     const txid = typeof txResult === 'string' ? txResult : txResult.txid || txResult;
@@ -273,10 +275,19 @@ function defaultExecutors(cfg) {
   return { executors, teardown };
 }
 
+/**
+ * Returns `tip + 200` when `tip` is a safe integer, otherwise `undefined`.
+ * Used to derive a sensible expiry height for identity-update transactions.
+ */
+function expiryForIdentity(tip) {
+  return Number.isInteger(tip) ? tip + 200 : undefined;
+}
+
 module.exports = {
   makeClientFactory,
   jobCompletionUpdateExecutor,
   defaultExecutors,
   decideWitnessWrite,
   validateContainerRecord,
+  expiryForIdentity,
 };

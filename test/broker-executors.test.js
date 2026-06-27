@@ -13,3 +13,9 @@ test('validateContainerRecord rejects a record bound to a different job', () => 
 test('validateContainerRecord accepts a well-formed self-record', () => {
   assert.deepEqual(validateContainerRecord({ jobId: 'job-1', note: 'ok' }, 'job-1'), { jobId: 'job-1', note: 'ok' });
 });
+
+const { expiryForIdentity } = require('../src/broker-executors.js');
+test('expiryForIdentity adds 200 to tip, undefined when tip missing', () => {
+  assert.equal(expiryForIdentity(5000), 5200);
+  assert.equal(expiryForIdentity(undefined), undefined);
+});
