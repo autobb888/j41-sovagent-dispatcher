@@ -47,6 +47,11 @@
     verus-typescript-primitives "git+https://github.com/VerusCoin/verus-typescript-primitives.git"
     wif "2.0.1"
 
+"@fastify/busboy@^2.0.0":
+  version "2.1.1"
+  resolved "https://registry.yarnpkg.com/@fastify/busboy/-/busboy-2.1.1.tgz#b9da6a878a371829a0502c9b6c1c143ef6663f4d"
+  integrity sha512-vBZP4NlzfOlerQTnba4aqZoMhE/a9HY7HRqoOPaETQcSQuWEIyZMHGfVu6w9wGtGK5fED5qRs2DteVCjOH60sA==
+
 "@grpc/grpc-js@^1.11.1":
   version "1.14.3"
   resolved "https://registry.yarnpkg.com/@grpc/grpc-js/-/grpc-js-1.14.3.tgz#4c9b817a900ae4020ddc28515ae4b52c78cfb8da"
@@ -103,10 +108,10 @@
   resolved "https://registry.yarnpkg.com/@junction41/secure-setup/-/secure-setup-0.3.0.tgz#3c7ddd9601ae3ec4a7c032b75ff6421ca0c613c1"
   integrity sha512-M3bX0lxx5gg0PIsVYUH98cK8sdQcfbqzXm8kgEs8t+Z/st7glNbRqfVtiXEGDvurUGkgiJEs3x9its+JIG1syQ==
 
-"@junction41/sovagent-sdk@2.7.0":
-  version "2.7.0"
-  resolved "https://registry.yarnpkg.com/@junction41/sovagent-sdk/-/sovagent-sdk-2.7.0.tgz#cfb4b1719079a948e43c12bdd5c8136e38f5ce86"
-  integrity sha512-RluOfsVeNJageFHgbv4kNuraUPmmZyWEsRp39718g/mgJNjV1l3jjUXcOb50yW8GZ3cS1VuQj5VsH3jSikulNQ==
+"@junction41/sovagent-sdk@2.10.0":
+  version "2.10.0"
+  resolved "https://registry.yarnpkg.com/@junction41/sovagent-sdk/-/sovagent-sdk-2.10.0.tgz#8e10358867bd583cb0275400d222b7458d97d770"
+  integrity sha512-ngvIAxFlqVijHkHMUICSzn0C2MwNYfzYEKn8Co/iASrWEf6cIWRyQJym5n6Hv573ldPrNx20uYiV0y+HZ/uGtg==
   dependencies:
     "@bitgo/utxo-lib" "github:VerusCoin/BitGoJS#5e82f4fda2975ca1af7f2b01590093b4a1439dc9"
     bn.js "^5.2.0"
@@ -1228,6 +1233,13 @@ undici-types@~7.18.0:
   version "7.18.2"
   resolved "https://registry.yarnpkg.com/undici-types/-/undici-types-7.18.2.tgz#29357a89e7b7ca4aef3bf0fd3fd0cd73884229e9"
   integrity sha512-AsuCzffGHJybSaRrmr5eHr81mwJU3kjw6M+uprWvCXiNeN9SOGwQ3Jn8jb8m3Z6izVgknn1R0FTCEAP2QrLY/w==
+
+undici@5:
+  version "5.29.0"
+  resolved "https://registry.yarnpkg.com/undici/-/undici-5.29.0.tgz#419595449ae3f2cdcba3580a2e8903399bd1f5a3"
+  integrity sha512-raqeBD6NQK4SkWhQzeYKd1KmIG6dllBOTt55Rmkt4HtI9mwdWtJljnrXjAFUBLTSN67HWrOIZ3EPF4kjUw80Bg==
+  dependencies:
+    "@fastify/busboy" "^2.0.0"
 
 util-deprecate@^1.0.1, util-deprecate@~1.0.1:
   version "1.0.2"
