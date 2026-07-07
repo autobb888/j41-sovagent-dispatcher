@@ -22,6 +22,7 @@ const { getRuntime, persistActiveJobs, loadActiveJobs, saveConfig, loadConfig } 
 const log = require('./logger');
 const { loadDispatcherConfig, fileConfiguredNetwork } = require('./config-loader.js');
 const { SignChannelHost } = require('./sign-channel-host.js');
+const { EgressProxyHost, deriveAllowedHosts, isolatedGatewayIp, EGRESS_PROXY_PORT } = require('./egress-proxy.js');
 const { defaultExecutors, expiryForIdentity } = require('./broker-executors.js');
 const { findMainnetSecurityViolations, resolveIsMainnet } = require('./mainnet-guard.js');
 const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, liveLogPath, archiveLogPath } = require('./job-log.js');
@@ -3809,6 +3810,15 @@ program
       state.emitEvent = () => {};
     }
 
+    // ── Start egress proxy (sole outbound path for sandboxed job containers) ──
+    state.egressProxy = new EgressProxyHost({
+      host: isolatedGatewayIp(),
+      port: EGRESS_PROXY_PORT,
+      log: (m) => console.log(`[egress] ${m}`),
+    });
+    await state.egressProxy.start();
+    console.log(`[egress] proxy listening on ${isolatedGatewayIp()}:${EGRESS_PROXY_PORT}`);
+
     // ── Start VRSC/USD rate poller (WP-D4 P0-2) ──
     startVrscRatePoller();
 
@@ -3899,6 +3909,7 @@ program
       if (state.active.size === 0) {
         console.log('\n✅ No active jobs. Shutting down.\n');
         persistActiveJobs(state.active);
+        try { if (state.egressProxy) await state.egressProxy.stop(); } catch { /* best-effort */ }
         stopControlServer(controlServer);
         stopControlApi(controlApi);
         stopVrscRatePoller();
@@ -3916,6 +3927,7 @@ program
           console.log('\n✅ All jobs finished. Shutting down.\n');
           state.active.clear();
           persistActiveJobs(state.active);
+          if (state.egressProxy) state.egressProxy.stop().catch(() => {});
           stopControlServer(controlServer);
           stopControlApi(controlApi);
           stopVrscRatePoller();
@@ -3926,6 +3938,7 @@ program
           clearInterval(drainInterval);
           console.log(`\n⚠️  Drain timeout (${Math.round(drainTimeoutMs / 60000)}min) — remaining ${state.active.size} job(s) will be refunded on next startup.`);
           // Don't clear active-jobs.json — crash recovery will handle refunds
+          if (state.egressProxy) state.egressProxy.stop().catch(() => {});
           stopControlServer(controlServer);
           stopControlApi(controlApi);
           stopVrscRatePoller();
@@ -5862,6 +5875,12 @@ async function startJobContainer(state, job, agentInfo) {
     if (hostConfig.CapAdd && hostConfig.CapAdd.includes('SYS_ADMIN')) {
       hostConfig.CapDrop = ['CHOWN','DAC_OVERRIDE','FOWNER','FSETID','KILL','MKNOD','NET_BIND_SERVICE','NET_RAW','SETGID','SETUID','SETFCAP','SETPCAP','SYS_CHROOT','AUDIT_WRITE'];
     }
+    // Per-job egress allowlist + token (sandbox reaches ONLY the proxy).
+    const containerEnvObj = buildContainerEnv(job, agentInfo, loadAgentConfig(agentInfo.id), canaryToken, jobDir, keysPath);
+    const egressToken = require('crypto').randomBytes(32).toString('hex');
+    const egressHosts = deriveAllowedHosts(containerEnvObj);
+    if (state.egressProxy) state.egressProxy.register(egressToken, egressHosts);
+
     const container = await docker.createContainer({
       name: containerName,
       Image: 'j41/job-agent:latest',  // PRE-BAKED IMAGE
@@ -5874,12 +5893,16 @@ async function startJobContainer(state, job, agentInfo) {
       // Docker bind-mounts SOUL.md/job (and the /app/sign channel) into /app/* —
       // strip the host-path env vars buildContainerEnv emits (they're host paths and
       // would override the in-container defaults the job-agent expects).
-      Env: Object.entries(buildContainerEnv(job, agentInfo, loadAgentConfig(agentInfo.id), canaryToken, jobDir, keysPath))
+      Env: Object.entries(containerEnvObj)
             .filter(([k, v]) => v !== undefined && v !== '' &&
               k !== 'J41_KEYS_FILE' && k !== 'J41_SOUL_FILE' && k !== 'J41_JOB_DIR')
             .map(([k, v]) => `${k}=${v}`)
             .concat(getExecutorEnvVars(agentInfo).filter(s => !s.startsWith('J41_LLM_')))
-            .concat(brokerEnv),
+            .concat(brokerEnv)
+            .concat([
+              `J41_EGRESS_PROXY=http://${isolatedGatewayIp()}:${EGRESS_PROXY_PORT}`,
+              `J41_EGRESS_TOKEN=${egressToken}`,
+            ]),
       HostConfig: hostConfig,
       Labels: {
         'j41.job.id': job.id,
@@ -5909,6 +5932,7 @@ async function startJobContainer(state, job, agentInfo) {
       _signerHost: signerHost,
       _signerChannelDir: signerChannelDir,
       _signerTeardown: signerTeardown,
+      _egressToken: egressToken,
     });
 
     state.emitEvent?.('container.started', {
@@ -5996,6 +6020,7 @@ async function startJobContainer(state, job, agentInfo) {
     // (state.active was never set, so stopJobContainer would early-return)
     try { if (signerHost) await signerHost.destroy(); } catch {}
     try { if (signerTeardown) await signerTeardown(); } catch {}
+    try { if (state.egressProxy && egressToken) state.egressProxy.revoke(egressToken); } catch {}
     // Return agent to pool
     state.available.push(agentInfo);
   }
@@ -6074,6 +6099,9 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   }
   if (active._signerTeardown) {
     try { await active._signerTeardown(); } catch { /* best-effort */ }
+  }
+  if (active._egressToken && state.egressProxy) {
+    try { state.egressProxy.revoke(active._egressToken); } catch { /* best-effort */ }
   }
 
   // Drain the per-job log stream before archiving. end() only *initiates* the

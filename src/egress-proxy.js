@@ -78,4 +78,14 @@ class EgressProxyHost {
   }
 }
 
-module.exports = { EgressProxyHost, deriveAllowedHosts, EGRESS_PROXY_PORT };
+const { execFileSync } = require('node:child_process');
+/** Read the j41-isolated bridge gateway IP; fall back to 172.18.0.1. `runner` is injectable for tests. */
+function isolatedGatewayIp(runner) {
+  const run = runner || (() => execFileSync('docker',
+    ['network', 'inspect', 'j41-isolated', '--format', '{{range .IPAM.Config}}{{.Gateway}}{{end}}'],
+    { stdio: 'pipe', timeout: 10000 }).toString());
+  try { const ip = String(run()).trim(); return /^\d{1,3}(\.\d{1,3}){3}$/.test(ip) ? ip : '172.18.0.1'; }
+  catch { return '172.18.0.1'; }
+}
+
+module.exports = { EgressProxyHost, deriveAllowedHosts, isolatedGatewayIp, EGRESS_PROXY_PORT };
