@@ -37,6 +37,9 @@ COPY src/sovguard-context.js ./
 
 # Copy runtime scripts (baked into image)
 COPY src/job-agent.js ./
+# Egress-proxy client — required by job-agent.js (installed before the SDK
+# require) to route all fetch through the host egress proxy via undici.
+COPY src/egress-proxy-client.js ./
 COPY src/sign-attestation.js ./
 COPY src/container-entry.sh ./
 # Broker mode (J41_SIGNING_BROKER=1) — container-side file-channel client +
@@ -51,14 +54,14 @@ RUN chmod +x container-entry.sh
 # SECURITY HARDENING
 # ─────────────────────────────────────────
 
-# Create non-root user for running agent
-RUN groupadd -r j41-agent && useradd -r -g j41-agent j41-agent
-
-# Set permissions
-RUN chown -R j41-agent:j41-agent /app
+# Run as the non-root `node` user that the node:22-slim base already ships
+# (uid 1000). We use it instead of creating a custom user — `useradd -r`
+# silently no-ops in some build environments, and the dispatcher pins no
+# specific uid, so the stock node user is the robust choice.
+RUN chown -R node:node /app
 
 # Drop to non-root
-USER j41-agent
+USER node
 
 # ─────────────────────────────────────────
 # CONTAINER CONFIG

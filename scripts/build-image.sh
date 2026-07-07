@@ -54,6 +54,9 @@ cp "$DISPATCHER_DIR/src/sovguard-context.js" .build-temp/src/
 # files must be present (job-agent.js requires them).
 cp "$DISPATCHER_DIR/src/sign-channel-client.js" .build-temp/src/
 cp "$DISPATCHER_DIR/src/job-signer.js" .build-temp/src/
+# Egress-proxy client — required by job-agent.js to route fetch through the
+# host egress proxy (undici ProxyAgent). Must be in the image.
+cp "$DISPATCHER_DIR/src/egress-proxy-client.js" .build-temp/src/
 cp "$DISPATCHER_DIR/src/executors/"*.js .build-temp/src/executors/
 cp "$DISPATCHER_DIR/Dockerfile.job-agent" .build-temp/Dockerfile
 
@@ -94,8 +97,10 @@ else
     echo "✓ Using npm SDK (per package.docker.json)"
 fi
 
-# Build
+# Build. Set J41_BUILD_NO_CACHE=1 to force a clean rebuild (avoids stale/partial
+# layer-cache reuse, e.g. after a mid-build failure).
 docker build \
+    ${J41_BUILD_NO_CACHE:+--no-cache} \
     -f .build-temp/Dockerfile \
     -t "${IMAGE_NAME}:${IMAGE_TAG}" \
     .build-temp
