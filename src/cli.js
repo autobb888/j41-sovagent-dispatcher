@@ -30,6 +30,7 @@ const { shouldRefundOrphan, isRefundAlreadyHandled } = require('./refund.js');
 const { isValidJobId } = require('./job-id.js');
 const { verifyInboxJobRecord } = require('./inbox-job-record.js');
 const { writeKeysFile } = require('./keys-file.js');
+const crypto = require('crypto');
 
 /** Feature flag: route in-container signing through the host-side broker
  *  instead of mounting the WIF into the container. Default ON; opt out only
@@ -3811,13 +3812,14 @@ program
     }
 
     // ── Start egress proxy (sole outbound path for sandboxed job containers) ──
+    state.gatewayIp = isolatedGatewayIp();
     state.egressProxy = new EgressProxyHost({
-      host: isolatedGatewayIp(),
+      host: state.gatewayIp,
       port: EGRESS_PROXY_PORT,
       log: (m) => console.log(`[egress] ${m}`),
     });
     await state.egressProxy.start();
-    console.log(`[egress] proxy listening on ${isolatedGatewayIp()}:${EGRESS_PROXY_PORT}`);
+    console.log(`[egress] proxy listening on ${state.gatewayIp}:${EGRESS_PROXY_PORT}`);
 
     // ── Start VRSC/USD rate poller (WP-D4 P0-2) ──
     startVrscRatePoller();
@@ -5766,6 +5768,7 @@ async function startJobContainer(state, job, agentInfo) {
   let signerChannelDir = null;
   let signerHost = null;
   let signerTeardown = null;
+  let egressToken;
   const hostKeys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
 
   // Audit C3: mounting the agent's private key inside a prompt-injectable job
@@ -5877,7 +5880,7 @@ async function startJobContainer(state, job, agentInfo) {
     }
     // Per-job egress allowlist + token (sandbox reaches ONLY the proxy).
     const containerEnvObj = buildContainerEnv(job, agentInfo, loadAgentConfig(agentInfo.id), canaryToken, jobDir, keysPath);
-    const egressToken = require('crypto').randomBytes(32).toString('hex');
+    egressToken = crypto.randomBytes(32).toString('hex');
     const egressHosts = deriveAllowedHosts(containerEnvObj);
     if (state.egressProxy) state.egressProxy.register(egressToken, egressHosts);
 
@@ -5900,7 +5903,7 @@ async function startJobContainer(state, job, agentInfo) {
             .concat(getExecutorEnvVars(agentInfo).filter(s => !s.startsWith('J41_LLM_')))
             .concat(brokerEnv)
             .concat([
-              `J41_EGRESS_PROXY=http://${isolatedGatewayIp()}:${EGRESS_PROXY_PORT}`,
+              `J41_EGRESS_PROXY=http://${state.gatewayIp}:${EGRESS_PROXY_PORT}`,
               `J41_EGRESS_TOKEN=${egressToken}`,
             ]),
       HostConfig: hostConfig,
