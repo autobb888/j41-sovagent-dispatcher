@@ -6,6 +6,9 @@
  * for privacy verification.
  */
 
+// --- Egress proxy (must run before the SDK require so all fetch is routed) ---
+require('./egress-proxy-client.js').installEgressProxy();
+
 const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
 const fs = require('fs');
 const path = require('path');
