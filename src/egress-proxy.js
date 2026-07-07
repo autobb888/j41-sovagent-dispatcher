@@ -16,7 +16,13 @@ function deriveAllowedHosts(env) {
     try { u = new URL(v); } catch { continue; }
     if (u.protocol !== 'https:' && u.protocol !== 'http:') continue;
     const host = u.hostname;
-    if (!host || host === 'localhost' || /^127\./.test(host)) continue;
+    // Skip loopback in all forms. Node's WHATWG URL parser returns IPv6 hostnames
+    // WITH brackets (e.g. "[::1]", "[::ffff:7f00:1]") and normalises dotted-decimal
+    // IPv4-mapped addresses to hex groups (127.x.x.x → 7fxx:xxxx), so we must match
+    // both the canonical and the possible no-bracket forms.
+    if (!host || host === 'localhost' || /^127\./.test(host) ||
+        host === '::1' || host === '[::1]' ||
+        /^::ffff:127\./i.test(host) || /^\[::ffff:7f/i.test(host)) continue;
     const port = u.port ? parseInt(u.port, 10) : (u.protocol === 'https:' ? 443 : 80);
     out.add(`${host}:${port}`);
   }
@@ -61,6 +67,7 @@ class EgressProxyHost {
     const allow = token && this._allow.get(token);
     if (!allow) return this._deny(clientSocket, 407, 'Proxy Authentication Required');
     const idx = req.url.lastIndexOf(':');
+    if (idx < 0) return this._deny(clientSocket, 400, 'Bad Request');
     const host = req.url.slice(0, idx);
     const port = parseInt(req.url.slice(idx + 1), 10) || 443;
     if (!allow.has(`${host}:${port}`)) { this._log(`egress DENY ${host}:${port}`); return this._deny(clientSocket, 403, 'Forbidden'); }

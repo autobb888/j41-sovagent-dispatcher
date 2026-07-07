@@ -3818,7 +3818,12 @@ program
       port: EGRESS_PROXY_PORT,
       log: (m) => console.log(`[egress] ${m}`),
     });
-    await state.egressProxy.start();
+    try {
+      await state.egressProxy.start();
+    } catch (err) {
+      console.error(`[egress] FATAL: proxy failed to bind ${state.gatewayIp}:${EGRESS_PROXY_PORT} — refusing to start (jobs would have no egress path): ${err}`);
+      process.exit(1);
+    }
     console.log(`[egress] proxy listening on ${state.gatewayIp}:${EGRESS_PROXY_PORT}`);
 
     // ── Start VRSC/USD rate poller (WP-D4 P0-2) ──
@@ -5863,7 +5868,12 @@ async function startJobContainer(state, job, agentInfo) {
       Tmpfs: { '/tmp': 'rw,noexec,nosuid,size=64m' },
       PidsLimit: 64,
       CapDrop: ['ALL'],
-      Dns: ['8.8.8.8', '1.1.1.1'], // j41-isolated network can't use host systemd-resolved
+      // The sandbox performs NO DNS — all name resolution happens at the host egress
+      // proxy, which receives the hostname via HTTP CONNECT. Setting an unusable resolver
+      // (0.0.0.0) prevents the container from falling back to Docker's embedded
+      // 127.0.0.11 resolver, which the bridge firewall cannot block (dockerd forwards
+      // those lookups from the host netns, not via the bridge).
+      Dns: ['0.0.0.0'],
       // --- Security hardening (Plan B) ---
       SecurityOpt: buildDispatcherSecurityOpt(),
       NetworkMode: getDispatcherNetworkMode(),
@@ -5881,7 +5891,17 @@ async function startJobContainer(state, job, agentInfo) {
     // Per-job egress allowlist + token (sandbox reaches ONLY the proxy).
     const containerEnvObj = buildContainerEnv(job, agentInfo, loadAgentConfig(agentInfo.id), canaryToken, jobDir, keysPath);
     egressToken = crypto.randomBytes(32).toString('hex');
-    const egressHosts = deriveAllowedHosts(containerEnvObj);
+    // Derive allowlist from the FULLY-MERGED effective env — same overlay precedence
+    // as the container Env array below (getExecutorEnvVars non-LLM entries win over base).
+    // Without this merge, agents using per-agent executorUrl/mcpUrl would have their
+    // real endpoint absent from the allowlist and every outbound call 403'd.
+    const mergedEnvForEgress = { ...containerEnvObj };
+    for (const s of getExecutorEnvVars(agentInfo)) {
+      if (s.startsWith('J41_LLM_')) continue; // filtered in container Env array too
+      const eq = s.indexOf('=');
+      if (eq > 0) mergedEnvForEgress[s.slice(0, eq)] = s.slice(eq + 1);
+    }
+    const egressHosts = deriveAllowedHosts(mergedEnvForEgress);
     if (state.egressProxy) state.egressProxy.register(egressToken, egressHosts);
 
     const container = await docker.createContainer({
