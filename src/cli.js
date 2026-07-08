@@ -4844,6 +4844,7 @@ async function pollForJobs(state) {
               const acceptSig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
               await agent.client.acceptJob(job.id, acceptSig, timestamp, agentInfo.address);
               console.log(`✅ Job ${job.id} accepted (signed, pay→${agentInfo.address.slice(0, 8)}...) — awaiting buyer payment`);
+              state.emitEvent?.('job.accepted', { jobId: job.id, agentId: agentInfo.id });
 
               // ── Allowlist lifecycle: add buyer refund address ──
               const buyerPayAddr = fullJob.buyerPayAddress || fullJob.buyer?.payAddress;
@@ -4927,6 +4928,7 @@ async function pollForJobs(state) {
       if (currentJob.status === lastStatus) continue; // Already sent this status
       if (currentJob.status === 'completed') {
         sendToJobAgent(activeInfo, { type: 'job.completed', data: { jobId } });
+        state.emitEvent?.('job.completed', { jobId, agentId: activeInfo.agentInfo?.id });
         state._lastSentStatus.set(jobId, currentJob.status);
       } else if (currentJob.status === 'disputed') {
         sendToJobAgent(activeInfo, { type: 'dispute.filed', data: { jobId, reason: currentJob.dispute?.reason } });
@@ -4941,6 +4943,7 @@ async function pollForJobs(state) {
         // Auto-deliver detected via poll (pause_ttl_expired)
         console.log(`[Poll] Job ${jobId.substring(0, 8)} auto-delivered`);
         sendToJobAgent(activeInfo, { type: 'end_session_request', jobId });
+        state.emitEvent?.('job.delivered', { jobId, agentId: activeInfo.agentInfo?.id });
         state._lastSentStatus.set(jobId, currentJob.status);
       }
 
@@ -5110,6 +5113,7 @@ async function handleWebhookEvent(state, agentId, payload) {
           const sig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
           await agent.client.acceptJob(jobId, sig, timestamp, agentInfo.address);
           console.log(`[Webhook] ✅ Job ${jobId.substring(0, 8)} accepted (pay→${agentInfo.address.slice(0, 8)}...)`);
+          state.emitEvent?.('job.accepted', { jobId, agentId: agentInfo.id });
 
           // ── Allowlist lifecycle: add buyer refund address ──
           const buyerPayAddr = fullJob.buyerPayAddress || fullJob.buyer?.payAddress;
