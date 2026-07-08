@@ -50,6 +50,27 @@ function makeVdxfData(recordObj) {
   };
 }
 
+/**
+ * Build vdxfData in the PLATFORM INBOX format (confirmed live 2026-07-08): the
+ * job.record value is a bare hex-encoded JSON string of the record, served
+ * directly at the key (NOT wrapped in a sub-DataDescriptor array).
+ */
+function makeHexVdxfData(recordObj) {
+  return {
+    [JOB_RECORD_KEY]: Buffer.from(JSON.stringify(recordObj), 'utf8').toString('hex'),
+  };
+}
+
+test('decodeInboxJobRecord accepts the platform inbox format (bare hex string)', () => {
+  const record = { ...SAMPLE_RECORD, witness: { schemaVersion: 1, signedByName: 'agentplatform@', signature: 'AgWzXhEA==' } };
+  const decoded = decodeInboxJobRecord(makeHexVdxfData(record));
+  assert.deepStrictEqual(decoded, record);
+});
+
+test('decodeInboxJobRecord rejects a non-hex / non-JSON string (fail-closed)', () => {
+  assert.throws(() => decodeInboxJobRecord({ [JOB_RECORD_KEY]: 'not-hex-zz' }));
+});
+
 const SAMPLE_RECORD = {
   amount: 5,
   buyerVerusId: 'buyer.agentplatform@',

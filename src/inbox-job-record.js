@@ -49,7 +49,35 @@ function decodeInboxJobRecord(vdxfData) {
     );
   }
 
-  const entries = vdxfData[jobRecordKey];
+  const raw = vdxfData[jobRecordKey];
+
+  // Platform inbox format (confirmed live 2026-07-08): the job.record value is a
+  // bare hex-encoded JSON string of `{ ...record, witness }`, served directly at
+  // the key — NOT wrapped in the on-chain sub-DataDescriptor array. Decode it
+  // directly. The on-chain contentmultimap representation (sub-DD array) is still
+  // supported below. Either way, security is enforced downstream by
+  // crossCheckInboxVsWitness against the independently-fetched platform witness,
+  // so accepting this shape does not weaken the fail-closed gate.
+  if (typeof raw === 'string') {
+    let jsonStr;
+    try {
+      jsonStr = Buffer.from(raw, 'hex').toString('utf-8');
+    } catch {
+      throw new Error(`inbox job_record: vdxfData[${jobRecordKey}] is a string but not valid hex`);
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(jsonStr);
+    } catch (e) {
+      throw new Error(`inbox job_record: JSON.parse failed on hex-decoded job.record: ${e.message}`);
+    }
+    if (typeof parsed !== 'object' || parsed === null) {
+      throw new Error(`inbox job_record: hex-decoded job.record is not an object`);
+    }
+    return parsed;
+  }
+
+  const entries = raw;
   if (!Array.isArray(entries) || entries.length === 0) {
     throw new Error(
       `inbox job_record: vdxfData[${jobRecordKey}] is not a non-empty array`,
