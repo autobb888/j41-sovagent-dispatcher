@@ -30,6 +30,7 @@ const { shouldRefundOrphan, isRefundAlreadyHandled } = require('./refund.js');
 const { isValidJobId } = require('./job-id.js');
 const { verifyInboxJobRecord } = require('./inbox-job-record.js');
 const { writeKeysFile, readKeysFile } = require('./keys-file.js');
+const keystore = require('./keystore.js');
 const crypto = require('crypto');
 
 /** Feature flag: route in-container signing through the host-side broker
@@ -62,6 +63,8 @@ try {
 
 const J41_DIR = path.join(os.homedir(), '.j41');
 const DISPATCHER_DIR = path.join(J41_DIR, 'dispatcher');
+const MASTER_KEY_PATH = path.join(DISPATCHER_DIR, 'master-key.json');
+keystore.setMasterKeyPath(MASTER_KEY_PATH);
 const AGENTS_DIR = path.join(DISPATCHER_DIR, 'agents');
 const QUEUE_DIR = path.join(DISPATCHER_DIR, 'queue');
 const JOBS_DIR = path.join(DISPATCHER_DIR, 'jobs');

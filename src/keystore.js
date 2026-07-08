@@ -164,6 +164,22 @@ function promptHidden(question) {
   });
 }
 
+// ── Lazy unlock (transparent, non-interactive) ────────────────────────────
+// Lets readKeysFile auto-unlock from env / systemd-cred without every call
+// site knowing where master-key.json lives. cli.js registers the path once at
+// startup. Unregistered (e.g. in unit tests) → lazyUnlockSync is a no-op.
+let _masterKeyPath = null;
+
+function setMasterKeyPath(p) { _masterKeyPath = p; }
+
+function lazyUnlockSync() {
+  if (isUnlocked() || !_masterKeyPath || !fs.existsSync(_masterKeyPath)) return false;
+  const pass = resolvePassphraseSync();
+  if (!pass) return false;
+  unlock(pass, _masterKeyPath); // throws EBADPASS on a wrong passphrase → fail closed
+  return true;
+}
+
 module.exports = {
   SCRYPT_PARAMS,
   deriveKek,
@@ -181,4 +197,6 @@ module.exports = {
   resolvePassphraseSync,
   resolvePassphrase,
   promptHidden,
+  setMasterKeyPath,
+  lazyUnlockSync,
 };
