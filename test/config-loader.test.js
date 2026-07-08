@@ -246,3 +246,32 @@ test('J41_JOB_LOG_* env overrides apply with correct types', withTmpHome(async (
     delete process.env.J41_JOB_LOG_MAX_RETAINED;
   }
 }));
+
+test('[platform] signer exports J41_PLATFORM_SIGNER into process.env', withTmpHome(async (t, tmp) => {
+  const cfgDir = path.join(tmp, '.j41', 'dispatcher');
+  fs.mkdirSync(cfgDir, { recursive: true });
+  fs.writeFileSync(path.join(cfgDir, 'config.toml'), '[platform]\nsigner = "RBgxQwD7mMLCfciTN68RjBQHsH68vcnUKb"\n');
+  delete process.env.J41_PLATFORM_SIGNER;
+  try {
+    const { loadDispatcherConfig } = require('../src/config-loader.js');
+    const cfg = loadDispatcherConfig({ skipMigration: true });
+    assert.strictEqual(cfg.platform.signer, 'RBgxQwD7mMLCfciTN68RjBQHsH68vcnUKb');
+    assert.strictEqual(process.env.J41_PLATFORM_SIGNER, 'RBgxQwD7mMLCfciTN68RjBQHsH68vcnUKb');
+  } finally {
+    delete process.env.J41_PLATFORM_SIGNER;
+  }
+}));
+
+test('explicit J41_PLATFORM_SIGNER env wins over [platform] signer', withTmpHome(async (t, tmp) => {
+  const cfgDir = path.join(tmp, '.j41', 'dispatcher');
+  fs.mkdirSync(cfgDir, { recursive: true });
+  fs.writeFileSync(path.join(cfgDir, 'config.toml'), '[platform]\nsigner = "RfromConfig"\n');
+  process.env.J41_PLATFORM_SIGNER = 'RfromEnv';
+  try {
+    const { loadDispatcherConfig } = require('../src/config-loader.js');
+    loadDispatcherConfig({ skipMigration: true });
+    assert.strictEqual(process.env.J41_PLATFORM_SIGNER, 'RfromEnv');
+  } finally {
+    delete process.env.J41_PLATFORM_SIGNER;
+  }
+}));

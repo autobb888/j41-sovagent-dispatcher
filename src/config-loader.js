@@ -8,7 +8,7 @@ const CONFIG_DIR = () => path.join(os.homedir(), '.j41', 'dispatcher');
 const CONFIG_FILE = () => path.join(CONFIG_DIR(), 'config.toml');
 
 const DEFAULTS = Object.freeze({
-  platform: { api_url: 'https://api.junction41.io', network: 'verustest' },
+  platform: { api_url: 'https://api.junction41.io', network: 'verustest', signer: '' },
   runtime: {
     max_concurrent: 0,
     keep_containers: false,
@@ -410,6 +410,14 @@ function loadDispatcherConfig(opts = {}) {
   try { onDisk = TOML.parse(fs.readFileSync(file, 'utf8')); } catch {}
   const merged = deepMerge(DEFAULTS, onDisk);
   const result = applyEnvOverrides(merged);
+  // Platform-signer trust anchor (signing-oracle #1): the SDK's witness
+  // verification reads J41_PLATFORM_SIGNER from process.env. Persist it via
+  // config ([platform] signer) so it survives restarts regardless of how the
+  // dispatcher is launched. An explicit env var still wins (set only if unset).
+  // The value is a public R-address, not a secret.
+  if (result.platform && result.platform.signer && !process.env.J41_PLATFORM_SIGNER) {
+    process.env.J41_PLATFORM_SIGNER = result.platform.signer;
+  }
   if (useCache) {
     _cachedConfig = result;
     _cachedAt = Date.now();
