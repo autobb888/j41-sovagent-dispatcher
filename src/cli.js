@@ -1342,6 +1342,7 @@ program
   .option('--trust-level <level>', 'Trust level (basic|verified|audited)')
   .option('--dispute-resolution <method>', 'Dispute resolution method')
   .action(async (agentId, identityName, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
 
     const keys = loadAgentKeys(agentId);
@@ -1521,6 +1522,7 @@ program
   .option('--trust-level <level>', 'Trust level (basic|verified|audited)')
   .option('--dispute-resolution <method>', 'Dispute resolution method')
   .action(async (agentId, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
 
     const keys = loadAgentKeys(agentId);
@@ -1778,6 +1780,7 @@ program
   .requiredOption('--revoke <iAddress>', 'Revocation authority i-address')
   .requiredOption('--recover <iAddress>', 'Recovery authority i-address')
   .action(async (agentId, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
 
     const keys = loadAgentKeys(agentId);
@@ -1827,6 +1830,7 @@ program
   .command('check-authorities')
   .description('Check revoke/recover authorities for all registered agents')
   .action(async () => {
+    await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
 
     const agents = listRegisteredAgents();
@@ -1879,6 +1883,7 @@ program
   .option('--purge', 'Also delete local finalize state and VDXF files')
   .option('-y, --yes', 'Skip confirmation prompt')
   .action(async (agentId, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
 
     const keys = loadAgentKeys(agentId);
@@ -1987,6 +1992,7 @@ program
   .description('Reactivate a deactivated agent: set status active on-chain + platform')
   .option('--platform-only', 'Skip on-chain VDXF status update (platform toggle only)')
   .action(async (agentId, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
 
     const keys = loadAgentKeys(agentId);
@@ -2057,6 +2063,7 @@ program
   .description('Activate all registered agents (platform + on-chain VDXF status)')
   .option('--platform-only', 'Skip on-chain VDXF status update')
   .action(async (options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
 
     const allAgentIds = listRegisteredAgents(); // returns string[] of dir names
@@ -2125,6 +2132,7 @@ program
   .option('--platform-only', 'Skip on-chain VDXF status update')
   .option('--keep-services', 'Keep service listings')
   .action(async (options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
 
     const allAgentIds = listRegisteredAgents();
@@ -2210,6 +2218,7 @@ program
   .option('--network-protocols <csv>', 'Protocols (comma-separated)')
   .option('--dry-run', 'Print payloads without broadcasting')
   .action(async (agentId, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
 
     const keys = loadAgentKeys(agentId);
@@ -2301,6 +2310,7 @@ program
   .description('Show full agent state: local files, on-chain identity, platform profile, and services')
   .option('--json', 'Output raw JSON instead of formatted text')
   .action(async (agentId, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
 
     const keys = loadAgentKeys(agentId);
