@@ -1055,7 +1055,7 @@ function getActiveJobs() {
   // Docker mode
   if (!docker) {
     console.error('❌ Docker runtime selected but Docker is not available.');
-    console.error('   Install Docker or switch to local mode: node src/cli.js config --runtime local');
+    console.error('   Install Docker or switch to local mode: j41-dispatcher config --runtime local');
     return Promise.resolve([]);
   }
   return docker.listContainers().then(containers => {
@@ -1064,7 +1064,7 @@ function getActiveJobs() {
     );
   }).catch(e => {
     console.error(`❌ Docker error: ${e.message}`);
-    console.error('   Install Docker or switch to local mode: node src/cli.js config --runtime local');
+    console.error('   Install Docker or switch to local mode: j41-dispatcher config --runtime local');
     return [];
   });
 }
@@ -1239,9 +1239,9 @@ program
     console.log(`  1. Export your LLM config:`);
     for (const hint of envHints) console.log(`     export ${hint}`);
     console.log(`\n  2. Set up your agent:`);
-    console.log(`     node src/cli.js setup agent-1 ${name} --template ${template}`);
+    console.log(`     j41-dispatcher setup agent-1 ${name} --template ${template}`);
     console.log(`\n  3. Start the dispatcher:`);
-    console.log(`     node src/cli.js start`);
+    console.log(`     j41-dispatcher start`);
     console.log('');
   });
 
@@ -1301,7 +1301,8 @@ program
     console.log('\nNext steps:');
     console.log('  1. Fund the agent addresses (they need VRSC for registration)');
     console.log('  2. Register each: j41-dispatcher register agent-1 <name>');
-    console.log('  3. Start dispatcher: j41-dispatcher start');
+    console.log('  3. Finalize each: j41-dispatcher finalize agent-1');
+    console.log('  4. Start dispatcher: j41-dispatcher start');
   });
 
 // Register command — register an agent identity on-chain
@@ -1436,7 +1437,7 @@ program
         }
       } catch (profileErr) {
         console.error(`⚠️  Profile registration failed: ${profileErr.message}`);
-        console.error(`   You can retry later with: node src/cli.js finalize ${agentId}`);
+        console.error(`   You can retry later with: j41-dispatcher finalize ${agentId}`);
       }
 
       if (options.finalize) {
@@ -1477,7 +1478,7 @@ program
         writeKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json'), keys);
         console.error(`\n⚠️  Partial state saved to keys.json`);
         console.error(`   The identity "${keys.identity}" may already exist on-chain.`);
-        console.error(`   To check and recover: node src/cli.js recover ${agentId}`);
+        console.error(`   To check and recover: j41-dispatcher recover ${agentId}`);
       }
 
       process.exit(1);
@@ -1639,14 +1640,14 @@ program
             console.log(`\n✅ Recovery successful!`);
             console.log(`   Identity: ${keys.identity}`);
             console.log(`   i-Address: ${iAddress}`);
-            console.log(`\n   Next: node src/cli.js finalize ${agentId}`);
+            console.log(`\n   Next: j41-dispatcher finalize ${agentId}`);
             return;
           }
         }
 
         if (status.status === 'failed') {
           console.error(`\n❌ Registration failed on-chain: ${status.error || 'unknown error'}`);
-          console.error(`   You may need to re-register: node src/cli.js register ${agentId} <name>`);
+          console.error(`   You may need to re-register: j41-dispatcher register ${agentId} <name>`);
           // Clean up timeout state so register can be retried
           delete keys.registrationStatus;
           delete keys.onboardId;
@@ -1658,7 +1659,7 @@ program
 
         // Still confirming — tell user to wait
         console.log(`\n⏳ Identity is still confirming (status: ${status.status}).`);
-        console.log(`   Try again in a few minutes: node src/cli.js recover ${agentId}`);
+        console.log(`   Try again in a few minutes: j41-dispatcher recover ${agentId}`);
         return;
       } catch (err) {
         console.error(`   Onboard status check failed: ${err.message}`);
@@ -1699,7 +1700,7 @@ program
       console.log(`\n✅ Recovery successful!`);
       console.log(`   Identity: ${keys.identity}`);
       if (keys.iAddress) console.log(`   i-Address: ${keys.iAddress}`);
-      console.log(`\n   Next: node src/cli.js finalize ${agentId}`);
+      console.log(`\n   Next: j41-dispatcher finalize ${agentId}`);
     } catch (err) {
       console.error(`   Login with ${agentId}'s key failed: ${err.message}`);
 
@@ -1865,7 +1866,7 @@ program
 
     if (warnings > 0) {
       console.log(`\n⚠️  ${warnings} agent(s) have self-referential authorities.`);
-      console.log(`   Run: node src/cli.js set-authorities <agentId> --revoke <iAddr> --recover <iAddr>`);
+      console.log(`   Run: j41-dispatcher set-authorities <agentId> --revoke <iAddr> --recover <iAddr>`);
     }
   });
 
@@ -1973,7 +1974,7 @@ program
         fs.writeFileSync(finalizePath, JSON.stringify(state, null, 2));
       }
 
-      console.log(`\n   To re-activate: node src/cli.js activate ${agentId}`);
+      console.log(`\n   To re-activate: j41-dispatcher activate ${agentId}`);
     } catch (e) {
       console.error(`\n❌ Deactivation failed: ${e.message}`);
       process.exit(1);
@@ -2043,7 +2044,7 @@ program
         fs.writeFileSync(finalizePath, JSON.stringify(state, null, 2));
       }
 
-      console.log(`\n   Start dispatcher: node src/cli.js start`);
+      console.log(`\n   Start dispatcher: j41-dispatcher start`);
     } catch (e) {
       console.error(`\n❌ Activation failed: ${e.message}`);
       process.exit(1);
@@ -2703,8 +2704,8 @@ program
           keys.registrationStatus = 'timeout';
           if (e.onboardId) keys.onboardId = e.onboardId;
           writeKeysFile(path.join(agentDir, 'keys.json'), keys);
-          console.error(`  ⚠️  Registration timed out. Run: node src/cli.js recover ${agentId}`);
-          console.error(`     Then re-run: node src/cli.js setup ${agentId} ${identityName} [flags...]`);
+          console.error(`  ⚠️  Registration timed out. Run: j41-dispatcher recover ${agentId}`);
+          console.error(`     Then re-run: j41-dispatcher setup ${agentId} ${identityName} [flags...]`);
           process.exit(1);
         }
         console.error(`  ❌ ${e.message}`);
@@ -2790,8 +2791,8 @@ program
     if (services.length) {
       console.log(`  Service:  ${services[0].name} — ${services[0].price} ${services[0].currency}`);
     }
-    console.log(`\n  Next: node src/cli.js start`);
-    console.log(`  Verify: node src/cli.js inspect ${agentId}`);
+    console.log(`\n  Next: j41-dispatcher start`);
+    console.log(`  Verify: j41-dispatcher inspect ${agentId}`);
   });
 
 // List available LLM providers (works without dispatcher running)
@@ -2928,6 +2929,12 @@ program
       try { agent.stop?.(); } catch {}
     }
   });
+
+// Dashboard command — launch interactive TUI
+program
+  .command('dashboard')
+  .description('Launch the interactive TUI menu')
+  .action(() => { require('./dashboard.js'); });
 
 // Start command — run the dispatcher (listen for jobs)
 program
@@ -4133,8 +4140,8 @@ program
         }
       }
 
-      console.log(`\n  View: node src/cli.js logs <job-id-prefix>`);
-      console.log(`  Tail: node src/cli.js logs <job-id-prefix> -f`);
+      console.log(`\n  View: j41-dispatcher logs <job-id-prefix>`);
+      console.log(`  Tail: j41-dispatcher logs <job-id-prefix> -f`);
       return;
     }
 
@@ -5804,7 +5811,7 @@ function readJobFileNoFollow(p, enc = 'utf8') {
 async function startJobContainer(state, job, agentInfo) {
   if (!isValidJobId(job.id)) { console.error(`[security] Refusing job with invalid id: ${String(job.id).slice(0,40)}`); return; }
   if (!docker) {
-    throw new Error('Docker not available. Switch to local mode: node src/cli.js config --runtime local');
+    throw new Error('Docker not available. Switch to local mode: j41-dispatcher config --runtime local');
   }
   const jobDir = path.join(JOBS_DIR, job.id);
   fs.mkdirSync(jobDir, { recursive: true });
@@ -6262,10 +6269,10 @@ async function startJobLocal(state, job, agentInfo) {
     console.error('  The agent process has full access to this machine.');
     console.error('');
     console.error('  To use local mode for development ONLY:');
-    console.error('    node src/cli.js start --dev-unsafe');
+    console.error('    j41-dispatcher start --dev-unsafe');
     console.error('');
     console.error('  For production: switch to docker runtime:');
-    console.error('    node src/cli.js config --runtime docker');
+    console.error('    j41-dispatcher config --runtime docker');
     console.error('  ============================================================');
     console.error('');
     throw new Error('Local mode blocked — use --dev-unsafe for development');
