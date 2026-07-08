@@ -2102,10 +2102,21 @@ async function securityScreen(inquirer) {
     { name: '  Run security setup (install/update profiles)', value: 'setup' },
     { name: '  Run self-test (container escape attempts)', value: 'test' },
     { name: '  Check profile integrity', value: 'check' },
+    { name: '  🔐 Encrypt WIF keys at rest (set a passphrase)', value: 'encrypt-keys' },
+    { name: '  🔑 Change encryption passphrase', value: 'change-passphrase' },
     { name: '  ← Back', value: '__back' },
   ]}]);
 
   if (action === '__back') return;
+
+  if (action === 'encrypt-keys') {
+    await runCommandAsync(process.execPath, [process.argv[1], 'encrypt-keys']);
+    return;
+  }
+  if (action === 'change-passphrase') {
+    await runCommandAsync(process.execPath, [process.argv[1], 'change-passphrase']);
+    return;
+  }
 
   try {
     const secureSetup = require('@junction41/secure-setup');
