@@ -790,6 +790,7 @@ function readKeysFile(p, { allowLocked = false } = {}) {
     e.code = 'ELOCKED';
     throw e;
   }
+  if (allowLocked) return pub; // unlocked, but caller only wants public fields — never expose wif
   const secret = JSON.parse(keystore.decryptSecret(keystore.getMasterKey(), encrypted).toString('utf8'));
   return { ...pub, ...secret };
 }
