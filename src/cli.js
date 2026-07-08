@@ -2856,6 +2856,7 @@ program
   .option('--category <slug>', 'Marketplace category', 'infrastructure-ops')
   .option('--no-register', 'Skip platform registration (write config only)')
   .action(async (agentId, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
     const agentDir = path.join(AGENTS_DIR, agentId);
     if (!fs.existsSync(agentDir)) {
       console.error(`✗ Agent directory not found: ${agentDir}`);
@@ -6657,6 +6658,7 @@ program
   .option('--rework-cost <cost>', 'Additional cost for rework (default: 0)', '0')
   .requiredOption('--message <message>', 'Agent statement / reason')
   .action(async (jobId, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
     try {
       const { action, agent: agentId, message } = options;
       if (!['refund', 'rework', 'rejected'].includes(action)) {
@@ -7142,6 +7144,7 @@ program
   .option('--max-claimants <n>', 'Max number of winners', '1')
   .option('--deadline <date>', 'Application deadline (YYYY-MM-DD)')
   .action(async (agentId, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
     const keys = loadAgentKeys(agentId);
     if (!keys || !keys.identity) {
@@ -7177,6 +7180,7 @@ program
   .option('--limit <n>', 'Number to show', '20')
   .option('--json', 'Output raw JSON')
   .action(async (options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
     const agents = listRegisteredAgents();
     if (agents.length === 0) {
@@ -7228,6 +7232,7 @@ program
   .option('--role <role>', 'Filter: poster or applicant')
   .option('--json', 'Output raw JSON')
   .action(async (agentId, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
     const keys = loadAgentKeys(agentId);
     if (!keys || !keys.identity) {
