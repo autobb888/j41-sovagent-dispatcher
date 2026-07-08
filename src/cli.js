@@ -31,6 +31,7 @@ const { isValidJobId } = require('./job-id.js');
 const { verifyInboxJobRecord } = require('./inbox-job-record.js');
 const { writeKeysFile, readKeysFile } = require('./keys-file.js');
 const keystore = require('./keystore.js');
+const { encryptAllKeys, decryptAllKeys } = require('./keys-migrate.js');
 const crypto = require('crypto');
 
 /** Feature flag: route in-container signing through the host-side broker
@@ -3957,6 +3958,53 @@ program
 
     // Keep alive
     await new Promise(() => {});
+  });
+
+program
+  .command('encrypt-keys')
+  .description('Encrypt all agent WIFs at rest with a passphrase (opt-in)')
+  .action(async () => {
+    if (fs.existsSync(MASTER_KEY_PATH)) {
+      console.error('❌ Keys are already encrypted (master-key.json exists). Use change-passphrase.');
+      process.exit(1);
+    }
+    const p1 = await keystore.promptHidden('New passphrase: ');
+    const p2 = await keystore.promptHidden('Confirm passphrase: ');
+    if (!p1 || p1 !== p2) { console.error('❌ Passphrases empty or do not match.'); process.exit(1); }
+    keystore.initMasterKey(p1, MASTER_KEY_PATH); // creates file + unlocks
+    const n = encryptAllKeys(AGENTS_DIR);
+    keystore.lock();
+    console.log(`\n🔐 Encrypted ${n} agent key file(s).`);
+    console.log('   The daemon will prompt for this passphrase on `start`.');
+    console.log('   Unattended: set J41_KEYS_PASSPHRASE or a systemd credential (j41-keys-passphrase).');
+    console.log('   Note: at-rest encryption protects a stolen disk/backup, not a live-compromised host.');
+  });
+
+program
+  .command('decrypt-keys')
+  .description('Remove at-rest encryption; store WIFs as plaintext again')
+  .action(async () => {
+    if (!fs.existsSync(MASTER_KEY_PATH)) { console.error('❌ Keys are not encrypted.'); process.exit(1); }
+    const pass = await keystore.resolvePassphrase({ promptFn: () => keystore.promptHidden('Passphrase: ') });
+    try { keystore.unlock(pass, MASTER_KEY_PATH); }
+    catch (e) { console.error(`❌ ${e.message}`); process.exit(1); }
+    const n = decryptAllKeys(AGENTS_DIR); // locks the keystore internally
+    fs.rmSync(MASTER_KEY_PATH);
+    console.log(`\n🔓 Decrypted ${n} agent key file(s). WIFs are now plaintext at rest (mode 0600 only).`);
+  });
+
+program
+  .command('change-passphrase')
+  .description('Change the at-rest encryption passphrase')
+  .action(async () => {
+    if (!fs.existsSync(MASTER_KEY_PATH)) { console.error('❌ Keys are not encrypted.'); process.exit(1); }
+    const oldPass = await keystore.promptHidden('Current passphrase: ');
+    const n1 = await keystore.promptHidden('New passphrase: ');
+    const n2 = await keystore.promptHidden('Confirm new passphrase: ');
+    if (!n1 || n1 !== n2) { console.error('❌ New passphrases empty or do not match.'); process.exit(1); }
+    try { keystore.changePassphrase(oldPass, n1, MASTER_KEY_PATH); }
+    catch (e) { console.error(`❌ ${e.message}`); process.exit(1); }
+    console.log('\n🔐 Passphrase changed.');
   });
 
 // Status command
