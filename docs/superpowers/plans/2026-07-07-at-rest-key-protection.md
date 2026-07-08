@@ -1038,8 +1038,10 @@ git commit -m "feat(cli): encrypt-keys / decrypt-keys / change-passphrase comman
 Make the daemon unlock the pool once at startup (single interactive prompt, or non-interactive source), fail closed if it cannot, and best-effort zeroize on shutdown. Verify the mainnet security gate does not reject the passphrase env var.
 
 **Files:**
-- Modify: `src/cli.js` (`start` action near `src/cli.js:2931`, after `ensureDirs()` and the mainnet gate, before it uses agents; plus the existing SIGTERM/SIGINT/exit shutdown path)
+- Modify: `src/cli.js` — (a) insert the unlock block inside the `start` action after the mainnet-gate block, immediately before `const agents = listRegisteredAgents();` (currently ~`src/cli.js:2951`); (b) register a `process.on('exit', ...)` zeroize handler next to the existing `process.on('SIGINT'/'SIGTERM', () => gracefulShutdown(...))` registrations (currently ~`src/cli.js:3956`).
 - Test: `test/keystore-resolve.test.js` (new — covers the fail-closed resolver precedence used by `start`)
+
+**Why `process.on('exit')` and not per-handler:** the `start` action's `gracefulShutdown(signal)` function (defined ~`src/cli.js:3870`) has multiple `process.exit()` points (drain-complete, drain-timeout, emergency second-signal) AND it signs a status-inactive message with the agent WIF *during* drain (`signMessage(agentInfo.wif, ...)`). Locking at the start of shutdown would be premature; sprinkling `keystore.lock()` before each exit point is error-prone. A single synchronous `process.on('exit')` handler zeroizes on every exit path (graceful, emergency, error) after all WIF use is done. `keystore.lock()` is synchronous, so it is valid in an `exit` handler.
 
 **Interfaces:**
 - Consumes: `keystore.{resolvePassphrase,unlock,lock,promptHidden}`, `MASTER_KEY_PATH` (Tasks 3–4), `findMainnetSecurityViolations` (existing, `src/cli.js:2937`).
@@ -1097,10 +1099,18 @@ In `src/cli.js`, inside the `start` action (after the mainnet-gate block that en
 
 - [ ] **Step 4: Zeroize on shutdown**
 
-Find the existing shutdown handler(s) in `src/cli.js` (search for `SIGTERM` within the `start` action) and add `keystore.lock();` to the cleanup so the master key is wiped on graceful exit. If a single `shutdown` function exists, add the call there; otherwise add to each `process.on('SIGTERM'|'SIGINT', ...)` handler:
+In `src/cli.js`, find the signal registrations inside the `start` action:
 
 ```js
-      keystore.lock();
+    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+```
+
+Add an `exit` handler right after them so the master key is wiped on every exit path (graceful drain, emergency second-signal, error). Do NOT put `keystore.lock()` inside `gracefulShutdown` — it signs with the WIF during drain, so locking there would be premature:
+
+```js
+    // Zeroize the in-memory master key on any exit (after all WIF use is done).
+    process.on('exit', () => { try { keystore.lock(); } catch (_) {} });
 ```
 
 - [ ] **Step 5: Verify the mainnet gate tolerates the passphrase env var**
