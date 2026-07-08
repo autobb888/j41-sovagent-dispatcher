@@ -28,3 +28,14 @@ test('writeKeysFile enforces 0600 even if file pre-exists with looser perms', ()
   writeKeysFile(p, { wif: 'y' });
   assert.equal(fs.statSync(p).mode & 0o777, 0o600);
 });
+
+test('writeKeysFile writes atomically — no .tmp file left behind, and an existing file is preserved on success', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kw-'));
+  const p = path.join(dir, 'keys.json');
+  fs.writeFileSync(p, JSON.stringify({ wif: 'old', identity: 'a@' }), { mode: 0o600 });
+  writeKeysFile(p, { wif: 'new', identity: 'a@' });
+  // Target updated, no leftover temp file, still 0600.
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(p, 'utf8')), { wif: 'new', identity: 'a@' });
+  assert.equal(fs.existsSync(p + '.tmp'), false);
+  assert.equal(fs.statSync(p).mode & 0o777, 0o600);
+});

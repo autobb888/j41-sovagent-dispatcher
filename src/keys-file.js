@@ -22,8 +22,19 @@ function writeKeysFile(p, obj) {
     const encrypted = keystore.encryptSecret(keystore.getMasterKey(), Buffer.from(JSON.stringify({ wif }), 'utf8'));
     toWrite = { v: 2, ...pub, encrypted };
   }
-  fs.writeFileSync(p, JSON.stringify(toWrite, null, 2), { mode: 0o600 });
-  try { fs.chmodSync(p, 0o600); } catch (_) {}
+  // Atomic write: temp file + fsync + rename, so a crash mid-write can never
+  // leave a torn/corrupt keys.json. Mode 0600 is enforced on the temp file
+  // before the rename replaces the target. Mirrors keystore._writeMasterDoc.
+  const tmp = p + '.tmp';
+  const fd = fs.openSync(tmp, 'w', 0o600);
+  try {
+    fs.writeSync(fd, JSON.stringify(toWrite, null, 2));
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  try { fs.chmodSync(tmp, 0o600); } catch (_) {}
+  fs.renameSync(tmp, p); // atomic replace
 }
 
 function readKeysFile(p, { allowLocked = false } = {}) {
