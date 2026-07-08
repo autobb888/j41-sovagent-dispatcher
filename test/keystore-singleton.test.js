@@ -64,6 +64,24 @@ test('changePassphrase preserves the master key (old fails, new unlocks)', () =>
   ks.lock();
 });
 
+test('initMasterKey + changePassphrase leaves no .tmp file and round-trips with new passphrase', () => {
+  const mk = tmpMk();
+  ks.lock();
+  ks.initMasterKey('first', mk);
+  ks.lock();
+  // No stale .tmp after initMasterKey
+  assert.strictEqual(fs.existsSync(mk + '.tmp'), false);
+  ks.changePassphrase('first', 'second', mk);
+  // No stale .tmp after changePassphrase
+  assert.strictEqual(fs.existsSync(mk + '.tmp'), false);
+  // Old passphrase no longer works
+  assert.throws(() => ks.unlock('first', mk), (e) => e.code === 'EBADPASS');
+  // New passphrase unlocks; master key is 32 bytes
+  ks.unlock('second', mk);
+  assert.equal(ks.getMasterKey().length, 32);
+  ks.lock();
+});
+
 test('resolvePassphraseSync prefers systemd credential, then env, else null', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cred-'));
   fs.writeFileSync(path.join(dir, 'j41-keys-passphrase'), 'from-cred\n');

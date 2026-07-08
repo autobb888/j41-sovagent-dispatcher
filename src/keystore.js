@@ -80,13 +80,17 @@ function _readMasterDoc(masterKeyPath) {
 }
 
 function _writeMasterDoc(masterKeyPath, salt, wrapped) {
-  const doc = {
-    v: 1,
-    kdf: { alg: 'scrypt', N: SCRYPT_PARAMS.N, r: SCRYPT_PARAMS.r, p: SCRYPT_PARAMS.p, salt: salt.toString('base64') },
-    wrapped,
-  };
-  fs.writeFileSync(masterKeyPath, JSON.stringify(doc, null, 2), { mode: 0o600 });
-  try { fs.chmodSync(masterKeyPath, 0o600); } catch (_) {}
+  const doc = { v: 1, kdf: { alg: 'scrypt', N: SCRYPT_PARAMS.N, r: SCRYPT_PARAMS.r, p: SCRYPT_PARAMS.p, salt: salt.toString('base64') }, wrapped };
+  const tmp = masterKeyPath + '.tmp';
+  const fd = fs.openSync(tmp, 'w', 0o600);
+  try {
+    fs.writeSync(fd, JSON.stringify(doc, null, 2));
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.chmodSync(tmp, 0o600);
+  fs.renameSync(tmp, masterKeyPath); // atomic replace
 }
 
 function initMasterKey(passphrase, masterKeyPath) {
@@ -126,6 +130,7 @@ function changePassphrase(oldPass, newPass, masterKeyPath) {
   const newSalt = crypto.randomBytes(16);
   const newKek = deriveKek(newPass, { ...SCRYPT_PARAMS, salt: newSalt });
   _writeMasterDoc(masterKeyPath, newSalt, wrapMasterKey(masterKey, newKek));
+  masterKey.fill(0);
 }
 
 // ── Passphrase resolution ─────────────────────────────────────────────────

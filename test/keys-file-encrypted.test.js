@@ -98,6 +98,28 @@ test('v2 read lazy-unlocks from J41_KEYS_PASSPHRASE when a master-key path is re
   }
 });
 
+test('fresh-agent write on encrypted pool stores wif encrypted (v2) and readKeysFile recovers it', () => {
+  const mk = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ke-mk-')), 'master-key.json');
+  ks.lock();
+  ks.initMasterKey('pw', mk);
+  const p = tmpKeys();
+  try {
+    writeKeysFile(p, { wif: 'Ufresh', address: 'Rfresh', network: 'verustest' });
+    const onDisk = JSON.parse(fs.readFileSync(p, 'utf8'));
+    // On-disk: v2, wif absent, encrypted envelope present
+    assert.equal(onDisk.v, 2);
+    assert.equal(onDisk.wif, undefined);
+    assert.ok(onDisk.encrypted && onDisk.encrypted.alg === 'aes-256-gcm');
+    // Round-trip: readKeysFile recovers the wif
+    const recovered = readKeysFile(p);
+    assert.equal(recovered.wif, 'Ufresh');
+    assert.equal(recovered.address, 'Rfresh');
+    assert.equal(recovered.network, 'verustest');
+  } finally {
+    ks.lock();
+  }
+});
+
 test('lazy unlock with a wrong J41_KEYS_PASSPHRASE surfaces EBADPASS', () => {
   const mk = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ke-mk-')), 'master-key.json');
   ks.lock(); ks.initMasterKey('rightpw', mk);

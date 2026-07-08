@@ -353,6 +353,22 @@ function loadAgentKeys(agentId) {
   return readKeysFile(keysPath);
 }
 
+// When the pool is encrypted (master-key.json exists), ensure the keystore is
+// unlocked before we read or write agent keys — so a freshly generated WIF is
+// stored encrypted (not silently plaintext) and an existing encrypted key is
+// not downgraded. Interactive prompt if a TTY, else env/systemd-cred, else
+// fail closed. No-op on a plaintext (default) install.
+async function ensureKeystoreUnlockedIfEncrypted() {
+  if (!fs.existsSync(MASTER_KEY_PATH) || keystore.isUnlocked()) return;
+  try {
+    const pass = await keystore.resolvePassphrase({ promptFn: () => keystore.promptHidden('🔐 Key pool is encrypted — unlock passphrase: ') });
+    keystore.unlock(pass, MASTER_KEY_PATH);
+  } catch (e) {
+    console.error(`\n❌ The key pool is encrypted; unlock required for this operation: ${e.message}`);
+    process.exit(1);
+  }
+}
+
 function listRegisteredAgents() {
   if (!fs.existsSync(AGENTS_DIR)) return [];
   return fs.readdirSync(AGENTS_DIR).filter(name => {
@@ -1556,6 +1572,7 @@ program
   .command('recover <agent-id>')
   .description('Recover from a timed-out registration by checking on-chain identity status')
   .action(async (agentId) => {
+    await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
 
     const keys = loadAgentKeys(agentId);
@@ -1618,9 +1635,7 @@ program
             delete keys.registrationTimestamp;
             delete keys.onboardId;
             delete keys.lastOnboardStatus;
-            fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2)
-            , { mode: 0o600 });
-            fs.chmodSync(path.join(AGENTS_DIR, agentId, 'keys.json'), 0o600);
+            writeKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json'), keys);
             console.log(`\n✅ Recovery successful!`);
             console.log(`   Identity: ${keys.identity}`);
             console.log(`   i-Address: ${iAddress}`);
@@ -1637,8 +1652,7 @@ program
           delete keys.onboardId;
           delete keys.lastOnboardStatus;
           delete keys.identity;
-          fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2)
-          , { mode: 0o600 });
+          writeKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json'), keys);
           process.exit(1);
         }
 
@@ -1680,9 +1694,7 @@ program
       delete keys.registrationTimestamp;
       delete keys.onboardId;
       delete keys.lastOnboardStatus;
-      fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2)
-      , { mode: 0o600 });
-      fs.chmodSync(path.join(AGENTS_DIR, agentId, 'keys.json'), 0o600);
+      writeKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json'), keys);
 
       console.log(`\n✅ Recovery successful!`);
       console.log(`   Identity: ${keys.identity}`);
@@ -1735,8 +1747,7 @@ program
         delete keys.onboardId;
         delete keys.lastOnboardStatus;
         delete keys.pendingName;
-        fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2), { mode: 0o600 });
-        fs.chmodSync(path.join(AGENTS_DIR, agentId, 'keys.json'), 0o600);
+        writeKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json'), keys);
 
         // Make sure the owning agent has iAddress if it was missing
         if (foundOwner.iAddress) {
@@ -1744,8 +1755,7 @@ program
           if (ownerKeys && !ownerKeys.iAddress) {
             ownerKeys.iAddress = foundOwner.iAddress;
             delete ownerKeys.registrationStatus;
-            fs.writeFileSync(path.join(AGENTS_DIR, foundOwner.agentId, 'keys.json'), JSON.stringify(ownerKeys, null, 2), { mode: 0o600 });
-            fs.chmodSync(path.join(AGENTS_DIR, foundOwner.agentId, 'keys.json'), 0o600);
+            writeKeysFile(path.join(AGENTS_DIR, foundOwner.agentId, 'keys.json'), ownerKeys);
           }
         }
 
@@ -2569,6 +2579,7 @@ program
   .option('-i, --interactive', 'Interactive mode — walk through all fields')
   .action(async (agentId, identityName, options) => {
     ensureDirs();
+    await ensureKeystoreUnlockedIfEncrypted();
 
     // Load template if specified
     if (options.template) {
@@ -2634,8 +2645,7 @@ program
       const { generateKeypair } = require('./keygen.js');
       keys = generateKeypair(J41_NETWORK);
       keys.network = J41_NETWORK;
-      fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2), { mode: 0o600 });
-      fs.chmodSync(path.join(agentDir, 'keys.json'), 0o600);
+      writeKeysFile(path.join(agentDir, 'keys.json'), keys);
       console.log(`  ✓ Keys generated (${keys.address})`);
     }
 
@@ -2685,15 +2695,14 @@ program
         keys.iAddress = regResult.iAddress;
         delete keys.registrationStatus;
         delete keys.onboardId;
-        fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2), { mode: 0o600 });
-        fs.chmodSync(path.join(agentDir, 'keys.json'), 0o600);
+        writeKeysFile(path.join(agentDir, 'keys.json'), keys);
         console.log(`  ✓ Registered: ${regResult.identity} (${regResult.iAddress})`);
       } catch (e) {
         if (e.name === 'RegistrationTimeoutError' || (e.message && e.message.includes('timed out'))) {
           keys.identity = e.identityName || (identityName + '.agentplatform@');
           keys.registrationStatus = 'timeout';
           if (e.onboardId) keys.onboardId = e.onboardId;
-          fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2), { mode: 0o600 });
+          writeKeysFile(path.join(agentDir, 'keys.json'), keys);
           console.error(`  ⚠️  Registration timed out. Run: node src/cli.js recover ${agentId}`);
           console.error(`     Then re-run: node src/cli.js setup ${agentId} ${identityName} [flags...]`);
           process.exit(1);
@@ -7053,11 +7062,11 @@ async function mainMenu() {
     }
 
     fs.mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+    await ensureKeystoreUnlockedIfEncrypted();
     const { generateKeypair } = require('./keygen.js');
     const keys = generateKeypair(J41_NETWORK);
     keys.network = J41_NETWORK;
-    fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2), { mode: 0o600 });
-    fs.chmodSync(path.join(agentDir, 'keys.json'), 0o600);
+    writeKeysFile(path.join(agentDir, 'keys.json'), keys);
     fs.writeFileSync(path.join(agentDir, 'SOUL.md'), `# ${id}\n\nA helpful AI assistant on the J41 platform.`);
     console.log(`\n  Created ${id} (${keys.address})`);
     console.log(`  Fund this address with VRSCTEST, then register the identity.\n`);
