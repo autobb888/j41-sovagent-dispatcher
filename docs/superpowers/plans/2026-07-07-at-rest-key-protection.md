@@ -606,23 +606,26 @@ git commit -m "feat(keystore): master-key.json lifecycle, unlock/lock singleton,
 
 ### Task 4: Wire encryption into the funnel
 
-Upgrade `readKeysFile`/`writeKeysFile` to handle v2 envelopes, and make `loadAgentKeys` lazily unlock from a non-interactive source when it hits a locked v2 file (so one-off commands work under `J41_KEYS_PASSPHRASE`/systemd-cred; `start` still unlocks interactively up-front in Task 6).
+Upgrade `readKeysFile`/`writeKeysFile` to handle v2 envelopes, and make `readKeysFile` transparently lazy-unlock from a non-interactive source (env / systemd-cred) when it meets a locked v2 file on the default (secret-needed) path — so every one-off signing command (register-service, dispute, etc.) works under `J41_KEYS_PASSPHRASE`/systemd-cred without threading unlock logic through ~40 call sites. `start` still unlocks interactively up-front (Task 6). Because `readKeysFile` lives in `keys-file.js` (which must stay path-agnostic and unit-testable), the lazy unlock finds `master-key.json` through a path the `keystore` singleton holds; `cli.js` registers it once at startup via `keystore.setMasterKeyPath(MASTER_KEY_PATH)`. In unit tests the path is unregistered, so lazy unlock is a deterministic no-op and the "locked → ELOCKED" behavior is preserved.
 
 **Files:**
-- Modify: `src/keys-file.js` (`readKeysFile` v2 branch; `writeKeysFile` v2 branch)
-- Modify: `src/cli.js` (`loadAgentKeys` lazy-unlock; add `MASTER_KEY_PATH` constant + `keystore` import)
+- Modify: `src/keystore.js` (add `setMasterKeyPath` + `lazyUnlockSync`, extend exports)
+- Modify: `src/keys-file.js` (`readKeysFile` v2 branch with lazy-unlock; `writeKeysFile` v2 branch)
+- Modify: `src/cli.js` (add `MASTER_KEY_PATH` constant + `keystore` import + `keystore.setMasterKeyPath(MASTER_KEY_PATH)` at module load). `loadAgentKeys` is NOT changed — Task 1 already routed it through `readKeysFile`, which now handles lazy unlock itself.
 - Test: `test/keys-file-encrypted.test.js` (new)
 
 **Interfaces:**
 - Consumes: `keystore.{isUnlocked,getMasterKey,encryptSecret,decryptSecret,unlock,resolvePassphraseSync}` (Tasks 2–3).
 - Produces:
-  - `readKeysFile(p, { allowLocked })`: v1 → plaintext; v2 + unlocked → decrypt & merge `wif`, return without `v`/`encrypted`; v2 + locked + `allowLocked` → public fields only (no `wif`, no `v`/`encrypted`); v2 + locked + default → throw `Error{code:'ELOCKED'}`.
+  - `keystore.setMasterKeyPath(p)` → void. Stores the `master-key.json` path in module state so `lazyUnlockSync` can find it. Unset in unit tests → lazy unlock is a no-op.
+  - `keystore.lazyUnlockSync()` → boolean. Returns `false` (no-op) if already unlocked, no path registered, the file is absent, or no non-interactive passphrase is available; otherwise calls `unlock(pass, path)` (may throw `EBADPASS` on a wrong env/cred passphrase — fail closed) and returns `true`.
+  - `readKeysFile(p, { allowLocked })`: v1 → plaintext; v2 + unlocked → decrypt & merge `wif`, return without `v`/`encrypted`; v2 + locked + default → attempt `keystore.lazyUnlockSync()`, then if still locked throw `Error{code:'ELOCKED'}`; v2 + locked + `allowLocked` → public fields only (no `wif`/`v`/`encrypted`), no unlock attempted.
   - `writeKeysFile(p, obj)`: keystore unlocked AND `obj.wif` defined → write `{ v:2, ...public, encrypted }`; otherwise plaintext (unchanged).
   - `MASTER_KEY_PATH` constant in `cli.js` = `path.join(DISPATCHER_DIR, 'master-key.json')`.
 
 - [ ] **Step 1: Write the failing test**
 
-Create `test/keys-file-encrypted.test.js`:
+Create `test/keys-file-encrypted.test.js`. Note test ordering: the ELOCKED test must run before any test registers a master-key path, so keep the auto-unlock test LAST (it registers a path + env passphrase and resets both in a `finally`).
 
 ```js
 'use strict';
@@ -664,7 +667,7 @@ test('v2 round-trips when unlocked (wif recovered, no envelope markers leak)', (
   ks.lock();
 });
 
-test('v2 read while locked throws ELOCKED by default', () => {
+test('v2 read while locked throws ELOCKED by default (no path registered, no lazy unlock)', () => {
   const mk = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ke-mk-')), 'master-key.json');
   ks.lock(); ks.initMasterKey('pw', mk);
   const p = tmpKeys(); writeKeysFile(p, OBJ);
@@ -691,14 +694,55 @@ test('locked write (no unlock) stays plaintext v1', () => {
   writeKeysFile(p, OBJ);
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(p, 'utf8')), OBJ);
 });
+
+test('v2 read lazy-unlocks from J41_KEYS_PASSPHRASE when a master-key path is registered', () => {
+  const mk = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ke-mk-')), 'master-key.json');
+  ks.lock(); ks.initMasterKey('envpw', mk);
+  const p = tmpKeys(); writeKeysFile(p, OBJ);
+  ks.lock();
+  ks.setMasterKeyPath(mk);
+  process.env.J41_KEYS_PASSPHRASE = 'envpw';
+  try {
+    assert.deepStrictEqual(readKeysFile(p), OBJ); // lazy-unlocks then decrypts
+    assert.ok(ks.isUnlocked());
+  } finally {
+    delete process.env.J41_KEYS_PASSPHRASE;
+    ks.setMasterKeyPath(null);
+    ks.lock();
+  }
+});
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `node --test test/keys-file-encrypted.test.js`
-Expected: FAIL — first test finds `onDisk.v === undefined` (write still plaintext).
+Expected: FAIL — the first test finds `onDisk.v === undefined` (write still plaintext); the lazy-unlock test fails with `ks.setMasterKeyPath is not a function`.
 
-- [ ] **Step 3: Upgrade `src/keys-file.js`**
+- [ ] **Step 3: Add `setMasterKeyPath` + `lazyUnlockSync` to `src/keystore.js`**
+
+In `src/keystore.js`, insert before `module.exports` (it already requires `fs` and `path` from Task 3):
+
+```js
+// ── Lazy unlock (transparent, non-interactive) ────────────────────────────
+// Lets readKeysFile auto-unlock from env / systemd-cred without every call
+// site knowing where master-key.json lives. cli.js registers the path once at
+// startup. Unregistered (e.g. in unit tests) → lazyUnlockSync is a no-op.
+let _masterKeyPath = null;
+
+function setMasterKeyPath(p) { _masterKeyPath = p; }
+
+function lazyUnlockSync() {
+  if (isUnlocked() || !_masterKeyPath || !fs.existsSync(_masterKeyPath)) return false;
+  const pass = resolvePassphraseSync();
+  if (!pass) return false;
+  unlock(pass, _masterKeyPath); // throws EBADPASS on a wrong passphrase → fail closed
+  return true;
+}
+```
+
+Extend `module.exports` to also export `setMasterKeyPath` and `lazyUnlockSync` (keep every existing export).
+
+- [ ] **Step 4: Upgrade `src/keys-file.js`**
 
 Replace the body of `src/keys-file.js` with:
 
@@ -712,8 +756,9 @@ Replace the body of `src/keys-file.js` with:
  * v1 / no-version files are plaintext (current behavior, and the default —
  * encryption is opt-in via `j41-dispatcher encrypt-keys`). v2 files carry an
  * `encrypted` AES-256-GCM envelope of the secret fields; public fields stay in
- * the clear so listing works without unlocking. See keystore.js and the design
- * spec for the threat model.
+ * the clear so listing works without unlocking. On a locked v2 file the default
+ * (secret-needed) read attempts a non-interactive lazy unlock (env / systemd-
+ * cred) before failing closed. See keystore.js and the design spec.
  */
 
 const fs = require('fs');
@@ -735,6 +780,10 @@ function readKeysFile(p, { allowLocked = false } = {}) {
   if (raw.v !== 2) return raw; // v1 / no version → plaintext
 
   const { v, encrypted, ...pub } = raw;
+  // Default (secret-needed) path: try a non-interactive lazy unlock before
+  // giving up. Display path (allowLocked) never unlocks — it only needs public
+  // fields.
+  if (!keystore.isUnlocked() && !allowLocked) keystore.lazyUnlockSync();
   if (!keystore.isUnlocked()) {
     if (allowLocked) return pub; // public fields only; no secret
     const e = new Error(`agent keys are encrypted and the pool is locked: ${p}`);
@@ -748,60 +797,38 @@ function readKeysFile(p, { allowLocked = false } = {}) {
 module.exports = { writeKeysFile, readKeysFile };
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 5: Run test to verify it passes**
 
 Run: `node --test test/keys-file-encrypted.test.js test/keys-file-read.test.js test/keys-write.test.js`
-Expected: PASS (all — plaintext behavior preserved, v2 behavior added).
+Expected: PASS (all — plaintext behavior preserved, v2 behavior + lazy unlock added).
 
-- [ ] **Step 5: Add `MASTER_KEY_PATH` + keystore import + lazy unlock to `loadAgentKeys`**
+- [ ] **Step 6: Wire `MASTER_KEY_PATH` + keystore registration into `src/cli.js`**
 
-In `src/cli.js`, add near the `keys-file` import (`src/cli.js:32`):
+In `src/cli.js`, add near the `keys-file` import (`src/cli.js:32`, which already imports `readKeysFile`/`writeKeysFile`):
 
 ```js
 const keystore = require('./keystore.js');
 ```
 
-Add a `MASTER_KEY_PATH` constant next to where `AGENTS_DIR`/`DISPATCHER_DIR` are defined (search for `AGENTS_DIR =`):
+Add a `MASTER_KEY_PATH` constant next to where `AGENTS_DIR`/`DISPATCHER_DIR` are defined (search for `AGENTS_DIR =`), and register it with the keystore on the next line so every command's `readKeysFile` calls can lazy-unlock:
 
 ```js
 const MASTER_KEY_PATH = path.join(DISPATCHER_DIR, 'master-key.json');
+keystore.setMasterKeyPath(MASTER_KEY_PATH);
 ```
 
-Change `loadAgentKeys` (`src/cli.js:342-350`) to lazily unlock from a non-interactive source when it meets a locked v2 file:
+Do NOT change `loadAgentKeys` — Task 1 already routed it through `readKeysFile`, which now performs the lazy unlock itself. Verify `loadAgentKeys` still reads `return readKeysFile(keysPath);` and leave it.
 
-```js
-function loadAgentKeys(agentId) {
-  // P2-4: Validate agentId format to prevent path traversal
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(agentId) || agentId.includes('..')) {
-    throw new Error(`Invalid agent ID format: ${agentId}`);
-  }
-  const keysPath = path.join(AGENTS_DIR, agentId, 'keys.json');
-  if (!fs.existsSync(keysPath)) return null;
-  try {
-    return readKeysFile(keysPath);
-  } catch (e) {
-    if (e.code === 'ELOCKED' && !keystore.isUnlocked()) {
-      const pass = keystore.resolvePassphraseSync();
-      if (pass) {
-        keystore.unlock(pass, MASTER_KEY_PATH); // throws EBADPASS on wrong passphrase
-        return readKeysFile(keysPath);
-      }
-    }
-    throw e;
-  }
-}
-```
+- [ ] **Step 7: Syntax-check and run the suite**
 
-- [ ] **Step 6: Syntax-check and run the suite**
-
-Run: `node --check src/cli.js src/keys-file.js && node --test test/keys-file-encrypted.test.js test/keys-file-read.test.js test/keys-write.test.js test/keystore-crypto.test.js test/keystore-singleton.test.js`
+Run: `node --check src/cli.js src/keys-file.js src/keystore.js && node --test test/keys-file-encrypted.test.js test/keys-file-read.test.js test/keys-write.test.js test/keystore-crypto.test.js test/keystore-singleton.test.js`
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add src/keys-file.js src/cli.js test/keys-file-encrypted.test.js
-git commit -m "feat(keys): transparent v2 at-rest encryption behind the read/write funnel"
+git add src/keystore.js src/keys-file.js src/cli.js test/keys-file-encrypted.test.js
+git commit -m "feat(keys): transparent v2 at-rest encryption + lazy unlock behind the read/write funnel"
 ```
 
 ---
