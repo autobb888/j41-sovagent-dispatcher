@@ -56,6 +56,17 @@ yarn global add @junction41/dispatcher
 
 ## Quick Start
 
+### Before you begin
+
+1. **Docker installed** — all job containers run inside Docker. Verify with `docker --version`.
+2. **Build the job-agent image** — required before the first `setup` or `start`; the dispatcher will hang mid-registration if it is missing:
+   ```bash
+   ./scripts/build-image.sh
+   ```
+3. **Fund a testnet address** — agent registration writes to the Verus blockchain (verustest network) and costs a small on-chain fee. After `init` or `setup` generates your keys, fund the displayed address from a verustest faucet before the `register` step can complete.
+
+> **Recommended path:** run `j41-dispatcher setup agent-1 <name> --template <tpl>` for your first agent — it is the single-command pipeline (init + register + finalize). `init -n 9` is for operators who want to bulk-generate a pool of identities before registering them separately.
+
 ```bash
 # Launch the interactive dashboard
 j41-dispatcher dashboard
@@ -71,29 +82,39 @@ Running `j41-dispatcher dashboard` launches the interactive TUI:
 
 ```
 ╔══════════════════════════════════════════════════╗
-║  J41 Dispatcher — Setup & Management             ║
+║  J41 Dispatcher v2.x.x — Setup & Management     ║
 ╚══════════════════════════════════════════════════╝
 
   Agents: 5 registered
   Dispatcher: running (PID 12345)
   Runtime: docker
-  LLM: kimi-nvidia
+  Global LLM: kimi-nvidia
+  Executor: local-llm (global default — per-agent overrides via [3])
 
   [1]  View Agents (5 registered)
   [2]  Add New Agent
-  [3]  Configure LLM Provider
-  [4]  Configure Services
-  [5]  Security Setup
+  [3]  Configure Agent Executor
+  [4]  Configure Global LLM Default
+  [5]  Configure Services
+  [6]  Security Setup
     ── Dispatcher ──
-  [6]  Start Dispatcher
-  [7]  Stop Dispatcher
-  [8]  View Logs
-  [9]  Status & Health
+  ⚡    Live Jobs (auto-refresh)
+  [7]  Start Dispatcher
+  [8]  Stop Dispatcher
+  [9]  View Logs
+  [10] Status & Health
     ── Tools ──
-  [10] Inspect Agent (on-chain)
-  [11] Check Inbox
-  [12] Earnings Summary
-  [13] Docker Containers
+  [11] Inspect Agent (on-chain)
+  [12] Check Inbox
+  [13] Earnings Summary
+  [14] Docker Containers
+    ── Agents ──
+  [15] Activate All Agents
+  [16] Deactivate All Agents
+    ── Marketplace ──
+  [17] Bounties
+  [18] API Endpoint Setup (sell GPU/compute)
+       Quit
 ```
 
 Arrow keys to navigate, Enter to select, **ESC to go back** from any screen.
@@ -149,7 +170,8 @@ All commands are also available directly for scripted/headless use:
 | Command | Description |
 |---|---|
 | *(no args)* | **Interactive TUI menu** — run agents, setup, system settings |
-| `init -n N` | Generate N agent identities (keys + SOUL.md) |
+| `dashboard` | Launch the interactive TUI (same as no args, explicit alias) |
+| `init -n N` | Generate N agent identities (keys + SOUL.md); default N is 9 |
 | `register <agent-id> <name>` | Register agent on-chain and create platform profile (interactive if no `--profile-name`) |
 | `finalize <agent-id>` | Publish VDXF on-chain and register service listing |
 | `setup <agent-id> <name>` | One-command pipeline: init + register + finalize (interactive if no `--profile-name` or `-i`) |
@@ -157,6 +179,8 @@ All commands are also available directly for scripted/headless use:
 | `recover <agent-id>` | Recover an agent stuck in a timed-out registration |
 | `activate <agent-id>` | Reactivate an agent (on-chain + platform) |
 | `deactivate <agent-id>` | Deactivate an agent, remove its services, and update on-chain status |
+| `activate-all` | Activate all registered agents (platform + on-chain VDXF status) |
+| `deactivate-all` | Deactivate all registered agents (platform + on-chain VDXF status) |
 | `start` | Start the dispatcher in poll mode |
 | `start --webhook-url <url>` | Start the dispatcher in webhook mode |
 | `status` | Show the dispatcher pool status (active workers, queued jobs) |
@@ -165,13 +189,19 @@ All commands are also available directly for scripted/headless use:
 | `ctl status` | Live status from running dispatcher (uptime, active, queue, agents) |
 | `ctl jobs` | List active jobs with PID, duration, workspace status |
 | `ctl agents` | List agents with workspace capability and service count |
+| `ctl resources` | CPU, RAM, per-job memory usage, and capacity headroom |
 | `ctl shutdown` | Trigger graceful shutdown from another terminal |
 | `ctl canary --agent <id>` | Check canary leak status for an agent |
 | `ctl earnings` | Per-agent earnings summary (jobs + VRSC) |
 | `ctl providers` | Current LLM config + available presets |
 | `ctl history` | Recent completed jobs with token usage |
+| `api-setup <agent-id>` | Set up an agent as an API endpoint proxy (sell GPU/compute) |
 | `quickstart` | Guided first-run setup (template, LLM, runtime) |
 | `providers` | List all 22 LLM providers and 12 executor types |
+| `privacy` | Show privacy attestation status for all completed jobs |
+| `encrypt-keys` | Encrypt all agent WIFs at rest with a passphrase (opt-in) |
+| `decrypt-keys` | Remove at-rest encryption; store WIFs as plaintext again |
+| `change-passphrase` | Change the at-rest encryption passphrase |
 | `set-authorities <agent-id>` | Set revoke/recover authorities for an agent identity |
 | `check-authorities` | Check authority configuration across all agents |
 | `respond-dispute <jobId>` | Respond to a buyer dispute (refund/rework/rejected) |
@@ -259,7 +289,7 @@ Per-service settings passed during registration:
 
 ### Provider & LLM Keys
 
-Run `j41-dispatcher dashboard` → "Configure Executor" / "Global LLM Default" to set your provider and API key. Config is stored at `~/.j41/dispatcher/config.toml` (mode 0600).
+Run `j41-dispatcher dashboard` → "[3] Configure Agent Executor" / "[4] Configure Global LLM Default" to set your provider and API key. Config is stored at `~/.j41/dispatcher/config.toml` (mode 0600).
 
 Provider API keys belong in the `[provider_keys]` table of `config.toml` — they are never read from the dispatcher's own environment. See `docs/config.toml.example` for the full format.
 
@@ -273,6 +303,17 @@ These env vars override the corresponding `config.toml` value for CI or one-shot
 | `J41_MAX_CONCURRENT` | Override max concurrent from config |
 | `IDLE_TIMEOUT_MS` | Idle timeout before pause (default: 600000 ms / 10 min) |
 | `J41_REQUIRE_FINALIZE` | When set, agents must be finalized before the dispatcher will use them |
+
+### Unattended / Production Operation
+
+By default, `start` and any key-dependent command (register, activate, etc.) will prompt interactively for a passphrase if at-rest encryption is enabled. In a headless environment, provide the passphrase non-interactively via one of these methods (checked in order):
+
+1. **Env var:** `J41_KEYS_PASSPHRASE=<passphrase> j41-dispatcher start`
+2. **systemd credential:** load a credential named `j41-keys-passphrase` (e.g., `LoadCredential=j41-keys-passphrase:/run/secrets/j41-passphrase` in the unit file)
+
+At-rest encryption is **opt-in** — run `j41-dispatcher encrypt-keys` to enable it. It wraps all agent WIFs with AES-GCM derived from a passphrase-based master key.
+
+**Honest scope:** at-rest encryption protects against a stolen disk image or backup leaking your agent private keys. It does **not** protect against a live-compromised host (the running process holds the decrypted keys in memory). If your threat model includes a live host compromise, treat key isolation (separate signing oracle, HSM) as a separate problem.
 
 ### Token Budget Enforcement (WP-D4)
 

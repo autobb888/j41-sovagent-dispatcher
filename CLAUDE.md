@@ -8,7 +8,7 @@ Multi-agent orchestration for the Junction41 sovereign AI agent marketplace. Man
 
 ```bash
 yarn global add @junction41/dispatcher
-j41-dispatcher dashboard          # Interactive TUI (15-item menu)
+j41-dispatcher dashboard          # Interactive TUI (18-item menu)
 j41-dispatcher setup agent-1 myname --template code-review
 j41-dispatcher start              # Listen for jobs
 j41-dispatcher inspect agent-1    # Full agent state dump
@@ -53,7 +53,7 @@ Source of truth: `~/.j41/dispatcher/config.toml` (mode 0600). Loaded once at pro
 - Runtime knobs (log level, max concurrent, etc.) accept env-var overrides per `ENV_OVERRIDES` in `config-loader.js` for ops convenience (CI, one-shot ops). The TOML file remains the source of truth.
 - Legacy `.env` files at the install dir are auto-migrated to `config.toml` on first load and marked with a `# MIGRATED` banner.
 
-To edit: `j41-dispatcher dashboard` → "Configure Executor" / "Global LLM Default", or hand-edit `~/.j41/dispatcher/config.toml`.
+To edit: `j41-dispatcher dashboard` → "[3] Configure Agent Executor" / "[4] Configure Global LLM Default", or hand-edit `~/.j41/dispatcher/config.toml`.
 
 ### Executor Types
 
@@ -109,15 +109,20 @@ SDK function: `removeAndRewriteVdxfFields()`. CLI: `j41-dispatcher update-profil
 
 ### Dashboard Menu Structure
 
+18 numbered items plus an unlabelled "⚡ Live Jobs" entry and a Quit option (verified against `src/dashboard.js` `choices` array):
+
 ```
-[1]  View Agents           [8]  Stop Dispatcher
-[2]  Add New Agent         [9]  View Logs
-[3]  Configure Executor    [10] Status & Health
-[4]  Global LLM Default    [11] Inspect Agent
-[5]  Configure Services    [12] Check Inbox
-[6]  Security Setup        [13] Earnings Summary
-[7]  Start Dispatcher      [14] Docker Containers
-                           [15] Bounties
+[1]  View Agents                 [10] Status & Health
+[2]  Add New Agent               [11] Inspect Agent (on-chain)
+[3]  Configure Agent Executor    [12] Check Inbox
+[4]  Configure Global LLM Default[13] Earnings Summary
+[5]  Configure Services          [14] Docker Containers
+[6]  Security Setup              [15] Activate All Agents
+  ── Dispatcher ──               [16] Deactivate All Agents
+⚡    Live Jobs (auto-refresh)    [17] Bounties
+[7]  Start Dispatcher            [18] API Endpoint Setup
+[8]  Stop Dispatcher                  (sell GPU/compute)
+[9]  View Logs
 ```
 
 ### Key Patterns

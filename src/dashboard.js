@@ -511,14 +511,14 @@ async function updateProfileScreen(inquirer, agentId, keys) {
   if (!confirm) return;
 
   // Build CLI flags
-  const cliArgs = ['node', 'src/cli.js', 'update-profile', agentId];
+  const cliArgs = [process.execPath, process.argv[1], 'update-profile', agentId];
   for (const [fieldName, newVal] of Object.entries(updates)) {
     const f = EDITABLE_PROFILE_FIELDS.find(e => e.field === fieldName);
     cliArgs.push(f.flag, newVal);
   }
 
   console.log('');
-  const exitCode = await runCommandAsync(cliArgs[0], cliArgs.slice(1), REPO_DIR);
+  const exitCode = await runCommandAsync(cliArgs[0], cliArgs.slice(1));
 
   if (exitCode === 0) {
     console.log('\n  ✅ Profile updated on-chain!\n');
@@ -1162,7 +1162,7 @@ async function addAgentScreen(inquirer) {
     console.log('');
     console.log('  ℹ️  Registration waits for block confirmations (can take 5-20 min).');
     console.log('  Press Ctrl+C to return to menu — registration continues on the platform.\n');
-    const exitCode = await runCommandAsync('node', ['src/cli.js', 'setup', agentId, name, '--template', template], REPO_DIR);
+    const exitCode = await runCommandAsync(process.execPath, [process.argv[1], 'setup', agentId, name, '--template', template]);
     if (exitCode === 0) {
       console.log('\n  ✅ Agent created successfully.\n');
 
@@ -1970,7 +1970,7 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
     writeKeysFile(keysPath, keysData);
 
     console.log(`\n  Recovering ${keysData.identity}...\n`);
-    const exitCode = await runCommandAsync('node', ['src/cli.js', 'recover', agentId], REPO_DIR);
+    const exitCode = await runCommandAsync(process.execPath, [process.argv[1], 'recover', agentId]);
 
     if (exitCode === 0) {
       console.log('\n  ✅ Recovery successful!\n');
@@ -2004,7 +2004,7 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
     console.log('');
     console.log('  ℹ️  Registration waits for block confirmations (can take 5-20 min).');
     console.log('  Press Ctrl+C to return to menu — registration continues on the platform.\n');
-    const exitCode = await runCommandAsync('node', ['src/cli.js', 'register', agentId, identityName], REPO_DIR);
+    const exitCode = await runCommandAsync(process.execPath, [process.argv[1], 'register', agentId, identityName]);
 
     if (exitCode === 0) {
       console.log('\n  ✅ Registration successful!\n');
@@ -2037,7 +2037,7 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
     console.log('');
     console.log('  ℹ️  Registration waits for block confirmations (can take 5-20 min).');
     console.log('  Press Ctrl+C to return to menu — registration continues on the platform.\n');
-    const exitCode = await runCommandAsync('node', ['src/cli.js', 'register', agentId, identityName], REPO_DIR);
+    const exitCode = await runCommandAsync(process.execPath, [process.argv[1], 'register', agentId, identityName]);
 
     if (exitCode === 0) {
       console.log('\n  ✅ Registration successful!\n');
@@ -2057,7 +2057,7 @@ async function retryFinalizeScreen(inquirer, agentId) {
   console.log(`\n  ═══ Retry Finalize: ${agentId} ═══\n`);
 
   console.log('  Resuming finalization...\n');
-  const exitCode = await runCommandAsync('node', ['src/cli.js', 'finalize', agentId, '--interactive'], REPO_DIR);
+  const exitCode = await runCommandAsync(process.execPath, [process.argv[1], 'finalize', agentId, '--interactive']);
 
   if (exitCode === 0) {
     console.log('\n  ✅ Finalize complete!\n');
@@ -2102,10 +2102,21 @@ async function securityScreen(inquirer) {
     { name: '  Run security setup (install/update profiles)', value: 'setup' },
     { name: '  Run self-test (container escape attempts)', value: 'test' },
     { name: '  Check profile integrity', value: 'check' },
+    { name: '  🔐 Encrypt WIF keys at rest (set a passphrase)', value: 'encrypt-keys' },
+    { name: '  🔑 Change encryption passphrase', value: 'change-passphrase' },
     { name: '  ← Back', value: '__back' },
   ]}]);
 
   if (action === '__back') return;
+
+  if (action === 'encrypt-keys') {
+    await runCommandAsync(process.execPath, [process.argv[1], 'encrypt-keys']);
+    return;
+  }
+  if (action === 'change-passphrase') {
+    await runCommandAsync(process.execPath, [process.argv[1], 'change-passphrase']);
+    return;
+  }
 
   try {
     const secureSetup = require('@junction41/secure-setup');
@@ -2943,8 +2954,7 @@ async function main() {
           console.log(`\n  Dispatcher already running (PID ${status.pid})\n`);
         } else {
           const { spawn } = require('child_process');
-          const child = spawn('node', ['src/cli.js', 'start'], {
-            cwd: REPO_DIR,
+          const child = spawn(process.execPath, [process.argv[1], 'start'], {
             detached: true,
             stdio: ['ignore', fs.openSync('/tmp/dispatcher.log', 'a'), fs.openSync('/tmp/dispatcher.log', 'a')],
           });
