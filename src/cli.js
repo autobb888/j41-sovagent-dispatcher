@@ -2948,12 +2948,27 @@ program
       }
     }
 
+    // ── Unlock the at-rest key pool (if encryption is enabled) ──
+    // One prompt at startup; the master key then lives in memory for the life
+    // of the daemon. At-rest encryption protects a stolen disk/backup — NOT a
+    // live-compromised running host (the key is resident once unlocked).
+    if (fs.existsSync(MASTER_KEY_PATH)) {
+      try {
+        const pass = await keystore.resolvePassphrase({ promptFn: () => keystore.promptHidden('🔐 Unlock passphrase: ') });
+        keystore.unlock(pass, MASTER_KEY_PATH);
+        console.log('  🔓 Key pool unlocked (WIFs decrypted in memory only)');
+      } catch (e) {
+        console.error(`\n❌ Cannot unlock the key pool: ${e.message}`);
+        process.exit(1);
+      }
+    }
+
     const agents = listRegisteredAgents();
     if (agents.length === 0) {
       console.error('❌ No agents found. Run: j41-dispatcher init');
       process.exit(1);
     }
-    
+
     // ── PID file: ensure only one dispatcher runs at a time ──
     // Kills previous dispatcher process only — Docker containers stay alive
     // and get adopted by the new instance via polling.
@@ -3955,6 +3970,8 @@ program
 
     process.on('SIGINT', () => gracefulShutdown('SIGINT'));
     process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    // Zeroize the in-memory master key on any exit (after all WIF use is done).
+    process.on('exit', () => { try { keystore.lock(); } catch (_) {} });
 
     // Keep alive
     await new Promise(() => {});
