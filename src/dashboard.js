@@ -15,7 +15,7 @@ const AGENTS_DIR = path.join(DISPATCHER_DIR, 'agents');
 const CONFIG_FILE = path.join(DISPATCHER_DIR, 'config.json');
 
 const { loadDispatcherConfig, saveDispatcherConfig } = require('./config-loader.js');
-const { writeKeysFile } = require('./keys-file.js');
+const { writeKeysFile, readKeysFile } = require('./keys-file.js');
 const { sendCommand } = require('./control.js');
 const { renderActiveJobs, runLiveScreen } = require('./tui/live-screen.js');
 const { formatUpstreamHealthTag } = require('./tui/health-tag.js');
@@ -60,7 +60,7 @@ function getAgents() {
     return fs.readdirSync(AGENTS_DIR)
       .filter(d => fs.existsSync(path.join(AGENTS_DIR, d, 'keys.json')))
       .map(id => {
-        const keys = JSON.parse(fs.readFileSync(path.join(AGENTS_DIR, id, 'keys.json'), 'utf8'));
+        const keys = readKeysFile(path.join(AGENTS_DIR, id, 'keys.json'), { allowLocked: true });
         const soul = fs.existsSync(path.join(AGENTS_DIR, id, 'SOUL.md'))
           ? fs.readFileSync(path.join(AGENTS_DIR, id, 'SOUL.md'), 'utf8').substring(0, 100)
           : '(none)';
@@ -266,7 +266,7 @@ async function agentListScreen(inquirer) {
 
 async function agentDetailScreen(inquirer, agentId) {
   const agentDir = path.join(AGENTS_DIR, agentId);
-  const keys = JSON.parse(fs.readFileSync(path.join(agentDir, 'keys.json'), 'utf8'));
+  const keys = readKeysFile(path.join(agentDir, 'keys.json'), { allowLocked: true });
 
   console.clear();
   console.log(`\n  ═══ ${keys.identity || agentId} ═══\n`);
@@ -1939,7 +1939,7 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
 
   // Check if we have a name from a previous attempt
   const keysPath = path.join(AGENTS_DIR, agentId, 'keys.json');
-  const keysData = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+  const keysData = readKeysFile(keysPath, { allowLocked: true });
   let identityName = keysData.identityName || keysData.pendingName || '';
 
   // Show current state to help user decide

@@ -29,7 +29,9 @@ const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, l
 const { shouldRefundOrphan, isRefundAlreadyHandled } = require('./refund.js');
 const { isValidJobId } = require('./job-id.js');
 const { verifyInboxJobRecord } = require('./inbox-job-record.js');
-const { writeKeysFile } = require('./keys-file.js');
+const { writeKeysFile, readKeysFile } = require('./keys-file.js');
+const keystore = require('./keystore.js');
+const { encryptAllKeys, decryptAllKeys } = require('./keys-migrate.js');
 const crypto = require('crypto');
 
 /** Feature flag: route in-container signing through the host-side broker
@@ -62,6 +64,8 @@ try {
 
 const J41_DIR = path.join(os.homedir(), '.j41');
 const DISPATCHER_DIR = path.join(J41_DIR, 'dispatcher');
+const MASTER_KEY_PATH = path.join(DISPATCHER_DIR, 'master-key.json');
+keystore.setMasterKeyPath(MASTER_KEY_PATH);
 const AGENTS_DIR = path.join(DISPATCHER_DIR, 'agents');
 const QUEUE_DIR = path.join(DISPATCHER_DIR, 'queue');
 const JOBS_DIR = path.join(DISPATCHER_DIR, 'jobs');
@@ -346,7 +350,23 @@ function loadAgentKeys(agentId) {
   }
   const keysPath = path.join(AGENTS_DIR, agentId, 'keys.json');
   if (!fs.existsSync(keysPath)) return null;
-  return JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+  return readKeysFile(keysPath);
+}
+
+// When the pool is encrypted (master-key.json exists), ensure the keystore is
+// unlocked before we read or write agent keys — so a freshly generated WIF is
+// stored encrypted (not silently plaintext) and an existing encrypted key is
+// not downgraded. Interactive prompt if a TTY, else env/systemd-cred, else
+// fail closed. No-op on a plaintext (default) install.
+async function ensureKeystoreUnlockedIfEncrypted() {
+  if (!fs.existsSync(MASTER_KEY_PATH) || keystore.isUnlocked()) return;
+  try {
+    const pass = await keystore.resolvePassphrase({ promptFn: () => keystore.promptHidden('🔐 Key pool is encrypted — unlock passphrase: ') });
+    keystore.unlock(pass, MASTER_KEY_PATH);
+  } catch (e) {
+    console.error(`\n❌ The key pool is encrypted; unlock required for this operation: ${e.message}`);
+    process.exit(1);
+  }
 }
 
 function listRegisteredAgents() {
@@ -1266,9 +1286,7 @@ program
       const { generateKeypair } = require('./keygen.js');
       const keys = generateKeypair(J41_NETWORK);
       
-      fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify({ ...keys, network: J41_NETWORK }, null, 2)
-      , { mode: 0o600 });
-      fs.chmodSync(path.join(agentDir, 'keys.json'), 0o600);
+      writeKeysFile(path.join(agentDir, 'keys.json'), { ...keys, network: J41_NETWORK });
       
       // Write SOUL template
       fs.writeFileSync(
@@ -1367,8 +1385,7 @@ program
       // Save identity to keys file
       keys.identity = result.identity;
       keys.iAddress = result.iAddress;
-      fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2)
-      , { mode: 0o600 });
+      writeKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json'), keys);
 
       console.log(`\n✅ ${agentId} identity registered on-chain!`);
       console.log(`   Identity: ${result.identity}`);
@@ -1457,9 +1474,7 @@ program
         keys.registrationTimestamp = new Date().toISOString();
         if (e.onboardId) keys.onboardId = e.onboardId;
         if (e.lastStatus) keys.lastOnboardStatus = e.lastStatus;
-        fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2)
-        , { mode: 0o600 });
-        fs.chmodSync(path.join(AGENTS_DIR, agentId, 'keys.json'), 0o600);
+        writeKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json'), keys);
         console.error(`\n⚠️  Partial state saved to keys.json`);
         console.error(`   The identity "${keys.identity}" may already exist on-chain.`);
         console.error(`   To check and recover: node src/cli.js recover ${agentId}`);
@@ -1557,6 +1572,7 @@ program
   .command('recover <agent-id>')
   .description('Recover from a timed-out registration by checking on-chain identity status')
   .action(async (agentId) => {
+    await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
 
     const keys = loadAgentKeys(agentId);
@@ -1619,9 +1635,7 @@ program
             delete keys.registrationTimestamp;
             delete keys.onboardId;
             delete keys.lastOnboardStatus;
-            fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2)
-            , { mode: 0o600 });
-            fs.chmodSync(path.join(AGENTS_DIR, agentId, 'keys.json'), 0o600);
+            writeKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json'), keys);
             console.log(`\n✅ Recovery successful!`);
             console.log(`   Identity: ${keys.identity}`);
             console.log(`   i-Address: ${iAddress}`);
@@ -1638,8 +1652,7 @@ program
           delete keys.onboardId;
           delete keys.lastOnboardStatus;
           delete keys.identity;
-          fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2)
-          , { mode: 0o600 });
+          writeKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json'), keys);
           process.exit(1);
         }
 
@@ -1681,9 +1694,7 @@ program
       delete keys.registrationTimestamp;
       delete keys.onboardId;
       delete keys.lastOnboardStatus;
-      fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2)
-      , { mode: 0o600 });
-      fs.chmodSync(path.join(AGENTS_DIR, agentId, 'keys.json'), 0o600);
+      writeKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json'), keys);
 
       console.log(`\n✅ Recovery successful!`);
       console.log(`   Identity: ${keys.identity}`);
@@ -1736,8 +1747,7 @@ program
         delete keys.onboardId;
         delete keys.lastOnboardStatus;
         delete keys.pendingName;
-        fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2), { mode: 0o600 });
-        fs.chmodSync(path.join(AGENTS_DIR, agentId, 'keys.json'), 0o600);
+        writeKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json'), keys);
 
         // Make sure the owning agent has iAddress if it was missing
         if (foundOwner.iAddress) {
@@ -1745,8 +1755,7 @@ program
           if (ownerKeys && !ownerKeys.iAddress) {
             ownerKeys.iAddress = foundOwner.iAddress;
             delete ownerKeys.registrationStatus;
-            fs.writeFileSync(path.join(AGENTS_DIR, foundOwner.agentId, 'keys.json'), JSON.stringify(ownerKeys, null, 2), { mode: 0o600 });
-            fs.chmodSync(path.join(AGENTS_DIR, foundOwner.agentId, 'keys.json'), 0o600);
+            writeKeysFile(path.join(AGENTS_DIR, foundOwner.agentId, 'keys.json'), ownerKeys);
           }
         }
 
@@ -2570,6 +2579,7 @@ program
   .option('-i, --interactive', 'Interactive mode — walk through all fields')
   .action(async (agentId, identityName, options) => {
     ensureDirs();
+    await ensureKeystoreUnlockedIfEncrypted();
 
     // Load template if specified
     if (options.template) {
@@ -2635,8 +2645,7 @@ program
       const { generateKeypair } = require('./keygen.js');
       keys = generateKeypair(J41_NETWORK);
       keys.network = J41_NETWORK;
-      fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2), { mode: 0o600 });
-      fs.chmodSync(path.join(agentDir, 'keys.json'), 0o600);
+      writeKeysFile(path.join(agentDir, 'keys.json'), keys);
       console.log(`  ✓ Keys generated (${keys.address})`);
     }
 
@@ -2686,15 +2695,14 @@ program
         keys.iAddress = regResult.iAddress;
         delete keys.registrationStatus;
         delete keys.onboardId;
-        fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2), { mode: 0o600 });
-        fs.chmodSync(path.join(agentDir, 'keys.json'), 0o600);
+        writeKeysFile(path.join(agentDir, 'keys.json'), keys);
         console.log(`  ✓ Registered: ${regResult.identity} (${regResult.iAddress})`);
       } catch (e) {
         if (e.name === 'RegistrationTimeoutError' || (e.message && e.message.includes('timed out'))) {
           keys.identity = e.identityName || (identityName + '.agentplatform@');
           keys.registrationStatus = 'timeout';
           if (e.onboardId) keys.onboardId = e.onboardId;
-          fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2), { mode: 0o600 });
+          writeKeysFile(path.join(agentDir, 'keys.json'), keys);
           console.error(`  ⚠️  Registration timed out. Run: node src/cli.js recover ${agentId}`);
           console.error(`     Then re-run: node src/cli.js setup ${agentId} ${identityName} [flags...]`);
           process.exit(1);
@@ -2884,7 +2892,7 @@ program
     // Load keys and register service on-platform
     const keysPath = path.join(agentDir, 'keys.json');
     if (!fs.existsSync(keysPath)) { console.error(`✗ keys.json not found for ${agentId}`); process.exit(1); }
-    const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+    const keys = readKeysFile(keysPath);
 
     const { J41Agent } = require('@junction41/sovagent-sdk');
     const agent = new J41Agent({
@@ -2949,12 +2957,27 @@ program
       }
     }
 
+    // ── Unlock the at-rest key pool (if encryption is enabled) ──
+    // One prompt at startup; the master key then lives in memory for the life
+    // of the daemon. At-rest encryption protects a stolen disk/backup — NOT a
+    // live-compromised running host (the key is resident once unlocked).
+    if (fs.existsSync(MASTER_KEY_PATH)) {
+      try {
+        const pass = await keystore.resolvePassphrase({ promptFn: () => keystore.promptHidden('🔐 Unlock passphrase: ') });
+        keystore.unlock(pass, MASTER_KEY_PATH);
+        console.log('  🔓 Key pool unlocked (WIFs decrypted in memory only)');
+      } catch (e) {
+        console.error(`\n❌ Cannot unlock the key pool: ${e.message}`);
+        process.exit(1);
+      }
+    }
+
     const agents = listRegisteredAgents();
     if (agents.length === 0) {
       console.error('❌ No agents found. Run: j41-dispatcher init');
       process.exit(1);
     }
-    
+
     // ── PID file: ensure only one dispatcher runs at a time ──
     // Kills previous dispatcher process only — Docker containers stay alive
     // and get adopted by the new instance via polling.
@@ -3956,9 +3979,58 @@ program
 
     process.on('SIGINT', () => gracefulShutdown('SIGINT'));
     process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    // Zeroize the in-memory master key on any exit (after all WIF use is done).
+    process.on('exit', () => { try { keystore.lock(); } catch (_) {} });
 
     // Keep alive
     await new Promise(() => {});
+  });
+
+program
+  .command('encrypt-keys')
+  .description('Encrypt all agent WIFs at rest with a passphrase (opt-in)')
+  .action(async () => {
+    if (fs.existsSync(MASTER_KEY_PATH)) {
+      console.error('❌ Keys are already encrypted (master-key.json exists). Use change-passphrase.');
+      process.exit(1);
+    }
+    const p1 = await keystore.promptHidden('New passphrase: ');
+    const p2 = await keystore.promptHidden('Confirm passphrase: ');
+    if (!p1 || p1 !== p2) { console.error('❌ Passphrases empty or do not match.'); process.exit(1); }
+    keystore.initMasterKey(p1, MASTER_KEY_PATH); // creates file + unlocks
+    const n = encryptAllKeys(AGENTS_DIR);
+    keystore.lock();
+    console.log(`\n🔐 Encrypted ${n} agent key file(s).`);
+    console.log('   The daemon will prompt for this passphrase on `start`.');
+    console.log('   Unattended: set J41_KEYS_PASSPHRASE or a systemd credential (j41-keys-passphrase).');
+    console.log('   Note: at-rest encryption protects a stolen disk/backup, not a live-compromised host.');
+  });
+
+program
+  .command('decrypt-keys')
+  .description('Remove at-rest encryption; store WIFs as plaintext again')
+  .action(async () => {
+    if (!fs.existsSync(MASTER_KEY_PATH)) { console.error('❌ Keys are not encrypted.'); process.exit(1); }
+    const pass = await keystore.resolvePassphrase({ promptFn: () => keystore.promptHidden('Passphrase: ') });
+    try { keystore.unlock(pass, MASTER_KEY_PATH); }
+    catch (e) { console.error(`❌ ${e.message}`); process.exit(1); }
+    const n = decryptAllKeys(AGENTS_DIR); // locks the keystore internally
+    fs.rmSync(MASTER_KEY_PATH);
+    console.log(`\n🔓 Decrypted ${n} agent key file(s). WIFs are now plaintext at rest (mode 0600 only).`);
+  });
+
+program
+  .command('change-passphrase')
+  .description('Change the at-rest encryption passphrase')
+  .action(async () => {
+    if (!fs.existsSync(MASTER_KEY_PATH)) { console.error('❌ Keys are not encrypted.'); process.exit(1); }
+    const oldPass = await keystore.promptHidden('Current passphrase: ');
+    const n1 = await keystore.promptHidden('New passphrase: ');
+    const n2 = await keystore.promptHidden('Confirm new passphrase: ');
+    if (!n1 || n1 !== n2) { console.error('❌ New passphrases empty or do not match.'); process.exit(1); }
+    try { keystore.changePassphrase(oldPass, n1, MASTER_KEY_PATH); }
+    catch (e) { console.error(`❌ ${e.message}`); process.exit(1); }
+    console.log('\n🔐 Passphrase changed.');
   });
 
 // Status command
@@ -5435,7 +5507,7 @@ function loadAgentConfig(agentId) {
     if (fs.existsSync(configPath)) {
       config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
     } else {
-      const keys = JSON.parse(fs.readFileSync(path.join(agentDir, 'keys.json'), 'utf8'));
+      const keys = readKeysFile(path.join(agentDir, 'keys.json'), { allowLocked: true });
       if (keys.executor) config = keys;
     }
   } catch {
@@ -5774,7 +5846,7 @@ async function startJobContainer(state, job, agentInfo) {
   let signerHost = null;
   let signerTeardown = null;
   let egressToken;
-  const hostKeys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+  const hostKeys = readKeysFile(keysPath);
 
   // Audit C3: mounting the agent's private key inside a prompt-injectable job
   // container that has network egress let untrusted in-container code read it
@@ -6582,7 +6654,7 @@ program
         process.exit(1);
       }
 
-      const keys = JSON.parse(fs.readFileSync(keysPath, 'utf-8'));
+      const keys = readKeysFile(keysPath);
       const { J41Agent } = require('@junction41/sovagent-sdk');
       const agent = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif, identityName: keys.identity, iAddress: keys.iAddress });
       await agent.authenticate();
@@ -6778,7 +6850,7 @@ async function mainMenu() {
     if (fs.existsSync(AGENTS_DIR)) {
       const dirs = fs.readdirSync(AGENTS_DIR).filter(d => fs.existsSync(path.join(AGENTS_DIR, d, 'keys.json'))).sort();
       for (const dir of dirs) {
-        const keys = JSON.parse(fs.readFileSync(path.join(AGENTS_DIR, dir, 'keys.json'), 'utf8'));
+        const keys = readKeysFile(path.join(AGENTS_DIR, dir, 'keys.json'), { allowLocked: true });
         agents.push({ id: dir, identity: keys.identity || '(not registered)', iAddress: keys.iAddress || '-', address: keys.address });
       }
     }
@@ -6831,7 +6903,7 @@ async function mainMenu() {
 
   async function editAgentProfile(agent) {
     const keysPath = path.join(AGENTS_DIR, agent.id, 'keys.json');
-    const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+    const keys = readKeysFile(keysPath);
     const soulPath = path.join(AGENTS_DIR, agent.id, 'SOUL.md');
     const soul = fs.existsSync(soulPath) ? fs.readFileSync(soulPath, 'utf-8').trim() : '';
 
@@ -6856,7 +6928,7 @@ async function mainMenu() {
 
   async function viewAgentProfile(agent) {
     const keysPath = path.join(AGENTS_DIR, agent.id, 'keys.json');
-    const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+    const keys = readKeysFile(keysPath, { allowLocked: true });
 
     if (!keys.identity || !keys.iAddress) {
       console.log('\n  Agent not registered on-chain yet.\n');
@@ -6903,7 +6975,7 @@ async function mainMenu() {
 
   async function registerAgentIdentity(agent) {
     const keysPath = path.join(AGENTS_DIR, agent.id, 'keys.json');
-    const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+    const keys = readKeysFile(keysPath);
 
     if (keys.identity && keys.iAddress) {
       console.log(`\n  Already registered: ${keys.identity} (${keys.iAddress})\n`);
@@ -6929,7 +7001,7 @@ async function mainMenu() {
 
   async function publishVdxfUpdate(agent) {
     const keysPath = path.join(AGENTS_DIR, agent.id, 'keys.json');
-    const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+    const keys = readKeysFile(keysPath);
     const profilePath = path.join(AGENTS_DIR, agent.id, 'profile.json');
 
     if (!keys.identity || !keys.iAddress) {
@@ -6990,11 +7062,11 @@ async function mainMenu() {
     }
 
     fs.mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+    await ensureKeystoreUnlockedIfEncrypted();
     const { generateKeypair } = require('./keygen.js');
     const keys = generateKeypair(J41_NETWORK);
     keys.network = J41_NETWORK;
-    fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify(keys, null, 2), { mode: 0o600 });
-    fs.chmodSync(path.join(agentDir, 'keys.json'), 0o600);
+    writeKeysFile(path.join(agentDir, 'keys.json'), keys);
     fs.writeFileSync(path.join(agentDir, 'SOUL.md'), `# ${id}\n\nA helpful AI assistant on the J41 platform.`);
     console.log(`\n  Created ${id} (${keys.address})`);
     console.log(`  Fund this address with VRSCTEST, then register the identity.\n`);
