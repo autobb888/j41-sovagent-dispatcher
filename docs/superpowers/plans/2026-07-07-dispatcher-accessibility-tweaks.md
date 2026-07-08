@@ -359,25 +359,31 @@ Expected: FAIL — none of the three are emitted (only `job.started`, `container
 
 Read each site first to confirm the in-scope variable names, then add the emit next to the existing action (do not remove the existing `sendToJobAgent`/`acceptJob` calls):
 
-1. **job.completed** — `src/cli.js:~4912`, inside the poll loop, in the `currentJob.status === 'completed'` branch, right after `sendToJobAgent(activeInfo, { type: 'job.completed', data: { jobId } });`:
+**Architecture note (corrected during execution):** `pollForJobs` (~cli.js:4773) owns BOTH poll-mode accept (~4845) and the status loop that detects completed/delivered (~4929/4944). `handleWebhookEvent` (~cli.js:5084) is webhook-mode only and its generic emit at ~5099 already mirrors every inbound event. So poll-mode emits go in `pollForJobs`; the webhook handler must NOT add its own (it would double the generic emit).
+
+1. **job.completed** — poll status loop, `currentJob.status === 'completed'` branch (~cli.js:4929), right after `sendToJobAgent(activeInfo, { type: 'job.completed', data: { jobId } });`:
 
 ```js
         state.emitEvent?.('job.completed', { jobId, agentId: activeInfo.agentInfo?.id });
 ```
 
-2. **job.accepted** — `src/cli.js:~5095`, in the `job.requested` handler, immediately after the `await agent.client.acceptJob(...)` call succeeds (inside the `if (fullJob?.jobHash && fullJob?.buyerVerusId)` block, after the accept log line):
+2. **job.accepted (poll)** — poll accept in `pollForJobs` (~cli.js:4846), right after the `✅ Job … accepted` log line, inside the `if (fullJob?.jobHash && fullJob?.buyerVerusId)` block:
 
 ```js
-          state.emitEvent?.('job.accepted', { jobId, agentId: agentInfo.id });
+              state.emitEvent?.('job.accepted', { jobId: job.id, agentId: agentInfo.id });
 ```
 
-3. **job.delivered** — `src/cli.js:~5348`, in the `case 'job.delivered':` handler, after `const deliverInfo = state.active.get(jobId);`:
+3. **job.accepted (webhook)** — keep the emit after the webhook `acceptJob` (~cli.js:5113): `state.emitEvent?.('job.accepted', { jobId, agentId: agentInfo.id });`. The generic path emits `job.requested`, not `job.accepted`, so this is the non-duplicating webhook signal.
+
+4. **job.delivered (poll)** — poll status loop, `currentJob.status === 'delivered'` branch (~cli.js:4944), right after `sendToJobAgent(activeInfo, { type: 'end_session_request', jobId });`:
 
 ```js
-      state.emitEvent?.('job.delivered', { jobId: jobId || null, agentId: deliverInfo?.agentInfo?.id });
+        state.emitEvent?.('job.delivered', { jobId, agentId: activeInfo.agentInfo?.id });
 ```
 
-If a hunk shows the in-scope agent variable is named differently (e.g. `activeInfo.agentInfo.id` vs `agentInfo.id`), use the name actually in scope at that site — the event just needs `jobId` and a best-effort `agentId`.
+Do NOT add a `job.delivered` emit in the webhook `case 'job.delivered':` handler — the generic emit at ~5099 already covers webhook mode; an emit there would unconditionally double.
+
+Use the variable actually in scope at each site (the event just needs `jobId` + a best-effort `agentId`).
 
 - [ ] **Step 4: Run tests + full suite**
 
