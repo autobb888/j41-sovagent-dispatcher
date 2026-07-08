@@ -29,7 +29,7 @@ const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, l
 const { shouldRefundOrphan, isRefundAlreadyHandled } = require('./refund.js');
 const { isValidJobId } = require('./job-id.js');
 const { verifyInboxJobRecord } = require('./inbox-job-record.js');
-const { writeKeysFile } = require('./keys-file.js');
+const { writeKeysFile, readKeysFile } = require('./keys-file.js');
 const crypto = require('crypto');
 
 /** Feature flag: route in-container signing through the host-side broker
@@ -346,7 +346,7 @@ function loadAgentKeys(agentId) {
   }
   const keysPath = path.join(AGENTS_DIR, agentId, 'keys.json');
   if (!fs.existsSync(keysPath)) return null;
-  return JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+  return readKeysFile(keysPath);
 }
 
 function listRegisteredAgents() {
@@ -1266,9 +1266,7 @@ program
       const { generateKeypair } = require('./keygen.js');
       const keys = generateKeypair(J41_NETWORK);
       
-      fs.writeFileSync(path.join(agentDir, 'keys.json'), JSON.stringify({ ...keys, network: J41_NETWORK }, null, 2)
-      , { mode: 0o600 });
-      fs.chmodSync(path.join(agentDir, 'keys.json'), 0o600);
+      writeKeysFile(path.join(agentDir, 'keys.json'), { ...keys, network: J41_NETWORK });
       
       // Write SOUL template
       fs.writeFileSync(
@@ -1367,8 +1365,7 @@ program
       // Save identity to keys file
       keys.identity = result.identity;
       keys.iAddress = result.iAddress;
-      fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2)
-      , { mode: 0o600 });
+      writeKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json'), keys);
 
       console.log(`\n✅ ${agentId} identity registered on-chain!`);
       console.log(`   Identity: ${result.identity}`);
@@ -1457,9 +1454,7 @@ program
         keys.registrationTimestamp = new Date().toISOString();
         if (e.onboardId) keys.onboardId = e.onboardId;
         if (e.lastStatus) keys.lastOnboardStatus = e.lastStatus;
-        fs.writeFileSync(path.join(AGENTS_DIR, agentId, 'keys.json'), JSON.stringify(keys, null, 2)
-        , { mode: 0o600 });
-        fs.chmodSync(path.join(AGENTS_DIR, agentId, 'keys.json'), 0o600);
+        writeKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json'), keys);
         console.error(`\n⚠️  Partial state saved to keys.json`);
         console.error(`   The identity "${keys.identity}" may already exist on-chain.`);
         console.error(`   To check and recover: node src/cli.js recover ${agentId}`);
@@ -2884,7 +2879,7 @@ program
     // Load keys and register service on-platform
     const keysPath = path.join(agentDir, 'keys.json');
     if (!fs.existsSync(keysPath)) { console.error(`✗ keys.json not found for ${agentId}`); process.exit(1); }
-    const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+    const keys = readKeysFile(keysPath);
 
     const { J41Agent } = require('@junction41/sovagent-sdk');
     const agent = new J41Agent({
@@ -5435,7 +5430,7 @@ function loadAgentConfig(agentId) {
     if (fs.existsSync(configPath)) {
       config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
     } else {
-      const keys = JSON.parse(fs.readFileSync(path.join(agentDir, 'keys.json'), 'utf8'));
+      const keys = readKeysFile(path.join(agentDir, 'keys.json'), { allowLocked: true });
       if (keys.executor) config = keys;
     }
   } catch {
@@ -5774,7 +5769,7 @@ async function startJobContainer(state, job, agentInfo) {
   let signerHost = null;
   let signerTeardown = null;
   let egressToken;
-  const hostKeys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+  const hostKeys = readKeysFile(keysPath);
 
   // Audit C3: mounting the agent's private key inside a prompt-injectable job
   // container that has network egress let untrusted in-container code read it
@@ -6582,7 +6577,7 @@ program
         process.exit(1);
       }
 
-      const keys = JSON.parse(fs.readFileSync(keysPath, 'utf-8'));
+      const keys = readKeysFile(keysPath);
       const { J41Agent } = require('@junction41/sovagent-sdk');
       const agent = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif, identityName: keys.identity, iAddress: keys.iAddress });
       await agent.authenticate();
@@ -6778,7 +6773,7 @@ async function mainMenu() {
     if (fs.existsSync(AGENTS_DIR)) {
       const dirs = fs.readdirSync(AGENTS_DIR).filter(d => fs.existsSync(path.join(AGENTS_DIR, d, 'keys.json'))).sort();
       for (const dir of dirs) {
-        const keys = JSON.parse(fs.readFileSync(path.join(AGENTS_DIR, dir, 'keys.json'), 'utf8'));
+        const keys = readKeysFile(path.join(AGENTS_DIR, dir, 'keys.json'), { allowLocked: true });
         agents.push({ id: dir, identity: keys.identity || '(not registered)', iAddress: keys.iAddress || '-', address: keys.address });
       }
     }
@@ -6831,7 +6826,7 @@ async function mainMenu() {
 
   async function editAgentProfile(agent) {
     const keysPath = path.join(AGENTS_DIR, agent.id, 'keys.json');
-    const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+    const keys = readKeysFile(keysPath);
     const soulPath = path.join(AGENTS_DIR, agent.id, 'SOUL.md');
     const soul = fs.existsSync(soulPath) ? fs.readFileSync(soulPath, 'utf-8').trim() : '';
 
@@ -6856,7 +6851,7 @@ async function mainMenu() {
 
   async function viewAgentProfile(agent) {
     const keysPath = path.join(AGENTS_DIR, agent.id, 'keys.json');
-    const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+    const keys = readKeysFile(keysPath, { allowLocked: true });
 
     if (!keys.identity || !keys.iAddress) {
       console.log('\n  Agent not registered on-chain yet.\n');
@@ -6903,7 +6898,7 @@ async function mainMenu() {
 
   async function registerAgentIdentity(agent) {
     const keysPath = path.join(AGENTS_DIR, agent.id, 'keys.json');
-    const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+    const keys = readKeysFile(keysPath);
 
     if (keys.identity && keys.iAddress) {
       console.log(`\n  Already registered: ${keys.identity} (${keys.iAddress})\n`);
@@ -6929,7 +6924,7 @@ async function mainMenu() {
 
   async function publishVdxfUpdate(agent) {
     const keysPath = path.join(AGENTS_DIR, agent.id, 'keys.json');
-    const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+    const keys = readKeysFile(keysPath);
     const profilePath = path.join(AGENTS_DIR, agent.id, 'profile.json');
 
     if (!keys.identity || !keys.iAddress) {
