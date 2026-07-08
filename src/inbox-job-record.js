@@ -237,7 +237,23 @@ async function verifyInboxJobRecord({
   const inboxRecord = decodeInboxJobRecord(inboxItemDetail.vdxfData);
 
   // ── Resolve jobId ────────────────────────────────────────────────────────────
-  const jobId = resolveJobId(inboxItemDetail);
+  // Primary: inboxItemDetail.jobDetails.id. Fallback: the platform sometimes
+  // serves jobDetails=null (confirmed live 2026-07-08); resolve the job UUID from
+  // the item's jobHash via getJobByHash. Security is unaffected — jobId only
+  // selects WHICH authoritative witness to cross-check against; a wrong hash
+  // yields a mismatching witness and crossCheckInboxVsWitness refuses below.
+  let jobId;
+  try {
+    jobId = resolveJobId(inboxItemDetail);
+  } catch (e) {
+    const jobHash = inboxItemDetail && inboxItemDetail.jobHash;
+    if (!jobHash || !client || typeof client.getJobByHash !== 'function') throw e;
+    const jr = await client.getJobByHash(jobHash);
+    const job = (jr && jr.data) || jr;
+    const id = job && job.id;
+    if (typeof id !== 'string' || id.length === 0) throw e;
+    jobId = id;
+  }
 
   // ── Fetch the authoritative platform witness ──────────────────────────────────
   let authRecord, authWitness;

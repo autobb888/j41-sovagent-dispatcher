@@ -391,3 +391,25 @@ test('verifyInboxJobRecord: mainnet, verified=true, cross-check passes — succe
   const result = await verifyInboxJobRecord(ctx);
   assert.ok(result === undefined || result === null);
 });
+
+test('verifyInboxJobRecord: jobDetails=null → resolves jobId via client.getJobByHash', async () => {
+  const base = makeCtx();
+  let hashUsed = null;
+  const inboxItemDetail = {
+    id: 'inbox-item-1',
+    jobDetails: null,
+    jobHash: 'hash-abc',
+    vdxfData: base.inboxItemDetail.vdxfData,
+  };
+  const client = { getJobByHash: async (h) => { hashUsed = h; return { data: { id: JOB_ID } }; } };
+  const result = await verifyInboxJobRecord({ ...base, inboxItemDetail, client });
+  assert.equal(hashUsed, 'hash-abc');
+  assert.ok(result === undefined || result === null);
+});
+
+test('verifyInboxJobRecord: jobDetails=null and getJobByHash yields no id → throws (fail-closed)', async () => {
+  const base = makeCtx();
+  const inboxItemDetail = { id: 'x', jobDetails: null, jobHash: 'h', vdxfData: base.inboxItemDetail.vdxfData };
+  const client = { getJobByHash: async () => ({ data: {} }) };
+  await assert.rejects(verifyInboxJobRecord({ ...base, inboxItemDetail, client }));
+});
