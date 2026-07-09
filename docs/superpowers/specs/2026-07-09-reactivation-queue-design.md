@@ -19,7 +19,7 @@ On pause, **free the container entirely** (0 CPU, 0 RAM, slot released) and move
 
 - **Stateless respawn (A).** Conversation/job state lives platform-side; a fresh worker reloads it on boot (re-auth, `connectChat`, reload messages). Killing + respawning the container loses nothing. *This is the linchpin — the plan must verify the respawned worker fully reloads context.*
 - **Free + queue + respawn (Y).** Not throttle-in-place. Kill on pause; respawn on resume. (A future "throttle tier" for instant resume of recently-paused jobs is a clean add-on — explicitly out of scope here.)
-- **Reuse `MAX_AGENTS` as the capacity gate.** Resumed and new jobs draw from the same fixed slot budget. Fixed per-container `2GB / 1 CPU` means the slot count already maps to hardware; no CPU/RAM watermarks.
+- **`MAX_AGENTS` is the capacity gate, auto-sized from hardware (conservative).** Resumed and new jobs draw from the same slot budget. When `max_concurrent` is unset/`0`, the dispatcher **derives** it from the box instead of defaulting to unlimited (unlimited × 2GB OOMs a stranger's machine — unacceptable for a download-and-run product): `max = floor((os.totalmem() − hostReserve) / perContainerMem)`, also bounded by `os.cpus().length − coreReserve`. Conservative reserve (generous host headroom) is the default; an explicit operator `max_concurrent` overrides but **warns** if it exceeds the safe estimate. Per-container size stays `2GB / 1 CPU` for launch.
 - **Resumed jobs get slot priority** over new jobs from `state.queue`.
 - **Full-box resume waits in the priority queue** (no reserved headroom). A `reserve_resume_slots` knob is a later tunable, out of scope.
 - **`pause_ttl` keeps running while queued;** expiry auto-cancels/refunds exactly as today, just applied to a queued job.
@@ -58,6 +58,11 @@ Respawn calls the existing `startJob(state, job, agentInfo)` / `startJobContaine
 ### Persistence + restart
 `reactivation-queue.json` is written on every mutation (enqueue, mark-ready, dequeue) and loaded at startup. On restart, queued jobs are **restored to `state.reactivationQueue`** (still paused, awaiting resume) — they are **excluded from the crash-recovery refund sweep** (`cli.js:4561`), which must continue to refund only genuinely-orphaned *active* jobs.
 
+### Hardware auto-sizing + OOM safety valve (launch scope)
+Reuses the hardware read already present in `control.js:360-363` (`os.cpus()`/`os.totalmem()`/`os.freemem()`).
+- **Startup auto-size:** if `config.runtime.max_concurrent` is unset/`0`, compute the conservative `MAX_AGENTS` (above) instead of `Infinity`. Print one clear first-run line: `Detected <RAM> / <cores> → capacity <N> agents (2GB each, <reserve> host reserve). Override with max_concurrent in config.` so a non-expert operator immediately understands what their machine will do.
+- **Runtime safety valve:** before every spawn/respawn, if `os.freemem()` < `perContainerMem + margin`, do **not** spawn — leave the job queued and retry next scheduler pass. Defense-in-depth against OOM when other host processes consume RAM; the count gate stays primary.
+
 ### `pause_ttl` while queued
 The existing TTL check (`cli.js:4987`) is extended to scan `state.reactivationQueue`: for each entry, if `now - pausedAt >= pauseTtlMin` → auto-cancel/refund and remove from the queue (same platform semantics as today). A queued job that exceeds its TTL never respawns.
 
@@ -87,6 +92,13 @@ The existing TTL check (`cli.js:4987`) is extended to scan `state.reactivationQu
 - **Persistence/restart:** enqueue → simulate restart (reload) → queue restored; crash-recovery refund sweep does **not** refund queued jobs.
 - **Idempotent resume:** duplicate resume signals → exactly one respawn.
 - **Stateless respawn (integration/live):** pause a real chat job, resume it, assert the respawned worker reconnects and continues the same conversation (the live proof; unit tests cover the scheduling/queue logic).
+
+## Deferred — later layers (explicitly NOT in this launch)
+Keep the launch tight; these come after people are using it:
+- A `dispatcher doctor` / `resources` command (detected hardware, capacity, live usage, queue depth). Observability, not launch-blocking.
+- Configurable per-container size (`container_memory_mb`/`container_cpus`) + `balanced`/`aggressive` auto-size profiles. Ship conservative + fixed 2GB/1CPU first.
+- Reserved resume headroom (`reserve_resume_slots`), a throttle-in-place tier for instant resume of recently-paused jobs, and per-agent heterogeneous resource profiles.
+- CPU/RAM watermarks as a *primary* gate (the count + freemem valve suffices at fixed sizing).
 
 ## Global constraints
 
