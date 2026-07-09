@@ -122,6 +122,10 @@ async function withRetry(fn, label, { maxAttempts = 3, baseDelayMs = 1000 } = {}
 let _agent = null;
 let _executor = null;
 let _paused = false;
+// Set when the job ended in a NON-DELIVERABLE state (paused/terminal): main()
+// skips STEP 3 delivery so the worker never fatal-crashes trying to deliver a
+// job the platform won't accept (a paused job returns INVALID_STATUS).
+let _skipDelivery = false;
 let _lastActivityAt = Date.now();
 let _postDeliveryHandler = null;
 let _workspaceConnected = false;
@@ -482,6 +486,16 @@ async function main() {
   // ─────────────────────────────────────────
   // STEP 3: DELIVER RESULT
   // ─────────────────────────────────────────
+  if (_skipDelivery) {
+    // The job ended in a non-deliverable state (paused/terminal). Skip delivery
+    // and the post-delivery wait; tear down and exit cleanly. The dispatcher's
+    // pause/reactivate/TTL lifecycle owns what happens next.
+    log.info('Job not deliverable — skipping delivery + post-delivery wait', { jobId: JOB_ID });
+    try { clearInterval(_ipcPoller); } catch {}
+    disconnectWorkspace();
+    await performCleanup(agent, keys, fullJob, { reason: 'not-deliverable' }, signer).catch(() => {});
+    return;
+  }
   log.info('Delivering result', { jobId: JOB_ID });
   // Strip canary token from deliverable content before sending to platform
   if (CANARY_TOKEN && result.content) {
@@ -495,12 +509,26 @@ async function main() {
   }
   const brokered = await signer.signDeliver({ jobId: job.id, jobHash: fullJob.jobHash, deliveryHash: deliverHash });
 
-  await withRetry(
-    () => agent.client.deliverJob(job.id, deliverHash, brokered.signature, brokered.timestamp, result.content.substring(0, 200)),
-    'deliverJob',
-    { maxAttempts: 5, baseDelayMs: 2000 }
-  );
-  log.info('Job delivered', { jobId: JOB_ID, hash: deliverHash });
+  try {
+    await withRetry(
+      () => agent.client.deliverJob(job.id, deliverHash, brokered.signature, brokered.timestamp, result.content.substring(0, 200)),
+      'deliverJob',
+      { maxAttempts: 5, baseDelayMs: 2000 }
+    );
+    log.info('Job delivered', { jobId: JOB_ID, hash: deliverHash });
+  } catch (e) {
+    // Safety net (defense-in-depth): a paused / otherwise non-deliverable job
+    // returns INVALID_STATUS. NEVER fatal-crash on it — tear down and exit
+    // cleanly; the dispatcher's pause/TTL lifecycle owns the eventual outcome.
+    if (e.code === 'INVALID_STATUS' || /Cannot deliver job in status/.test(e.message || '')) {
+      log.warn('Job not in a deliverable state at delivery — exiting cleanly without delivering', { jobId: JOB_ID, error: e.message });
+      try { clearInterval(_ipcPoller); } catch {}
+      disconnectWorkspace();
+      await performCleanup(agent, keys, fullJob, { reason: 'not-deliverable' }, signer).catch(() => {});
+      return;
+    }
+    throw e;
+  }
 
   // Signal workspace done to buyer
   if (_workspaceConnected) {
@@ -816,11 +844,31 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
         if (process.send) process.send({ type: 'job_idle', jobId: job.id });
         log.info('Session paused', { jobId: job.id });
       } catch (err) {
-        // If pause fails (job already delivered/completed by backend), end session
+        // pauseJob is rejected with "Only in-progress jobs can be paused" in TWO
+        // opposite situations: the job is ALREADY PAUSED (the platform paused us
+        // first on idle) OR it is terminal (delivered/completed/cancelled). These
+        // need opposite handling and must NEVER end in a delivery of a paused job
+        // (that returns INVALID_STATUS and used to fatal-crash the worker). Re-fetch
+        // the authoritative status to decide.
         if (err.message?.includes('cannot be paused') || err.message?.includes('Only in-progress')) {
-          log.warn('Pause rejected, ending session', { jobId: job.id, error: err.message });
-          _paused = true; // Stop retrying
-          if (resolveSession) resolveSession('backend-ended');
+          let curStatus;
+          try { curStatus = (await agent.client.getJob(job.id))?.status; } catch { /* best-effort */ }
+          if (curStatus === 'paused') {
+            // Keep-alive model: the platform paused us on idle. Stay alive & paused —
+            // the dispatcher tracks it (job_idle), sends a 'reconnect' IPC on resume,
+            // or an end_session on pause_ttl. Do NOT deliver and do NOT end the
+            // session here.
+            _paused = true; // stops the idle timer from re-requesting a pause
+            if (process.send) process.send({ type: 'job_idle', jobId: job.id });
+            log.info('Job paused by platform on idle — staying paused (awaiting resume/TTL)', { jobId: job.id });
+          } else {
+            // Terminal / not-deliverable — nothing to deliver. End the session and
+            // flag main() to skip delivery so we exit cleanly instead of crashing.
+            log.warn('Pause rejected and job is not deliverable — ending without delivery', { jobId: job.id, status: curStatus || 'unknown', error: err.message });
+            _paused = true;
+            _skipDelivery = true;
+            if (resolveSession) resolveSession('backend-ended');
+          }
         }
       }
     }
