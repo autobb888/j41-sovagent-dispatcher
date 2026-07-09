@@ -48,6 +48,12 @@ COPY src/container-entry.sh ./
 # these aren't present.
 COPY src/sign-channel-client.js ./
 COPY src/job-signer.js ./
+# Token-budget math + broker executors — required by job-agent.js (lazy
+# require at runtime: token budget derivation / extension pricing, and the
+# broker executor surface). Missing these crashes the worker at module load
+# when those code paths run (after auth, before chat).
+COPY src/token-budget.js ./
+COPY src/broker-executors.js ./
 RUN chmod +x container-entry.sh
 
 # ─────────────────────────────────────────

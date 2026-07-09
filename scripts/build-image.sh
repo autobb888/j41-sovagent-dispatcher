@@ -57,6 +57,10 @@ cp "$DISPATCHER_DIR/src/job-signer.js" .build-temp/src/
 # Egress-proxy client — required by job-agent.js to route fetch through the
 # host egress proxy (undici ProxyAgent). Must be in the image.
 cp "$DISPATCHER_DIR/src/egress-proxy-client.js" .build-temp/src/
+# Token-budget math + broker executors — required by job-agent.js at runtime
+# (lazy require). Missing these crashes the worker at module load.
+cp "$DISPATCHER_DIR/src/token-budget.js" .build-temp/src/
+cp "$DISPATCHER_DIR/src/broker-executors.js" .build-temp/src/
 cp "$DISPATCHER_DIR/src/executors/"*.js .build-temp/src/executors/
 cp "$DISPATCHER_DIR/Dockerfile.job-agent" .build-temp/Dockerfile
 
