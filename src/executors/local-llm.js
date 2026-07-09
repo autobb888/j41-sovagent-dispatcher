@@ -108,9 +108,11 @@ class LocalLLMExecutor extends Executor {
       'When you believe the work is complete, say so clearly.',
     ].join('\n');
 
-    // Skip greeting on reconnect — buyer already got a greeting from a previous container
+    // Skip greeting on reconnect — buyer already got a greeting from a previous container.
+    // Fetch and seed prior conversation history so the LLM has context on cold respawn.
     if (options.isReconnect) {
       console.log(`[CHAT] Skipping greeting (reconnect — job already in_progress)`);
+      await this._seedHistoryFromPlatform(job.id, agent);
       return;
     }
 
@@ -133,6 +135,44 @@ class LocalLLMExecutor extends Executor {
     agent.sendChatMessage(job.id, greeting);
     this.conversationLog.push({ role: 'assistant', content: greeting });
     console.log(`[CHAT] Sent greeting`);
+  }
+
+  /**
+   * Seed conversationLog from a flat array of platform ChatMessage objects.
+   * Called internally by _seedHistoryFromPlatform; also exported for unit tests.
+   *
+   * @param {Array<{senderVerusId: string, content: string, type?: string}>} messages
+   *   Ordered oldest-first (as returned by getChatMessages).
+   * @param {string} agentId  Agent's iAddress (identifies 'assistant' turns).
+   * @param {string} [agentName] Agent's identityName (secondary match).
+   */
+  seedConversationLog(messages, agentId, agentName) {
+    let seeded = 0;
+    for (const m of messages) {
+      // Skip platform system/notification messages — they're not part of the conversation.
+      if (m.type === 'system') continue;
+      const isAgent =
+        (agentId && m.senderVerusId === agentId) ||
+        (agentName && m.senderVerusId === agentName);
+      this.conversationLog.push({ role: isAgent ? 'assistant' : 'user', content: m.content });
+      seeded++;
+    }
+    return seeded;
+  }
+
+  /**
+   * Fetch prior messages from the platform REST API and seed conversationLog.
+   * Non-fatal: if the fetch fails, logs a warning and continues with empty context.
+   */
+  async _seedHistoryFromPlatform(jobId, agent) {
+    try {
+      const histRes = await agent.client.getChatMessages(jobId, { limit: 100 });
+      const msgs = histRes.data || [];
+      const seeded = this.seedConversationLog(msgs, agent.iAddress, agent.identityName);
+      console.log(`[CHAT] Seeded ${seeded} prior message(s) into conversation context`);
+    } catch (e) {
+      console.warn(`[CHAT] Could not fetch message history (${e.message}) — continuing with empty context`);
+    }
   }
 
   async handleMessage(message, meta) {
