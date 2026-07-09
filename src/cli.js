@@ -78,9 +78,14 @@ const J41_API_URL = cfg.platform.api_url;
 const J41_NETWORK = cfg.platform.network;
 const IS_MAINNET = resolveIsMainnet(fileConfiguredNetwork(), J41_NETWORK);
 const _cfg = loadConfig();
-const MAX_AGENTS = cfg.runtime.max_concurrent > 0
+const { computeMaxAgents, capacityLine, DEFAULTS: SIZING_DEFAULTS } = require('./hardware-sizing.js');
+
+const _explicitMax = cfg.runtime.max_concurrent > 0
   ? cfg.runtime.max_concurrent
-  : (_cfg.maxConcurrent ? parseInt(_cfg.maxConcurrent) : Infinity);
+  : (_cfg.maxConcurrent ? parseInt(_cfg.maxConcurrent) : 0);
+const _autoMax = computeMaxAgents({ totalMemBytes: os.totalmem(), cpuCount: os.cpus().length });
+const MAX_AGENTS = _explicitMax > 0 ? _explicitMax : _autoMax;
+const MAX_AGENTS_AUTO = _explicitMax <= 0; // true when we derived it
 const JOB_TIMEOUT_MS = (_cfg.jobTimeoutMin || 60) * 60 * 1000;
 const MAX_RETRIES = 2;
 const SEEN_JOBS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -3036,7 +3041,18 @@ program
 
     console.log(`Runtime: ${RUNTIME} mode`);
     console.log(`Registered agents: ${agents.length}`);
-    console.log(`Max concurrent: ${MAX_AGENTS === Infinity ? 'unlimited' : MAX_AGENTS}`);
+    console.log(`Max concurrent: ${MAX_AGENTS_AUTO ? `${MAX_AGENTS} (auto)` : MAX_AGENTS}`);
+    if (MAX_AGENTS_AUTO) {
+      console.log(capacityLine({
+        totalMemBytes: os.totalmem(),
+        cpuCount: os.cpus().length,
+        maxAgents: MAX_AGENTS,
+        perContainerMemBytes: SIZING_DEFAULTS.perContainerMemBytes,
+        hostReserveBytes: Math.max(SIZING_DEFAULTS.minHostReserveBytes, Math.floor(os.totalmem() * SIZING_DEFAULTS.hostReserveFraction)),
+      }));
+    } else if (_autoMax < _explicitMax) {
+      console.log(`⚠️  max_concurrent=${_explicitMax} exceeds the safe estimate for this box (${_autoMax}); you may OOM under load.`);
+    }
     console.log(`Job timeout: ${JOB_TIMEOUT_MS / 60000} min`);
     if (RUNTIME === 'docker') {
       console.log(`Keep containers: ${cfg.runtime.keep_containers ? 'ON (debug)' : 'OFF'}`);
