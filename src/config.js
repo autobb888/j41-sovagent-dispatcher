@@ -9,6 +9,7 @@ const os = require('os');
 const DISPATCHER_DIR = path.join(os.homedir(), '.j41', 'dispatcher');
 const CONFIG_PATH = path.join(DISPATCHER_DIR, 'config.json');
 const ACTIVE_JOBS_PATH = path.join(DISPATCHER_DIR, 'active-jobs.json');
+const REACTIVATION_QUEUE_PATH = path.join(DISPATCHER_DIR, 'reactivation-queue.json');
 
 const DEFAULTS = {
   runtime: 'docker',
@@ -73,12 +74,37 @@ function loadActiveJobs() {
   return {};
 }
 
+function persistReactivationQueue(arr) {
+  try {
+    fs.mkdirSync(DISPATCHER_DIR, { recursive: true });
+    const tmp = REACTIVATION_QUEUE_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(arr || [], null, 2));
+    fs.renameSync(tmp, REACTIVATION_QUEUE_PATH); // atomic replace
+  } catch (e) {
+    console.error(`[config] Failed to persist reactivation queue: ${e.message}`);
+  }
+}
+
+function loadReactivationQueue() {
+  try {
+    if (!fs.existsSync(REACTIVATION_QUEUE_PATH)) return [];
+    const raw = JSON.parse(fs.readFileSync(REACTIVATION_QUEUE_PATH, 'utf-8'));
+    return Array.isArray(raw) ? raw : [];
+  } catch (e) {
+    console.error(`[config] Failed to load reactivation queue (starting empty): ${e.message}`);
+    return [];
+  }
+}
+
 module.exports = {
   CONFIG_PATH,
   ACTIVE_JOBS_PATH,
+  REACTIVATION_QUEUE_PATH,
   loadConfig,
   saveConfig,
   getRuntime,
   persistActiveJobs,
   loadActiveJobs,
+  persistReactivationQueue,
+  loadReactivationQueue,
 };
