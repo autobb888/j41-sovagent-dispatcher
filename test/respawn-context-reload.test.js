@@ -88,6 +88,30 @@ test('seedConversationLog: preserves message order (oldest first)', () => {
   assert.deepStrictEqual(ex.conversationLog.map(m => m.role), ['user', 'assistant', 'user']);
 });
 
+test('seedConversationLog: sorts unordered (out-of-order createdAt) oldest-first', () => {
+  const ex = new LocalLLMExecutor();
+  const msgs = [
+    { senderVerusId: BUYER_ID, content: 'Third', type: 'text', createdAt: '2026-07-09T10:03:00Z' },
+    { senderVerusId: BUYER_ID, content: 'First', type: 'text', createdAt: '2026-07-09T10:01:00Z' },
+    { senderVerusId: AGENT_IADDRESS, content: 'Second', type: 'text', createdAt: '2026-07-09T10:02:00Z' },
+  ];
+  ex.seedConversationLog(msgs, AGENT_IADDRESS, AGENT_NAME);
+  assert.deepStrictEqual(ex.conversationLog.map(m => m.content), ['First', 'Second', 'Third']);
+  assert.deepStrictEqual(ex.conversationLog.map(m => m.role), ['user', 'assistant', 'user']);
+});
+
+test('seedConversationLog: skips file-type messages', () => {
+  const ex = new LocalLLMExecutor();
+  const msgs = [
+    { senderVerusId: BUYER_ID, content: 'https://opaque/file/id', type: 'file', createdAt: '2026-07-09T10:00:00Z' },
+    { senderVerusId: BUYER_ID, content: 'Please review', type: 'text', createdAt: '2026-07-09T10:01:00Z' },
+  ];
+  const count = ex.seedConversationLog(msgs, AGENT_IADDRESS, AGENT_NAME);
+  assert.strictEqual(count, 1);
+  assert.strictEqual(ex.conversationLog.length, 1);
+  assert.strictEqual(ex.conversationLog[0].content, 'Please review');
+});
+
 test('seedConversationLog: empty message list → empty conversationLog', () => {
   const ex = new LocalLLMExecutor();
   const count = ex.seedConversationLog([], AGENT_IADDRESS, AGENT_NAME);

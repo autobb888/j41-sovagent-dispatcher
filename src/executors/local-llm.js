@@ -141,16 +141,23 @@ class LocalLLMExecutor extends Executor {
    * Seed conversationLog from a flat array of platform ChatMessage objects.
    * Called internally by _seedHistoryFromPlatform; also exported for unit tests.
    *
-   * @param {Array<{senderVerusId: string, content: string, type?: string}>} messages
-   *   Ordered oldest-first (as returned by getChatMessages).
+   * @param {Array<{senderVerusId: string, content: string, type?: string, createdAt?: string}>} messages
+   *   Platform ChatMessage list. Sorted oldest-first defensively before seeding —
+   *   the backend's ORDER BY for GET /v1/jobs/:id/messages is undocumented, so a
+   *   newest-first response would otherwise invert the conversation.
    * @param {string} agentId  Agent's iAddress (identifies 'assistant' turns).
    * @param {string} [agentName] Agent's identityName (secondary match).
    */
   seedConversationLog(messages, agentId, agentName) {
+    // Defensive oldest-first sort by createdAt (guarantees correct order
+    // regardless of backend sort, for conversations up to the fetch limit).
+    const ordered = (messages || []).slice()
+      .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
     let seeded = 0;
-    for (const m of messages) {
-      // Skip platform system/notification messages — they're not part of the conversation.
-      if (m.type === 'system') continue;
+    for (const m of ordered) {
+      // Skip platform system/notification and file messages — the former aren't
+      // part of the conversation; the latter carry an opaque URL/ID, not text.
+      if (m.type === 'system' || m.type === 'file') continue;
       const isAgent =
         (agentId && m.senderVerusId === agentId) ||
         (agentName && m.senderVerusId === agentName);
@@ -172,6 +179,10 @@ class LocalLLMExecutor extends Executor {
       console.log(`[CHAT] Seeded ${seeded} prior message(s) into conversation context`);
     } catch (e) {
       console.warn(`[CHAT] Could not fetch message history (${e.message}) — continuing with empty context`);
+      // Tell the buyer so a resumed agent doesn't appear to have silent amnesia.
+      try {
+        agent.sendChatMessage(jobId, 'Resuming this job — my earlier conversation history was temporarily unavailable, please recap if needed.');
+      } catch {}
     }
   }
 
