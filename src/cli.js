@@ -4425,7 +4425,7 @@ async function moveJobToReactivationQueue(state, jobId, { persist = true } = {})
     persistReactivationQueue(state.reactivationQueue);
     persistActiveJobs(state.active);
   }
-  console.log(`[Reactivation] Job ${jobId.substring(0, 8)} paused → container freed, queued (active=${state.active.size}, queued=${state.reactivationQueue.length})`);
+  console.log(`[Reactivation] Job ${jobId.substring(0, 8)} paused → container freed, queued (active=${state.active.size}/${MAX_AGENTS}, queued=${state.reactivationQueue.length})`);
   return true;
 }
 
@@ -5392,7 +5392,8 @@ async function handleWebhookEvent(state, agentId, payload) {
       const pauseReason = data?.auto ? ` (auto: ${data.reason || 'idle'})` : '';
       console.log(`[Webhook] Job ${jobId?.substring(0, 8)} paused${pauseReason}`);
       const pauseInfo = state.active.get(jobId);
-      if (pauseInfo && !pauseInfo.paused) {
+      if (pauseInfo && !pauseInfo.paused && !pauseInfo._pausing) {
+        pauseInfo._pausing = true;   // synchronous guard — survives the await yields below
         // For free-lifecycle agents, auto-extend to resume before tearing down
         if (data?.auto && pauseInfo.reactivationFee === 0) {
           try {
@@ -6482,8 +6483,6 @@ async function startJobLocal(state, job, agentInfo) {
       agentInfo,
       workspaceNotified: false,
       workspaceChecked: false,
-      paused: false,
-      pausedAt: null,
       pauseTTL: job.lifecycle?.pauseTTL || 60,
       pauseTtlMin: job.lifecycle?.pauseTTL || 60,
       jobAmount: job.amount || 0,
