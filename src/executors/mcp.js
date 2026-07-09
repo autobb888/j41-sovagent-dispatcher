@@ -47,7 +47,7 @@ class MCPExecutor extends Executor {
     this.workspaceHandler = null;
   }
 
-  async init(job, agent, soulPrompt) {
+  async init(job, agent, soulPrompt, options = {}) {
     if (!MCP_COMMAND && !MCP_URL) {
       throw new Error('J41_MCP_COMMAND or J41_MCP_URL is required for mcp executor');
     }
@@ -97,6 +97,17 @@ class MCPExecutor extends Executor {
       "Use tools when needed to fulfill the buyer's request.",
       'Respond helpfully and concisely.',
     ].join('\n');
+
+    // Minor 5: on reconnect, skip the greeting (buyer already received one from the
+    // prior container) and send a non-fatal amnesia notice instead of silently
+    // producing an amnesiac agent. Full history reload is deferred to a later pass.
+    if (options.isReconnect) {
+      console.log(`[MCP] Skipping greeting (reconnect — job already in_progress)`);
+      try {
+        agent.sendChatMessage(job.id, 'Resuming this job — my earlier conversation history was temporarily unavailable, please recap if needed.');
+      } catch {}
+      return;
+    }
 
     const greeting = `Hello! I've accepted your job: "${this.safeDescription.substring(0, 100)}". I have ${this.tools.length} tools available to help. How can I assist you?`;
     agent.sendChatMessage(job.id, greeting);
