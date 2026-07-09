@@ -18,7 +18,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
-const { getRuntime, persistActiveJobs, loadActiveJobs, saveConfig, loadConfig } = require('./config');
+const { getRuntime, persistActiveJobs, loadActiveJobs, saveConfig, loadConfig, persistReactivationQueue, loadReactivationQueue } = require('./config');
+const rq = require('./reactivation-queue.js');
 const log = require('./logger');
 const { loadDispatcherConfig, fileConfiguredNetwork } = require('./config-loader.js');
 const { SignChannelHost } = require('./sign-channel-host.js');
@@ -3114,6 +3115,7 @@ program
     const state = {
       agents: [...readyAgents], // all registered agents (never modified)
       active: new Map(), // jobId -> { agentId, container, startedAt, retries }
+      reactivationQueue: [], // paused jobs waiting to respawn
       available: [...readyAgents], // pool of idle agents
       queue: [], // pending jobs
       seen: loadSeenJobs(), // completed/claimed jobs with timestamps (Map<jobId, timestamp>)
@@ -4396,6 +4398,37 @@ function sendToJobAgent(activeInfo, msg) {
   return false;
 }
 
+// Free a paused job's container and move it to the reactivation queue. The
+// container is torn down (0 CPU/RAM/slot); the job waits in the queue until the
+// buyer resumes (respawn) or pause_ttl expires (refund). Reuses the job's
+// stored info from state.active.
+async function moveJobToReactivationQueue(state, jobId, { persist = true } = {}) {
+  const info = state.active.get(jobId);
+  if (!info) return false;
+  try {
+    if (info.container) {
+      await info.container.stop().catch(() => {});
+      await info.container.remove().catch(() => {});
+    } else if (info.process) {
+      try { info.process.kill(); } catch {}
+    }
+  } catch { /* best-effort teardown; state is platform-side */ }
+  state.active.delete(jobId);
+  rq.enqueue(state.reactivationQueue, {
+    job: info.job || { id: jobId },
+    agentId: info.agentId,
+    pausedAt: Date.now(),
+    pauseTtlMin: info.pauseTtlMin || 60,
+    readyToRespawn: false,
+  });
+  if (persist) {
+    persistReactivationQueue(state.reactivationQueue);
+    persistActiveJobs(state.active);
+  }
+  console.log(`[Reactivation] Job ${jobId.substring(0, 8)} paused → container freed, queued (active=${state.active.size}, queued=${state.reactivationQueue.length})`);
+  return true;
+}
+
 /**
  * VDXF Policy Check: verify agent has workspace.capability on-chain before
  * forwarding workspace_ready to job-agent. Returns true if allowed.
@@ -5360,11 +5393,7 @@ async function handleWebhookEvent(state, agentId, payload) {
       console.log(`[Webhook] Job ${jobId?.substring(0, 8)} paused${pauseReason}`);
       const pauseInfo = state.active.get(jobId);
       if (pauseInfo && !pauseInfo.paused) {
-        pauseInfo.paused = true;
-        pauseInfo.pausedAt = Date.now();
-        pauseInfo.pauseCount = (pauseInfo.pauseCount || 0) + 1;
-        state.available.push(pauseInfo.agentInfo);
-        // For free-lifecycle agents, auto-extend to resume
+        // For free-lifecycle agents, auto-extend to resume before tearing down
         if (data?.auto && pauseInfo.reactivationFee === 0) {
           try {
             const agentSession = await getAgentSession(state, pauseInfo.agentInfo);
@@ -5375,6 +5404,7 @@ async function handleWebhookEvent(state, agentId, payload) {
             console.warn(`[Webhook] Auto-extend failed: ${extErr.message}`);
           }
         }
+        await moveJobToReactivationQueue(state, jobId);
       }
       break;
     }
@@ -6049,6 +6079,7 @@ async function startJobContainer(state, job, agentInfo) {
     
     state.active.set(job.id, {
       agentId: agentInfo.id,
+      job,
       container,
       startedAt: Date.now(),
       agentInfo,
@@ -6061,6 +6092,7 @@ async function startJobContainer(state, job, agentInfo) {
       reworkCount: 0,
       reactivationFee: job.lifecycle?.reactivationFee ?? null,
       pauseCount: 0,
+      pauseTtlMin: job.lifecycle?.pauseTTL || 60,
       // Broker-mode resources — tracked here so stopJobContainer can tear them down.
       _signerHost: signerHost,
       _signerChannelDir: signerChannelDir,
@@ -6398,15 +6430,7 @@ async function startJobLocal(state, job, agentInfo) {
         const info = state.active.get(msg.jobId);
         // Guard: don't re-pause if a resume webhook already cleared it (race condition)
         if (info && !info.paused && !info.resumedAt) {
-          info.paused = true;
-          info.pausedAt = Date.now();
-          info.pauseTTL = parseInt(env.PAUSE_TTL_MS || '3600000') / 60000;
-          // Free the agent slot
-          if (info.agentInfo && !state.available.some(a => a.id === info.agentInfo.id)) {
-            state.available.push(info.agentInfo);
-          }
-          console.log(`[IDLE] Job ${msg.jobId.substring(0, 8)} paused — agent slot freed`);
-          persistActiveJobs(state.active);
+          moveJobToReactivationQueue(state, msg.jobId).catch(e => console.error('[Reactivation] pause failed:', e.message));
         }
       }
       if (msg?.type === 'extension_needed') {
@@ -6451,6 +6475,7 @@ async function startJobLocal(state, job, agentInfo) {
 
     state.active.set(job.id, {
       agentId: agentInfo.id,
+      job,
       process: child,
       pid: child.pid,
       startedAt: Date.now(),
@@ -6460,6 +6485,7 @@ async function startJobLocal(state, job, agentInfo) {
       paused: false,
       pausedAt: null,
       pauseTTL: job.lifecycle?.pauseTTL || 60,
+      pauseTtlMin: job.lifecycle?.pauseTTL || 60,
       jobAmount: job.amount || 0,
       buyerPayAddress: job.buyerPayAddress || job.buyer?.payAddress || null,
       currency: job.currency || 'VRSC',
@@ -7290,7 +7316,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
