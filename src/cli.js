@@ -4410,15 +4410,10 @@ function sendToJobAgent(activeInfo, msg) {
 async function moveJobToReactivationQueue(state, jobId, { persist = true } = {}) {
   const info = state.active.get(jobId);
   if (!info) return false;
-  try {
-    if (info.container) {
-      await info.container.stop().catch(() => {});
-      await info.container.remove().catch(() => {});
-    } else if (info.process) {
-      try { info.process.kill(); } catch {}
-    }
-  } catch { /* best-effort teardown; state is platform-side */ }
-  state.active.delete(jobId);
+  info._pausing = true; // guard: prevents cleanupCompletedJobs from respawning mid-teardown (I3)
+
+  // C1: enqueue + persist BEFORE touching the container so a crash at any point
+  // leaves the job safely recoverable (never active-only, never silently dropped).
   rq.enqueue(state.reactivationQueue, {
     job: info.job || { id: jobId },
     agentId: info.agentId,
@@ -4426,10 +4421,20 @@ async function moveJobToReactivationQueue(state, jobId, { persist = true } = {})
     pauseTtlMin: info.pauseTtlMin || 60,
     readyToRespawn: false,
   });
-  if (persist) {
-    persistReactivationQueue(state.reactivationQueue);
-    persistActiveJobs(state.active);
+  if (persist) persistReactivationQueue(state.reactivationQueue);
+
+  // Remove from active map and flush so active-jobs.json no longer lists it.
+  state.active.delete(jobId);
+  if (persist) persistActiveJobs(state.active);
+
+  // Best-effort teardown LAST — failure here cannot lose the job.
+  if (info.container) {
+    await info.container.stop().catch(() => {});
+    await info.container.remove().catch(() => {});
+  } else if (info.process) {
+    try { info.process.kill(); } catch {}
   }
+
   console.log(`[Reactivation] Job ${jobId.substring(0, 8)} paused → container freed, queued (active=${state.active.size}/${MAX_AGENTS}, queued=${state.reactivationQueue.length})`);
   return true;
 }
@@ -4453,10 +4458,20 @@ async function respawnReadyResumes(state, deps = {}) {
     rq.removeJob(state.reactivationQueue, entry.job.id);
     try {
       await startJobFn(state, entry.job, findAgent(entry.agentId));
+      // C2: startJobContainer swallows its own boot failures (catch ~6241 logs +
+      // returns agent to pool, does NOT rethrow). Verify placement explicitly so a
+      // silently-dropped boot doesn't lose the paid job.
+      if (!state.active.has(entry.job.id)) {
+        console.error(`[Reactivation] Respawn did not place ${entry.job.id.substring(0, 8)} — re-queuing`);
+        rq.enqueue(state.reactivationQueue, entry);
+        persistReactivationQueue(state.reactivationQueue);
+        break; // stop this pass; retry next cycle
+      }
       count++;
     } catch (e) {
       console.error(`[Reactivation] Respawn failed for ${entry.job.id.substring(0, 8)}: ${e.message} — re-queuing`);
       rq.enqueue(state.reactivationQueue, entry); // leave ready for the next pass
+      persistReactivationQueue(state.reactivationQueue);
       break; // avoid a tight failure loop
     }
   }
@@ -5156,6 +5171,11 @@ async function pollForJobs(state) {
 
   // Process queue if slots available (D3: re-queue on failure instead of dropping)
   while (state.queue.length > 0 && state.active.size < MAX_AGENTS && state.available.length > 0) {
+    // I4: OOM valve — guard every spawn path, not just respawns.
+    if (!hasMemoryHeadroom(os.freemem(), SIZING_DEFAULTS.perContainerMemBytes)) {
+      console.warn('[Scheduler] Low free memory — deferring new job start');
+      break;
+    }
     const queuedJob = state.queue.shift();
     const agent = state.available.pop();
     console.log(`   → Processing queued job ${queuedJob.id} with ${agent.id}`);
@@ -6703,6 +6723,10 @@ async function cleanupCompletedJobs(state) {
       }
     } else {
       // Docker mode
+      // I3: skip jobs mid-teardown (moveJobToReactivationQueue sets _pausing before
+      // deleting from active; the flag closes the race where cleanup sees a stopped
+      // container and tries to respawn a job that is already being paused).
+      if (active._pausing) continue;
       try {
         const container = docker.getContainer(`j41-job-${jobId}`);
         const info = await container.inspect();

@@ -37,3 +37,28 @@ test('does nothing when at capacity', async () => {
   const n = await respawnReadyResumes(state, { startJob: async () => { throw new Error('should not start'); }, findAgentById: () => ({}), maxAgents: 2 });
   assert.strictEqual(n, 0);
 });
+
+// C2 money-safety: startJobContainer swallows its own boot errors (returns without
+// adding the job to state.active). The placement check must detect this and re-queue
+// the entry so the paid job is not silently dropped.
+test('re-queues entry when startJob returns without placing the job in state.active', async () => {
+  const state = {
+    active: new Map(),
+    reactivationQueue: [
+      { job: { id: 'r1' }, agentId: 'a', pausedAt: 1000, pauseTtlMin: 60, readyToRespawn: true },
+    ],
+  };
+  const deps = {
+    // Simulates startJobContainer swallowing a boot failure: returns normally but
+    // never inserts into state.active.
+    startJob: async () => { /* no-op — job NOT placed */ },
+    findAgentById: () => ({ id: 'a' }),
+    maxAgents: 3,
+  };
+
+  const n = await respawnReadyResumes(state, deps);
+
+  assert.strictEqual(n, 0, 'count must be 0 — no successful placement');
+  assert.strictEqual(state.reactivationQueue.length, 1, 'entry must be re-queued');
+  assert.strictEqual(state.reactivationQueue[0].job.id, 'r1');
+});

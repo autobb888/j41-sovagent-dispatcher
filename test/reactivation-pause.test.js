@@ -46,3 +46,21 @@ test('pause on an unknown job is a no-op returning false', async () => {
   const state = fakeState();
   assert.strictEqual(await moveJobToReactivationQueue(state, 'ghost', { persist: false }), false);
 });
+
+// C1 money-safety: enqueue+persist BEFORE teardown — a stop() failure must NOT
+// prevent the job from being recorded in the reactivation queue and removed from active.
+test('enqueues and removes from active even when container.stop() throws', async () => {
+  const state = fakeState();
+  const container = {
+    stop: async () => { throw new Error('docker stop failed'); },
+    remove: async () => {},
+  };
+  state.active.set('j3', { agentId: 'agent-5', container, startedAt: 1, pauseTtlMin: 60 });
+
+  const ok = await moveJobToReactivationQueue(state, 'j3', { persist: false });
+
+  assert.strictEqual(ok, true);
+  assert.strictEqual(state.active.has('j3'), false, 'job must be removed from active map');
+  assert.strictEqual(state.reactivationQueue.length, 1, 'job must be in reactivation queue');
+  assert.strictEqual(state.reactivationQueue[0].job.id, 'j3');
+});
