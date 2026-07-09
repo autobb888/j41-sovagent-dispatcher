@@ -4429,6 +4429,32 @@ async function moveJobToReactivationQueue(state, jobId, { persist = true } = {})
   return true;
 }
 
+// Respawn buyer-resumed jobs from the reactivation queue, oldest-first, until
+// capacity is reached. deps.maxAgents defaults to the module MAX_AGENTS; injected
+// in tests. Reuses the normal startJob spawn path — the fresh worker reloads all
+// state from the platform (stateless respawn).
+async function respawnReadyResumes(state, deps = {}) {
+  const startJobFn = deps.startJob || startJob;
+  const findAgent = deps.findAgentById || ((id) => state.agents.find(a => a.id === id));
+  const cap = deps.maxAgents != null ? deps.maxAgents : MAX_AGENTS;
+  let count = 0;
+  while (state.active.size < cap) {
+    const entry = rq.nextReady(state.reactivationQueue);
+    if (!entry) break;
+    rq.removeJob(state.reactivationQueue, entry.job.id);
+    try {
+      await startJobFn(state, entry.job, findAgent(entry.agentId));
+      count++;
+    } catch (e) {
+      console.error(`[Reactivation] Respawn failed for ${entry.job.id.substring(0, 8)}: ${e.message} — re-queuing`);
+      rq.enqueue(state.reactivationQueue, entry); // leave ready for the next pass
+      break; // avoid a tight failure loop
+    }
+  }
+  if (count > 0) persistReactivationQueue(state.reactivationQueue);
+  return count;
+}
+
 /**
  * VDXF Policy Check: verify agent has workspace.capability on-chain before
  * forwarding workspace_ready to job-agent. Returns true if allowed.
@@ -5000,12 +5026,17 @@ async function pollForJobs(state) {
       // Poll-mode fallback: detect paused → in_progress (resume happened without webhook)
       if (currentJob.status === 'in_progress' && activeInfo.paused) {
         console.log(`[Poll] Job ${jobId.substring(0, 8)} resumed (was paused) — unthrottling`);
-        activeInfo.paused = false;
-        activeInfo.pausedAt = null;
-        activeInfo.resumedAt = Date.now();
-        state.available = state.available.filter(a => a.id !== activeInfo.agentInfo?.id);
-        sendToJobAgent(activeInfo, { type: 'reconnect', jobId });
-        state._lastSentStatus.set(jobId, currentJob.status);
+        if (rq.markReady(state.reactivationQueue, jobId)) {
+          persistReactivationQueue(state.reactivationQueue);
+          await respawnReadyResumes(state);
+        } else if (state.active.has(jobId)) {
+          activeInfo.paused = false;
+          activeInfo.pausedAt = null;
+          activeInfo.resumedAt = Date.now();
+          state.available = state.available.filter(a => a.id !== activeInfo.agentInfo?.id);
+          sendToJobAgent(activeInfo, { type: 'reconnect', jobId });
+          state._lastSentStatus.set(jobId, currentJob.status);
+        }
       }
     } catch (e) {
       // Job may have been deleted — ignore
@@ -5098,6 +5129,9 @@ async function pollForJobs(state) {
       // Don't give up — will retry next poll cycle
     }
   }
+
+  // Resumes claim free slots first (priority over new jobs)
+  await respawnReadyResumes(state);
 
   // Process queue if slots available (D3: re-queue on failure instead of dropping)
   while (state.queue.length > 0 && state.active.size < MAX_AGENTS && state.available.length > 0) {
@@ -5377,8 +5411,11 @@ async function handleWebhookEvent(state, agentId, payload) {
 
     case 'job.resumed': {
       console.log(`[Webhook] Job resumed — unthrottling ${jobId?.substring(0, 8)}`);
-      const resumeInfo = state.active.get(jobId);
-      if (resumeInfo) {
+      if (rq.markReady(state.reactivationQueue, jobId)) {
+        persistReactivationQueue(state.reactivationQueue);
+        await respawnReadyResumes(state);
+      } else if (state.active.has(jobId)) {
+        const resumeInfo = state.active.get(jobId);
         resumeInfo.paused = false;
         resumeInfo.pausedAt = null;
         resumeInfo.resumedAt = Date.now();
@@ -7315,7 +7352,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
