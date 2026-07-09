@@ -3115,7 +3115,7 @@ program
     const state = {
       agents: [...readyAgents], // all registered agents (never modified)
       active: new Map(), // jobId -> { agentId, container, startedAt, retries }
-      reactivationQueue: [], // paused jobs waiting to respawn
+      reactivationQueue: loadReactivationQueue(), // paused jobs waiting to respawn (persisted)
       available: [...readyAgents], // pool of idle agents
       queue: [], // pending jobs
       seen: loadSeenJobs(), // completed/claimed jobs with timestamps (Map<jobId, timestamp>)
@@ -3840,6 +3840,11 @@ program
     // Drain any pending refunds left over from a previous crash mid-loop
     await drainPendingRefunds(state);
 
+    // Log restored reactivation queue entries (loaded above in state initialisation)
+    if (state.reactivationQueue.length) {
+      console.log(`[Reactivation] Restored ${state.reactivationQueue.length} paused job(s) from disk`);
+    }
+
     // Crash recovery — process orphaned jobs before accepting new ones
     await handleCrashRecovery(state);
 
@@ -4439,6 +4444,10 @@ async function respawnReadyResumes(state, deps = {}) {
   const cap = deps.maxAgents != null ? deps.maxAgents : MAX_AGENTS;
   let count = 0;
   while (state.active.size < cap) {
+    if (!hasMemoryHeadroom(os.freemem(), SIZING_DEFAULTS.perContainerMemBytes)) {
+      console.warn('[Reactivation] Low free memory — deferring respawn');
+      break;
+    }
     const entry = rq.nextReady(state.reactivationQueue);
     if (!entry) break;
     rq.removeJob(state.reactivationQueue, entry.job.id);
@@ -4453,6 +4462,26 @@ async function respawnReadyResumes(state, deps = {}) {
   }
   if (count > 0) persistReactivationQueue(state.reactivationQueue);
   return count;
+}
+
+const REACTIVATION_MEM_MARGIN_BYTES = 512 * 1024 * 1024; // 0.5 GB host margin
+
+function hasMemoryHeadroom(freeBytes, perContainerBytes, marginBytes = REACTIVATION_MEM_MARGIN_BYTES) {
+  return freeBytes >= perContainerBytes + marginBytes;
+}
+
+// Remove queued jobs whose pause_ttl has elapsed. The platform owns the
+// cancel+refund path (via pause_ttl webhook/poll), so the dispatcher only
+// needs to drop the local queue entry and log. deps.now() is injectable for tests.
+async function sweepExpiredQueue(state, deps = {}) {
+  const now = (deps.now || Date.now)();
+  const expired = rq.findExpired(state.reactivationQueue, now);
+  for (const e of expired) {
+    console.log(`[TTL] queued job ${e.job.id.substring(0, 8)} exceeded pause_ttl (${e.pauseTtlMin}min) — removed from reactivation queue (platform auto-cancels/refunds)`);
+    rq.removeJob(state.reactivationQueue, e.job.id);
+  }
+  if (expired.length) persistReactivationQueue(state.reactivationQueue);
+  return expired.map(e => e.job.id);
 }
 
 /**
@@ -4661,6 +4690,12 @@ async function handleCrashRecovery(state) {
   for (const jobId of jobIds) {
     const orphan = orphanedJobs[jobId];
     console.log(`  Processing ${jobId.substring(0, 8)}...`);
+
+    // Skip intentionally-paused jobs — they are queued for reactivation, not orphaned.
+    if (rq.has(state.reactivationQueue, jobId)) {
+      console.log(`    ⏭️  Job is in reactivation queue (paused) — skipping crash refund`);
+      continue;
+    }
 
     // Never re-queue a job already paid by a prior run / the startup drain.
     if (isRefundAlreadyHandled(jobId, alreadyRefunded, existingPending)) {
@@ -5029,7 +5064,7 @@ async function pollForJobs(state) {
         if (rq.markReady(state.reactivationQueue, jobId)) {
           persistReactivationQueue(state.reactivationQueue);
           await respawnReadyResumes(state);
-        } else if (state.active.has(jobId)) {
+        } else {
           activeInfo.paused = false;
           activeInfo.pausedAt = null;
           activeInfo.resumedAt = Date.now();
@@ -5062,23 +5097,9 @@ async function pollForJobs(state) {
     }
   }
 
-  // Check paused jobs for TTL expiry
-  for (const [jobId, info] of state.active) {
-    if (!info.paused || !info.pausedAt) continue;
-    const pauseMinutes = (Date.now() - info.pausedAt) / 60000;
-    const ttl = info.pauseTTL || 60;
-    if (pauseMinutes >= ttl) {
-      console.log(`[TTL] Job ${jobId.substring(0, 8)} paused for ${Math.round(pauseMinutes)}min (TTL: ${ttl}min) — auto-delivering`);
-      if (info.process?.send) {
-        info.process.send({ type: 'ttl_expired', jobId });
-      }
-      // Remove agent from available pool (was freed on pause) so stopJob can return it cleanly
-      state.available = state.available.filter(a => a.id !== info.agentInfo?.id);
-      // Mark as no longer paused to avoid re-sending
-      info.paused = false;
-      info.pausedAt = null;
-    }
-  }
+  // Sweep queued reactivation entries whose pause_ttl has elapsed.
+  // (Nothing in state.active is ever paused — pause deletes the active entry.)
+  await sweepExpiredQueue(state);
 
   // Flush queued workspace messages for newly-spawned job-agents
   if (state._pendingWorkspace?.size) {
@@ -7352,7 +7373,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
