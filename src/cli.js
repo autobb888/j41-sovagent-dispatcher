@@ -20,6 +20,13 @@ const os = require('os');
 const { spawn } = require('child_process');
 const { getRuntime, persistActiveJobs, loadActiveJobs, saveConfig, loadConfig, persistReactivationQueue, loadReactivationQueue } = require('./config');
 const rq = require('./reactivation-queue.js');
+const {
+  isDeadLettered,
+  recordInboxFailure,
+  clearInboxFailure,
+  pruneInboxFailures,
+  MAX_INBOX_ATTEMPTS,
+} = require('./inbox-deadletter.js');
 const log = require('./logger');
 const { loadDispatcherConfig, fileConfiguredNetwork } = require('./config-loader.js');
 const { SignChannelHost } = require('./sign-channel-host.js');
@@ -3135,6 +3142,7 @@ program
       _pendingWorkspace: new Map(), // jobId -> workspace connect promise
       _agentErrors: new Map(), // agentId -> last error string (health document)
       _containerCrashes: new Map(), // agentId -> unexpected-exit count (health document)
+      _inboxFailures: new Map(), // inbox itemId -> { attempts, deadLettered, lastError } — bounds accept retries (dead-letter)
       _devUnsafe, // security: allows local mode when true
     };
 
@@ -5588,6 +5596,10 @@ async function handleWebhookEvent(state, agentId, payload) {
 
 // Check for pending inbox items (reviews + job records) and process them
 async function checkPendingInbox(state) {
+  if (!state._inboxFailures) state._inboxFailures = new Map(); // defensive: older state objects
+  const seenInboxIds = new Set(); // every pending id observed this cycle (for pruning)
+  let completeView = true; // false if any agent failed to poll — then we prune nothing
+
   for (let i = 0; i < state.agents.length; i++) {
     const agentInfo = state.agents[i];
     if (!agentInfo.identity || !agentInfo.wif || !agentInfo.iAddress) continue;
@@ -5604,6 +5616,13 @@ async function checkPendingInbox(state) {
       console.log(`[Inbox] ${agentInfo.id}: ${pending.length} pending item(s)`);
 
       for (const item of pending) {
+        seenInboxIds.add(item.id);
+        // Quarantined: repeatedly unacceptable (e.g. a review whose signature can
+        // never verify). Skip silently — the loud log already fired once on the
+        // dead-letter transition, and retrying every cycle is exactly the ~10k-spin
+        // failure this guards against.
+        if (isDeadLettered(state._inboxFailures, item.id)) continue;
+
         try {
           if (item.type === 'review') {
             console.log(`[Inbox] Processing review ${item.id}`);
@@ -5636,17 +5655,44 @@ async function checkPendingInbox(state) {
             await agent.acceptJobRecord(item.id);
             console.log(`[Inbox] ✅ Job record written on-chain for ${agentInfo.id}`);
           }
+          // Reached only on a real accept (the transient job_record skip `continue`s
+          // above and is neither counted nor cleared). Clear any prior failure streak.
+          clearInboxFailure(state._inboxFailures, item.id);
         } catch (e) {
-          console.error(`[Inbox] ❌ Failed to process ${item.type} ${item.id}:`, e.message);
+          const dl = recordInboxFailure(state._inboxFailures, item.id, e.message);
+          if (dl.justDeadLettered) {
+            // Fail loud, exactly once, and surface into the agent health document so
+            // it's visible without grepping logs. This is the signal the ~10k silent
+            // retries never gave.
+            console.error(
+              `[Inbox] ☠️  DEAD-LETTER ${item.type} ${item.id.substring(0, 8)} for ${agentInfo.id} ` +
+              `after ${dl.attempts} attempts — quarantined, will NOT retry until restart. Last error: ${e.message}`,
+            );
+            state._agentErrors.set(
+              agentInfo.id,
+              `inbox ${item.type} ${item.id.substring(0, 8)} dead-lettered (${dl.attempts}x): ${String(e.message).slice(0, 100)}`,
+            );
+          } else {
+            console.error(
+              `[Inbox] ❌ Failed to process ${item.type} ${item.id.substring(0, 8)} ` +
+              `(attempt ${dl.attempts}/${MAX_INBOX_ATTEMPTS}): ${e.message}`,
+            );
+          }
         }
       }
     } catch (e) {
+      completeView = false; // this agent's pending set is unknown → don't prune its items
       state.agentSessions.delete(agentInfo.id);
       if (!e.message.includes('not registered')) {
         console.error(`[Inbox] Error checking ${agentInfo.id}:`, e.message);
       }
     }
   }
+
+  // Drop tracking for items no longer pending (accepted or expired), so a
+  // long-lived daemon's failure map can't grow without bound. Only safe with a
+  // complete view — see pruneInboxFailures.
+  pruneInboxFailures(state._inboxFailures, seenInboxIds, completeView);
 }
 
 // Load per-agent config (agent-config.json with fallback to executor fields in keys.json).
