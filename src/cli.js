@@ -79,14 +79,16 @@ const J41_API_URL = cfg.platform.api_url;
 const J41_NETWORK = cfg.platform.network;
 const IS_MAINNET = resolveIsMainnet(fileConfiguredNetwork(), J41_NETWORK);
 const _cfg = loadConfig();
-const { computeMaxAgents, capacityLine, DEFAULTS: SIZING_DEFAULTS } = require('./hardware-sizing.js');
+const { computeMaxAgents, capacityLine, resolveCapacity, DEFAULTS: SIZING_DEFAULTS } = require('./hardware-sizing.js');
 
-const _explicitMax = cfg.runtime.max_concurrent > 0
-  ? cfg.runtime.max_concurrent
-  : (_cfg.maxConcurrent ? parseInt(_cfg.maxConcurrent) : 0);
+// The cap auto-follows the hardware estimate unless the OWNER explicitly sets a
+// positive max_concurrent in config.toml (source of truth) or J41_MAX_CONCURRENT.
+// A stale legacy config.json `maxConcurrent` is deliberately NOT consulted here —
+// it must not act as a phantom override the owner never chose.
 const _autoMax = computeMaxAgents({ totalMemBytes: os.totalmem(), cpuCount: os.cpus().length });
-const MAX_AGENTS = _explicitMax > 0 ? _explicitMax : _autoMax;
-const MAX_AGENTS_AUTO = _explicitMax <= 0; // true when we derived it
+const _cap = resolveCapacity({ configMax: cfg.runtime.max_concurrent, estimate: _autoMax });
+const MAX_AGENTS = _cap.maxAgents;
+const MAX_AGENTS_AUTO = _cap.auto;
 const JOB_TIMEOUT_MS = (_cfg.jobTimeoutMin || 60) * 60 * 1000;
 const MAX_RETRIES = 2;
 const SEEN_JOBS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -3042,7 +3044,7 @@ program
 
     console.log(`Runtime: ${RUNTIME} mode`);
     console.log(`Registered agents: ${agents.length}`);
-    console.log(`Max concurrent: ${MAX_AGENTS_AUTO ? `${MAX_AGENTS} (auto)` : MAX_AGENTS}`);
+    console.log(`Max concurrent: ${MAX_AGENTS}${MAX_AGENTS_AUTO ? ' (auto)' : ' (owner override)'}`);
     if (MAX_AGENTS_AUTO) {
       console.log(capacityLine({
         totalMemBytes: os.totalmem(),
@@ -3051,8 +3053,11 @@ program
         perContainerMemBytes: SIZING_DEFAULTS.perContainerMemBytes,
         hostReserveBytes: Math.max(SIZING_DEFAULTS.minHostReserveBytes, Math.floor(os.totalmem() * SIZING_DEFAULTS.hostReserveFraction)),
       }));
-    } else if (_autoMax < _explicitMax) {
-      console.log(`⚠️  max_concurrent=${_explicitMax} exceeds the safe estimate for this box (${_autoMax}); you may OOM under load.`);
+    } else {
+      console.log(`   Owner override via max_concurrent; hardware estimate for this box is ${_autoMax} agents.`);
+      if (_autoMax < MAX_AGENTS) {
+        console.log(`⚠️  max_concurrent=${MAX_AGENTS} exceeds the safe estimate (${_autoMax}); you may OOM or CPU-contend under load.`);
+      }
     }
     console.log(`Job timeout: ${JOB_TIMEOUT_MS / 60000} min`);
     if (RUNTIME === 'docker') {

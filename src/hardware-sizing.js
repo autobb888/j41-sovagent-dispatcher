@@ -33,4 +33,20 @@ function capacityLine({ totalMemBytes, cpuCount, maxAgents, perContainerMemBytes
     + `Override with max_concurrent in config.`;
 }
 
-module.exports = { computeMaxAgents, capacityLine, DEFAULTS };
+// Resolve the effective agent cap. The owner overrides ONLY by setting an
+// explicit positive max_concurrent in the source-of-truth config (config.toml)
+// or the J41_MAX_CONCURRENT env var. Anything else (unset, 0, negative, garbage)
+// auto-follows the conservative hardware `estimate` — the system self-sizes and
+// never runs above what the box safely supports unless the owner deliberately
+// says so. `overridden` drives the startup notification.
+function resolveCapacity({ configMax, estimate }) {
+  const overridden = Number.isFinite(configMax) && configMax > 0;
+  return {
+    maxAgents: overridden ? configMax : estimate,
+    auto: !overridden,
+    overridden,
+    estimate,
+  };
+}
+
+module.exports = { computeMaxAgents, capacityLine, resolveCapacity, DEFAULTS };

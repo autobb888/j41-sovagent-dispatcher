@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
-const { computeMaxAgents, capacityLine, DEFAULTS } = require('../src/hardware-sizing.js');
+const { computeMaxAgents, capacityLine, resolveCapacity, DEFAULTS } = require('../src/hardware-sizing.js');
 
 const GB = 1024 * 1024 * 1024;
 
@@ -36,4 +36,40 @@ test('capacityLine is human-readable and states the override', () => {
   assert.match(line, /8 cores/);
   assert.match(line, /3 agents/);
   assert.match(line, /max_concurrent/);
+});
+
+test('resolveCapacity: unset config (0) auto-follows the hardware estimate', () => {
+  const r = resolveCapacity({ configMax: 0, estimate: 7 });
+  assert.strictEqual(r.maxAgents, 7);
+  assert.strictEqual(r.auto, true);
+  assert.strictEqual(r.overridden, false);
+  assert.strictEqual(r.estimate, 7);
+});
+
+test('resolveCapacity: undefined/missing config is treated as auto (not an override)', () => {
+  const r = resolveCapacity({ configMax: undefined, estimate: 5 });
+  assert.strictEqual(r.maxAgents, 5);
+  assert.strictEqual(r.auto, true);
+  assert.strictEqual(r.overridden, false);
+});
+
+test('resolveCapacity: explicit owner override above the estimate is honored', () => {
+  const r = resolveCapacity({ configMax: 9, estimate: 7 });
+  assert.strictEqual(r.maxAgents, 9);
+  assert.strictEqual(r.auto, false);
+  assert.strictEqual(r.overridden, true);
+  assert.strictEqual(r.estimate, 7);
+});
+
+test('resolveCapacity: explicit override equal to the estimate still counts as owner-set', () => {
+  const r = resolveCapacity({ configMax: 7, estimate: 7 });
+  assert.strictEqual(r.maxAgents, 7);
+  assert.strictEqual(r.overridden, true);
+  assert.strictEqual(r.auto, false);
+});
+
+test('resolveCapacity: a negative/garbage configMax falls back to auto (never below estimate)', () => {
+  const r = resolveCapacity({ configMax: -3, estimate: 4 });
+  assert.strictEqual(r.maxAgents, 4);
+  assert.strictEqual(r.auto, true);
 });
