@@ -57,9 +57,17 @@ function persistActiveJobs(activeMap) {
     };
   }
   try {
-    fs.writeFileSync(ACTIVE_JOBS_PATH, JSON.stringify(jobs, null, 2));
-  } catch {
-    // best effort
+    // Atomic write: this is the crash-recovery refund input. A torn bare write →
+    // loadActiveJobs absorbs it as {} → handleCrashRecovery sees zero orphans →
+    // NO refunds for jobs in-flight at the crash. tmp→rename (same pattern as
+    // persistReactivationQueue below) makes the replace atomic. mkdirSync mirrors
+    // persistReactivationQueue too — the prior bare write assumed the dir existed.
+    fs.mkdirSync(DISPATCHER_DIR, { recursive: true });
+    const tmp = ACTIVE_JOBS_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(jobs, null, 2));
+    fs.renameSync(tmp, ACTIVE_JOBS_PATH);
+  } catch (e) {
+    console.error(`[config] Failed to persist active jobs: ${e.message}`);
   }
 }
 

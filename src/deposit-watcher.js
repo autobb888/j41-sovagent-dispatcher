@@ -162,8 +162,13 @@ function loadDeposits(agentId) {
 function saveDeposits(agentId, data) {
   const p = depositsPath(agentId);
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, JSON.stringify(data, null, 2) + '\n');
-  fs.chmodSync(p, 0o600);
+  // Atomic write: `processed` is the txid dedup ledger that stops a deposit from
+  // being credited twice. A torn bare write → loadDeposits absorbs it as
+  // {processed:[],pending:[]} → the dedup guard is gone → any re-reported/pending
+  // deposit re-verifies on-chain and CREDITS AGAIN. tmp→rename makes it atomic.
+  const tmp = p + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+  fs.renameSync(tmp, p);
 }
 
 /**

@@ -3839,6 +3839,13 @@ program
     // Check for completed jobs
     safeInterval(() => cleanupCompletedJobs(state), 10000, 'Cleanup');
 
+    // Re-drive owed refunds that failed to send (RPC blip, momentary funds/UTXO
+    // issue). Without this, drainPendingRefunds runs ONLY at boot, so a transient
+    // send failure leaves a buyer's owed refund unpaid for the entire daemon
+    // uptime. markJobRefunded/loadRefundedJobs make the drain idempotent, so a
+    // periodic re-drive is safe and simply pays anything still pending.
+    safeInterval(() => drainPendingRefunds(state), 5 * 60 * 1000, 'RefundDrain');
+
     // Status report every minute
     setInterval(() => {
       console.log(`[${new Date().toISOString()}] Active: ${state.active.size}/${MAX_AGENTS}, Queue: ${state.queue.length}, Available: ${state.available.length}, Seen: ${state.seen.size}`);
