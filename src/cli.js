@@ -34,7 +34,7 @@ const { EgressProxyHost, deriveAllowedHosts, isolatedGatewayIp, EGRESS_PROXY_POR
 const { defaultExecutors, expiryForIdentity } = require('./broker-executors.js');
 const { findMainnetSecurityViolations, resolveIsMainnet } = require('./mainnet-guard.js');
 const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, liveLogPath, archiveLogPath } = require('./job-log.js');
-const { shouldRefundOrphan, isRefundAlreadyHandled } = require('./refund.js');
+const { shouldRefundOrphan, isRefundAlreadyHandled, buildAbandonedJobRefund } = require('./refund.js');
 const { isValidJobId } = require('./job-id.js');
 const { verifyInboxJobRecord } = require('./inbox-job-record.js');
 const { writeKeysFile, readKeysFile } = require('./keys-file.js');
@@ -4844,6 +4844,46 @@ async function handleCrashRecovery(state) {
 }
 
 /**
+ * Refund a PAID job that cleanupCompletedJobs ABANDONED after exhausting its docker
+ * launch retries. stopJobContainer deletes the job from state.active BEFORE any
+ * restart, so handleCrashRecovery (which only refunds jobs still in active-jobs.json)
+ * would never see it — the buyer's payment would be stuck with no delivery. This
+ * routes it into the SAME durable pending-refunds ledger crash-recovery uses, so the
+ * periodic drainPendingRefunds pays it out, and reuses the same idempotency guards
+ * (loadRefundedJobs / the ledger) so it is never refunded twice. No-op for a job that
+ * recorded no payment.
+ */
+async function refundAbandonedJob(state, jobId, active) {
+  const agentId = active?.agentInfoId || active?.agentInfo?.id || null;
+  const refundPercent = state.disputePolicy?.get(agentId)?.systemCrashRefund ?? 100;
+
+  const refundedJobs = loadRefundedJobs();
+  const pending = loadPendingRefunds();
+
+  const record = buildAbandonedJobRefund(active, jobId, refundPercent, refundedJobs, pending);
+  if (!record) {
+    // Unpaid, already refunded, or already queued — nothing to enqueue.
+    return;
+  }
+
+  console.log(`  [refund] Enqueuing abandoned-job refund: ${record.refundPercent}% = ${record.refundAmount} ${record.orphan.currency} → ${record.buyerAddress} (job ${jobId.substring(0, 8)})`);
+
+  // Persist to the durable ledger BEFORE sending (crash-safe), merging so a
+  // concurrent entry is never clobbered — mirrors handleCrashRecovery Step 2.
+  const ledger = { ...pending, [jobId]: record };
+  savePendingRefunds(ledger);
+
+  // Try to pay immediately; on success drop from the ledger. On failure the entry
+  // stays for the periodic drainPendingRefunds / next-startup drain, which is
+  // idempotent via markJobRefunded. Mirrors handleCrashRecovery Step 3.
+  const success = await attemptPendingRefund(state, jobId, record);
+  if (success) {
+    delete ledger[jobId];
+    savePendingRefunds(ledger);
+  }
+}
+
+/**
  * Auto-approve or reject extension requests based on system capacity.
  * Approve if: queue empty + slots open + system has headroom.
  * Reject with reason otherwise.
@@ -6819,6 +6859,24 @@ async function cleanupCompletedJobs(state) {
               continue;
             }
             console.log(`❌ Job ${jobId} failed after ${MAX_RETRIES + 1} attempts`);
+            // Abandoned-after-exhaustion: this paid job will never deliver. The
+            // docker path had NO health signal and NO refund (stopJobContainer
+            // frees the agent and deletes the job from active-jobs.json before
+            // handleCrashRecovery could ever see it). Signal health (parity with
+            // the local-mode child.on('exit') handler) and auto-refund the buyer
+            // via the shared durable ledger BEFORE stopJobContainer tears down.
+            try {
+              const abandonedAgentId = active.agentInfoId || active.agentInfo?.id || null;
+              if (abandonedAgentId) {
+                const n = (state._containerCrashes.get(abandonedAgentId) || 0) + 1;
+                state._containerCrashes.set(abandonedAgentId, n);
+                state._agentErrors.set(abandonedAgentId, `job ${jobId} abandoned after ${MAX_RETRIES + 1} docker launch attempts`);
+                state.emitEvent?.('container.died', { jobId, agentId: abandonedAgentId, code: active._exitCode ?? null, signal: null });
+              }
+              await refundAbandonedJob(state, jobId, active);
+            } catch (refundErr) {
+              console.error(`[refund] Could not process abandoned-job refund for ${jobId.substring(0, 8)}: ${refundErr.message}`);
+            }
           }
           await stopJobContainer(state, jobId);
         }
