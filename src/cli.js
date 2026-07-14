@@ -3236,30 +3236,28 @@ program
     }
     console.log('');
 
-    // Retry loop: if any agents failed capability fetch AND no api-endpoint found,
-    // retry every 5 minutes. Operator must restart dispatcher once detected.
-    const failedAgents = readyAgents.filter(a => state.capabilities.get(a.id)?._fetchFailed);
-    const hasApiAfterLoad = readyAgents.some(a => {
-      const cap = state.capabilities.get(a.id);
-      return cap?.services?.some(s => s.serviceType === 'api-endpoint' || s.endpointUrl || s._isApiEndpoint);
-    });
-    if (failedAgents.length > 0 && !hasApiAfterLoad) {
-      console.log(`  ⚠  ${failedAgents.length} agent(s) failed capability fetch — retrying every 5min`);
+    // Self-healing retry: re-run full capability load for failed agents every 60s
+    // until all agents succeed — no restart required after a boot-time chain-sync gap.
+    const { stillFailed } = require('./capability-retry.js');
+    let failedAgents = stillFailed(state, readyAgents);
+    if (failedAgents.length > 0) {
+      console.log(`  ⚠  ${failedAgents.length} agent(s) failed capability fetch — self-healing retry every 60s`);
       const retryTimer = setInterval(async () => {
-        console.log('[Capabilities] Retrying failed agents...');
-        for (const agentInfo of failedAgents) {
-          try {
-            const agent = await getAgentSession(state, agentInfo);
-            const svcResp = await agent.client.getAgentServices(agentInfo.iAddress || agentInfo.identity);
-            const platformServices = svcResp.data || svcResp || [];
-            if (platformServices.some(s => s.serviceType === 'api-endpoint' || s.endpointUrl)) {
-              console.log('[Capabilities] ✓ api-endpoint agent detected — restart dispatcher to activate proxy');
-              clearInterval(retryTimer);
-              return;
-            }
-          } catch {}
+        const pending = stillFailed(state, readyAgents);
+        if (pending.length === 0) { clearInterval(retryTimer); return; }
+        console.log(`[Capabilities] Retrying ${pending.length} agent(s)...`);
+        for (const agentInfo of pending) {
+          const ok = await loadAgentCapabilities(state, agentInfo);   // re-runs full load, clears _fetchFailed on success
+          if (ok) {
+            await loadAgentDisputePolicy(state, agentInfo);
+            console.log(`[Capabilities] ✓ ${agentInfo.id} healed`);
+          }
         }
-      }, 5 * 60 * 1000);
+        if (stillFailed(state, readyAgents).length === 0) {
+          console.log('[Capabilities] ✅ all agents healed');
+          clearInterval(retryTimer);
+        }
+      }, 60 * 1000);
       retryTimer.unref();
     }
 
