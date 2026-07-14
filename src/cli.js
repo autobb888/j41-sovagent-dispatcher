@@ -5169,6 +5169,15 @@ async function pollForJobs(state) {
           state._lastSentStatus.set(jobId, currentJob.status);
         }
       }
+
+      // Poll-mode fallback: detect in_progress → paused (pause happened without a
+      // webhook / without a working job_idle IPC in Docker). Free the container.
+      const { shouldPauseOnPoll } = require('./reactivation-poll.js');
+      if (shouldPauseOnPoll(currentJob, activeInfo)) {
+        console.log(`[Poll] Job ${jobId.substring(0, 8)} paused (platform) — freeing container`);
+        await moveJobToReactivationQueue(state, jobId);
+        state._lastSentStatus.set(jobId, currentJob.status);
+      }
     } catch (e) {
       // Job may have been deleted — ignore
     }
