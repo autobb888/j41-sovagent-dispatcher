@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert');
-const { checkAndRecordNonce, _reset, _size, DEFAULT_TTL_MS } = require('../src/nonce-cache.js');
+const { checkAndRecordNonce, checkNonceAfterVerify, _reset, _size, DEFAULT_TTL_MS } = require('../src/nonce-cache.js');
 
 test('first sighting of a nonce is accepted', () => {
   _reset();
@@ -39,4 +39,34 @@ test('invalid nonce is rejected', () => {
   assert.strictEqual(checkAndRecordNonce(undefined, Date.now() + 60_000).ok, false);
   assert.strictEqual(checkAndRecordNonce('', Date.now() + 60_000).ok, false);
   assert.strictEqual(checkAndRecordNonce(123, Date.now() + 60_000).ok, false);
+});
+
+// ── checkNonceAfterVerify: nonce must never be recorded before the caller's
+// signature verification succeeds (wire-audit fix — an unauthenticated caller
+// could otherwise burn/churn the bounded nonce cache with junk nonces). ──────
+test('checkNonceAfterVerify: verified=false never touches the cache', () => {
+  _reset();
+  const n = 'd'.repeat(32);
+  const r = checkNonceAfterVerify(false, n, Date.now() + 60_000);
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.reason, 'signature-invalid');
+  assert.strictEqual(_size(), 0, 'an invalid-signature request must not record a nonce');
+  // Proof the cache is untouched: the SAME nonce, now presented as verified,
+  // is accepted as a first sighting rather than being rejected as a replay.
+  const r2 = checkNonceAfterVerify(true, n, Date.now() + 60_000);
+  assert.strictEqual(r2.ok, true);
+  assert.strictEqual(_size(), 1);
+});
+
+test('checkNonceAfterVerify: verified=true records the nonce; a replayed valid request is rejected', () => {
+  _reset();
+  const n = 'e'.repeat(32);
+  const exp = Date.now() + 60_000;
+  const first = checkNonceAfterVerify(true, n, exp);
+  assert.strictEqual(first.ok, true);
+  assert.strictEqual(_size(), 1);
+  // Same nonce, verified again (e.g. the same envelope replayed) — rejected.
+  const replay = checkNonceAfterVerify(true, n, exp);
+  assert.strictEqual(replay.ok, false);
+  assert.strictEqual(replay.reason, 'replay');
 });

@@ -3508,16 +3508,9 @@ program
               canonicalMessage = canonicalBytes(envelope).toString('utf8');
               signaturesV2 = signatures;
 
-              // Replay protection (2.1.13): reject any nonce we've already accepted
-              // within its expiry window.
-              {
-                const { checkAndRecordNonce } = require('./nonce-cache.js');
-                const expiresMs = Date.parse(envelope.expiresAt);
-                const replayCheck = checkAndRecordNonce(envelope.nonce, expiresMs);
-                if (!replayCheck.ok) {
-                  throw new Error(`v2 envelope rejected: ${replayCheck.reason} (nonce=${envelope.nonce.slice(0, 8)}…)`);
-                }
-              }
+              // Replay protection (2.1.13) happens AFTER signature verification below
+              // (audit fix — recording the nonce before the signature is checked would
+              // let an unauthenticated caller populate the nonce cache with junk).
 
               // Normalize to v1-like shape so downstream code (mintAccessEnvelope, meter, etc.) stays unchanged.
               accessRequest = {
@@ -3556,6 +3549,16 @@ program
               const verified = await verifyCanonicalSignatures(wireBody.envelope, signaturesV2, client, J41_NETWORK);
               if (!verified) throw new Error('Buyer signature verification failed (v2)');
               console.log(`[Discovery] Buyer signature verified (v2): ${accessRequest.buyerVerusId}`);
+
+              // Replay protection (2.1.13): reject any nonce we've already accepted
+              // within its expiry window. Recorded ONLY now that the signature has
+              // verified — an invalid-signature request never touches the nonce cache.
+              const { checkNonceAfterVerify } = require('./nonce-cache.js');
+              const expiresMs = Date.parse(wireBody.envelope.expiresAt);
+              const replayCheck = checkNonceAfterVerify(verified, wireBody.envelope.nonce, expiresMs);
+              if (!replayCheck.ok) {
+                throw new Error(`v2 envelope rejected: ${replayCheck.reason} (nonce=${wireBody.envelope.nonce.slice(0, 8)}…)`);
+              }
             } else {
               // Enforce freshness + single-use nonce (replay protection) in
               // addition to the signature. The nonce-cache check-and-records,
@@ -3901,6 +3904,7 @@ program
       host: state.gatewayIp,
       port: EGRESS_PROXY_PORT,
       log: (m) => console.log(`[egress] ${m}`),
+      allowLocalUpstream: !!cfg.runtime.allow_local_upstream,
     });
     try {
       await state.egressProxy.start();

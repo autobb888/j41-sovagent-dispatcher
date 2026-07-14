@@ -76,4 +76,25 @@ function _reset() {
 }
 function _size() { return _seen.size; }
 
-module.exports = { checkAndRecordNonce, _reset, _size, MAX_ENTRIES, SWEEP_INTERVAL_MS, DEFAULT_TTL_MS };
+/**
+ * Verify-gated nonce check for v2 access-request envelopes.
+ *
+ * The nonce cache must NEVER be populated before the caller's signature has
+ * been verified — recording first lets an unauthenticated caller burn/churn
+ * the (bounded, 100k-entry) nonce cache with junk nonces, either evicting
+ * legitimate entries early or wasting the cache on requests that were never
+ * going to be honored. This helper makes that ordering an explicit, testable
+ * gate: the cache is touched ONLY when `verified` is true.
+ *
+ * @param {boolean} verified - result of the caller's signature verification,
+ *   computed and checked BEFORE this is called.
+ * @param {string} nonce
+ * @param {number} expiresAtMs
+ * @returns {{ok: boolean, reason?: string}}
+ */
+function checkNonceAfterVerify(verified, nonce, expiresAtMs) {
+  if (!verified) return { ok: false, reason: 'signature-invalid' };
+  return checkAndRecordNonce(nonce, expiresAtMs);
+}
+
+module.exports = { checkAndRecordNonce, checkNonceAfterVerify, _reset, _size, MAX_ENTRIES, SWEEP_INTERVAL_MS, DEFAULT_TTL_MS };

@@ -2,6 +2,11 @@
 const http = require('node:http');
 const net = require('node:net');
 const dns = require('node:dns').promises;
+// Shared private-IP classifier (127/8, 10/8, 172.16/12, 192.168/16, 169.254/16,
+// 0.0.0.0, IPv6 loopback/link-local/ULA + IPv4-mapped forms). Same helper
+// proxy-handler.js uses to SSRF-guard buyer→seller traffic; reused here so the
+// two egress paths can't drift out of sync.
+const { isPrivateIp } = require('./proxy-handler.js');
 
 const EGRESS_PROXY_PORT = 9847;
 
@@ -30,11 +35,15 @@ function deriveAllowedHosts(env) {
 }
 
 class EgressProxyHost {
-  constructor({ host = '127.0.0.1', port = EGRESS_PROXY_PORT, resolve, log } = {}) {
+  constructor({ host = '127.0.0.1', port = EGRESS_PROXY_PORT, resolve, log, allowLocalUpstream = false } = {}) {
     this._host = host;
     this._wantPort = port;
     this._resolve = resolve || ((h) => dns.lookup(h));
     this._log = log || (() => {});
+    // Dev/test escape hatch — same flag family as J41_ALLOW_LOCAL_UPSTREAM for
+    // proxy-handler.js ("disables SSRF protection on the proxy"). Defaults to
+    // false: fail closed in production.
+    this._allowLocalUpstream = !!allowLocalUpstream;
     this._allow = new Map(); // token -> Set("host:port")
     this._server = null;
   }
@@ -74,6 +83,17 @@ class EgressProxyHost {
     let address;
     try { const r = await this._resolve(host); address = typeof r === 'string' ? r : r.address; }
     catch { return this._deny(clientSocket, 502, 'Bad Gateway (dns)'); }
+    // DNS-rebind SSRF guard: the allowlist above only checked the CONFIGURED
+    // hostname, not what it actually resolves to. An allowlisted host whose DNS
+    // is attacker-influenced (or simply misconfigured) could resolve to a
+    // private/link-local address — e.g. 169.254.169.254, the cloud metadata
+    // endpoint. Re-validate the RESOLVED address here and fail closed. The
+    // `address` we validate is exactly the literal IP passed to net.connect
+    // below (no second resolution happens), so there's no TOCTOU window.
+    if (!this._allowLocalUpstream && isPrivateIp(address)) {
+      this._log(`egress DENY ${host}:${port} resolved to private address ${address}`);
+      return this._deny(clientSocket, 502, 'Bad Gateway (private upstream)');
+    }
     const upstream = net.connect(port, address, () => {
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       if (head && head.length) upstream.write(head);

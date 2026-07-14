@@ -64,11 +64,19 @@ test('unknown/absent token → 407', async () => {
 });
 
 test('non-allowlisted host → 403; allowlisted host → 200 (dns mocked, upstream stub)', async () => {
-  // Stub upstream so a real connection can be established.
+  // Stub upstream so a real connection can be established. The stub is on
+  // loopback, which is a private address — allowLocalUpstream:true is the
+  // documented dev/test escape hatch (same flag family as
+  // J41_ALLOW_LOCAL_UPSTREAM) so this test can exercise the allowlist logic
+  // in isolation from the private-IP guard (covered separately below).
   const upstream = net.createServer(sock => sock.end()).listen(0, '127.0.0.1');
   await new Promise(r => upstream.once('listening', r));
   const upPort = upstream.address().port;
-  const proxy = new EgressProxyHost({ host: '127.0.0.1', port: 0, resolve: async () => ({ address: '127.0.0.1' }) });
+  const proxy = new EgressProxyHost({
+    host: '127.0.0.1', port: 0,
+    resolve: async () => ({ address: '127.0.0.1' }),
+    allowLocalUpstream: true,
+  });
   await proxy.start();
   proxy.register('tok1', new Set([`api.groq.com:${upPort}`]));
   try {
@@ -76,6 +84,51 @@ test('non-allowlisted host → 403; allowlisted host → 200 (dns mocked, upstre
     assert.match(denied, /403/);
     const ok = await connectVia(proxy.port, 'tok1', `api.groq.com:${upPort}`);
     assert.match(ok, /200/);
+  } finally { await proxy.stop(); upstream.close(); }
+});
+
+// ── DNS-rebind SSRF guard: allowlisted host resolves to a private/link-local
+// address (e.g. an attacker-controlled DNS answer, or the cloud metadata IP) ──
+test('allowlisted host resolving to a private IP is rejected (502), even though the hostname passed the allowlist', async () => {
+  const proxy = new EgressProxyHost({
+    host: '127.0.0.1', port: 0,
+    resolve: async () => ({ address: '169.254.169.254' }), // cloud metadata endpoint
+  });
+  await proxy.start();
+  proxy.register('tok3', new Set(['api.groq.com:443']));
+  try {
+    const line = await connectVia(proxy.port, 'tok3', 'api.groq.com:443');
+    assert.match(line, /502/);
+  } finally { await proxy.stop(); }
+});
+
+test('allowlisted host resolving to an RFC1918 address is rejected (502) by default', async () => {
+  const proxy = new EgressProxyHost({
+    host: '127.0.0.1', port: 0,
+    resolve: async () => ({ address: '10.0.0.5' }),
+  });
+  await proxy.start();
+  proxy.register('tok4', new Set(['api.groq.com:443']));
+  try {
+    const line = await connectVia(proxy.port, 'tok4', 'api.groq.com:443');
+    assert.match(line, /502/);
+  } finally { await proxy.stop(); }
+});
+
+test('allowLocalUpstream:true bypasses the private-IP guard (dev/test escape hatch)', async () => {
+  const upstream = net.createServer(sock => sock.end()).listen(0, '127.0.0.1');
+  await new Promise(r => upstream.once('listening', r));
+  const upPort = upstream.address().port;
+  const proxy = new EgressProxyHost({
+    host: '127.0.0.1', port: 0,
+    resolve: async () => ({ address: '127.0.0.1' }),
+    allowLocalUpstream: true,
+  });
+  await proxy.start();
+  proxy.register('tok5', new Set([`api.groq.com:${upPort}`]));
+  try {
+    const line = await connectVia(proxy.port, 'tok5', `api.groq.com:${upPort}`);
+    assert.match(line, /200/);
   } finally { await proxy.stop(); upstream.close(); }
 });
 
