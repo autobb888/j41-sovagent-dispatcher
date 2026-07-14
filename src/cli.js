@@ -3144,6 +3144,7 @@ program
       _containerCrashes: new Map(), // agentId -> unexpected-exit count (health document)
       _inboxFailures: new Map(), // inbox itemId -> { attempts, deadLettered, lastError } — bounds accept retries (dead-letter)
       _resumeCursor: 0, // round-robin cursor for the poll-mode queued-resume sweep (Task 4)
+      _proxyStarted: false, // true once the api-endpoint proxy is wired at boot; drives the heal-time "restart to activate proxy" notice
       _devUnsafe, // security: allows local mode when true
     };
 
@@ -3240,7 +3241,7 @@ program
     // Self-healing retry: re-run full capability load for failed agents every 60s
     // until all agents succeed — no restart required after a boot-time chain-sync gap.
     const { stillFailed } = require('./capability-retry.js');
-    let failedAgents = stillFailed(state, readyAgents);
+    const failedAgents = stillFailed(state, readyAgents);
     if (failedAgents.length > 0) {
       console.log(`  ⚠  ${failedAgents.length} agent(s) failed capability fetch — self-healing retry every 60s`);
       const retryTimer = setInterval(async () => {
@@ -3252,6 +3253,15 @@ program
           if (ok) {
             await loadAgentDisputePolicy(state, agentInfo);
             console.log(`[Capabilities] ✓ ${agentInfo.id} healed`);
+            // The proxy is a boot-time snapshot (built once from state.capabilities);
+            // reloading capabilities does NOT wire it. If an api-endpoint agent only
+            // became visible after healing and no proxy was started at boot, the
+            // operator must restart to serve it.
+            const cap = state.capabilities.get(agentInfo.id);
+            const nowApi = cap?.services?.some(s => s.serviceType === 'api-endpoint' || s.endpointUrl || s._isApiEndpoint);
+            if (nowApi && !state._proxyStarted) {
+              console.log(`[Capabilities] ⚠  ${agentInfo.id} exposes an api-endpoint — restart dispatcher to activate the proxy`);
+            }
           }
         }
         if (stillFailed(state, readyAgents).length === 0) {
@@ -3335,6 +3345,7 @@ program
         const cap = state.capabilities.get(a.id);
         return cap?.services?.some(s => s.serviceType === 'api-endpoint' || s.endpointUrl || s._isApiEndpoint);
       });
+      state._proxyStarted = apiAgents.length > 0; // the proxy is wired here, once, from this boot-time snapshot
       if (apiAgents.length > 0) {
         const { mintAccessEnvelope, verifyAccessRequest } = require('@junction41/sovagent-sdk/dist/crypto/envelope.js');
         const { validateEnvelope, canonicalBytes, verifyCanonicalSignatures, CanonicalError } = require('@junction41/sovagent-sdk/dist/crypto/canonical.js');
