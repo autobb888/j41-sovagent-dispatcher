@@ -27,4 +27,26 @@ function shouldPauseOnPoll(currentJob, activeInfo) {
   );
 }
 
-module.exports = { shouldPauseOnPoll };
+/**
+ * Round-robin slice of `queue` for the resume sweep. Starting at `cursor`,
+ * picks `min(batchSize, queue.length)` entries (wrapping), and returns the
+ * next cursor position (also wrapped).
+ *
+ * @param {Array<{job:{id:string}, agentId:string, readyToRespawn?:boolean}>} queue
+ * @param {number} cursor  Current position in the queue.
+ * @param {number} batchSize  Max entries per sweep.
+ * @returns {{ batch: Array, nextCursor: number }}
+ */
+function pickResumeBatch(queue, cursor, batchSize) {
+  if (!queue || queue.length === 0) return { batch: [], nextCursor: 0 };
+  const n = Math.min(batchSize, queue.length);
+  const batch = [];
+  let i = cursor % queue.length;
+  for (let k = 0; k < n; k++) {
+    batch.push(queue[i]);
+    i = (i + 1) % queue.length;
+  }
+  return { batch, nextCursor: i };
+}
+
+module.exports = { shouldPauseOnPoll, pickResumeBatch };

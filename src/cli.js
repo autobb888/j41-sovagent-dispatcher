@@ -3143,6 +3143,7 @@ program
       _agentErrors: new Map(), // agentId -> last error string (health document)
       _containerCrashes: new Map(), // agentId -> unexpected-exit count (health document)
       _inboxFailures: new Map(), // inbox itemId -> { attempts, deadLettered, lastError } — bounds accept retries (dead-letter)
+      _resumeCursor: 0, // round-robin cursor for the poll-mode queued-resume sweep (Task 4)
       _devUnsafe, // security: allows local mode when true
     };
 
@@ -5180,6 +5181,33 @@ async function pollForJobs(state) {
       }
     } catch (e) {
       // Job may have been deleted — ignore
+    }
+  }
+
+  // Poll-mode fallback: resume queued (container-freed) jobs whose platform status
+  // returned to in_progress — the webhook (job.resumed) path may be absent in poll
+  // mode. Batched round-robin so 100 queued jobs don't hammer the platform.
+  const RESUME_POLL_BATCH = 10;
+  if (state.reactivationQueue.length > 0 && state.active.size < MAX_AGENTS) {
+    const { pickResumeBatch } = require('./reactivation-poll.js');
+    const { batch, nextCursor } = pickResumeBatch(state.reactivationQueue, state._resumeCursor || 0, RESUME_POLL_BATCH);
+    state._resumeCursor = nextCursor;
+    for (const entry of batch) {
+      const jobId = entry.job.id;
+      if (entry.readyToRespawn) continue; // already flagged
+      try {
+        const agentInfo = state.agents.find(a => a.id === entry.agentId);
+        if (!agentInfo) continue;
+        const session = await getAgentSession(state, agentInfo);
+        const full = await session.client.getJob(jobId);
+        if (full?.status === 'in_progress') {
+          console.log(`[Poll] Queued job ${jobId.substring(0, 8)} resumed (platform) — respawning`);
+          if (rq.markReady(state.reactivationQueue, jobId)) {
+            persistReactivationQueue(state.reactivationQueue);
+            await respawnReadyResumes(state);
+          }
+        }
+      } catch { /* transient — retried next sweep */ }
     }
   }
 
