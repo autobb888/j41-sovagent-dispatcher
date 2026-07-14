@@ -3230,6 +3230,7 @@ program
     // ── Load on-chain capabilities for VDXF policy enforcement ──
     console.log('→ Loading on-chain agent capabilities...\n');
     for (let i = 0; i < readyAgents.length; i++) {
+      // Stagger 2s between agents to avoid rate limiting
       if (i > 0) await new Promise(r => setTimeout(r, 2000));
       await loadAgentCapabilities(state, readyAgents[i]);
     }
@@ -4310,11 +4311,15 @@ async function loadAgentCapabilities(state, agentInfo) {
     const agent = await getAgentSession(state, agentInfo);
 
     // Fetch on-chain VDXF data
-    const id = await agent.client.getMyIdentity();
+    const idRaw = await agent.client.getIdentityRaw();
+    const id = idRaw.data?.identity || idRaw.identity;
 
     // Also fetch platform services (has serviceType, endpointUrl, modelPricing)
-    const svcResp = await agent.client.getAgentServices(agentInfo.iAddress || agentInfo.identity);
-    const platformServices = svcResp.data || svcResp || [];
+    let platformServices = [];
+    try {
+      const svcResp = await agent.client.getAgentServices(agentInfo.iAddress || agentInfo.identity);
+      platformServices = svcResp.data || svcResp || [];
+    } catch {}
 
     const { decodeContentMultimap } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
 
