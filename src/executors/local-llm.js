@@ -376,6 +376,7 @@ async function callLLM(systemPrompt, messages) {
     if (!res.ok) {
       const err = await res.text();
       log.error('LLM API error', { status: res.status, error: err.substring(0, 200) });
+      log.error('[LLM-OUTAGE] shipping canned fallback', { model: LLM_CONFIG.model, base: LLM_CONFIG.baseUrl, error: `${res.status}: ${err.substring(0, 200)}` });
       return { content: 'I encountered an issue generating a response. Let me try to help directly — could you rephrase your question?', usage: null };
     }
 
@@ -431,6 +432,7 @@ async function callLLMWithTools(systemPrompt, messages, tools) {
     if (!res.ok) {
       const err = await res.text();
       log.error('LLM API error', { status: res.status, error: err.substring(0, 200) });
+      log.error('[LLM-OUTAGE] shipping canned fallback', { model: LLM_CONFIG.model, base: LLM_CONFIG.baseUrl, error: `${res.status}: ${err.substring(0, 200)}` });
       return { content: 'I encountered an issue processing your request. Please try again.' };
     }
 

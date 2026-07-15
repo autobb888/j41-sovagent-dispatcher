@@ -274,6 +274,7 @@ class MCPExecutor extends Executor {
       if (!res.ok) {
         const err = await res.text();
         console.error(`[MCP] LLM API error ${res.status}: ${err.substring(0, 200)}`);
+        console.error(`[LLM-OUTAGE] shipping canned fallback model=${LLM.model} base=${LLM.baseUrl} error=${res.status}: ${err.substring(0, 200)}`);
         return { content: 'I encountered an issue processing your request. Please try again.' };
       }
 
