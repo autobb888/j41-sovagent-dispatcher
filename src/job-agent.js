@@ -18,6 +18,7 @@ const { createJobSigner } = require('./job-signer.js');
 const { SignChannelClient } = require('./sign-channel-client.js');
 const log = require('./logger.js');
 const { scanUntrusted } = require('./sovguard-context.js');
+const { markIfNew } = require('./message-dedup.js');
 
 const API_URL = process.env.J41_API_URL;
 const AGENT_ID = process.env.J41_AGENT_ID;
@@ -709,9 +710,13 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   const isReconnect = job.status === 'in_progress';
   await executor.init(job, agent, soulPrompt, { isReconnect });
 
-  // Handle incoming messages — delegate to executor (J4: serialized via queue)
-  agent.onChatMessage((jobId, msg) => {
-    if (jobId !== job.id) return;
+  // Shared dedup set for WS handler and poll fallback (Task 3)
+  const _processedMsgIds = new Set();
+
+  // Reusable message processor — called by the WS handler and (Task 3) the poll fallback.
+  // Deduplicates by msg.id so a message delivered by both paths is handled exactly once.
+  async function processBuyerMessage(msg) {
+    if (!markIfNew(_processedMsgIds, msg.id)) return;
 
     // Layer 3 message guard: refuse LLM calls when paused (don't update activity for dropped messages)
     if (_paused) {
@@ -753,7 +758,10 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
         agent.sendChatMessage(job.id, 'I experienced an issue processing your message. Please try again.');
       }
     });
-  });
+  }
+
+  // Handle incoming messages — delegate to executor (J4: serialized via queue)
+  agent.onChatMessage((jobId, msg) => { if (jobId !== job.id) return; processBuyerMessage(msg); });
 
   // ── File detection: react to platform's "📎 Uploaded file:" chat messages ──
   const knownFileIds = new Set(jobFiles.map(f => f.id));
