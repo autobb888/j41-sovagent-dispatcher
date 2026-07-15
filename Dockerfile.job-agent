@@ -54,6 +54,11 @@ COPY src/job-signer.js ./
 # when those code paths run (after auth, before chat).
 COPY src/token-budget.js ./
 COPY src/broker-executors.js ./
+# Message reliability — required by job-agent.js at module load (require at top):
+# id-dedup for the WS+poll paths and the poll-fallback selector. Missing these
+# crashes the worker at startup with MODULE_NOT_FOUND.
+COPY src/message-dedup.js ./
+COPY src/message-poll.js ./
 RUN chmod +x container-entry.sh
 
 # ─────────────────────────────────────────

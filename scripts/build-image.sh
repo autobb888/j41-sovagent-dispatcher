@@ -61,6 +61,9 @@ cp "$DISPATCHER_DIR/src/egress-proxy-client.js" .build-temp/src/
 # (lazy require). Missing these crashes the worker at module load.
 cp "$DISPATCHER_DIR/src/token-budget.js" .build-temp/src/
 cp "$DISPATCHER_DIR/src/broker-executors.js" .build-temp/src/
+# Message reliability — required by job-agent.js at module load (top-level require).
+cp "$DISPATCHER_DIR/src/message-dedup.js" .build-temp/src/
+cp "$DISPATCHER_DIR/src/message-poll.js" .build-temp/src/
 cp "$DISPATCHER_DIR/src/executors/"*.js .build-temp/src/executors/
 cp "$DISPATCHER_DIR/Dockerfile.job-agent" .build-temp/Dockerfile
 
