@@ -777,7 +777,16 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   if (!_buyerVerusId) {
     console.warn('[MSG-POLL] No buyerVerusId — message-poll fallback disabled for this job');
   }
-  let _lastPolledIso = new Date(Date.now() - 15000).toISOString();
+  // Fresh hire: 15s covers clock skew / setup timing. Reconnect (resumed job):
+  // the buyer's message can be posted up to a full queued-resume poll cycle
+  // (~60-90s) before this worker respawns, so reach back further to catch it —
+  // but stay under the idle timeout so we never re-reply to pre-pause history
+  // (idle-pause requires IDLE_TIMEOUT_MS of silence, so any already-answered
+  // message is strictly older than that window).
+  const _pollLookbackMs = isReconnect
+    ? Math.max(15000, Math.min(240000, IDLE_TIMEOUT_MS - 60000))
+    : 15000;
+  let _lastPolledIso = new Date(Date.now() - _pollLookbackMs).toISOString();
   _msgPoll = setInterval(async () => {
     if (_paused || sessionEnded || !_buyerVerusId) return;
     try {
