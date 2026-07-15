@@ -723,13 +723,29 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   // Reusable message processor — called by the WS handler and (Task 3) the poll fallback.
   // Deduplicates by msg.id so a message delivered by both paths is handled exactly once.
   async function processBuyerMessage(msg) {
-    // Layer 3 message guard: refuse LLM calls when paused (don't update activity for dropped messages)
-    if (_paused) {
-      console.log(`[GUARD] Message received while paused — dropping (sender: ${msg.senderVerusId})`);
-      return;
-    }
-
+    // Dedup first — a message delivered by both the WS and the poll is handled once.
     if (!markIfNew(_processedMsgIds, msg.id)) return;
+
+    // A genuinely-new buyer message while paused means the buyer is resuming. In
+    // Docker+Poll mode a brief pause (reactivated before the ~60s poll can free
+    // this worker) never triggers a dispatcher 'reconnect', so the worker would
+    // otherwise stay stuck _paused and DROP every message (tester: "resume never
+    // re-attaches"). Self-heal: un-pause + reconnect chat and serve it, mirroring
+    // the 'reconnect' IPC path. In the normal long-pause flow the container is
+    // already killed before any message arrives, so this only fires when stuck.
+    if (_paused) {
+      console.log(`[RESUME] Buyer message while paused — self-reconnecting to serve (sender: ${msg.senderVerusId})`);
+      _paused = false;
+      _idleMessageSent = false;
+      try {
+        await agent.authenticate();
+        await agent.connectChat();
+        agent.joinJobChat(job.id);
+        console.log(`[RESUME] Chat reconnected for job ${job.id}`);
+      } catch (err) {
+        console.error(`[RESUME] chat reconnect failed: ${err.message}`);
+      }
+    }
 
     _lastActivityAt = Date.now();
     const buyerMessage = sanitizeInput(msg.content);
