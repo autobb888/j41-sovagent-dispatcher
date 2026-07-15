@@ -19,6 +19,7 @@ const { SignChannelClient } = require('./sign-channel-client.js');
 const log = require('./logger.js');
 const { scanUntrusted } = require('./sovguard-context.js');
 const { markIfNew } = require('./message-dedup.js');
+const { selectBuyerMessages } = require('./message-poll.js');
 
 const API_URL = process.env.J41_API_URL;
 const AGENT_ID = process.env.J41_AGENT_ID;
@@ -33,6 +34,7 @@ const BUDGET_WARNING_PERCENT = parseInt(process.env.J41_BUDGET_WARNING_PERCENT |
 const BUDGET_EXTENSION_WAIT_MS = parseInt(process.env.J41_BUDGET_EXTENSION_WAIT_MS || '600000');
 const EXTENSION_RETRY_INTERVAL_MS = 60000; // min spacing between failed extension attempts
 const RATE_LIMIT_BACKOFF_MULTIPLIER = parseInt(process.env.J41_RATE_LIMIT_BACKOFF_MULTIPLIER || '3');
+const MESSAGE_POLL_MS = 8000; // poll interval for getChatMessages fallback
 
 const J41_NETWORK = process.env.J41_NETWORK || 'verustest';
 const KEYS_FILE = process.env.J41_KEYS_FILE || '/app/keys.json';
@@ -135,6 +137,7 @@ let _workspaceStats = null;
 let _workspaceMode = 'supervised';
 let _shuttingDown = false;
 let _sessionEndResolve = null; // global ref so shutdown IPC can resolve the session
+let _msgPoll = null; // message-poll fallback interval (Task 3); cleared on session end + delivery paths
 let _disputePolicy = null;
 let _agentMarkup = 15;
 let _reworkCount = 0;
@@ -493,6 +496,7 @@ async function main() {
     // pause/reactivate/TTL lifecycle owns what happens next.
     log.info('Job not deliverable — skipping delivery + post-delivery wait', { jobId: JOB_ID });
     try { clearInterval(_ipcPoller); } catch {}
+    clearInterval(_msgPoll);
     disconnectWorkspace();
     await performCleanup(agent, keys, fullJob, { reason: 'not-deliverable' }, signer).catch(() => {});
     return;
@@ -524,6 +528,7 @@ async function main() {
     if (e.code === 'INVALID_STATUS' || /Cannot deliver job in status/.test(e.message || '')) {
       log.warn('Job not in a deliverable state at delivery — exiting cleanly without delivering', { jobId: JOB_ID, error: e.message });
       try { clearInterval(_ipcPoller); } catch {}
+      clearInterval(_msgPoll);
       disconnectWorkspace();
       await performCleanup(agent, keys, fullJob, { reason: 'not-deliverable' }, signer).catch(() => {});
       return;
@@ -557,6 +562,7 @@ async function main() {
   // STEP 5: CLEANUP + ATTESTATION + IDENTITY UPDATE
   // ─────────────────────────────────────────
   clearInterval(_ipcPoller); // Safe to clear now — post-delivery wait is done
+  clearInterval(_msgPoll);
   disconnectWorkspace();
   await performCleanup(agent, keys, fullJob, postDeliveryResult, signer);
 }
@@ -763,6 +769,26 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   // Handle incoming messages — delegate to executor (J4: serialized via queue)
   agent.onChatMessage((jobId, msg) => { if (jobId !== job.id) return; processBuyerMessage(msg); });
 
+  // ── Message-poll fallback (Task 3) ──
+  // Catches API/SDK-posted buyer messages that the WebSocket didn't push.
+  // processBuyerMessage dedups by id via markIfNew → WS-delivered messages are no-ops.
+  const _buyerVerusId = job.buyerVerusId || (await agent.client.getJob(job.id))?.buyerVerusId || null;
+  if (!_buyerVerusId) {
+    console.warn('[MSG-POLL] No buyerVerusId — message-poll fallback disabled for this job');
+  }
+  _msgPoll = setInterval(async () => {
+    if (_paused || sessionEnded || !_buyerVerusId) return;
+    try {
+      const res = await agent.client.getChatMessages(job.id, { limit: 50 });
+      const msgs = res?.data || res || [];
+      for (const m of selectBuyerMessages(msgs, _buyerVerusId)) {
+        // processBuyerMessage dedups by id (markIfNew) → WS-delivered ones are skipped.
+        await processBuyerMessage({ id: m.id, jobId: job.id, senderVerusId: m.senderVerusId, content: m.content, createdAt: m.createdAt });
+      }
+    } catch { /* transient — retry next tick */ }
+  }, MESSAGE_POLL_MS);
+  _msgPoll.unref();
+
   // ── File detection: react to platform's "📎 Uploaded file:" chat messages ──
   const knownFileIds = new Set(jobFiles.map(f => f.id));
 
@@ -909,6 +935,7 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   await sessionPromise;
   clearInterval(idleCheck);
   clearInterval(budgetCheck);
+  clearInterval(_msgPoll); // stop message-poll fallback — session ended
   // NOTE: _ipcPoller is NOT cleared here — it must survive for post-delivery IPC (dispute/rework)
   _wsPollerStopped = true;
   if (_wsPollTimer) clearTimeout(_wsPollTimer);
