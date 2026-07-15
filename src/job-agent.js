@@ -483,6 +483,7 @@ async function main() {
     }
   } catch (e) {
     log.error('Job failed', { jobId: JOB_ID, error: e.message });
+    clearInterval(_msgPoll);
     await executor.cleanup().catch(() => {});
     result = { error: e.message, content: 'Job failed: ' + e.message };
   }
@@ -722,13 +723,13 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   // Reusable message processor — called by the WS handler and (Task 3) the poll fallback.
   // Deduplicates by msg.id so a message delivered by both paths is handled exactly once.
   async function processBuyerMessage(msg) {
-    if (!markIfNew(_processedMsgIds, msg.id)) return;
-
     // Layer 3 message guard: refuse LLM calls when paused (don't update activity for dropped messages)
     if (_paused) {
       console.log(`[GUARD] Message received while paused — dropping (sender: ${msg.senderVerusId})`);
       return;
     }
+
+    if (!markIfNew(_processedMsgIds, msg.id)) return;
 
     _lastActivityAt = Date.now();
     const buyerMessage = sanitizeInput(msg.content);
@@ -776,15 +777,18 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   if (!_buyerVerusId) {
     console.warn('[MSG-POLL] No buyerVerusId — message-poll fallback disabled for this job');
   }
+  let _lastPolledIso = new Date(Date.now() - 15000).toISOString();
   _msgPoll = setInterval(async () => {
     if (_paused || sessionEnded || !_buyerVerusId) return;
     try {
-      const res = await agent.client.getChatMessages(job.id, { limit: 50 });
+      const res = await agent.client.getChatMessages(job.id, { since: _lastPolledIso, limit: 50 });
       const msgs = res?.data || res || [];
       for (const m of selectBuyerMessages(msgs, _buyerVerusId)) {
         // processBuyerMessage dedups by id (markIfNew) → WS-delivered ones are skipped.
         await processBuyerMessage({ id: m.id, jobId: job.id, senderVerusId: m.senderVerusId, content: m.content, createdAt: m.createdAt });
       }
+      // Advance the cursor past everything returned (buyer + agent) so the window moves forward.
+      for (const m of msgs) { if (m && m.createdAt && m.createdAt > _lastPolledIso) _lastPolledIso = m.createdAt; }
     } catch { /* transient — retry next tick */ }
   }, MESSAGE_POLL_MS);
   _msgPoll.unref();
@@ -933,6 +937,7 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
 
   // Wait for session end or idle timeout
   await sessionPromise;
+  sessionEnded = true;
   clearInterval(idleCheck);
   clearInterval(budgetCheck);
   clearInterval(_msgPoll); // stop message-poll fallback — session ended
