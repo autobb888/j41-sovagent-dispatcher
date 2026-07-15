@@ -388,6 +388,7 @@ async function callLLM(systemPrompt, messages) {
     };
   } catch (e) {
     log.error('LLM call failed', { error: e.message });
+    log.error('[LLM-OUTAGE] shipping canned fallback', { model: LLM_CONFIG.model, base: LLM_CONFIG.baseUrl, error: e.message });
     return { content: 'I experienced a temporary issue. Please try sending your message again.', usage: null };
   }
 }
@@ -456,6 +457,7 @@ async function callLLMWithTools(systemPrompt, messages, tools) {
     return msg;
   } catch (e) {
     log.error('LLM call failed', { error: e.message });
+    log.error('[LLM-OUTAGE] shipping canned fallback', { model: LLM_CONFIG.model, base: LLM_CONFIG.baseUrl, error: e.message });
     return { content: 'I experienced a temporary issue. Please try again.', _usage: null };
   }
 }

@@ -286,6 +286,7 @@ class MCPExecutor extends Executor {
     } catch (e) {
       clearTimeout(timer);
       console.error(`[MCP] LLM call failed: ${e.message}`);
+      console.error(`[LLM-OUTAGE] shipping canned fallback model=${LLM.model} base=${LLM.baseUrl} error=${e.message}`);
       return { content: 'I experienced a temporary issue. Please try again.' };
     }
   }
