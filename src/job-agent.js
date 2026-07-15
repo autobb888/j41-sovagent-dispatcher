@@ -802,7 +802,15 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   const _pollLookbackMs = isReconnect
     ? Math.max(15000, Math.min(240000, IDLE_TIMEOUT_MS - 60000))
     : 15000;
-  let _lastPolledIso = new Date(Date.now() - _pollLookbackMs).toISOString();
+  // CRITICAL: the platform's `since` filter is a STRING comparison against the
+  // stored createdAt, which is Postgres format "YYYY-MM-DD HH:MM:SS.ffffff+00"
+  // (SPACE separator). Date.toISOString() uses a 'T' separator, and ' ' (0x20)
+  // < 'T' (0x54), so a toISOString `since` sorts BEFORE every stored row → the
+  // filter excludes everything → the poll silently fetches nothing. Emit the
+  // space-separated form so the cursor actually matches. (The advance step below
+  // assigns m.createdAt, which is already in this format.)
+  const toBackendTs = (d) => d.toISOString().replace('T', ' ').replace('Z', '');
+  let _lastPolledIso = toBackendTs(new Date(Date.now() - _pollLookbackMs));
   _msgPoll = setInterval(async () => {
     if (_paused || sessionEnded || !_buyerVerusId) return;
     try {
