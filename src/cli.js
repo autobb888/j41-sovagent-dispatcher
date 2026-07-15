@@ -3143,6 +3143,8 @@ program
       _agentErrors: new Map(), // agentId -> last error string (health document)
       _containerCrashes: new Map(), // agentId -> unexpected-exit count (health document)
       _inboxFailures: new Map(), // inbox itemId -> { attempts, deadLettered, lastError } — bounds accept retries (dead-letter)
+      _resumeCursor: 0, // round-robin cursor for the poll-mode queued-resume sweep (Task 4)
+      _proxyStarted: false, // true once the api-endpoint proxy is wired at boot; drives the heal-time "restart to activate proxy" notice
       _devUnsafe, // security: allows local mode when true
     };
 
@@ -3229,147 +3231,49 @@ program
 
     // ── Load on-chain capabilities for VDXF policy enforcement ──
     console.log('→ Loading on-chain agent capabilities...\n');
-    const { decodeContentMultimap } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
     for (let i = 0; i < readyAgents.length; i++) {
-      const agentInfo = readyAgents[i];
       // Stagger 2s between agents to avoid rate limiting
       if (i > 0) await new Promise(r => setTimeout(r, 2000));
-      try {
-        const agent = await getAgentSession(state, agentInfo);
-
-        // Fetch on-chain VDXF data
-        const idRaw = await agent.client.getIdentityRaw();
-        const id = idRaw.data?.identity || idRaw.identity;
-
-        // Also fetch platform services (has serviceType, endpointUrl, modelPricing)
-        let platformServices = [];
-        try {
-          const svcResp = await agent.client.getAgentServices(agentInfo.iAddress || agentInfo.identity);
-          platformServices = svcResp.data || svcResp || [];
-        } catch {}
-
-        if (id?.contentmultimap) {
-          const decoded = decodeContentMultimap(id.contentmultimap);
-          const hasWorkspace = !!decoded.profile?.workspaceCapability;
-          const { VDXF_KEYS: VK, PARENT_KEYS: PK } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
-          const hasWorkspaceKey = !!id.contentmultimap[VK.workspace.capability] || !!id.contentmultimap[PK.workspace];
-          // Merge on-chain services with platform services
-          const services = platformServices.length > 0 ? platformServices : (decoded.services || []);
-          // Check if this agent has api-endpoint capabilities.
-          // Sources: (a) on-chain profile type, (b) on-chain networkEndpoints, (c) any platform
-          // service declared as serviceType='api-endpoint', (d) agent-config.json apiEndpointUrl.
-          // Any of these flips the agent into proxy mode — operators who fix one but not the
-          // others shouldn't silently lose proxy support.
-          const agentType = decoded.profile?.type;
-          const hasEndpoints = decoded.profile?.network?.endpoints?.length > 0;
-          const hasApiService = services.some(s => s.serviceType === 'api-endpoint');
-          let hasConfiguredUpstream = false;
-          try {
-            const agentCfgPath = path.join(AGENTS_DIR, agentInfo.id, 'agent-config.json');
-            if (fs.existsSync(agentCfgPath)) {
-              const agentCfg = JSON.parse(fs.readFileSync(agentCfgPath, 'utf8'));
-              hasConfiguredUpstream = !!(agentCfg.apiEndpointUrl || agentCfg.endpointUrl);
-            }
-          } catch {}
-          if (agentType === 'api-provider' || hasEndpoints || hasApiService || hasConfiguredUpstream) {
-            const { VDXF_KEYS: VK2 } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
-            const endpointsRaw = id.contentmultimap[VK2.agent.networkEndpoints];
-            let onChainEndpoint = '';
-            if (endpointsRaw) {
-              try {
-                const epEntry = Array.isArray(endpointsRaw) ? endpointsRaw[0] : endpointsRaw;
-                const dd = epEntry['i4GC1YGEVD21afWudGoFJVdnfjJ5XWnCQv'];
-                const endpoints = JSON.parse(dd?.objectdata?.message || '[]');
-                onChainEndpoint = endpoints[0] || '';
-              } catch {}
-            }
-            // Also check agent-config.json for apiEndpointUrl (upstream LLM backend)
-            let agentConfigEndpoint = '';
-            try {
-              const agentCfgPath = path.join(AGENTS_DIR, agentInfo.id, 'agent-config.json');
-              if (fs.existsSync(agentCfgPath)) {
-                const agentCfg = JSON.parse(fs.readFileSync(agentCfgPath, 'utf8'));
-                agentConfigEndpoint = agentCfg.apiEndpointUrl || agentCfg.endpointUrl || '';
-              }
-            } catch {}
-
-            for (const svc of services) {
-              svc._isApiEndpoint = true;
-              // Priority: agent-config > on-chain VDXF networkEndpoints
-              if (!svc.endpointUrl) svc.endpointUrl = agentConfigEndpoint || onChainEndpoint;
-              if (!svc.modelPricing && decoded.services?.length > 0) {
-                const onChainSvc = decoded.services.find(s => s.modelPricing);
-                if (onChainSvc) svc.modelPricing = onChainSvc.modelPricing;
-              }
-            }
-          }
-          state.capabilities.set(agentInfo.id, {
-            workspace: hasWorkspace,
-            hasWorkspaceKey,
-            services,
-            profile: decoded.profile,
-          });
-          const apiCount = services.filter(s => s.serviceType === 'api-endpoint' || s.endpointUrl || s._isApiEndpoint).length;
-          console.log(`  ${agentInfo.id}: workspace=${hasWorkspace || hasWorkspaceKey}, services=${services.length}${apiCount > 0 ? `, api-endpoints=${apiCount}` : ''}`);
-        } else {
-          state.capabilities.set(agentInfo.id, { workspace: false, services: platformServices, profile: null });
-          console.log(`  ${agentInfo.id}: no VDXF data on-chain, ${platformServices.length} platform services`);
-        }
-      } catch (e) {
-        state.capabilities.set(agentInfo.id, { workspace: false, services: [], profile: null, _fetchFailed: true });
-        console.log(`  ${agentInfo.id}: capability fetch failed (${e.message})`);
-      }
+      await loadAgentCapabilities(state, readyAgents[i]);
     }
     console.log('');
 
-    // Retry loop: if any agents failed capability fetch AND no api-endpoint found,
-    // retry every 5 minutes. Operator must restart dispatcher once detected.
-    const failedAgents = readyAgents.filter(a => state.capabilities.get(a.id)?._fetchFailed);
-    const hasApiAfterLoad = readyAgents.some(a => {
-      const cap = state.capabilities.get(a.id);
-      return cap?.services?.some(s => s.serviceType === 'api-endpoint' || s.endpointUrl || s._isApiEndpoint);
-    });
-    if (failedAgents.length > 0 && !hasApiAfterLoad) {
-      console.log(`  ⚠  ${failedAgents.length} agent(s) failed capability fetch — retrying every 5min`);
+    // Self-healing retry: re-run full capability load for failed agents every 60s
+    // until all agents succeed — no restart required after a boot-time chain-sync gap.
+    const { stillFailed } = require('./capability-retry.js');
+    const failedAgents = stillFailed(state, readyAgents);
+    if (failedAgents.length > 0) {
+      console.log(`  ⚠  ${failedAgents.length} agent(s) failed capability fetch — self-healing retry every 60s`);
       const retryTimer = setInterval(async () => {
-        console.log('[Capabilities] Retrying failed agents...');
-        for (const agentInfo of failedAgents) {
-          try {
-            const agent = await getAgentSession(state, agentInfo);
-            const svcResp = await agent.client.getAgentServices(agentInfo.iAddress || agentInfo.identity);
-            const platformServices = svcResp.data || svcResp || [];
-            if (platformServices.some(s => s.serviceType === 'api-endpoint' || s.endpointUrl)) {
-              console.log('[Capabilities] ✓ api-endpoint agent detected — restart dispatcher to activate proxy');
-              clearInterval(retryTimer);
-              return;
+        const pending = stillFailed(state, readyAgents);
+        if (pending.length === 0) { clearInterval(retryTimer); return; }
+        console.log(`[Capabilities] Retrying ${pending.length} agent(s)...`);
+        for (const agentInfo of pending) {
+          const ok = await loadAgentCapabilities(state, agentInfo);   // re-runs full load, clears _fetchFailed on success
+          if (ok) {
+            await loadAgentDisputePolicy(state, agentInfo);
+            console.log(`[Capabilities] ✓ ${agentInfo.id} healed`);
+            // The proxy is a boot-time snapshot (built once from state.capabilities);
+            // reloading capabilities does NOT wire it. If an api-endpoint agent only
+            // became visible after healing and no proxy was started at boot, the
+            // operator must restart to serve it.
+            const cap = state.capabilities.get(agentInfo.id);
+            const nowApi = cap?.services?.some(s => s.serviceType === 'api-endpoint' || s.endpointUrl || s._isApiEndpoint);
+            if (nowApi && !state._proxyStarted) {
+              console.log(`[Capabilities] ⚠  ${agentInfo.id} exposes an api-endpoint — restart dispatcher to activate the proxy`);
             }
-          } catch {}
+          }
         }
-      }, 5 * 60 * 1000);
+        if (stillFailed(state, readyAgents).length === 0) {
+          console.log('[Capabilities] ✅ all agents healed');
+          clearInterval(retryTimer);
+        }
+      }, 60 * 1000);
       retryTimer.unref();
     }
 
     // Cache dispute policy and markup per agent from VDXF
-    for (const agentInfo of readyAgents) {
-      try {
-        const agent = await getAgentSession(state, agentInfo);
-        const identity = await agent.client.getMyIdentity();
-        if (identity?.contentmultimap) {
-          const decoded = decodeContentMultimap(identity.contentmultimap);
-          if (decoded.disputePolicy) {
-            state.disputePolicy.set(agentInfo.id, decoded.disputePolicy);
-            console.log(`  ✅ ${agentInfo.id}: dispute policy loaded (default=${decoded.disputePolicy.defaultAction})`);
-          } else {
-            console.log(`  ⚠️  ${agentInfo.id}: no dispute policy on-chain — disputes will log only`);
-          }
-          if (decoded.profile?.markup != null) {
-            state.agentMarkup.set(agentInfo.id, decoded.profile.markup);
-          }
-        }
-      } catch (e) {
-        console.log(`  ⚠️  ${agentInfo.id}: failed to load dispute policy (${e.message.slice(0, 60)})`);
-      }
-    }
+    for (const agentInfo of readyAgents) await loadAgentDisputePolicy(state, agentInfo);
     console.log('');
 
     // Guard all interval callbacks against unhandled rejections
@@ -3441,6 +3345,7 @@ program
         const cap = state.capabilities.get(a.id);
         return cap?.services?.some(s => s.serviceType === 'api-endpoint' || s.endpointUrl || s._isApiEndpoint);
       });
+      state._proxyStarted = apiAgents.length > 0; // the proxy is wired here, once, from this boot-time snapshot
       if (apiAgents.length > 0) {
         const { mintAccessEnvelope, verifyAccessRequest } = require('@junction41/sovagent-sdk/dist/crypto/envelope.js');
         const { validateEnvelope, canonicalBytes, verifyCanonicalSignatures, CanonicalError } = require('@junction41/sovagent-sdk/dist/crypto/canonical.js');
@@ -4386,6 +4291,7 @@ function stopVrscRatePoller() {
 }
 
 async function getAgentSession(state, agentInfo) {
+  if (process.env.NODE_ENV === 'test' && state._testAgentSession) return state._testAgentSession;
   const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
   const baseUrl = J41_API_URL;
 
@@ -4403,6 +4309,129 @@ async function getAgentSession(state, agentInfo) {
   await agent.authenticate();
   state.agentSessions.set(agentInfo.id, { agent, authedAt: Date.now() });
   return agent;
+}
+
+/**
+ * Load on-chain capabilities for one agent into state.capabilities.
+ * Returns true on success, false on error (stores _fetchFailed sentinel).
+ * Called at boot and by the self-healing retry (Task 2).
+ */
+async function loadAgentCapabilities(state, agentInfo) {
+  try {
+    const agent = await getAgentSession(state, agentInfo);
+
+    // Fetch on-chain VDXF data
+    const idRaw = await agent.client.getIdentityRaw();
+    const id = idRaw.data?.identity || idRaw.identity;
+
+    // Also fetch platform services (has serviceType, endpointUrl, modelPricing)
+    let platformServices = [];
+    try {
+      const svcResp = await agent.client.getAgentServices(agentInfo.iAddress || agentInfo.identity);
+      platformServices = svcResp.data || svcResp || [];
+    } catch {}
+
+    const { decodeContentMultimap } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+
+    if (id?.contentmultimap) {
+      const decoded = decodeContentMultimap(id.contentmultimap);
+      const hasWorkspace = !!decoded.profile?.workspaceCapability;
+      const { VDXF_KEYS: VK, PARENT_KEYS: PK } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+      const hasWorkspaceKey = !!id.contentmultimap[VK.workspace.capability] || !!id.contentmultimap[PK.workspace];
+      // Merge on-chain services with platform services
+      const services = platformServices.length > 0 ? platformServices : (decoded.services || []);
+      // Check if this agent has api-endpoint capabilities.
+      // Sources: (a) on-chain profile type, (b) on-chain networkEndpoints, (c) any platform
+      // service declared as serviceType='api-endpoint', (d) agent-config.json apiEndpointUrl.
+      // Any of these flips the agent into proxy mode — operators who fix one but not the
+      // others shouldn't silently lose proxy support.
+      const agentType = decoded.profile?.type;
+      const hasEndpoints = decoded.profile?.network?.endpoints?.length > 0;
+      const hasApiService = services.some(s => s.serviceType === 'api-endpoint');
+      let hasConfiguredUpstream = false;
+      try {
+        const agentCfgPath = path.join(AGENTS_DIR, agentInfo.id, 'agent-config.json');
+        if (fs.existsSync(agentCfgPath)) {
+          const agentCfg = JSON.parse(fs.readFileSync(agentCfgPath, 'utf8'));
+          hasConfiguredUpstream = !!(agentCfg.apiEndpointUrl || agentCfg.endpointUrl);
+        }
+      } catch {}
+      if (agentType === 'api-provider' || hasEndpoints || hasApiService || hasConfiguredUpstream) {
+        const { VDXF_KEYS: VK2 } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+        const endpointsRaw = id.contentmultimap[VK2.agent.networkEndpoints];
+        let onChainEndpoint = '';
+        if (endpointsRaw) {
+          try {
+            const epEntry = Array.isArray(endpointsRaw) ? endpointsRaw[0] : endpointsRaw;
+            const dd = epEntry['i4GC1YGEVD21afWudGoFJVdnfjJ5XWnCQv'];
+            const endpoints = JSON.parse(dd?.objectdata?.message || '[]');
+            onChainEndpoint = endpoints[0] || '';
+          } catch {}
+        }
+        // Also check agent-config.json for apiEndpointUrl (upstream LLM backend)
+        let agentConfigEndpoint = '';
+        try {
+          const agentCfgPath = path.join(AGENTS_DIR, agentInfo.id, 'agent-config.json');
+          if (fs.existsSync(agentCfgPath)) {
+            const agentCfg = JSON.parse(fs.readFileSync(agentCfgPath, 'utf8'));
+            agentConfigEndpoint = agentCfg.apiEndpointUrl || agentCfg.endpointUrl || '';
+          }
+        } catch {}
+
+        for (const svc of services) {
+          svc._isApiEndpoint = true;
+          // Priority: agent-config > on-chain VDXF networkEndpoints
+          if (!svc.endpointUrl) svc.endpointUrl = agentConfigEndpoint || onChainEndpoint;
+          if (!svc.modelPricing && decoded.services?.length > 0) {
+            const onChainSvc = decoded.services.find(s => s.modelPricing);
+            if (onChainSvc) svc.modelPricing = onChainSvc.modelPricing;
+          }
+        }
+      }
+      state.capabilities.set(agentInfo.id, {
+        workspace: hasWorkspace,
+        hasWorkspaceKey,
+        services,
+        profile: decoded.profile,
+      });
+      const apiCount = services.filter(s => s.serviceType === 'api-endpoint' || s.endpointUrl || s._isApiEndpoint).length;
+      console.log(`  ${agentInfo.id}: workspace=${hasWorkspace || hasWorkspaceKey}, services=${services.length}${apiCount > 0 ? `, api-endpoints=${apiCount}` : ''}`);
+    } else {
+      state.capabilities.set(agentInfo.id, { workspace: false, services: platformServices, profile: null });
+      console.log(`  ${agentInfo.id}: no VDXF data on-chain, ${platformServices.length} platform services`);
+    }
+    return true;
+  } catch (e) {
+    state.capabilities.set(agentInfo.id, { workspace: false, services: [], profile: null, _fetchFailed: true });
+    console.log(`  ${agentInfo.id}: capability fetch failed (${e.message})`);
+    return false;
+  }
+}
+
+/**
+ * Load dispute policy and markup for one agent into state.disputePolicy / state.agentMarkup.
+ * Never throws (logs on error). Called at boot and after a capability heal (Task 2).
+ */
+async function loadAgentDisputePolicy(state, agentInfo) {
+  try {
+    const agent = await getAgentSession(state, agentInfo);
+    const identity = await agent.client.getMyIdentity();
+    if (identity?.contentmultimap) {
+      const { decodeContentMultimap } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+      const decoded = decodeContentMultimap(identity.contentmultimap);
+      if (decoded.disputePolicy) {
+        state.disputePolicy.set(agentInfo.id, decoded.disputePolicy);
+        console.log(`  ✅ ${agentInfo.id}: dispute policy loaded (default=${decoded.disputePolicy.defaultAction})`);
+      } else {
+        console.log(`  ⚠️  ${agentInfo.id}: no dispute policy on-chain — disputes will log only`);
+      }
+      if (decoded.profile?.markup != null) {
+        state.agentMarkup.set(agentInfo.id, decoded.profile.markup);
+      }
+    }
+  } catch (e) {
+    console.log(`  ⚠️  ${agentInfo.id}: failed to load dispute policy (${e.message.slice(0, 60)})`);
+  }
 }
 
 /**
@@ -5152,8 +5181,44 @@ async function pollForJobs(state) {
           state._lastSentStatus.set(jobId, currentJob.status);
         }
       }
+
+      // Poll-mode fallback: detect in_progress → paused (pause happened without a
+      // webhook / without a working job_idle IPC in Docker). Free the container.
+      const { shouldPauseOnPoll } = require('./reactivation-poll.js');
+      if (shouldPauseOnPoll(currentJob, activeInfo)) {
+        console.log(`[Poll] Job ${jobId.substring(0, 8)} paused (platform) — freeing container`);
+        await moveJobToReactivationQueue(state, jobId);
+        state._lastSentStatus.set(jobId, currentJob.status);
+      }
     } catch (e) {
       // Job may have been deleted — ignore
+    }
+  }
+
+  // Poll-mode fallback: resume queued (container-freed) jobs whose platform status
+  // returned to in_progress — the webhook (job.resumed) path may be absent in poll
+  // mode. Batched round-robin so 100 queued jobs don't hammer the platform.
+  const RESUME_POLL_BATCH = 10;
+  if (state.reactivationQueue.length > 0 && state.active.size < MAX_AGENTS) {
+    const { pickResumeBatch } = require('./reactivation-poll.js');
+    const { batch, nextCursor } = pickResumeBatch(state.reactivationQueue, state._resumeCursor || 0, RESUME_POLL_BATCH);
+    state._resumeCursor = nextCursor;
+    for (const entry of batch) {
+      const jobId = entry.job.id;
+      if (entry.readyToRespawn) continue; // already flagged
+      try {
+        const agentInfo = state.agents.find(a => a.id === entry.agentId);
+        if (!agentInfo) continue;
+        const session = await getAgentSession(state, agentInfo);
+        const full = await session.client.getJob(jobId);
+        if (full?.status === 'in_progress') {
+          console.log(`[Poll] Queued job ${jobId.substring(0, 8)} resumed (platform) — respawning`);
+          if (rq.markReady(state.reactivationQueue, jobId)) {
+            persistReactivationQueue(state.reactivationQueue);
+            await respawnReadyResumes(state);
+          }
+        }
+      } catch { /* transient — retried next sweep */ }
     }
   }
 
@@ -7517,7 +7582,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
