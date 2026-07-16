@@ -35,6 +35,7 @@ const BUDGET_EXTENSION_WAIT_MS = parseInt(process.env.J41_BUDGET_EXTENSION_WAIT_
 const EXTENSION_RETRY_INTERVAL_MS = 60000; // min spacing between failed extension attempts
 const RATE_LIMIT_BACKOFF_MULTIPLIER = parseInt(process.env.J41_RATE_LIMIT_BACKOFF_MULTIPLIER || '3');
 const MESSAGE_POLL_MS = 8000; // poll interval for getChatMessages fallback
+const OVERLAP_MS = 60000; // overlap window: re-query the last 60s so late-appearing messages are re-included
 
 const J41_NETWORK = process.env.J41_NETWORK || 'verustest';
 const KEYS_FILE = process.env.J41_KEYS_FILE || '/app/keys.json';
@@ -49,6 +50,34 @@ const SIGNING_BROKER_ENABLED = process.env.J41_SIGNING_BROKER === '1';
 /** Channel directory the dispatcher bind-mounts when broker mode is on.
  *  Both subdirs (`req/`, `resp/`) must exist before this process starts. */
 const SIGNING_BROKER_CHANNEL_DIR = process.env.J41_SIGNING_CHANNEL_DIR || '/app/sign';
+
+/**
+ * nextPollSince(highWaterIso, overlapMs) → string
+ *
+ * Pure helper: given the poll high-water mark in backend space-format
+ * ("YYYY-MM-DD HH:MM:SS.ffffff+00"), return a `since` string that is
+ * `overlapMs` ms earlier — still in the same space-format — so the next
+ * getChatMessages call re-examines the overlap window and catches any
+ * messages that appeared slightly late.
+ *
+ * If `highWaterIso` is falsy or unparseable (Date.parse → NaN), returns
+ * it unchanged (fail-safe: caller falls through to its existing query).
+ */
+function nextPollSince(highWaterIso, overlapMs) {
+  if (!highWaterIso) return highWaterIso;
+  // Backend stores "YYYY-MM-DD HH:MM:SS.ffffff+00" (space-separated).
+  // Normalise to ISO 8601 for Date.parse: replace the space separator with T,
+  // and expand bare "+00" to "+00:00" (required by the spec; some runtimes
+  // accept it but Node is strict).
+  const normalised = String(highWaterIso)
+    .replace(' ', 'T')
+    .replace(/([+-]\d{2})$/, '$1:00');
+  const ms = Date.parse(normalised);
+  if (isNaN(ms)) return highWaterIso;
+  const shifted = ms - overlapMs;
+  // Re-emit in the same backend space-format (no 'Z', no 'T' separator).
+  return new Date(shifted).toISOString().replace('T', ' ').replace('Z', '');
+}
 
 /**
  * Construct the right signer for this container. In broker mode the
@@ -838,17 +867,39 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   // assigns m.createdAt, which is already in this format.)
   const toBackendTs = (d) => d.toISOString().replace('T', ' ').replace('Z', '');
   let _lastPolledIso = toBackendTs(new Date(Date.now() - _pollLookbackMs));
+  // High-water mark: the maximum createdAt we have observed across all poll ticks.
+  // Kept separate from _lastPolledIso so the overlap-shifted `since` doesn't grow
+  // the high-water backward.
+  let _pollHighWater = _lastPolledIso;
   _msgPoll = setInterval(async () => {
     if (_paused || sessionEnded || !_buyerVerusId) return;
     try {
-      const res = await agent.client.getChatMessages(job.id, { since: _lastPolledIso, limit: 50 });
+      // Query with a 60s overlap so messages that appeared slightly late are re-fetched.
+      // processBuyerMessage dedups by id (markIfNew) → already-processed messages are no-ops.
+      const since = nextPollSince(_pollHighWater, OVERLAP_MS);
+      const res = await agent.client.getChatMessages(job.id, { since, limit: 50 });
       const msgs = res?.data || res || [];
-      for (const m of selectBuyerMessages(msgs, _buyerVerusId)) {
-        // processBuyerMessage dedups by id (markIfNew) → WS-delivered ones are skipped.
-        await processBuyerMessage({ id: m.id, jobId: job.id, senderVerusId: m.senderVerusId, content: m.content, createdAt: m.createdAt });
+      const debugPoll = process.env.J41_DEBUG_POLL === '1';
+      const buyerMsgs = selectBuyerMessages(msgs, _buyerVerusId);
+      if (debugPoll) {
+        console.log(`[MSG-POLL] since=${since} fetched=${msgs.length} buyerMsgs=${buyerMsgs.length}`);
       }
-      // Advance the cursor past everything returned (buyer + agent) so the window moves forward.
-      for (const m of msgs) { if (m && m.createdAt && m.createdAt > _lastPolledIso) _lastPolledIso = m.createdAt; }
+      for (const m of buyerMsgs) {
+        const isDup = _processedMsgIds.has(m.id);
+        if (debugPoll) {
+          console.log(`[MSG-POLL] msg id=${m.id} createdAt=${m.createdAt} safetyScore=${m.safetyScore ?? 'n/a'} status=${isDup ? 'dup(skip)' : 'new'}`);
+        }
+        if (!isDup) {
+          // processBuyerMessage dedups by id (markIfNew) → WS-delivered ones are skipped.
+          await processBuyerMessage({ id: m.id, jobId: job.id, senderVerusId: m.senderVerusId, content: m.content, createdAt: m.createdAt });
+        }
+      }
+      // Advance the high-water mark to the maximum createdAt observed across all
+      // returned messages (buyer + agent). The next tick will query from
+      // (highWater − OVERLAP_MS) to re-examine the last 60s.
+      for (const m of msgs) { if (m && m.createdAt && m.createdAt > _pollHighWater) _pollHighWater = m.createdAt; }
+      // Keep _lastPolledIso in sync (legacy; no longer used for the query since).
+      _lastPolledIso = _pollHighWater;
     } catch { /* transient — retry next tick */ }
   }, MESSAGE_POLL_MS);
   _msgPoll.unref();
@@ -1832,5 +1883,5 @@ if (require.main === module) {
 // Export testable helpers when running under NODE_ENV=test.
 // Avoids shipping a test seam in production while keeping coverage honest.
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { handleBudgetDelivery };
+  module.exports = { handleBudgetDelivery, nextPollSince };
 }

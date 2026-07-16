@@ -3,6 +3,7 @@
 // buyer sent (positive match — never the agent's own, so no self-reply loop),
 // oldest-first. Exactly-once dedup is handled downstream by markIfNew inside
 // processBuyerMessage.
+// Note: filtering is intentionally score-agnostic — safetyScore/flagged status is NOT checked here.
 function selectBuyerMessages(messages, buyerVerusId) {
   if (!Array.isArray(messages) || !buyerVerusId) return [];
   return messages
