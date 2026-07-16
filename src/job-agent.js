@@ -69,9 +69,13 @@ function nextPollSince(highWaterIso, overlapMs) {
   // Normalise to ISO 8601 for Date.parse: replace the space separator with T,
   // and expand bare "+00" to "+00:00" (required by the spec; some runtimes
   // accept it but Node is strict).
-  const normalised = String(highWaterIso)
+  let normalised = String(highWaterIso)
     .replace(' ', 'T')
     .replace(/([+-]\d{2})$/, '$1:00');
+  // No timezone offset (e.g. the suffix-less seed from toBackendTs) → force UTC,
+  // never local time. Production containers are UTC, but this keeps the cursor
+  // machine-TZ-independent so the first tick can't silently shift the window.
+  if (!/([+-]\d{2}:\d{2}|Z)$/.test(normalised)) normalised += 'Z';
   const ms = Date.parse(normalised);
   if (isNaN(ms)) return highWaterIso;
   const shifted = ms - overlapMs;

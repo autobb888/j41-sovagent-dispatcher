@@ -101,3 +101,12 @@ test('overlap window re-includes a message just below high-water; markIfNew make
   // The set has exactly one entry
   assert.strictEqual(processedIds.size, 1);
 });
+
+// Minor A (Task 3 review): suffix-less timestamps must be treated as UTC, not
+// local time, so the poll cursor is machine-TZ-independent.
+test('nextPollSince treats a suffix-less (no +00) timestamp as UTC', () => {
+  const { nextPollSince } = require('../src/job-agent.js');
+  // 18:00:00 UTC minus 60s = 17:59:00 UTC, regardless of the host TZ.
+  const out = nextPollSince('2026-07-16 18:00:00.000', 60000);
+  assert.equal(out, '2026-07-16 17:59:00.000');
+});
