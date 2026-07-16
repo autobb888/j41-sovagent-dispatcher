@@ -40,6 +40,7 @@ const { verifyInboxJobRecord } = require('./inbox-job-record.js');
 const { writeKeysFile, readKeysFile } = require('./keys-file.js');
 const keystore = require('./keystore.js');
 const { encryptAllKeys, decryptAllKeys } = require('./keys-migrate.js');
+const { preflightAllowsAccept } = require('./preflight-gate.js');
 const crypto = require('crypto');
 
 /** Feature flag: route in-container signing through the host-side broker
@@ -3163,6 +3164,7 @@ program
       _resumeCursor: 0, // round-robin cursor for the poll-mode queued-resume sweep (Task 4)
       _proxyStarted: false, // true once the api-endpoint proxy is wired at boot; drives the heal-time "restart to activate proxy" notice
       _devUnsafe, // security: allows local mode when true
+      llmHealth: new Map(), // agentId -> { ok, at } — preflight probe cache (ok-only, 30s TTL)
     };
 
     // ── Startup sweep: remove stale _live/*.log for jobs not in active state ──
@@ -5359,6 +5361,11 @@ async function pollForJobs(state) {
             const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
             const fullJob = await agent.client.getJob(job.id);
             if (fullJob?.jobHash && fullJob?.buyerVerusId) {
+              if (!(await preflightAllowsAccept(state, agentInfo))) {
+                console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${job.id.substring(0, 8)}, buyer not charged`);
+                state.emitEvent?.('job.declined_llm_down', { jobId: job.id, agentId: agentInfo.id });
+                continue;
+              }
               const timestamp = Math.floor(Date.now() / 1000);
               const acceptSig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
               await agent.client.acceptJob(job.id, acceptSig, timestamp, agentInfo.address);
@@ -5663,6 +5670,11 @@ async function handleWebhookEvent(state, agentId, payload) {
         const agent = await getAgentSession(state, agentInfo);
         const fullJob = await agent.client.getJob(jobId);
         if (fullJob?.jobHash && fullJob?.buyerVerusId) {
+          if (!(await preflightAllowsAccept(state, agentInfo))) {
+            console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${jobId.substring(0, 8)}, buyer not charged`);
+            state.emitEvent?.('job.declined_llm_down', { jobId, agentId: agentInfo.id });
+            return;
+          }
           const timestamp = Math.floor(Date.now() / 1000);
           const sig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
           await agent.client.acceptJob(jobId, sig, timestamp, agentInfo.address);
@@ -5937,6 +5949,11 @@ async function handleWebhookEvent(state, agentId, payload) {
         const agent = await getAgentSession(state, agentInfo);
         const fullJob = await agent.client.getJob(bountyJobId);
         if (fullJob?.jobHash && fullJob?.buyerVerusId) {
+          if (!(await preflightAllowsAccept(state, agentInfo))) {
+            console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${bountyJobId.substring(0, 8)}, buyer not charged`);
+            state.emitEvent?.('job.declined_llm_down', { jobId: bountyJobId, agentId: agentInfo.id });
+            return;
+          }
           const timestamp = Math.floor(Date.now() / 1000);
           const sig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
           await agent.client.acceptJob(bountyJobId, sig, timestamp, agentInfo.address);
@@ -7953,7 +7970,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
