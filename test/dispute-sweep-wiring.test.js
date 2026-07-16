@@ -181,3 +181,45 @@ test('sweepDisputesForRefund: idempotent — second run does not re-call respond
   const keys = Object.keys(ledgerAfterSecond).filter(k => k === 'job-dispute-3');
   assert.equal(keys.length, 1, 'ledger must have exactly one entry for job-dispute-3');
 });
+
+// ── Test 4 (M1): respondToDispute throws → job NOT enqueued (retry next sweep) ──
+// We must never enqueue a refund we failed to acknowledge to the buyer.
+test('sweepDisputesForRefund: respondToDispute throw → no ledger entry, no event', async () => {
+  clearLedger();
+  const events = [];
+  const job = makeUndeliveredJob({ id: 'job-dispute-throw' });
+  const dispute = makeConfidentDispute();
+  const state = {
+    agents: [{ id: 'agent-5', identity: 'testagent@', iAddress: SELF_I, address: 'RSELFADDRXXXXXXXXXXXXXXXXXXXXXX', wif: 'wif-test' }],
+    agentSessions: new Map(),
+    emitEvent: (t, d) => events.push({ t, d }),
+    _testAgentSession: {
+      respondToDispute: async () => { throw new Error('platform 503'); },
+      client: { getMyJobs: async () => ({ data: [job] }), getDispute: async () => dispute, resolveNames: async () => [] },
+    },
+  };
+
+  await sweepDisputesForRefund(state); // must not throw (per-agent try/catch)
+
+  assert.deepEqual(readLedger(), {}, 'no entry may be enqueued when the acknowledgement failed');
+  assert.equal(events.length, 0, 'no refund event when respondToDispute threw');
+});
+
+// ── Test 5 (M2): job already in refunded-set → skipped (no respond, no enqueue) ──
+test('sweepDisputesForRefund: job in refunded-set is skipped', async () => {
+  clearLedger();
+  const respondCalls = [];
+  const events = [];
+  // Pre-mark this job as already refunded.
+  fs.writeFileSync(path.join(dispDir, 'refunded-jobs.json'), JSON.stringify(['job-dispute-refunded']));
+  const job = makeUndeliveredJob({ id: 'job-dispute-refunded' });
+  const dispute = makeConfidentDispute();
+  const state = makeState({ job, dispute, respondCalls, events });
+
+  await sweepDisputesForRefund(state);
+
+  assert.equal(respondCalls.length, 0, 'must NOT respond for an already-refunded job');
+  assert.deepEqual(readLedger(), {}, 'must NOT enqueue an already-refunded job');
+  // cleanup so other tests are unaffected
+  fs.unlinkSync(path.join(dispDir, 'refunded-jobs.json'));
+});
