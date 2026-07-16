@@ -62,7 +62,7 @@ function makeUnverifiedDispute() {
   return { id: 'dispute-d2', raised_by: SELF_I, action: 'pending' };
 }
 
-function makeState({ job, dispute, respondCalls, events }) {
+function makeState({ job, dispute, respondCalls, events, resolveNames }) {
   return {
     agents: [{
       id: 'agent-5',
@@ -80,7 +80,8 @@ function makeState({ job, dispute, respondCalls, events }) {
       client: {
         getMyJobs: async () => ({ data: [job] }),
         getDispute: async () => dispute,
-        resolveNames: async () => [],
+        // Live resolveNames returns a MAP { iaddress: name }, not an array.
+        resolveNames: resolveNames || (async () => ({})),
       },
     },
   };
@@ -239,4 +240,26 @@ test('sweepDisputesForRefund: ledger file is written per-item (entry present imm
   const onDisk = readLedger();
   assert.ok(onDisk['job-persist-check'], 'ledger file must contain the entry after a single-item sweep');
   assert.equal(onDisk['job-persist-check'].status, 'pending_approval');
+});
+
+// ── Test 6: live resolveNames MAP shape → displayName populated, no crash ──────
+// Regression: resolveNames returns { iaddress: name } (map), not an array. The
+// earlier stub `[]` passed vacuously; this pins the real shape.
+test('sweepDisputesForRefund: resolveNames map shape populates buyerDisplayName', async () => {
+  clearLedger();
+  const respondCalls = [];
+  const events = [];
+  const job = makeUndeliveredJob({ id: 'job-dispute-name' });
+  const dispute = makeConfidentDispute();
+  const state = makeState({
+    job, dispute, respondCalls, events,
+    resolveNames: async () => ({ [BUYER_I]: 'subid.agentplatform' }),
+  });
+
+  await sweepDisputesForRefund(state);
+
+  const entry = readLedger()['job-dispute-name'];
+  assert.ok(entry, 'entry enqueued');
+  assert.equal(entry.status, 'pending_approval', 'confident → pending_approval (name round-trip on map key)');
+  assert.equal(entry.buyerDisplayName, 'subid.agentplatform', 'displayName resolved from the map');
 });

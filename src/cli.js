@@ -4901,10 +4901,10 @@ async function sweepDisputesForRefund(state) {
         let nameMap = new Map();
         try {
           if (job.buyerVerusId) {
-            const names = await agent.client.resolveNames([job.buyerVerusId]);
-            for (const n of (names || [])) {
-              const ia = n.iAddress || n.iaddress;
-              if (ia) nameMap.set(ia, { name: n.name, iaddress: ia });
+            // resolveNames returns a map { iaddress: name }, NOT an array.
+            const nameByAddr = await agent.client.resolveNames([job.buyerVerusId]);
+            for (const [ia, nm] of Object.entries(nameByAddr || {})) {
+              if (ia && nm) nameMap.set(ia, { name: nm, iaddress: ia });
             }
           }
         } catch (e) {
@@ -5078,10 +5078,10 @@ async function refundsApprove(state, jobId, opts = {}, ledgerPath) {
     let nameMap = new Map();
     try {
       if (job.buyerVerusId) {
-        const names = await agent.client.resolveNames([job.buyerVerusId]);
-        for (const n of (names || [])) {
-          const ia = n.iAddress || n.iaddress;
-          if (ia) nameMap.set(ia, { name: n.name, iaddress: ia });
+        // resolveNames returns a map { iaddress: name }, NOT an array.
+        const nameByAddr = await agent.client.resolveNames([job.buyerVerusId]);
+        for (const [ia, nm] of Object.entries(nameByAddr || {})) {
+          if (ia && nm) nameMap.set(ia, { name: nm, iaddress: ia });
         }
       }
     } catch (e) {
