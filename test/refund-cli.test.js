@@ -245,3 +245,55 @@ test('refundsList returns pending_approval+needs_review by default; all:true ret
   const allResult = refundsList(state, { all: true }, ledgerPath);
   assert.equal(allResult.length, 4, 'all:true must return all 4 entries');
 });
+
+// A third valid i-address, not the agent's self address — used for the
+// "confident but address changed since enqueue" abort branch.
+const OTHER_I = 'iDP6VUHKfd5NwLgFuvdNc8PmRkZT6ayGJN';
+
+// ── Test 8: dispute target re-resolves CONFIDENT but to a DIFFERENT address ───
+// The money-safety branch: re-fetch yields a fully-verified (isIAddress, notSelf,
+// dispute-signer-matched) address that is NOT the stored buyerAddress. Must abort.
+test('refundsApprove aborts when re-resolved target is confident but address changed', async () => {
+  const sendCalls = [];
+  const state = makeState({
+    sendCurrency: async () => { sendCalls.push(1); return 'TXID'; },
+    // getJob now returns OTHER_I; dispute signed by OTHER_I ⇒ resolveRefundTarget
+    // is CONFIDENT for OTHER_I, but the ledger stored BUYER_I → address mismatch.
+    getJob: async (jid) => ({ id: jid, buyerVerusId: OTHER_I, amount: 1.0, currency: 'VRSCTEST' }),
+    getDispute: async () => ({ id: 'dispute-1', raised_by: OTHER_I, action: 'pending' }),
+    resolveNames: async () => [],
+  });
+  const ledgerPath = makeLedgerPath('t8');
+  fs.writeFileSync(ledgerPath, JSON.stringify({
+    'job-t8': makeDisputeEntry({ buyerAddress: BUYER_I }),
+  }, null, 2));
+
+  const result = await refundsApprove(state, 'job-t8', { yes: true }, ledgerPath);
+
+  assert.equal(sendCalls.length, 0, 'must NOT send when the verified address differs from the stored one');
+  assert.equal(result.status, 'needs_review', 'address-change must downgrade to needs_review');
+});
+
+// ── Test 9: approveAll sends only pending_approval, re-verifies each, skips others ──
+test('refundsApproveAll approves only pending_approval entries, skips needs_review/rejected', async () => {
+  resetAllowlist();
+  const sendCalls = [];
+  const state = makeState({
+    sendCurrency: async (addr) => { sendCalls.push(addr); return 'TXID-ALL'; },
+  });
+  const ledgerPath = makeLedgerPath('t9');
+  fs.writeFileSync(ledgerPath, JSON.stringify({
+    'job-pa':  makeDisputeEntry({ status: 'pending_approval' }), // confident (BUYER_I) → should send
+    'job-nr':  makeDisputeEntry({ status: 'needs_review' }),     // must be skipped
+    'job-rej': makeDisputeEntry({ status: 'rejected' }),         // must be skipped
+  }, null, 2));
+
+  await refundsApproveAll(state, { yes: true }, ledgerPath);
+
+  assert.equal(sendCalls.length, 1, 'exactly one send — only the pending_approval entry');
+  assert.equal(sendCalls[0], BUYER_I);
+  const led = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+  assert.equal(led['job-pa'].status, 'refunded', 'pending_approval entry refunded');
+  assert.equal(led['job-nr'].status, 'needs_review', 'needs_review left untouched');
+  assert.equal(led['job-rej'].status, 'rejected', 'rejected left untouched');
+});

@@ -4974,8 +4974,21 @@ async function refundsApprove(state, jobId, opts = {}, ledgerPath) {
   savePendingRefunds(ledger, ledgerPath);
 
   const ok = await attemptPendingRefund(state, jobId, entry, ledgerPath);
-  if (ok && entry.refundTxid) {
-    console.log(`[refunds] ✅ Sent for ${jobId.substring(0, 8)}: ${entry.refundTxid}`);
+  if (ok) {
+    // attemptPendingRefund persists only refundTxid; it marks 'refunded' in-memory
+    // because the DRAIN path deletes the entry on success. The approve path keeps the
+    // entry for the audit trail, so persist the terminal 'refunded' status here — else
+    // the file lingers as 'approved' and drainPendingRefunds would re-attempt an
+    // already-sent entry (de-dup catches it, but the state would be wrong).
+    const finalLedger = loadPendingRefunds(ledgerPath);
+    if (finalLedger[jobId]) {
+      finalLedger[jobId].status = 'refunded';
+      if (entry.refundTxid) finalLedger[jobId].refundTxid = entry.refundTxid;
+      finalLedger[jobId].refundedAt = entry.refundedAt || new Date().toISOString();
+      savePendingRefunds(finalLedger, ledgerPath);
+    }
+    entry.status = 'refunded';
+    if (entry.refundTxid) console.log(`[refunds] ✅ Sent for ${jobId.substring(0, 8)}: ${entry.refundTxid}`);
   }
   return entry;
 }
