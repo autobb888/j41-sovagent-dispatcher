@@ -3772,6 +3772,7 @@ program
     // uptime. markJobRefunded/loadRefundedJobs make the drain idempotent, so a
     // periodic re-drive is safe and simply pays anything still pending.
     safeInterval(() => drainPendingRefunds(state), 5 * 60 * 1000, 'RefundDrain');
+    safeInterval(() => sweepDisputesForRefund(state), 5 * 60 * 1000, 'DisputeSweep');
 
     // Status report every minute
     setInterval(() => {
@@ -3786,6 +3787,9 @@ program
 
     // Drain any pending refunds left over from a previous crash mid-loop
     await drainPendingRefunds(state);
+    sweepDisputesForRefund(state).catch(e =>
+      console.error(`[DisputeSweep] Boot sweep failed (non-fatal): ${e.message}`)
+    );
 
     // Log restored reactivation queue entries (loaded above in state initialisation)
     if (state.reactivationQueue.length) {
@@ -4776,6 +4780,129 @@ async function drainPendingRefunds(state, opts = {}) {
     }
   }
   console.log(`✅ Pending-refunds drain complete\n`);
+}
+
+// ── Pillar C: dispute sweep — auto-acknowledge + enqueue for owner approval ──
+
+const OUTAGE_APOLOGY =
+  'Our LLM provider was unavailable during your session, so no work was delivered. ' +
+  'Refunding your payment in full — apologies for the inconvenience.';
+
+/**
+ * Periodically find disputes this agent caused (undelivered, no tokens, dispute.action=pending)
+ * and auto-respond refund 100% (honest acknowledgement — NOT owner-gated), then enqueue the
+ * refund send for owner approval via `j41-dispatcher refunds approve`.
+ *
+ * Idempotent: jobs already in the pending-refunds ledger or already refunded are skipped.
+ * Per-agent failures do not abort the rest of the sweep.
+ */
+async function sweepDisputesForRefund(state) {
+  const { selectRefundableDisputes, buildDisputeRefundEntry } = require('./dispute-sweep.js');
+  const { resolveRefundTarget } = require('./refund-target.js');
+
+  const selfAddresses = new Set();
+  for (const a of state.agents) {
+    if (a.address) selfAddresses.add(a.address);
+    if (a.iAddress) selfAddresses.add(a.iAddress);
+  }
+
+  for (const agentInfo of state.agents) {
+    try {
+      const agent = await getAgentSession(state, agentInfo);
+
+      let jobs;
+      try {
+        const res = await agent.client.getMyJobs({ role: 'seller', status: 'disputed' });
+        jobs = res && res.data ? res.data : (Array.isArray(res) ? res : []);
+      } catch (e) {
+        console.error(`[DisputeSweep] ${agentInfo.id}: failed to fetch jobs — ${e.message}`);
+        continue;
+      }
+
+      const disputeByJobId = {};
+      for (const job of jobs) {
+        if (!job || !job.id) continue;
+        try {
+          const dispute = await agent.client.getDispute(job.id);
+          if (dispute) disputeByJobId[job.id] = dispute;
+        } catch (_) {
+          // 404 / no dispute — skip
+        }
+      }
+
+      const refundable = selectRefundableDisputes(jobs, disputeByJobId);
+      if (refundable.length === 0) continue;
+
+      const ledger = loadPendingRefunds();
+      const refunded = loadRefundedJobs();
+      let ledgerDirty = false;
+
+      for (const job of refundable) {
+        const jobId = job.id;
+
+        if (ledger[jobId] || refunded.has(jobId)) continue;
+
+        const dispute = disputeByJobId[jobId];
+
+        let nameMap = new Map();
+        try {
+          if (job.buyerVerusId) {
+            const names = await agent.client.resolveNames([job.buyerVerusId]);
+            for (const n of (names || [])) {
+              const ia = n.iAddress || n.iaddress;
+              if (ia) nameMap.set(ia, { name: n.name, iaddress: ia });
+            }
+          }
+        } catch (e) {
+          console.warn(`[DisputeSweep] ${agentInfo.id}: name resolution failed for ${jobId.substring(0, 8)}: ${e.message}`);
+        }
+
+        const ctx = {
+          selfAddresses,
+          platformFeeAddress: null,
+          resolveName: (addr) => nameMap.get(addr) || null,
+        };
+
+        const target = resolveRefundTarget(job, dispute, ctx);
+
+        try {
+          await agent.respondToDispute(jobId, {
+            action: 'refund',
+            refundPercent: 100,
+            message: OUTAGE_APOLOGY,
+          });
+        } catch (e) {
+          console.error(`[DisputeSweep] ${agentInfo.id}: respondToDispute failed for ${jobId.substring(0, 8)}: ${e.message} — will retry next sweep`);
+          continue;
+        }
+
+        const entry = buildDisputeRefundEntry(job, dispute, agentInfo.id, target, new Date().toISOString());
+        ledger[jobId] = entry;
+        ledgerDirty = true;
+
+        const eventType = entry.status === 'needs_review' ? 'refund.needs_review' : 'refund.pending_approval';
+        state.emitEvent?.(eventType, {
+          jobId,
+          agentId: agentInfo.id,
+          amount: entry.refundAmount,
+          buyerAddress: entry.buyerAddress,
+          displayName: entry.buyerDisplayName,
+          reason: entry.reason,
+        });
+
+        if (entry.status === 'needs_review') {
+          console.error(`\x1b[31m[DisputeSweep] ⚠️  needs_review: ${jobId.substring(0, 8)} → ${entry.buyerAddress || '?'} — ${entry.reason}\x1b[0m`);
+        } else {
+          console.log(`[DisputeSweep] ⏸️  Queued for owner approval: ${jobId.substring(0, 8)} → ${entry.buyerAddress} (${entry.refundAmount} ${entry.orphan?.currency || 'VRSC'})`);
+        }
+      }
+
+      if (ledgerDirty) savePendingRefunds(ledger);
+
+    } catch (e) {
+      console.error(`[DisputeSweep] Agent ${agentInfo.id} sweep failed: ${e.message}`);
+    }
+  }
 }
 
 // ── Owner-facing refund CLI handlers ─────────────────────────────────────────
@@ -7970,7 +8097,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
