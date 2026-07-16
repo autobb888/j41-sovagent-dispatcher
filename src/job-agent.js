@@ -642,6 +642,22 @@ async function requestBudgetExtension(job, agent, executor, usage, budget) {
   }
 }
 
+/**
+ * Deliver accumulated work the first time budget is exhausted (deliver-once).
+ * Extracted as a testable helper — deps are injected so tests can stub them.
+ *
+ * @param {import('./executors/base').Executor} executor
+ * @param {{ deliver: (out: {content:string,hash:string}) => Promise<void>,
+ *           endSession: (reason: string) => Promise<void> }} deps
+ */
+async function handleBudgetDelivery(executor, { deliver, endSession }) {
+  if (!executor.shouldDeliverOnBudget()) return;
+  executor.markBudgetDelivered();
+  const out = await executor.finalize();
+  await deliver(out);
+  await endSession('budget-exhausted');
+}
+
 async function processJob(job, agent, soulPrompt, executor, registerSessionEndResolve) {
   _lastActivityAt = Date.now();
   _paused = false;
@@ -662,6 +678,13 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   if (_shuttingDown) {
     resolveSession('dispatcher-shutdown');
   }
+
+  // Budget-delivery closures — used by handleBudgetDelivery inside the message loop.
+  // `deliver` stores the finalize result so main() picks it up without a second
+  // finalize() call; `endSession` resolves the session promise immediately.
+  let _budgetDeliveryResult = null;
+  const deliver = async (out) => { _budgetDeliveryResult = out; };
+  const endSession = async (reason) => { resolveSession(reason); };
 
   // Check for files attached to the job (buyer may have uploaded before session)
   let jobFiles = [];
@@ -776,6 +799,10 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
           agent.sendChatMessage(job.id, response);
           console.log(`[CHAT] Agent: ${response.substring(0, 80)}`);
         }
+
+        // After each message: if budget is exhausted and not yet delivered, deliver
+        // accumulated work once and end the session (instead of stalling to TTL).
+        await handleBudgetDelivery(executor, { deliver, endSession });
       } catch (e) {
         console.error(`[CHAT] Executor error: ${e.message}`);
         agent.sendChatMessage(job.id, 'I experienced an issue processing your message. Please try again.');
@@ -978,8 +1005,10 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   _wsPollerStopped = true;
   if (_wsPollTimer) clearTimeout(_wsPollTimer);
 
-  // Finalize executor — get deliverable
-  return await executor.finalize();
+  // Finalize executor — get deliverable.
+  // If handleBudgetDelivery already called finalize() and stored the result,
+  // use it directly to avoid a redundant call and to keep the content stable.
+  return _budgetDeliveryResult !== null ? _budgetDeliveryResult : await executor.finalize();
 }
 
 let _workspaceConnecting = false;
@@ -1252,76 +1281,84 @@ process.on('SIGTERM', async () => {
 // - ≤11-min job: 1min floor
 const _warningMs = Math.max(60000, TIMEOUT_MS * 0.9);
 const _warningRemainingMs = Math.round((TIMEOUT_MS - _warningMs) / 60000);
-setTimeout(() => {
-  console.warn(`⚠️  Job approaching timeout — ${_warningRemainingMs} minute(s) remaining`);
-  if (_agent && !_paused) {
-    try { _agent.sendChatMessage(JOB_ID, `This session will end in ${_warningRemainingMs} minute(s). Wrapping up current work.`); } catch {}
-  }
-}, _warningMs);
+// .unref() allows the process to exit naturally when required by tests while
+// still firing when the process stays alive (normal job-agent runtime).
+if (require.main === module) {
+  setTimeout(() => {
+    console.warn(`⚠️  Job approaching timeout — ${_warningRemainingMs} minute(s) remaining`);
+    if (_agent && !_paused) {
+      try { _agent.sendChatMessage(JOB_ID, `This session will end in ${_warningRemainingMs} minute(s). Wrapping up current work.`); } catch {}
+    }
+  }, _warningMs);
+}
 
 // Timeout protection (J4: also submit attestation to API, not just disk)
-setTimeout(async () => {
-  console.error('⏰ Job timeout! Signing deletion attestation and exiting.');
+// Guarded under require.main so that requiring this module in tests doesn't
+// schedule a 10-minute timer that prevents the test process from exiting.
+if (require.main === module) {
+  setTimeout(async () => {
+    console.error('⏰ Job timeout! Signing deletion attestation and exiting.');
 
-  try {
-    // Build a fresh signer for this code path — in broker mode reads from the
-    // channel; in legacy mode reads keys.json off disk.
-    let keys = null;
-    if (!SIGNING_BROKER_ENABLED) {
-      keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
-    }
-    const timeoutSigner = SIGNING_BROKER_ENABLED
-      ? createJobSigner({ channelClient: new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR }), brokerEnabled: true })
-      : createJobSigner({ wif: keys.wif, network: J41_NETWORK, brokerEnabled: false });
-    const attestTimestamp = Math.floor(Date.now() / 1000);
-
-    // Try to use the platform's canonical attestation flow (J4)
-    // M14 fix: reuse existing _agent if available
     try {
-      const agent = _agent || (() => {
-        const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
-        // In broker mode the agent runs without a WIF; pass signer instead.
-        const cfg = SIGNING_BROKER_ENABLED
-          ? { apiUrl: API_URL, signer: new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR }), identityName: IDENTITY, iAddress: process.env.J41_IADDRESS }
-          : { apiUrl: API_URL, wif: keys.wif, identityName: IDENTITY, iAddress: keys.iAddress };
-        const a = new J41Agent(cfg);
-        return a;
-      })();
+      // Build a fresh signer for this code path — in broker mode reads from the
+      // channel; in legacy mode reads keys.json off disk.
+      let keys = null;
+      if (!SIGNING_BROKER_ENABLED) {
+        keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
+      }
+      const timeoutSigner = SIGNING_BROKER_ENABLED
+        ? createJobSigner({ channelClient: new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR }), brokerEnabled: true })
+        : createJobSigner({ wif: keys.wif, network: J41_NETWORK, brokerEnabled: false });
+      const attestTimestamp = Math.floor(Date.now() / 1000);
 
-      // If using existing agent, skip re-authenticate (already authed)
-      if (!_agent) await agent.authenticate();
-      const { message: attestMessage } = await agent.client.getDeletionAttestationMessage(JOB_ID, attestTimestamp);
-      const attestSig = await timeoutSigner.signMessage(attestMessage);
+      // Try to use the platform's canonical attestation flow (J4)
+      // M14 fix: reuse existing _agent if available
+      try {
+        const agent = _agent || (() => {
+          const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+          // In broker mode the agent runs without a WIF; pass signer instead.
+          const cfg = SIGNING_BROKER_ENABLED
+            ? { apiUrl: API_URL, signer: new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR }), identityName: IDENTITY, iAddress: process.env.J41_IADDRESS }
+            : { apiUrl: API_URL, wif: keys.wif, identityName: IDENTITY, iAddress: keys.iAddress };
+          const a = new J41Agent(cfg);
+          return a;
+        })();
 
-      fs.writeFileSync(
-        path.join(JOB_DIR, 'deletion-attestation-timeout.json'),
-        JSON.stringify({ jobId: JOB_ID, message: attestMessage, signature: attestSig, timestamp: attestTimestamp }, null, 2)
-      );
+        // If using existing agent, skip re-authenticate (already authed)
+        if (!_agent) await agent.authenticate();
+        const { message: attestMessage } = await agent.client.getDeletionAttestationMessage(JOB_ID, attestTimestamp);
+        const attestSig = await timeoutSigner.signMessage(attestMessage);
 
-      const result = await agent.client.submitDeletionAttestation(JOB_ID, attestSig, attestTimestamp);
-      console.log(`✅ Timeout attestation submitted (verified: ${result.signatureVerified})`);
-      agent.stop();
-    } catch (apiErr) {
-      // Fallback: sign locally and save to disk only
-      console.error('⚠️  Could not submit attestation to API:', apiErr.message);
-      const deletionAttestation = {
-        jobId: JOB_ID,
-        containerId: CONTAINER_ID,
-        destroyedAt: new Date().toISOString(),
-        deletionMethod: 'timeout',
-      };
-      deletionAttestation.signature = await timeoutSigner.signMessage(JSON.stringify(deletionAttestation));
-      fs.writeFileSync(
-        path.join(JOB_DIR, 'deletion-attestation-timeout.json'),
-        JSON.stringify(deletionAttestation, null, 2)
-      );
+        fs.writeFileSync(
+          path.join(JOB_DIR, 'deletion-attestation-timeout.json'),
+          JSON.stringify({ jobId: JOB_ID, message: attestMessage, signature: attestSig, timestamp: attestTimestamp }, null, 2)
+        );
+
+        const result = await agent.client.submitDeletionAttestation(JOB_ID, attestSig, attestTimestamp);
+        console.log(`✅ Timeout attestation submitted (verified: ${result.signatureVerified})`);
+        agent.stop();
+      } catch (apiErr) {
+        // Fallback: sign locally and save to disk only
+        console.error('⚠️  Could not submit attestation to API:', apiErr.message);
+        const deletionAttestation = {
+          jobId: JOB_ID,
+          containerId: CONTAINER_ID,
+          destroyedAt: new Date().toISOString(),
+          deletionMethod: 'timeout',
+        };
+        deletionAttestation.signature = await timeoutSigner.signMessage(JSON.stringify(deletionAttestation));
+        fs.writeFileSync(
+          path.join(JOB_DIR, 'deletion-attestation-timeout.json'),
+          JSON.stringify(deletionAttestation, null, 2)
+        );
+      }
+    } catch (e) {
+      console.error('Could not sign timeout attestation:', e.message);
     }
-  } catch (e) {
-    console.error('Could not sign timeout attestation:', e.message);
-  }
 
-  process.exit(1);
-}, TIMEOUT_MS);
+    process.exit(1);
+  }, TIMEOUT_MS);
+}
 
 /**
  * Resume an existing job session for rework. Instead of processJob() which
@@ -1783,7 +1820,17 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult, signer) 
   process.exit(0);
 }
 
-main().catch(e => {
-  console.error('❌ Fatal error:', e);
-  process.exit(1);
-});
+// Only run as a script when this file is the entry point (not when required by tests).
+// Standard Node.js pattern: https://nodejs.org/api/modules.html#accessing-the-main-module
+if (require.main === module) {
+  main().catch(e => {
+    console.error('❌ Fatal error:', e);
+    process.exit(1);
+  });
+}
+
+// Export testable helpers when running under NODE_ENV=test.
+// Avoids shipping a test seam in production while keeping coverage honest.
+if (process.env.NODE_ENV === 'test') {
+  module.exports = { handleBudgetDelivery };
+}

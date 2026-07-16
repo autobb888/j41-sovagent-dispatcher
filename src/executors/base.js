@@ -13,6 +13,7 @@ class Executor {
     this._onBudgetWarning = null;     // callback(usage, budget)
     this._exhaustedAt = null;         // ms epoch of crossing into exhaustion
     this._extensionRequested = false; // an extension ask is in flight (re-armed by increaseBudget)
+    this._budgetDelivered = false;    // true once deliver-on-budget has fired (guards deliver-once)
   }
 
   /** Accumulate token usage from an LLM API response's usage object */
@@ -70,6 +71,19 @@ class Executor {
   /** ms epoch when the budget was first exhausted, or null while within budget */
   budgetExhaustedSince() {
     return this._exhaustedAt;
+  }
+
+  /**
+   * True the first time budget is exhausted and not yet delivered.
+   * After markBudgetDelivered() it stays false — deliver-once invariant.
+   */
+  shouldDeliverOnBudget() {
+    return this.isBudgetExhausted() && !this._budgetDelivered;
+  }
+
+  /** Mark that partial-delivery on budget exhaustion has already occurred. */
+  markBudgetDelivered() {
+    this._budgetDelivered = true;
   }
 
   /** Honest status line for the buyer while generation is paused on budget */

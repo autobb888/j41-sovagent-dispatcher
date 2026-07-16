@@ -215,16 +215,22 @@ class LocalLLMExecutor extends Executor {
       // Budget gate (audit fix #1): no LLM call ever goes out over budget.
       // The extension ask is handled by the setBudget warning callback;
       // here we pause generation and tell the buyer honestly.
+      // Do NOT push the status line to conversationLog — finalize() must deliver
+      // the real accumulated work, not a repeated canned budget message.
       if (this.isBudgetExhausted()) {
         console.log(`[BUDGET] Generation paused — token budget exhausted (${this.getTokenUsage().totalTokens} tokens)`);
-        response = this.budgetExhaustedMessage();
-        this.conversationLog.push({ role: 'assistant', content: response });
-        return response;
+        return this.budgetExhaustedMessage();
       }
       this.llmBusy = true;
       try {
         if (this.workspaceTools.length > 0 && this.workspaceHandler) {
           response = await this._agentLoop();
+          // If _agentLoop hit a budget gate it set _budgetGateHit. Return the
+          // status string without appending it to conversationLog so finalize()
+          // delivers only real accumulated work, not repeated canned lines.
+          if (this._budgetGateHit) {
+            return response;
+          }
         } else {
           const result = await callLLM(this.systemPrompt, this.conversationLog);
           this._trackUsage(result.usage);
@@ -266,12 +272,17 @@ class LocalLLMExecutor extends Executor {
     const messages = [...this.conversationLog];
     let totalToolCalls = 0;
     const MAX_TOTAL_CALLS = 15;
+    // Reset per-invocation flag so handleMessage can detect a budget gate return
+    // without falsely skipping a real last-round LLM response.
+    this._budgetGateHit = false;
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       // Budget gate (audit fix #1): re-checked before every LLM round, so a
       // long tool loop can't keep burning past exhaustion mid-message.
+      // Set _budgetGateHit so handleMessage skips the conversationLog push.
       if (this.isBudgetExhausted()) {
         console.log(`[BUDGET] Agent loop paused mid-task — token budget exhausted`);
+        this._budgetGateHit = true;
         return 'I had to pause mid-task: the token budget for this job is exhausted and an ' +
           'extension has been requested. Here is my progress so far — I\'ll continue once ' +
           'the extension is approved.';
@@ -325,6 +336,8 @@ class LocalLLMExecutor extends Executor {
       // If we hit the total call limit, force one more LLM round to get a text response
       if (totalToolCalls >= MAX_TOTAL_CALLS) {
         if (this.isBudgetExhausted()) {
+          // Set flag so handleMessage skips the conversationLog push (canned line)
+          this._budgetGateHit = true;
           return 'I reached the tool-call limit and the token budget is exhausted. ' +
             'I\'ve requested a budget extension and will summarize my findings once it\'s approved.';
         }
