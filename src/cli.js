@@ -158,6 +158,23 @@ function removeActiveJobFromAllowlist(jobId) {
   }
 }
 
+function addToRefundAllowlist(address, jobId) {
+  try {
+    fs.mkdirSync(path.dirname(ALLOWLIST_PATH), { recursive: true });
+    const list = loadFinancialAllowlist();
+    if (!list.permanent.some(e => e.address === address)) {
+      list.permanent.push({ address, jobId, added: new Date().toISOString(), via: 'refund-approve' });
+    }
+    const tmp = `${ALLOWLIST_PATH}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(list, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, ALLOWLIST_PATH);
+    console.log(`[refund] owner-approved allowlist add ${address} for job ${jobId}`);
+  } catch (err) {
+    console.error(`[allowlist] Failed to add refund address: ${err.message}`);
+    throw err;
+  }
+}
+
 // Dispatcher-side rate limiting (in-memory, resets on restart)
 const dispatcherSendHistory = { global: [], perJob: new Map() };
 const DISPATCHER_RATE_LIMITS = {
@@ -4759,6 +4776,238 @@ async function drainPendingRefunds(state, opts = {}) {
   console.log(`✅ Pending-refunds drain complete\n`);
 }
 
+// ── Owner-facing refund CLI handlers ─────────────────────────────────────────
+
+/**
+ * List pending-refund entries.
+ * Default shows pending_approval + needs_review. Pass {all:true} for every entry.
+ * Returns the array of entries shown (for tests).
+ */
+function refundsList(state, opts = {}, ledgerPath) {
+  const ledger = loadPendingRefunds(ledgerPath);
+  const entries = Object.entries(ledger).map(([jobId, entry]) => ({ jobId, ...entry }));
+  const visible = opts.all
+    ? entries
+    : entries.filter(e => e.status === 'pending_approval' || e.status === 'needs_review');
+
+  if (visible.length === 0) {
+    console.log('No pending refunds.');
+    return visible;
+  }
+
+  const W = { job: 12, agent: 10, amt: 16, status: 18, age: 8 };
+  console.log(
+    `\n${'JobId'.padEnd(W.job)} ${'Agent'.padEnd(W.agent)} ${'Amount'.padEnd(W.amt)} ` +
+    `${'Status'.padEnd(W.status)} ${'Age'.padEnd(W.age)} Buyer`
+  );
+  console.log('─'.repeat(100));
+
+  for (const e of visible) {
+    const age = e.enqueuedAt
+      ? Math.round((Date.now() - new Date(e.enqueuedAt).getTime()) / 60000) + 'm'
+      : '?';
+    const amount = `${e.refundAmount ?? '?'} ${e.orphan?.currency || 'VRSC'}`;
+    const buyer = e.buyerDisplayName
+      ? `${e.buyerDisplayName} (${e.buyerAddress})`
+      : (e.buyerAddress || '?');
+    console.log(
+      `${(e.jobId || '').substring(0, 10).padEnd(W.job)} ` +
+      `${(e.agentInfoId || '').substring(0, 8).padEnd(W.agent)} ` +
+      `${amount.padEnd(W.amt)} ` +
+      `${(e.status || '').padEnd(W.status)} ` +
+      `${age.padEnd(W.age)} ${buyer}`
+    );
+    if (e.reason) console.log(`  ${e.reason.substring(0, 80)}`);
+    if (e.addressChecks) {
+      for (const [check, result] of Object.entries(e.addressChecks)) {
+        console.log(`  ${result ? '✓' : '✗'} ${check}`);
+      }
+    }
+  }
+  console.log(`\nTotal: ${visible.length}`);
+  return visible;
+}
+
+/**
+ * Reject a pending-refund entry. Sets status:'rejected', stores reason.
+ * NO send, NO allowlist change. Returns the updated entry.
+ */
+function refundsReject(state, jobId, opts = {}, ledgerPath) {
+  const ledger = loadPendingRefunds(ledgerPath);
+  const entry = ledger[jobId];
+  if (!entry) throw new Error(`No pending refund entry for job ${jobId}`);
+
+  entry.status = 'rejected';
+  entry.rejectedReason = opts.reason || 'owner-rejected';
+  entry.rejectedAt = new Date().toISOString();
+  ledger[jobId] = entry;
+  savePendingRefunds(ledger, ledgerPath);
+  console.log(`[refunds] Rejected ${jobId.substring(0, 8)}: ${entry.rejectedReason}`);
+  return entry;
+}
+
+/**
+ * Approve a single pending-refund entry with re-verification at approve time.
+ * This is the gated send path — fail closed on any verification failure.
+ *
+ * opts.yes = true → proceed without interactive confirm (handler is non-interactive;
+ * the Commander wrapper is responsible for the confirmation prompt when yes=false).
+ */
+async function refundsApprove(state, jobId, opts = {}, ledgerPath) {
+  const ledger = loadPendingRefunds(ledgerPath);
+  const entry = ledger[jobId];
+  if (!entry) throw new Error(`No pending refund entry for job ${jobId}`);
+
+  if (entry.status === 'refunded' || entry.status === 'rejected' || entry.status === 'approved') {
+    console.log(`[refunds] Job ${jobId.substring(0, 8)} already ${entry.status} — no action`);
+    return entry;
+  }
+
+  // needs_review: refuse — never attempt to send an address that failed verification
+  if (entry.status === 'needs_review') {
+    console.error(`[refunds] ❌ REFUSED: ${jobId.substring(0, 8)} is needs_review — address unverifiable.`);
+    console.error('  Fix the underlying data or use "refunds reject" to close the entry.');
+    if (entry.addressChecks) {
+      for (const [check, result] of Object.entries(entry.addressChecks)) {
+        console.error(`  ${result ? '✓' : '✗'} ${check}`);
+      }
+    }
+    return entry;
+  }
+
+  // pending_approval: re-verify before allowing any funds to move
+  const agentForEntry = state.agents.find(a => a.id === entry.agentInfoId);
+  if (!agentForEntry) throw new Error(`Agent ${entry.agentInfoId} not found for job ${jobId}`);
+
+  const agent = await getAgentSession(state, agentForEntry);
+
+  const selfAddresses = new Set();
+  for (const a of state.agents) {
+    if (a.address) selfAddresses.add(a.address);
+    if (a.iAddress) selfAddresses.add(a.iAddress);
+  }
+
+  if (entry.disputeId) {
+    // ── Dispute entry: re-fetch job + dispute, re-run resolveRefundTarget ──────
+    const job = await agent.client.getJob(jobId);
+    const dispute = await agent.client.getDispute(jobId);
+
+    let nameMap = new Map();
+    try {
+      if (job.buyerVerusId) {
+        const names = await agent.client.resolveNames([job.buyerVerusId]);
+        for (const n of (names || [])) {
+          const ia = n.iAddress || n.iaddress;
+          if (ia) nameMap.set(ia, { name: n.name, iaddress: ia });
+        }
+      }
+    } catch (e) {
+      console.warn(`[refunds] Name resolution failed: ${e.message}`);
+    }
+
+    const { resolveRefundTarget } = require('./refund-target.js');
+    const ctx = {
+      selfAddresses,
+      platformFeeAddress: null,
+      resolveName: (addr) => nameMap.get(addr) || null,
+    };
+    const target = resolveRefundTarget(job, dispute, ctx);
+
+    if (!target.confident) {
+      const failing = Object.entries(target.checks).filter(([, v]) => !v).map(([k]) => k);
+      console.error(`[refunds] ❌ ABORT: Re-verify failed for ${jobId.substring(0, 8)} — ${failing.join(', ')}`);
+      entry.status = 'needs_review';
+      entry.addressChecks = target.checks;
+      ledger[jobId] = entry;
+      savePendingRefunds(ledger, ledgerPath);
+      return entry;
+    }
+
+    if (target.address !== entry.buyerAddress) {
+      console.error(
+        `[refunds] ❌ ABORT: Re-resolved address (${target.address}) differs from stored ` +
+        `buyerAddress (${entry.buyerAddress}) for ${jobId.substring(0, 8)}`
+      );
+      entry.status = 'needs_review';
+      entry.addressChecks = { ...target.checks, addressChanged: false };
+      ledger[jobId] = entry;
+      savePendingRefunds(ledger, ledgerPath);
+      return entry;
+    }
+
+    console.log(`[refunds] Re-verify OK — ${target.displayName || target.address} (${target.address})`);
+    for (const [check, result] of Object.entries(target.checks)) {
+      console.log(`  ${result ? '✓' : '✗'} ${check}`);
+    }
+
+  } else {
+    // ── Crash-recovery entry: basic safety checks on stored buyerAddress ───────
+    // R-addresses are valid crash-recovery targets (buyer paid from an R-address).
+    // No i-address requirement here — do NOT run resolveRefundTarget.
+    const addr = entry.buyerAddress;
+    if (!addr) {
+      console.error(`[refunds] ❌ ABORT: Missing buyerAddress on crash-recovery entry for ${jobId.substring(0, 8)}`);
+      entry.status = 'needs_review';
+      entry.addressChecks = { hasAddress: false };
+      ledger[jobId] = entry;
+      savePendingRefunds(ledger, ledgerPath);
+      return entry;
+    }
+    if (selfAddresses.has(addr)) {
+      console.error(`[refunds] ❌ ABORT: buyerAddress ${addr} is a self-address for ${jobId.substring(0, 8)}`);
+      entry.status = 'needs_review';
+      entry.addressChecks = { notSelf: false };
+      ledger[jobId] = entry;
+      savePendingRefunds(ledger, ledgerPath);
+      return entry;
+    }
+    console.log(`[refunds] Crash-recovery verify OK — ${addr}`);
+  }
+
+  // Add verified address to the financial allowlist with an audit line
+  addToRefundAllowlist(entry.buyerAddress, jobId);
+
+  // Mark approved and persist before the irreversible send
+  entry.status = 'approved';
+  entry.approvedAt = new Date().toISOString();
+  ledger[jobId] = entry;
+  savePendingRefunds(ledger, ledgerPath);
+
+  const ok = await attemptPendingRefund(state, jobId, entry, ledgerPath);
+  if (ok && entry.refundTxid) {
+    console.log(`[refunds] ✅ Sent for ${jobId.substring(0, 8)}: ${entry.refundTxid}`);
+  }
+  return entry;
+}
+
+/**
+ * Approve all pending_approval entries (still audited + re-verified per entry).
+ * Skips needs_review — those require explicit per-entry action.
+ * Returns array of { jobId, entry } results.
+ */
+async function refundsApproveAll(state, opts = {}, ledgerPath) {
+  const ledger = loadPendingRefunds(ledgerPath);
+  const pendingIds = Object.keys(ledger).filter(id => ledger[id].status === 'pending_approval');
+  const skippedCount = Object.keys(ledger).filter(id => ledger[id].status === 'needs_review').length;
+
+  if (pendingIds.length === 0) {
+    console.log(
+      'No pending_approval entries to approve.' +
+      (skippedCount > 0 ? ` (${skippedCount} needs_review skipped — handle individually)` : '')
+    );
+    return [];
+  }
+  if (skippedCount > 0) console.log(`[refunds] Skipping ${skippedCount} needs_review entries.`);
+
+  const results = [];
+  for (const jobId of pendingIds) {
+    const entry = await refundsApprove(state, jobId, opts, ledgerPath);
+    results.push({ jobId, entry });
+  }
+  console.log(`[refunds] approve-all: processed ${results.length} entries`);
+  return results;
+}
+
 /**
  * Handle crash recovery: detect orphaned jobs from active-jobs.json,
  * issue refunds for interrupted jobs, clean up Docker containers.
@@ -7617,10 +7866,81 @@ program
     }
   });
 
+// ── Refunds management commands ───────────────────────────────────────────────
+
+/**
+ * Build a minimal dispatcher state for refund CLI commands (no running process needed).
+ * Loads all registered agent keys so getAgentSession can authenticate for re-verify.
+ */
+function buildRefundsState() {
+  const agentIds = listRegisteredAgents();
+  const agents = [];
+  for (const id of agentIds) {
+    const keys = loadAgentKeys(id);
+    if (keys) agents.push({ id, ...keys });
+  }
+  return { agents, agentSessions: new Map() };
+}
+
+program
+  .command('refunds [job-id]')
+  .description('List pending refund approvals (default: pending_approval + needs_review entries)')
+  .option('--all', 'Show all entries including refunded and rejected')
+  .action(async (jobId, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
+    ensureDirs();
+    const state = buildRefundsState();
+    refundsList(state, { all: options.all });
+  });
+
+program
+  .command('refunds list')
+  .description('List pending refund approvals')
+  .option('--all', 'Show all entries including refunded and rejected')
+  .action(async (options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
+    ensureDirs();
+    const state = buildRefundsState();
+    refundsList(state, { all: options.all });
+  });
+
+program
+  .command('refunds approve [job-id]')
+  .description('Approve a pending refund and send payment (re-verifies address at approve time)')
+  .option('--yes', 'Skip interactive confirmation prompt')
+  .option('--all', 'Approve all pending_approval entries')
+  .action(async (jobId, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
+    ensureDirs();
+    const state = buildRefundsState();
+    if (options.all) {
+      await refundsApproveAll(state, { yes: true });
+    } else if (jobId) {
+      const result = await refundsApprove(state, jobId, { yes: options.yes || false });
+      if (result && result.status === 'pending_approval' && !options.yes) {
+        console.log('\n[refunds] Use --yes to confirm and send, or re-run with --yes.');
+      }
+    } else {
+      console.error('❌ Provide a <job-id> or --all');
+      process.exit(1);
+    }
+  });
+
+program
+  .command('refunds reject <job-id>')
+  .description('Reject a pending refund — no payment sent, entry kept for audit')
+  .option('--reason <text>', 'Rejection reason', 'owner-rejected')
+  .action(async (jobId, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
+    ensureDirs();
+    const state = buildRefundsState();
+    refundsReject(state, jobId, { reason: options.reason });
+  });
+
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
