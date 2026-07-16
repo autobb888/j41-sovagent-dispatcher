@@ -34,3 +34,14 @@ test('unknown model on kimi-nvidia yields a much larger budget than on openai', 
   assert.match(metered.basis, /priced-conservative:o3/);
   assert.ok(selfHosted.tokens > metered.tokens * 5, `expected ≫ budget: ${selfHosted.tokens} vs ${metered.tokens}`);
 });
+
+// priceExtension basis parity (Task 1 review, Minor)
+test('priceExtension basis: self-hosted vs conservative vs known', () => {
+  const base = { model: 'openai/gpt-oss-120b', additionalTokens: 5000, markupPercent: 100 };
+  const sh = tb.priceExtension(base, { J41_LLM_PROVIDER: 'kimi-nvidia' });
+  assert.match(sh.basis, /priced-selfhosted:self-hosted-70b/);
+  const met = tb.priceExtension(base, { J41_LLM_PROVIDER: 'openai' });
+  assert.match(met.basis, /priced-conservative:o3/);
+  const known = tb.priceExtension({ ...base, model: 'gpt-4.1' }, {});
+  assert.match(known.basis, /^priced:gpt-4\.1/);
+});

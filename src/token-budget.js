@@ -233,6 +233,7 @@ function priceExtension({ model, usage, additionalTokens, markupPercent }, env =
 
   const entry = getModelCost(model) || unknownModelCost(env);
   const assumedModel = !getModelCost(model);
+  const selfHosted = assumedModel && isSelfHostedProvider(env.J41_LLM_PROVIDER, env);
 
   const { calculateListedPrice } = require('@junction41/sovagent-sdk/dist/pricing/calculator.js');
   const pricing = calculateListedPrice({
@@ -248,6 +249,10 @@ function priceExtension({ model, usage, additionalTokens, markupPercent }, env =
     amountVrsc: r ? round6(pricing.listedPrice / r.rate) : null,
     model: entry.model,
     assumedModel,
+    // Diagnostic parity with initialTokenBudget so ops can see which basis priced the extension.
+    basis: assumedModel
+      ? (selfHosted ? `priced-selfhosted:${entry.model}` : `priced-conservative:${entry.model}`)
+      : `priced:${entry.model}`,
     inputShare: round6(inputShare),
     markupPercent: markup,
   };
