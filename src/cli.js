@@ -4585,11 +4585,12 @@ function checkWorkspaceCapability(state, agentId) {
 
 // ── Pending-refunds durability helpers ──────────────────────────────────────
 
-/** Load the durable pending-refunds ledger (object keyed by jobId). */
-function loadPendingRefunds() {
+/** Load the durable pending-refunds ledger (object keyed by jobId).
+ *  @param {string} [filePath] — override path for tests (defaults to PENDING_REFUNDS_PATH). */
+function loadPendingRefunds(filePath = PENDING_REFUNDS_PATH) {
   try {
-    if (fs.existsSync(PENDING_REFUNDS_PATH)) {
-      return JSON.parse(fs.readFileSync(PENDING_REFUNDS_PATH, 'utf8'));
+    if (fs.existsSync(filePath)) {
+      return JSON.parse(fs.readFileSync(filePath, 'utf8'));
     }
   } catch {
     // corrupted — treat as empty
@@ -4600,13 +4601,14 @@ function loadPendingRefunds() {
 /** Persist the pending-refunds ledger atomically (mode 0600).
  *  Writes to a temp file then renames — rename is atomic on POSIX, so a crash
  *  mid-write can never leave a corrupted ledger that loadPendingRefunds() would
- *  silently treat as empty (which would permanently drop owed refunds). */
-function savePendingRefunds(obj) {
+ *  silently treat as empty (which would permanently drop owed refunds).
+ *  @param {string} [filePath] — override path for tests (defaults to PENDING_REFUNDS_PATH). */
+function savePendingRefunds(obj, filePath = PENDING_REFUNDS_PATH) {
   try {
-    fs.mkdirSync(DISPATCHER_DIR, { recursive: true, mode: 0o700 });
-    const tmp = `${PENDING_REFUNDS_PATH}.${process.pid}.tmp`;
+    fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+    const tmp = `${filePath}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, PENDING_REFUNDS_PATH);
+    fs.renameSync(tmp, filePath);
   } catch (e) {
     console.error(`[refund] Could not save pending-refunds ledger: ${e.message}`);
   }
@@ -4651,7 +4653,7 @@ function markJobRefunded(jobId) {
  * point at which we durably mark the job refunded — BEFORE recording on the
  * platform — so a crash in between can never trigger a second send.
  */
-async function attemptPendingRefund(state, jobId, entry) {
+async function attemptPendingRefund(state, jobId, entry, ledgerPath = PENDING_REFUNDS_PATH) {
   const { agentInfoId, orphan, refundAmount, refundPercent, buyerAddress } = entry;
 
   // Hard de-dup: never re-send a refund for a job already paid.
@@ -4690,10 +4692,19 @@ async function attemptPendingRefund(state, jobId, entry) {
     markJobRefunded(jobId);
     console.log(`  [refund] ✅ Refund TX: ${txid}`);
 
-    try {
-      await agent.client.submitRefundTxid(jobId, txid);
-    } catch (e) {
-      console.log(`  [refund] ⚠️  Could not record refund on platform: ${e.message}`);
+    // Persist txid to the ledger BEFORE the platform call that follows, so a crash
+    // between the on-chain send and the platform-submit can never lose the txid.
+    entry.refundTxid = txid;
+    const _l = loadPendingRefunds(ledgerPath);
+    if (_l[jobId]) { _l[jobId].refundTxid = txid; savePendingRefunds(_l, ledgerPath); }
+
+    // Only close the dispute on-chain when this refund is tied to a dispute.
+    if (entry.disputeId) {
+      try {
+        await agent.client.submitRefundTxid(jobId, txid);
+      } catch (e) {
+        console.log(`  [refund] ⚠️  Could not record refund on platform: ${e.message}`);
+      }
     }
 
     try {
@@ -4701,6 +4712,10 @@ async function attemptPendingRefund(state, jobId, entry) {
     } catch (e) {
       console.log(`  [refund] ⚠️  Could not notify buyer: ${e.message}`);
     }
+
+    // Record final status on the in-memory entry (drain removes from ledger on success).
+    entry.status = 'refunded';
+    entry.refundedAt = new Date().toISOString();
 
     return true;
   } catch (e) {
@@ -4712,18 +4727,33 @@ async function attemptPendingRefund(state, jobId, entry) {
 /**
  * Drain any leftover entries in pending-refunds.json.  Called at startup
  * BEFORE handleCrashRecovery so prior-crash unsent refunds are retried first.
+ *
+ * Only entries with `status === 'approved'` are sent.  Entries with status
+ * 'pending_approval', 'needs_review', 'rejected', or no status (legacy) are
+ * left untouched — only owner approval via `j41-dispatcher refunds approve`
+ * can promote them to 'approved' and trigger a send.
+ *
+ * @param {object} state
+ * @param {object} [opts]
+ * @param {string} [opts.ledgerPath] — override ledger file path (tests / custom installs).
  */
-async function drainPendingRefunds(state) {
-  const pending = loadPendingRefunds();
+async function drainPendingRefunds(state, opts = {}) {
+  const ledgerPath = (opts && opts.ledgerPath) || PENDING_REFUNDS_PATH;
+  const pending = loadPendingRefunds(ledgerPath);
   const jobIds = Object.keys(pending);
   if (jobIds.length === 0) return;
 
-  console.log(`\n⚠️  Startup drain: ${jobIds.length} pending refund(s) from previous run`);
-  for (const jobId of jobIds) {
-    const success = await attemptPendingRefund(state, jobId, pending[jobId]);
+  const approvedIds = jobIds.filter(id => pending[id].status === 'approved');
+  const skippedCount = jobIds.length - approvedIds.length;
+
+  console.log(`\n⚠️  Startup drain: ${approvedIds.length} approved refund(s) to send` +
+    (skippedCount > 0 ? ` (${skippedCount} awaiting owner approval — skipped)` : ''));
+
+  for (const jobId of approvedIds) {
+    const success = await attemptPendingRefund(state, jobId, pending[jobId], ledgerPath);
     if (success) {
       delete pending[jobId];
-      savePendingRefunds(pending);
+      savePendingRefunds(pending, ledgerPath);
     }
   }
   console.log(`✅ Pending-refunds drain complete\n`);
@@ -7582,7 +7612,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
