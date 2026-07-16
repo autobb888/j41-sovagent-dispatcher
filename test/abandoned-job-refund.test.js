@@ -32,11 +32,13 @@ test('(a) a PAID abandoned job produces a correct refund record', () => {
   assert.equal(record.orphan.currency, 'VRSCTEST');
   assert.equal(record.orphan.buyerPayAddress, 'iBuyerAddr');
   assert.equal(record.orphan.jobAmount, 4);
-  // Shape matches the record handleCrashRecovery enqueues.
+  // Shape matches the record handleCrashRecovery enqueues — now includes approval gate fields.
   assert.deepEqual(
     Object.keys(record).sort(),
-    ['agentInfoId', 'buyerAddress', 'orphan', 'refundAmount', 'refundPercent'],
+    ['agentInfoId', 'buyerAddress', 'orphan', 'reason', 'refundAmount', 'refundPercent', 'status'],
   );
+  assert.equal(record.status, 'pending_approval', 'record must be gated pending owner approval');
+  assert.equal(typeof record.reason, 'string', 'record must carry a reason string');
   // A partial policy percentage scales the amount.
   const partial = buildAbandonedJobRefund(paidJob, 'job-1', 50, new Set(), {});
   assert.equal(partial.refundAmount, 2, '50% policy halves the refund');

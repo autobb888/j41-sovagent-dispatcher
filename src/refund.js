@@ -64,6 +64,8 @@ function buildAbandonedJobRefund(job, jobId, refundPercent, refundedJobs, pendin
     refundAmount,
     refundPercent: pct,
     buyerAddress,
+    status: 'pending_approval',
+    reason: 'crash-recovery: paid job abandoned after docker launch retries',
   };
 }
 

@@ -4847,6 +4847,8 @@ async function handleCrashRecovery(state) {
           refundAmount,
           refundPercent,
           buyerAddress,
+          status: 'pending_approval',
+          reason: 'crash-recovery: job interrupted (dispatcher restart) — undelivered paid job',
         };
       } else {
         console.log(`    ⚠️  Cannot issue refund — missing amount (${jobAmount}) or address (${buyerAddress})`);
@@ -4888,15 +4890,19 @@ async function handleCrashRecovery(state) {
     savePendingRefunds(ledger);
   }
 
-  // ── Step 3: send each refund; remove from durable ledger on success ──────
-  const remaining = { ...ledger };
+  // ── Step 3: notify owner; entries wait for approval (no auto-send) ──────
+  // All crash-recovery refunds require owner approval before funds move.
+  // Use `j41-dispatcher refunds approve <jobId>` to approve and send.
   for (const jobId of Object.keys(pendingRefunds)) {
-    const success = await attemptPendingRefund(state, jobId, pendingRefunds[jobId]);
-    if (success) {
-      delete remaining[jobId];
-      savePendingRefunds(remaining);
-    }
-    // On failure: entry stays in remaining / on disk for next-startup drain
+    const entry = pendingRefunds[jobId];
+    state.emitEvent?.('refund.pending_approval', {
+      jobId,
+      agentId: entry.agentInfoId,
+      amount: entry.refundAmount,
+      buyerAddress: entry.buyerAddress,
+      reason: entry.reason,
+    });
+    console.log('  [refund] ⏸️  Queued for owner approval (j41-dispatcher refunds approve): ' + jobId.substring(0, 8) + ' → ' + entry.buyerAddress);
   }
 
   // ── Step 4: clear the active-jobs ledger (orphans are now handled) ───────
@@ -4936,14 +4942,16 @@ async function refundAbandonedJob(state, jobId, active) {
   const ledger = { ...pending, [jobId]: record };
   savePendingRefunds(ledger);
 
-  // Try to pay immediately; on success drop from the ledger. On failure the entry
-  // stays for the periodic drainPendingRefunds / next-startup drain, which is
-  // idempotent via markJobRefunded. Mirrors handleCrashRecovery Step 3.
-  const success = await attemptPendingRefund(state, jobId, record);
-  if (success) {
-    delete ledger[jobId];
-    savePendingRefunds(ledger);
-  }
+  // Notify owner; entry waits for approval before funds move (no auto-send).
+  // Use `j41-dispatcher refunds approve <jobId>` to approve and send.
+  state.emitEvent?.('refund.pending_approval', {
+    jobId,
+    agentId: record.agentInfoId,
+    amount: record.refundAmount,
+    buyerAddress: record.buyerAddress,
+    reason: record.reason,
+  });
+  console.log('  [refund] ⏸️  Queued for owner approval (j41-dispatcher refunds approve): ' + jobId.substring(0, 8) + ' → ' + record.buyerAddress);
 }
 
 /**
@@ -7612,7 +7620,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
