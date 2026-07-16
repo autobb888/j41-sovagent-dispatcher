@@ -5361,7 +5361,7 @@ async function pollForJobs(state) {
             const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
             const fullJob = await agent.client.getJob(job.id);
             if (fullJob?.jobHash && fullJob?.buyerVerusId) {
-              if (!(await preflightAllowsAccept(state, agentInfo))) {
+              if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
                 console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${job.id.substring(0, 8)}, buyer not charged`);
                 state.emitEvent?.('job.declined_llm_down', { jobId: job.id, agentId: agentInfo.id });
                 continue;
@@ -5670,7 +5670,7 @@ async function handleWebhookEvent(state, agentId, payload) {
         const agent = await getAgentSession(state, agentInfo);
         const fullJob = await agent.client.getJob(jobId);
         if (fullJob?.jobHash && fullJob?.buyerVerusId) {
-          if (!(await preflightAllowsAccept(state, agentInfo))) {
+          if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
             console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${jobId.substring(0, 8)}, buyer not charged`);
             state.emitEvent?.('job.declined_llm_down', { jobId, agentId: agentInfo.id });
             return;
@@ -5949,7 +5949,7 @@ async function handleWebhookEvent(state, agentId, payload) {
         const agent = await getAgentSession(state, agentInfo);
         const fullJob = await agent.client.getJob(bountyJobId);
         if (fullJob?.jobHash && fullJob?.buyerVerusId) {
-          if (!(await preflightAllowsAccept(state, agentInfo))) {
+          if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
             console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${bountyJobId.substring(0, 8)}, buyer not charged`);
             state.emitEvent?.('job.declined_llm_down', { jobId: bountyJobId, agentId: agentInfo.id });
             return;
