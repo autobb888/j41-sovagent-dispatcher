@@ -95,6 +95,41 @@ function mostExpensiveModelCost() {
 }
 
 /**
+ * Set of provider names that are self-hosted class (not metered/SaaS).
+ * These providers get a generous fallback budget (self-hosted-70b) for
+ * unknown models instead of the conservative most-expensive fallback.
+ */
+const SELF_HOSTED_CLASS_PROVIDERS = new Set([
+  'kimi-nvidia', 'ollama', 'vllm', 'localai', 'lmstudio', 'text-generation-webui', 'self-hosted',
+]);
+
+/**
+ * Check if a provider is in the self-hosted class.
+ * Reads J41_SELF_HOSTED_PROVIDERS env for comma-separated additions.
+ */
+function isSelfHostedProvider(providerRaw, env = process.env) {
+  const p = String(providerRaw || '').trim().toLowerCase();
+  if (!p) return false;
+  if (SELF_HOSTED_CLASS_PROVIDERS.has(p)) return true;
+  const extra = String(env.J41_SELF_HOSTED_PROVIDERS || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+  return extra.includes(p);
+}
+
+/**
+ * Cost entry for unknown models, chosen by provider class.
+ * Self-hosted providers get self-hosted-70b (generous); metered providers
+ * get the most expensive model (fail-closed, conservative).
+ */
+function unknownModelCost(env = process.env) {
+  if (isSelfHostedProvider(env.J41_LLM_PROVIDER, env)) {
+    const table = loadCostTable();
+    const sh = table.find(m => m.model === 'self-hosted-70b');
+    if (sh) return sh;
+  }
+  return mostExpensiveModelCost();
+}
+
+/**
  * Current VRSC→USD rate from the environment, or null when missing,
  * non-positive, non-finite, or stale. Null means "cannot price" — callers
  * must fail closed, never substitute a constant.
@@ -158,15 +193,16 @@ function initialTokenBudget({ model, amountVrsc, spendFraction }, env = process.
   }
   const spendUsd = usd * fraction;
 
-  const entry = getModelCost(model) || mostExpensiveModelCost();
+  const entry = getModelCost(model) || unknownModelCost(env);
   const knownModel = !!getModelCost(model);
+  const selfHosted = !knownModel && isSelfHostedProvider(env.J41_LLM_PROVIDER, env);
   const blendedPer1k = (entry.inputPer1k + entry.outputPer1k) / 2;
   if (!(blendedPer1k > 0)) return { tokens: fullFallback, basis: 'fallback:zero-cost-model' };
 
   const tokens = Math.max(Math.floor((spendUsd / blendedPer1k) * 1000), MIN_TOKEN_BUDGET);
   return {
     tokens,
-    basis: knownModel ? `priced:${entry.model}` : `priced-conservative:${entry.model}`,
+    basis: knownModel ? `priced:${entry.model}` : (selfHosted ? `priced-selfhosted:${entry.model}` : `priced-conservative:${entry.model}`),
     spendUsd,
   };
 }
@@ -195,7 +231,7 @@ function priceExtension({ model, usage, additionalTokens, markupPercent }, env =
   const inputTokens = Math.round(tokens * inputShare);
   const outputTokens = tokens - inputTokens;
 
-  const entry = getModelCost(model) || mostExpensiveModelCost();
+  const entry = getModelCost(model) || unknownModelCost(env);
   const assumedModel = !getModelCost(model);
 
   const { calculateListedPrice } = require('@junction41/sovagent-sdk/dist/pricing/calculator.js');
@@ -225,6 +261,9 @@ module.exports = {
   normalizeModelId,
   getModelCost,
   mostExpensiveModelCost,
+  isSelfHostedProvider,
+  unknownModelCost,
+  SELF_HOSTED_CLASS_PROVIDERS,
   getVrscUsdRate,
   vrscToUsd,
   initialTokenBudget,
