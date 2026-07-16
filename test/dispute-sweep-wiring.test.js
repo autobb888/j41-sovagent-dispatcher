@@ -223,3 +223,20 @@ test('sweepDisputesForRefund: job in refunded-set is skipped', async () => {
   // cleanup so other tests are unaffected
   fs.unlinkSync(path.join(dispDir, 'refunded-jobs.json'));
 });
+
+// ── Test 6 (FIX 3): per-item ledger save — entry persisted immediately after enqueue ──
+test('sweepDisputesForRefund: ledger file is written per-item (entry present immediately after sweep)', async () => {
+  clearLedger();
+  const respondCalls = [];
+  const events = [];
+  const job = makeUndeliveredJob({ id: 'job-persist-check' });
+  const dispute = makeConfidentDispute();
+  const state = makeState({ job, dispute, respondCalls, events });
+
+  await sweepDisputesForRefund(state);
+
+  // The ledger FILE (not just in-memory) must already contain the entry
+  const onDisk = readLedger();
+  assert.ok(onDisk['job-persist-check'], 'ledger file must contain the entry after a single-item sweep');
+  assert.equal(onDisk['job-persist-check'].status, 'pending_approval');
+});

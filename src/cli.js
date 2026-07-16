@@ -81,6 +81,7 @@ const JOBS_DIR = path.join(DISPATCHER_DIR, 'jobs');
 const SEEN_JOBS_PATH = path.join(DISPATCHER_DIR, 'seen-jobs.json');
 const PENDING_REFUNDS_PATH = path.join(DISPATCHER_DIR, 'pending-refunds.json');
 const REFUNDED_JOBS_PATH = path.join(DISPATCHER_DIR, 'refunded-jobs.json');
+const REFUND_LOCKS_DIR = path.join(DISPATCHER_DIR, 'refund-locks');
 const FINALIZE_STATE_FILENAME = 'finalize-state.json';
 
 const J41_API_URL = cfg.platform.api_url;
@@ -4665,6 +4666,55 @@ function markJobRefunded(jobId) {
   }
 }
 
+const REFUND_LOCK_STALE_MS = 120000;
+
+/**
+ * Acquire an inter-process send lock for a single jobId.
+ * Returns true if the lock was acquired (caller owns it), false if another
+ * process is mid-send.  On EEXIST checks the timestamp in the lock file; if
+ * older than REFUND_LOCK_STALE_MS (or unparseable) the lock is stolen.
+ */
+function acquireSendLock(jobId) {
+  fs.mkdirSync(REFUND_LOCKS_DIR, { recursive: true, mode: 0o700 });
+  const lockPath = path.join(REFUND_LOCKS_DIR, `${jobId}.lock`);
+  try {
+    const fd = fs.openSync(lockPath, 'wx');
+    fs.writeSync(fd, `${process.pid}:${Date.now()}`);
+    fs.closeSync(fd);
+    return true;
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    // Lock exists — check staleness
+    let stale = false;
+    try {
+      const content = fs.readFileSync(lockPath, 'utf8');
+      const ts = parseInt(content.split(':')[1], 10);
+      stale = !ts || (Date.now() - ts) > REFUND_LOCK_STALE_MS;
+    } catch {
+      stale = true; // unreadable → treat as stale
+    }
+    if (stale) {
+      try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
+      try {
+        const fd = fs.openSync(lockPath, 'wx');
+        fs.writeSync(fd, `${process.pid}:${Date.now()}`);
+        fs.closeSync(fd);
+        return true;
+      } catch {
+        return false; // lost the race after unlink
+      }
+    }
+    console.log(`  [refund] Lock held by another process for ${jobId.substring(0, 8)} — skipping (will retry next drain)`);
+    return false;
+  }
+}
+
+/** Release the send lock for a jobId (unlinks the lock file, guarded). */
+function releaseSendLock(jobId) {
+  const lockPath = path.join(REFUND_LOCKS_DIR, `${jobId}.lock`);
+  try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
+}
+
 /**
  * Attempt a single pending refund entry.  On success, removes the entry from
  * the durable ledger.  On failure, leaves it for the next startup drain.
@@ -4679,13 +4729,16 @@ function markJobRefunded(jobId) {
 async function attemptPendingRefund(state, jobId, entry, ledgerPath = PENDING_REFUNDS_PATH) {
   const { agentInfoId, orphan, refundAmount, refundPercent, buyerAddress } = entry;
 
-  // Hard de-dup: never re-send a refund for a job already paid.
-  if (loadRefundedJobs().has(jobId)) {
-    console.log(`  [refund] ⏭️  Job ${jobId.substring(0, 8)} already refunded — clearing ledger entry`);
-    return true;
-  }
-
+  // Inter-process lock: prevents a concurrent `refunds approve` process and a
+  // daemon drain tick from both passing the de-dup check and double-sending.
+  if (!acquireSendLock(jobId)) return false;
   try {
+    // Hard de-dup (inside lock): never re-send a refund for a job already paid.
+    if (loadRefundedJobs().has(jobId)) {
+      console.log(`  [refund] ⏭️  Job ${jobId.substring(0, 8)} already refunded — clearing ledger entry`);
+      return true;
+    }
+
     const agentInfo = state.agents.find(a => a.id === agentInfoId);
     if (!agentInfo) {
       console.log(`  [refund] Agent ${agentInfoId} not found for ${jobId.substring(0, 8)} — will retry later`);
@@ -4744,6 +4797,8 @@ async function attemptPendingRefund(state, jobId, entry, ledgerPath = PENDING_RE
   } catch (e) {
     console.error(`  [refund] ❌ Refund TX failed for ${jobId.substring(0, 8)}: ${e.message} — will retry on next start`);
     return false;
+  } finally {
+    releaseSendLock(jobId);
   }
 }
 
@@ -4835,7 +4890,6 @@ async function sweepDisputesForRefund(state) {
 
       const ledger = loadPendingRefunds();
       const refunded = loadRefundedJobs();
-      let ledgerDirty = false;
 
       for (const job of refundable) {
         const jobId = job.id;
@@ -4878,7 +4932,7 @@ async function sweepDisputesForRefund(state) {
 
         const entry = buildDisputeRefundEntry(job, dispute, agentInfo.id, target, new Date().toISOString());
         ledger[jobId] = entry;
-        ledgerDirty = true;
+        savePendingRefunds(ledger);
 
         const eventType = entry.status === 'needs_review' ? 'refund.needs_review' : 'refund.pending_approval';
         state.emitEvent?.(eventType, {
@@ -4896,8 +4950,6 @@ async function sweepDisputesForRefund(state) {
           console.log(`[DisputeSweep] ⏸️  Queued for owner approval: ${jobId.substring(0, 8)} → ${entry.buyerAddress} (${entry.refundAmount} ${entry.orphan?.currency || 'VRSC'})`);
         }
       }
-
-      if (ledgerDirty) savePendingRefunds(ledger);
 
     } catch (e) {
       console.error(`[DisputeSweep] Agent ${agentInfo.id} sweep failed: ${e.message}`);
@@ -5016,6 +5068,8 @@ async function refundsApprove(state, jobId, opts = {}, ledgerPath) {
     if (a.iAddress) selfAddresses.add(a.iAddress);
   }
 
+  let verifiedTarget = null;
+
   if (entry.disputeId) {
     // ── Dispute entry: re-fetch job + dispute, re-run resolveRefundTarget ──────
     const job = await agent.client.getJob(jobId);
@@ -5068,6 +5122,7 @@ async function refundsApprove(state, jobId, opts = {}, ledgerPath) {
     for (const [check, result] of Object.entries(target.checks)) {
       console.log(`  ${result ? '✓' : '✗'} ${check}`);
     }
+    verifiedTarget = target;
 
   } else {
     // ── Crash-recovery entry: basic safety checks on stored buyerAddress ───────
@@ -5091,6 +5146,15 @@ async function refundsApprove(state, jobId, opts = {}, ledgerPath) {
       return entry;
     }
     console.log(`[refunds] Crash-recovery verify OK — ${addr}`);
+  }
+
+  // ── Owner confirmation gate (skipped when opts.yes===true) ───────────────────
+  if (!opts.yes) {
+    const ok = opts.confirmFn ? await opts.confirmFn(entry, verifiedTarget) : true;
+    if (!ok) {
+      console.log(`[refunds] Approval cancelled for ${jobId.substring(0, 8)} — no funds sent`);
+      return entry; // status stays pending_approval
+    }
   }
 
   // Add verified address to the financial allowlist with an audit line
@@ -8070,13 +8134,58 @@ program
     await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
     const state = buildRefundsState();
+    const yes = options.yes || false;
+
+    function printWhyReport(entry, target) {
+      const checks = target ? target.checks : (entry.addressChecks || {});
+      console.log(`\n[refunds] Pending approval:`);
+      console.log(`  Job:     ${jobId}`);
+      console.log(`  Amount:  ${entry.refundAmount} ${entry.orphan?.currency || 'VRSC'}`);
+      console.log(`  Buyer:   ${entry.buyerAddress}`);
+      if (entry.buyerDisplayName) console.log(`  Name:    ${entry.buyerDisplayName}`);
+      if (entry.reason) console.log(`  Reason:  ${entry.reason}`);
+      for (const [check, result] of Object.entries(checks)) {
+        console.log(`  ${result ? '✓' : '✗'} ${check}`);
+      }
+    }
+
+    async function confirmSingle(entry, target) {
+      printWhyReport(entry, target);
+      const readline = require('readline');
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      const answer = await new Promise(resolve => rl.question('\n  Send refund? (y/N) ', resolve));
+      rl.close();
+      return answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes';
+    }
+
     if (options.all) {
+      if (!yes) {
+        const pending = loadPendingRefunds();
+        const ids = Object.keys(pending).filter(id => pending[id].status === 'pending_approval');
+        if (ids.length === 0) {
+          console.log('[refunds] No pending_approval entries to approve.');
+          return;
+        }
+        const total = ids.reduce((s, id) => s + (pending[id].refundAmount || 0), 0);
+        const currency = pending[ids[0]].orphan?.currency || 'VRSC';
+        console.log(`\n[refunds] Approving ${ids.length} pending refund(s), total ~${total.toFixed(4)} ${currency}:`);
+        for (const id of ids) {
+          const e = pending[id];
+          console.log(`  ${id.substring(0, 10)}  ${e.buyerAddress}  ${e.refundAmount} ${e.orphan?.currency || 'VRSC'}`);
+        }
+        const readline = require('readline');
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        const answer = await new Promise(resolve => rl.question('\n  Approve all? (y/N) ', resolve));
+        rl.close();
+        if (answer.toLowerCase() !== 'y' && answer.toLowerCase() !== 'yes') {
+          console.log('[refunds] Cancelled — no funds sent.');
+          return;
+        }
+      }
       await refundsApproveAll(state, { yes: true });
     } else if (jobId) {
-      const result = await refundsApprove(state, jobId, { yes: options.yes || false });
-      if (result && result.status === 'pending_approval' && !options.yes) {
-        console.log('\n[refunds] Use --yes to confirm and send, or re-run with --yes.');
-      }
+      const confirmFn = yes ? undefined : confirmSingle;
+      await refundsApprove(state, jobId, { yes, confirmFn });
     } else {
       console.error('❌ Provide a <job-id> or --all');
       process.exit(1);
@@ -8097,7 +8206,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');

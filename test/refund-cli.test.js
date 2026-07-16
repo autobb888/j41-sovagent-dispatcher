@@ -297,3 +297,64 @@ test('refundsApproveAll approves only pending_approval entries, skips needs_revi
   assert.equal(led['job-nr'].status, 'needs_review', 'needs_review left untouched');
   assert.equal(led['job-rej'].status, 'rejected', 'rejected left untouched');
 });
+
+// ── Tests for FIX 2: confirmFn gate ─────────────────────────────────────────
+
+// Test 10: confirmFn returning false → no send, status stays pending_approval
+test('refundsApprove: confirmFn returning false aborts send, status stays pending_approval', async () => {
+  resetAllowlist();
+  const sendCalls = [];
+  const state = makeState({
+    sendCurrency: async () => { sendCalls.push(1); return 'TXID'; },
+  });
+  const ledgerPath = makeLedgerPath('t10');
+  fs.writeFileSync(ledgerPath, JSON.stringify({
+    'job-t10': makeDisputeEntry({ status: 'pending_approval' }),
+  }, null, 2));
+
+  const result = await refundsApprove(state, 'job-t10', {
+    confirmFn: async () => false,
+  }, ledgerPath);
+
+  assert.equal(sendCalls.length, 0, 'sendCurrency must NOT be called when confirmFn returns false');
+  assert.equal(result.status, 'pending_approval', 'status must remain pending_approval when cancelled');
+});
+
+// Test 11: confirmFn returning true → sends, status=refunded
+test('refundsApprove: confirmFn returning true proceeds with send, status=refunded', async () => {
+  resetAllowlist();
+  const sendCalls = [];
+  const state = makeState({
+    sendCurrency: async (addr) => { sendCalls.push(addr); return 'TXID-T11'; },
+  });
+  const ledgerPath = makeLedgerPath('t11');
+  fs.writeFileSync(ledgerPath, JSON.stringify({
+    'job-t11': makeDisputeEntry({ status: 'pending_approval' }),
+  }, null, 2));
+
+  const result = await refundsApprove(state, 'job-t11', {
+    confirmFn: async () => true,
+  }, ledgerPath);
+
+  assert.equal(sendCalls.length, 1, 'sendCurrency must be called when confirmFn returns true');
+  assert.equal(sendCalls[0], BUYER_I);
+  assert.equal(result.status, 'refunded', 'status must be refunded after confirmed send');
+});
+
+// Test 12: opts.yes=true with no confirmFn → sends (confirmation skipped)
+test('refundsApprove: yes=true with no confirmFn skips confirmation and sends', async () => {
+  resetAllowlist();
+  const sendCalls = [];
+  const state = makeState({
+    sendCurrency: async (addr) => { sendCalls.push(addr); return 'TXID-T12'; },
+  });
+  const ledgerPath = makeLedgerPath('t12');
+  fs.writeFileSync(ledgerPath, JSON.stringify({
+    'job-t12': makeDisputeEntry({ status: 'pending_approval' }),
+  }, null, 2));
+
+  const result = await refundsApprove(state, 'job-t12', { yes: true }, ledgerPath);
+
+  assert.equal(sendCalls.length, 1, 'sendCurrency must be called when yes=true');
+  assert.equal(result.status, 'refunded', 'status must be refunded');
+});
