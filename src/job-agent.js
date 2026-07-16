@@ -83,6 +83,38 @@ function nextPollSince(highWaterIso, overlapMs) {
   return new Date(shifted).toISOString().replace('T', ' ').replace('Z', '');
 }
 
+// The platform rejects chat messages over 4000 chars ("Message too long"). A real
+// code review easily exceeds that, so a single send is silently lost. Split long
+// replies into ordered, boundary-aware chunks that fit — margin under 4000 leaves
+// room for the "(part i/n)" marker.
+const CHAT_MAX_LEN = 3900;
+function chunkMessage(text, maxLen = CHAT_MAX_LEN) {
+  const s = String(text == null ? '' : text);
+  if (s.length <= maxLen) return [s];
+  const chunks = [];
+  let rest = s;
+  while (rest.length > maxLen) {
+    // Prefer a paragraph break, then a line break, then a word boundary, else hard-cut.
+    let cut = rest.lastIndexOf('\n\n', maxLen);
+    if (cut < maxLen * 0.5) cut = rest.lastIndexOf('\n', maxLen);
+    if (cut < maxLen * 0.5) cut = rest.lastIndexOf(' ', maxLen);
+    if (cut < maxLen * 0.5) cut = maxLen;
+    chunks.push(rest.slice(0, cut).replace(/\s+$/, ''));
+    rest = rest.slice(cut).replace(/^\s+/, '');
+  }
+  if (rest.length) chunks.push(rest);
+  return chunks;
+}
+async function sendChatChunked(agent, jobId, text, maxLen = CHAT_MAX_LEN) {
+  const chunks = chunkMessage(text, maxLen);
+  for (let i = 0; i < chunks.length; i++) {
+    const prefix = chunks.length > 1 ? `(part ${i + 1}/${chunks.length})\n` : '';
+    // Sequential so the buyer sees the parts in order.
+    await agent.sendChatMessage(jobId, prefix + chunks[i]);
+  }
+  return chunks.length;
+}
+
 /**
  * Construct the right signer for this container. In broker mode the
  * `SignChannelClient` is built from the bind-mounted channel directory and
@@ -829,8 +861,8 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
           agent.sendChatMessage(job.id, 'I\'m sorry, I can\'t share that information. How else can I help you?');
           console.log('[CHAT] Agent: [BLOCKED — canary leak detected]');
         } else {
-          agent.sendChatMessage(job.id, response);
-          console.log(`[CHAT] Agent: ${response.substring(0, 80)}`);
+          const parts = await sendChatChunked(agent, job.id, response);
+          console.log(`[CHAT] Agent: ${response.substring(0, 80)}${parts > 1 ? ` [sent in ${parts} parts]` : ''}`);
         }
 
         // After each message: if budget is exhausted and not yet delivered, deliver
@@ -1887,5 +1919,5 @@ if (require.main === module) {
 // Export testable helpers when running under NODE_ENV=test.
 // Avoids shipping a test seam in production while keeping coverage honest.
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { handleBudgetDelivery, nextPollSince };
+  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN };
 }
