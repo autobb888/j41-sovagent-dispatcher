@@ -6390,6 +6390,7 @@ function buildContainerEnv(job, agentInfo, agentCfg, canaryToken, jobDir, keysPa
   if (cfg.executor.url)         env.J41_EXECUTOR_URL = cfg.executor.url;
 
   if (cfg.debug.chat) env.J41_DEBUG_CHAT = '1';
+  if (cfg.debug.poll || process.env.J41_DEBUG_POLL === '1') env.J41_DEBUG_POLL = '1';
 
   // Jailbox park gate forwarded into the container. In Docker mode the job-agent's
   // workspace poller talks to the platform directly (bypassing the dispatcher's
