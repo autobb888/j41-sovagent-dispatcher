@@ -55,3 +55,21 @@ test('name round-trip populates displayName; bad round-trip fails confident', ()
   assert.equal(bad.checks.nameRoundTrip, false);
   assert.equal(bad.confident, false);
 });
+
+// Fail-closed regression locks (Task 2 review, Important): a money-routing gate
+// must never reopen these paths silently.
+test('fail-closed: missing buyerVerusId => not confident, address null', () => {
+  const r = resolveRefundTarget({ amount: 0.5, currency: 'VRSCTEST' }, dispute, baseCtx);
+  assert.equal(r.address, null);
+  assert.equal(r.confident, false);
+  assert.equal(r.checks.isIAddress, false);
+});
+
+test('fail-closed: resolveName throwing => nameRoundTrip false, not confident', () => {
+  const r = resolveRefundTarget(job, dispute, {
+    ...baseCtx,
+    resolveName: () => { throw new Error('resolver down'); },
+  });
+  assert.equal(r.checks.nameRoundTrip, false);
+  assert.equal(r.confident, false);
+});
