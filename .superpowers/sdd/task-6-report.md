@@ -49,3 +49,33 @@ None — all three `client.acceptJob` call sites are pre-payment or pre-commitme
 ## Concerns
 
 None.
+
+---
+
+## Fix Report (Important finding + 2 Minors) — commit 0e97a1b
+
+### Important: legacy executor resolution via dependency injection
+
+`preflight-gate.js` previously re-implemented agent-config loading (`_loadAgentConfig`) reading only `agent-config.json`. The real `loadAgentConfig` in `cli.js` also falls back to `keys.json`'s `executor` field for legacy agents with no `agent-config.json`. A legacy agent with `executor:'webhook'` in `keys.json` would be mis-resolved by preflight as `local-llm` → false-positive LLM probe → wrongly DECLINED a webhook job.
+
+**Fix (dependency injection):** `resolveAgentLLMConfig` now accepts `(agentCfg, dispatcherCfg)` objects that are already loaded. `preflightAllowsAccept` now accepts `(state, agentInfo, agentCfg, dispatcherCfg, deps={})`. All three call sites in `cli.js` now pass `loadAgentConfig(agentInfo.id)` and `loadDispatcherConfig()` — using the same resolution path as `buildContainerEnv`, including the keys.json fallback. `_loadAgentConfig` removed. No circular require.
+
+### Minor A: dispatcher config loaded twice per accept
+
+Previously `preflightAllowsAccept` called `loadDispatcherConfig()` once itself and `resolveAgentLLMConfig` called it again internally. Now loaded once by the caller in `cli.js` and passed in.
+
+### Minor B: `deps.probeLLM` injection
+
+`probeLLM` is now injectable via `deps.probeLLM` in `preflightAllowsAccept`, enabling the two new cache tests without HTTP mocking infrastructure.
+
+### New tests added (11 total in preflight-gate.test.js, was 7)
+
+- `resolveAgentLLMConfig: legacy keys.json executor=webhook → null` — the exact bug scenario
+- `resolveAgentLLMConfig: global executor type webhook (no agentCfg override) → null`
+- `preflightAllowsAccept: ok probe is cached within 30s TTL (probe called once)` — assert probeCount === 1
+- `preflightAllowsAccept: down result is NOT cached — re-probed on next call, both return false` — assert probeCount === 2
+
+### Test summary
+
+**preflight-gate.test.js:** 11 pass, 0 fail (+4 new vs Task 6 baseline of 7)
+**Full suite (`node --test test/*.js`):** 474 pass, 0 fail (was 470)
