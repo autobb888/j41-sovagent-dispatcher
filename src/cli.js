@@ -8103,104 +8103,109 @@ function buildRefundsState() {
   return { agents, agentSessions: new Map() };
 }
 
+// Single dispatcher command — Commander uses only the FIRST word as the command
+// name, so separate `.command('refunds approve ...')` registrations all collide on
+// "refunds". One `refunds [action] [job-id]` command dispatches on the action.
 program
-  .command('refunds [job-id]')
-  .description('List pending refund approvals (default: pending_approval + needs_review entries)')
-  .option('--all', 'Show all entries including refunded and rejected')
-  .action(async (jobId, options) => {
+  .command('refunds [action] [job-id]')
+  .description('Refund approval queue — actions: list (default) | approve <job-id>|--all | reject <job-id>')
+  .option('--all', 'list: include refunded/rejected; approve: approve every pending_approval entry')
+  .option('--yes', 'approve: skip the interactive confirmation prompt')
+  .option('--reason <text>', 'reject: rejection reason', 'owner-rejected')
+  .action(async (action, jobId, options) => {
     await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
     const state = buildRefundsState();
-    refundsList(state, { all: options.all });
-  });
+    action = (action || 'list').toLowerCase();
 
-program
-  .command('refunds list')
-  .description('List pending refund approvals')
-  .option('--all', 'Show all entries including refunded and rejected')
-  .action(async (options) => {
-    await ensureKeystoreUnlockedIfEncrypted();
-    ensureDirs();
-    const state = buildRefundsState();
-    refundsList(state, { all: options.all });
-  });
-
-program
-  .command('refunds approve [job-id]')
-  .description('Approve a pending refund and send payment (re-verifies address at approve time)')
-  .option('--yes', 'Skip interactive confirmation prompt')
-  .option('--all', 'Approve all pending_approval entries')
-  .action(async (jobId, options) => {
-    await ensureKeystoreUnlockedIfEncrypted();
-    ensureDirs();
-    const state = buildRefundsState();
-    const yes = options.yes || false;
-
-    function printWhyReport(entry, target) {
-      const checks = target ? target.checks : (entry.addressChecks || {});
-      console.log(`\n[refunds] Pending approval:`);
-      console.log(`  Job:     ${jobId}`);
-      console.log(`  Amount:  ${entry.refundAmount} ${entry.orphan?.currency || 'VRSC'}`);
-      console.log(`  Buyer:   ${entry.buyerAddress}`);
-      if (entry.buyerDisplayName) console.log(`  Name:    ${entry.buyerDisplayName}`);
-      if (entry.reason) console.log(`  Reason:  ${entry.reason}`);
-      for (const [check, result] of Object.entries(checks)) {
-        console.log(`  ${result ? '✓' : '✗'} ${check}`);
+    // Owner types short jobId prefixes from `refunds list` — resolve to the full
+    // ledger key. Refuse on ambiguity so a prefix can never approve the wrong job.
+    if (jobId && (action === 'approve' || action === 'reject')) {
+      const led = loadPendingRefunds();
+      if (!led[jobId]) {
+        const matches = Object.keys(led).filter(k => k.startsWith(jobId));
+        if (matches.length === 1) {
+          jobId = matches[0];
+        } else if (matches.length > 1) {
+          console.error(`❌ Ambiguous job-id '${jobId}' — matches ${matches.length} entries; use the full id`);
+          process.exit(1);
+        }
       }
     }
 
-    async function confirmSingle(entry, target) {
-      printWhyReport(entry, target);
-      const readline = require('readline');
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      const answer = await new Promise(resolve => rl.question('\n  Send refund? (y/N) ', resolve));
-      rl.close();
-      return answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes';
+    if (action === 'list') {
+      refundsList(state, { all: options.all });
+      return;
     }
 
-    if (options.all) {
-      if (!yes) {
-        const pending = loadPendingRefunds();
-        const ids = Object.keys(pending).filter(id => pending[id].status === 'pending_approval');
-        if (ids.length === 0) {
-          console.log('[refunds] No pending_approval entries to approve.');
-          return;
+    if (action === 'reject') {
+      if (!jobId) { console.error('❌ Provide a <job-id> to reject'); process.exit(1); }
+      refundsReject(state, jobId, { reason: options.reason });
+      return;
+    }
+
+    if (action === 'approve') {
+      const yes = options.yes || false;
+
+      function printWhyReport(entry, target) {
+        const checks = target ? target.checks : (entry.addressChecks || {});
+        console.log(`\n[refunds] Pending approval:`);
+        console.log(`  Job:     ${jobId}`);
+        console.log(`  Amount:  ${entry.refundAmount} ${entry.orphan?.currency || 'VRSC'}`);
+        console.log(`  Buyer:   ${entry.buyerAddress}`);
+        if (entry.buyerDisplayName) console.log(`  Name:    ${entry.buyerDisplayName}`);
+        if (entry.reason) console.log(`  Reason:  ${entry.reason}`);
+        for (const [check, result] of Object.entries(checks)) {
+          console.log(`  ${result ? '✓' : '✗'} ${check}`);
         }
-        const total = ids.reduce((s, id) => s + (pending[id].refundAmount || 0), 0);
-        const currency = pending[ids[0]].orphan?.currency || 'VRSC';
-        console.log(`\n[refunds] Approving ${ids.length} pending refund(s), total ~${total.toFixed(4)} ${currency}:`);
-        for (const id of ids) {
-          const e = pending[id];
-          console.log(`  ${id.substring(0, 10)}  ${e.buyerAddress}  ${e.refundAmount} ${e.orphan?.currency || 'VRSC'}`);
-        }
+      }
+
+      async function confirmSingle(entry, target) {
+        printWhyReport(entry, target);
         const readline = require('readline');
         const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-        const answer = await new Promise(resolve => rl.question('\n  Approve all? (y/N) ', resolve));
+        const answer = await new Promise(resolve => rl.question('\n  Send refund? (y/N) ', resolve));
         rl.close();
-        if (answer.toLowerCase() !== 'y' && answer.toLowerCase() !== 'yes') {
-          console.log('[refunds] Cancelled — no funds sent.');
-          return;
-        }
+        return answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes';
       }
-      await refundsApproveAll(state, { yes: true });
-    } else if (jobId) {
-      const confirmFn = yes ? undefined : confirmSingle;
-      await refundsApprove(state, jobId, { yes, confirmFn });
-    } else {
-      console.error('❌ Provide a <job-id> or --all');
-      process.exit(1);
-    }
-  });
 
-program
-  .command('refunds reject <job-id>')
-  .description('Reject a pending refund — no payment sent, entry kept for audit')
-  .option('--reason <text>', 'Rejection reason', 'owner-rejected')
-  .action(async (jobId, options) => {
-    await ensureKeystoreUnlockedIfEncrypted();
-    ensureDirs();
-    const state = buildRefundsState();
-    refundsReject(state, jobId, { reason: options.reason });
+      if (options.all) {
+        if (!yes) {
+          const pending = loadPendingRefunds();
+          const ids = Object.keys(pending).filter(id => pending[id].status === 'pending_approval');
+          if (ids.length === 0) {
+            console.log('[refunds] No pending_approval entries to approve.');
+            return;
+          }
+          const total = ids.reduce((s, id) => s + (pending[id].refundAmount || 0), 0);
+          const currency = pending[ids[0]].orphan?.currency || 'VRSC';
+          console.log(`\n[refunds] Approving ${ids.length} pending refund(s), total ~${total.toFixed(4)} ${currency}:`);
+          for (const id of ids) {
+            const e = pending[id];
+            console.log(`  ${id.substring(0, 10)}  ${e.buyerAddress}  ${e.refundAmount} ${e.orphan?.currency || 'VRSC'}`);
+          }
+          const readline = require('readline');
+          const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+          const answer = await new Promise(resolve => rl.question('\n  Approve all? (y/N) ', resolve));
+          rl.close();
+          if (answer.toLowerCase() !== 'y' && answer.toLowerCase() !== 'yes') {
+            console.log('[refunds] Cancelled — no funds sent.');
+            return;
+          }
+        }
+        await refundsApproveAll(state, { yes: true });
+      } else if (jobId) {
+        const confirmFn = yes ? undefined : confirmSingle;
+        await refundsApprove(state, jobId, { yes, confirmFn });
+      } else {
+        console.error('❌ Provide a <job-id> or --all');
+        process.exit(1);
+      }
+      return;
+    }
+
+    console.error(`❌ Unknown refunds action '${action}'. Use: list | approve | reject`);
+    process.exit(1);
   });
 
 // ── Entry point ──
