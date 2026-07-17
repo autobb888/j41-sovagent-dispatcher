@@ -86,12 +86,17 @@ class Executor {
     this._budgetDelivered = true;
   }
 
-  /** Honest status line for the buyer while generation is paused on budget */
+  /**
+   * Honest status line for the buyer on budget exhaustion. States only what
+   * actually happens next (partial delivery). Must NOT claim a budget-extension
+   * request — no such request is made (there is no approval path), and narrating
+   * a mechanism that doesn't exist is exactly the "agents describe things they
+   * cannot do" failure. Behaviour: handleBudgetDelivery delivers the work so far.
+   */
   budgetExhaustedMessage() {
     const used = this._tokenUsage.totalTokens;
-    return `I've reached the token budget for this job (${used} tokens used)` +
-      ` and have requested a budget extension. I'll continue as soon as it's approved —` +
-      ` otherwise I'll deliver what I have so far.`;
+    return `I've reached the token budget for this job (${used} tokens used) — ` +
+      `delivering the work completed so far.`;
   }
 
   /**

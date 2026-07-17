@@ -105,12 +105,17 @@ function chunkMessage(text, maxLen = CHAT_MAX_LEN) {
   if (rest.length) chunks.push(rest);
   return chunks;
 }
-async function sendChatChunked(agent, jobId, text, maxLen = CHAT_MAX_LEN) {
+// Gap between chunk sends so the platform's chat rate limiter doesn't reject a
+// rapid burst ("Sending too fast"). Overridable (0 in tests) to keep them fast.
+const CHUNK_SEND_GAP_MS = 750;
+async function sendChatChunked(agent, jobId, text, maxLen = CHAT_MAX_LEN, gapMs = CHUNK_SEND_GAP_MS) {
   const chunks = chunkMessage(text, maxLen);
   for (let i = 0; i < chunks.length; i++) {
     const prefix = chunks.length > 1 ? `(part ${i + 1}/${chunks.length})\n` : '';
     // Sequential so the buyer sees the parts in order.
     await agent.sendChatMessage(jobId, prefix + chunks[i]);
+    // Pace the parts (not after the last) to stay under the chat rate limit.
+    if (i < chunks.length - 1 && gapMs > 0) await new Promise(r => setTimeout(r, gapMs));
   }
   return chunks.length;
 }

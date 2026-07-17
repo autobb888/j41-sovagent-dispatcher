@@ -261,6 +261,39 @@ function buildUpstreamHealth(state) {
  * Back-compat scalars (active/queue/available) are retained so existing
  * 200-checks keep working; `agents` is now an array (the intended v1 shape).
  */
+// Observability: a provable stamp of exactly which code is running — the
+// dispatcher's version+commit and the digest of the job-agent image it spawns.
+// The tester's highest-leverage ask ("add a commit stamp"), applied to our side,
+// so which build is live is a fact in /health, not something read out by hand.
+let _verBase = null;        // {dispatcher, commit, node} — computed once
+let _imgId = 'unknown';     // job-agent image digest — refreshed on a TTL
+let _imgAt = 0;
+function getVersionStamp() {
+  if (!_verBase) {
+    let dispatcher = 'unknown';
+    try { dispatcher = require('../package.json').version || 'unknown'; } catch { /* not packaged */ }
+    let commit = 'unknown';
+    try {
+      commit = require('child_process')
+        .execSync('git rev-parse --short HEAD', { cwd: __dirname, stdio: ['ignore', 'pipe', 'ignore'] })
+        .toString().trim() || 'unknown';
+    } catch { /* not a git checkout (npm install) */ }
+    _verBase = { dispatcher, commit, node: process.version };
+  }
+  // The image can change between restarts; refresh at most once a minute. docker
+  // inspect is bounded by a short timeout and never throws out of here.
+  const now = Date.now();
+  if (now - _imgAt > 60000) {
+    try {
+      _imgId = require('child_process')
+        .execSync("docker image inspect j41/job-agent:latest --format '{{.Id}}'", { stdio: ['ignore', 'pipe', 'ignore'], timeout: 2500 })
+        .toString().trim() || 'unknown';
+    } catch { _imgId = 'unknown'; }
+    _imgAt = now;
+  }
+  return { ..._verBase, jobAgentImage: _imgId };
+}
+
 function buildHealthDocument(state, startedAt) {
   const uptime = Date.now() - startedAt;
 
@@ -295,6 +328,7 @@ function buildHealthDocument(state, startedAt) {
   return {
     status: containersUnhealthy > 0 ? 'degraded' : 'ok',
     uptime,
+    version: getVersionStamp(),
     agents,
     containers,
     // back-compat scalars (pre-WP-D2 consumers / Docker healthcheck)
@@ -535,4 +569,5 @@ module.exports = {
   buildUpstreamHealth,
   buildEarnings,
   buildHealthDocument,
+  getVersionStamp,
 };

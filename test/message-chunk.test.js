@@ -52,7 +52,7 @@ test('sendChatChunked: long text → ordered parts, each under the 4000 cap, mar
   const sent = [];
   const agent = { sendChatMessage: async (jid, txt) => sent.push(txt) };
   const review = 'line\n'.repeat(2000); // ~10000 chars
-  const n = await sendChatChunked(agent, 'job1', review);
+  const n = await sendChatChunked(agent, 'job1', review, undefined, 0); // gapMs=0 keeps the test fast
   assert.ok(n > 1, 'must split');
   assert.equal(sent.length, n);
   sent.forEach((txt, i) => {

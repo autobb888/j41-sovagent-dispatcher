@@ -98,11 +98,14 @@ test('setBudget resets all edge state', () => {
   assert.equal(ex._extensionRequested, false);
 });
 
-test('budgetExhaustedMessage is honest about usage', () => {
+test('budgetExhaustedMessage is honest: states usage + delivery, NOT a fictional extension request', () => {
   const ex = new Executor();
   ex.setBudget(100, 80, null);
   ex._trackUsage(usage(150));
   const msg = ex.budgetExhaustedMessage();
   assert.match(msg, /150 tokens/);
-  assert.match(msg, /extension/i);
+  assert.match(msg, /deliver/i, 'must say what actually happens (partial delivery)');
+  // Must NOT claim a budget-extension request — no such request is made (no
+  // approval path). Narrating a mechanism that does not exist is the bug.
+  assert.doesNotMatch(msg, /extension/i, 'must not narrate a budget-extension request that never happens');
 });
