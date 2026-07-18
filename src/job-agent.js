@@ -120,6 +120,14 @@ async function sendChatChunked(agent, jobId, text, maxLen = CHAT_MAX_LEN, gapMs 
   return chunks.length;
 }
 
+// A worker spawned for an already-delivered or disputed job must NOT redo the
+// work or re-deliver — it reconnects straight into the post-delivery wait so it
+// can surface/handle a dispute. (Fixes the job-agent.js:600 "not deliverable →
+// exit" drop that made torn-down disputes unreachable.)
+function isPostDeliveryReconnect(status) {
+  return status === 'delivered' || status === 'disputed';
+}
+
 /**
  * Construct the right signer for this container. In broker mode the
  * `SignChannelClient` is built from the bind-mounted channel directory and
@@ -360,8 +368,10 @@ async function main() {
     throw new Error(`Invalid job data from API for ${job.id}: missing jobHash or buyerVerusId`);
   }
 
-  if (fullJob.status === 'accepted' || fullJob.status === 'in_progress') {
-    log.info('Job already accepted', { jobId: JOB_ID, status: fullJob.status });
+  const _isPostDeliveryReconnect = isPostDeliveryReconnect(fullJob.status);
+
+  if (_isPostDeliveryReconnect || fullJob.status === 'accepted' || fullJob.status === 'in_progress') {
+    log.info('Job already accepted (or post-delivery reconnect)', { jobId: JOB_ID, status: fullJob.status });
   } else {
     const brokered = await signer.signAccept({
       jobId: job.id,
@@ -379,19 +389,23 @@ async function main() {
     await agent.connectChat();
     console.log('✅ Connected to SovGuard\n');
   } catch (chatErr) {
-    console.error('❌ Chat connection failed after job acceptance:', chatErr.message);
-    // Deliver a "failed" result so the accepted job isn't left in limbo
-    const failContent = `Chat connection failed: ${chatErr.message}`;
-    const failHash = require('crypto').createHash('sha256').update(failContent).digest('hex');
-    const brokered = await signer.signDeliver({ jobId: job.id, jobHash: fullJob.jobHash, deliveryHash: failHash });
-    await withRetry(
-      () => agent.client.deliverJob(job.id, failHash, brokered.signature, brokered.timestamp, failContent),
-      'deliverJob-chatfail',
-      { maxAttempts: 5, baseDelayMs: 2000 }
-    );
-    console.log('✅ Delivered failure result');
-    agent.stop();
-    process.exit(1);
+    if (_isPostDeliveryReconnect) {
+      console.error('❌ Chat connect failed on post-delivery reconnect — continuing to post-delivery wait:', chatErr.message);
+    } else {
+      console.error('❌ Chat connection failed after job acceptance:', chatErr.message);
+      // Deliver a "failed" result so the accepted job isn't left in limbo
+      const failContent = `Chat connection failed: ${chatErr.message}`;
+      const failHash = require('crypto').createHash('sha256').update(failContent).digest('hex');
+      const brokered = await signer.signDeliver({ jobId: job.id, jobHash: fullJob.jobHash, deliveryHash: failHash });
+      await withRetry(
+        () => agent.client.deliverJob(job.id, failHash, brokered.signature, brokered.timestamp, failContent),
+        'deliverJob-chatfail',
+        { maxAttempts: 5, baseDelayMs: 2000 }
+      );
+      console.log('✅ Delivered failure result');
+      agent.stop();
+      process.exit(1);
+    }
   }
 
   // Note: connectChat() auto-joins all active job rooms including this one.
@@ -539,6 +553,7 @@ async function main() {
     } catch {}
   }, 2000);
 
+  if (!_isPostDeliveryReconnect) {
   let result;
   try {
     job.status = fullJob.status; // pass current status so processJob knows if this is a reconnect
@@ -615,6 +630,7 @@ async function main() {
 
   // Wait for chat to flush
   await new Promise(r => setTimeout(r, 3000));
+  } // end if (!_isPostDeliveryReconnect)
 
   // ─────────────────────────────────────────
   // STEP 4: POST-DELIVERY WAIT (Dispute Resolution)
@@ -1924,5 +1940,5 @@ if (require.main === module) {
 // Export testable helpers when running under NODE_ENV=test.
 // Avoids shipping a test seam in production while keeping coverage honest.
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN };
+  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect };
 }
