@@ -1664,6 +1664,14 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
               }
             }
 
+            // A container respawned post-delivery (dispute reconnect) skipped
+            // processJob(), so the executor was never init()'d. Initialize it
+            // before any rework work runs, or the rework is generated with no
+            // job/system-prompt context (executor.job stays null from constructor).
+            if (executor && !executor.job) {
+              await executor.init(job, agent, soulPrompt, { isReconnect: true });
+            }
+
             const reworkResult = await resumeJob(job, agent, soulPrompt, executor, registerSessionEndResolve, reworkContext, tokenBudget);
             console.log('✅ Rework completed — re-delivering...');
 

@@ -4593,7 +4593,13 @@ async function queueDisputedJobForRespawn(state, jobId, opts = {}) {
   }
 
   const sellerId = job.sellerVerusId || job.seller || job.agentVerusId;
-  const match = state.agents.find(a => a.iAddress === sellerId || a.identity === sellerId);
+  // Prefer the already-verified agentInfo when it matches the seller OR when no
+  // seller field is present (platform field-name mismatch → sellerId undefined).
+  // Fall back to a full agents-list search so a provided agentInfo that
+  // demonstrably mismatches a known seller is never blindly trusted.
+  const match = (agentInfo && (agentInfo.iAddress === sellerId || agentInfo.identity === sellerId || !sellerId))
+    ? agentInfo
+    : state.agents.find(a => a.iAddress === sellerId || a.identity === sellerId);
   if (!match) {
     console.error(`[Dispute] job ${jobId.substring(0, 8)} seller ${sellerId} not a local agent — cannot respawn`);
     state.emitEvent?.('dispute.unresolved_agent', { jobId, seller: sellerId });
@@ -4623,7 +4629,12 @@ async function sweepExpiredQueue(state, deps = {}) {
   const now = (deps.now || Date.now)();
   const expired = rq.findExpired(state.reactivationQueue, now);
   for (const e of expired) {
-    console.log(`[TTL] queued job ${e.job.id.substring(0, 8)} exceeded pause_ttl (${e.pauseTtlMin}min) — removed from reactivation queue (platform auto-cancels/refunds)`);
+    if (e.dispute) {
+      console.error(`[TTL] dispute job ${e.job.id.substring(0, 8)} dropped from respawn queue after ${e.pauseTtlMin} min — surfacing failed; operator must respond via the dispute CLI`);
+      state.emitEvent?.('dispute.surfacing_expired', { jobId: e.job.id });
+    } else {
+      console.log(`[TTL] queued job ${e.job.id.substring(0, 8)} exceeded pause_ttl (${e.pauseTtlMin}min) — removed from reactivation queue (platform auto-cancels/refunds)`);
+    }
     rq.removeJob(state.reactivationQueue, e.job.id);
   }
   if (expired.length) persistReactivationQueue(state.reactivationQueue);
@@ -6016,6 +6027,9 @@ async function handleWebhookEvent(state, agentId, payload) {
     case 'job.dispute.filed': {
       console.log(`[Webhook] ⚠️  Dispute filed for job ${jobId?.substring(0, 8)} by ${data?.disputedBy || '?'}: ${data?.reason || '?'}`);
       await queueDisputedJobForRespawn(state, jobId, { agentId, reason: data?.reason });
+      // Record that we've surfaced the dispute so the next pollForJobs cycle
+      // sees the correct status and does NOT double-fire to the buyer.
+      if (jobId) state._lastSentStatus.set(jobId, 'disputed');
       break;
     }
 
