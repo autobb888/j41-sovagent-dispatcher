@@ -430,6 +430,9 @@ async function main() {
         sessionEndResolve('session-ended');
       }
     },
+    onJobDisputed: async (dJob, reason, deadline) => {
+      console.log(`[SESSION] onJobDisputed hook: job ${dJob.id} reason="${reason}" deadline=${deadline || 'none'}`);
+    },
   });
 
 
@@ -635,6 +638,10 @@ async function main() {
   // ─────────────────────────────────────────
   // STEP 4: POST-DELIVERY WAIT (Dispute Resolution)
   // ─────────────────────────────────────────
+  if (fullJob.status === 'disputed') {
+    await surfaceDispute(job, agent).catch((e) => console.error('[DISPUTE] startup surface failed:', e.message));
+  }
+
   let postDeliveryResult;
   if (_shuttingDown) {
     console.log('→ Skipping post-delivery wait (dispatcher shutting down)');
@@ -1503,6 +1510,37 @@ async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndRes
   return result;
 }
 
+// Surface a dispute to the operator (human has final say — no auto-response).
+// Fetches the authoritative deadline from the platform, fires the handler hook,
+// and posts ONE operator-facing chat message. A future agent-autonomous policy
+// engine would decide a response here; for now we only surface.
+async function surfaceDispute(job, agent) {
+  let d = {};
+  try { d = (await agent.client.getDispute(job.id)) || {}; }
+  catch (e) { console.error(`[DISPUTE] getDispute failed for ${job.id}: ${e.message}`); }
+
+  const reason = d.reason || 'no reason given';
+  const deadline_at = d.deadline_at || null;
+  const owner = d.deadline_owner || null;
+  const when = deadline_at ? `by ${deadline_at}` : 'soon (no deadline set)';
+  const whose = owner === 'seller' ? "it's your move" : owner === 'buyer' ? "waiting on the buyer" : '';
+
+  if (agent.handler?.onJobDisputed) {
+    try {
+      const freshJob = await agent.client.getJob(job.id).catch(() => job);
+      await agent.handler.onJobDisputed(freshJob, reason, deadline_at || undefined);
+    } catch (e) { console.error(`[DISPUTE] handler error: ${e.message}`); }
+  }
+
+  try {
+    await agent.sendChatMessage(job.id,
+      `⚠️ A dispute was filed on this job: "${reason}". A response is needed ${when}${whose ? ` — ${whose}` : ''}.`);
+  } catch (e) { console.error(`[DISPUTE] surface chat failed: ${e.message}`); }
+
+  console.log(`[DISPUTE] surfaced job ${job.id} — reason="${reason}" deadline=${deadline_at || 'none'} owner=${owner || 'n/a'}`);
+  return { surfaced: true, deadline_at };
+}
+
 /**
  * Post-delivery wait loop. Listens for IPC messages from dispatcher
  * for job completion, disputes, and rework events.
@@ -1541,65 +1579,10 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
 
         case 'dispute.filed': {
           console.log(`⚠️  Dispute filed: ${msg.data?.reason || 'no reason'}`);
-
-          // Call handler hook first (escape hatch)
-          if (agent.handler?.onJobDisputed) {
-            try {
-              const freshJob = await agent.client.getJob(job.id);
-              await agent.handler.onJobDisputed(freshJob, msg.data?.reason || '');
-            } catch (e) {
-              console.error('Handler error:', e.message);
-            }
-          }
-
-          // VDXF policy auto-response (if no handler handled it)
-          if (_disputePolicy) {
-            try {
-              const policy = _disputePolicy;
-              let action = policy.defaultAction || 'rework';
-              let refundPercent = 0;
-              let reworkCost = 0;
-
-              // Check rework cycle limit
-              if (action === 'rework' && _reworkCount >= policy.maxReworkCycles) {
-                if (policy.escalateAfter === 'max_rework') {
-                  console.log(`⚠️  Max rework cycles (${policy.maxReworkCycles}) reached — deferring to platform arbitration`);
-                  break;
-                }
-                action = 'refund';
-              }
-
-              if (action === 'refund') {
-                refundPercent = Math.min(policy.maxRefundPercent || 100, 100);
-              } else if (action === 'rework') {
-                reworkCost = (policy.reworkBudgetPercent || 30) / 100 * (fullJob.amount || 0);
-              }
-
-              const brokered = await signer.signDisputeRespond({
-                jobId: job.id,
-                jobHash: fullJob.jobHash,
-                action,
-              });
-
-              await withRetry(
-                () => agent.client.respondToDispute(job.id, {
-                  action,
-                  message: `Auto per VDXF policy: ${action}`,
-                  timestamp: brokered.timestamp,
-                  signature: brokered.signature,
-                  ...(action === 'refund' ? { refundPercent } : {}),
-                  ...(action === 'rework' ? { reworkCost } : {}),
-                }),
-                'respondToDispute (auto)',
-                { maxAttempts: 3, baseDelayMs: 2000 }
-              );
-              console.log(`✅ Auto-responded to dispute: ${action}`);
-            } catch (e) {
-              console.error('❌ Auto-dispute response failed:', e.message);
-            }
-          }
-
-          // Stay alive — wait for resolution
+          await surfaceDispute(job, agent);
+          // Surface-only: the operator (human) has the final say. A future
+          // agent-autonomous policy engine would decide a response here.
+          // Stay alive — wait for resolution.
           break;
         }
 
@@ -1940,5 +1923,5 @@ if (require.main === module) {
 // Export testable helpers when running under NODE_ENV=test.
 // Avoids shipping a test seam in production while keeping coverage honest.
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect };
+  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute };
 }
