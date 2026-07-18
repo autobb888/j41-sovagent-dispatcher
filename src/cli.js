@@ -4556,6 +4556,60 @@ async function respawnReadyResumes(state, deps = {}) {
   return count;
 }
 
+const DISPUTE_RESPAWN_TTL_MIN = 720; // 12 h window for operator to respond
+
+// Route a job.disputed observation to a worker. Live jobs get the dispute
+// forwarded to their running container; torn-down jobs are respawned via the
+// same reactivation-queue machinery job.resumed uses. Never silently drops:
+// an unresolvable seller emits dispute.unresolved_agent. The respawned worker
+// fetches the authoritative deadline itself (getDispute) — we plumb no deadline.
+async function queueDisputedJobForRespawn(state, jobId, opts = {}) {
+  const send = opts.sendToJobAgent || sendToJobAgent;
+  const respawn = opts.respawnReadyResumes || respawnReadyResumes;
+  const persist = opts.persistReactivationQueue || persistReactivationQueue;
+
+  const active = state.active.get(jobId);
+  if (active) {
+    send(active, { type: 'dispute.filed', data: { jobId, reason: opts.reason } });
+    return { forwarded: true };
+  }
+
+  // Torn-down: resolve the job + its local agent, then respawn.
+  const findAgent = (id) => state.agents.find(a => a.id === id);
+  const agentInfo = opts.agentId ? findAgent(opts.agentId) : null;
+  let job;
+  try {
+    if (opts.getJob) job = await opts.getJob(jobId);
+    else if (agentInfo) {
+      const session = await getAgentSession(state, agentInfo);
+      job = await session.client.getJob(jobId);
+    }
+  } catch (e) {
+    console.error(`[Dispute] Could not fetch torn-down job ${jobId.substring(0, 8)}: ${e.message}`);
+  }
+  if (!job) {
+    state.emitEvent?.('dispute.unresolved_agent', { jobId, reason: 'job-fetch-failed' });
+    return { unresolved: true };
+  }
+
+  const sellerId = job.sellerVerusId || job.seller || job.agentVerusId;
+  const match = state.agents.find(a => a.iAddress === sellerId || a.identity === sellerId);
+  if (!match) {
+    console.error(`[Dispute] job ${jobId.substring(0, 8)} seller ${sellerId} not a local agent — cannot respawn`);
+    state.emitEvent?.('dispute.unresolved_agent', { jobId, seller: sellerId });
+    return { unresolved: true };
+  }
+
+  rq.enqueue(state.reactivationQueue, {
+    job, agentId: match.id, pausedAt: Date.now(),
+    pauseTtlMin: DISPUTE_RESPAWN_TTL_MIN, readyToRespawn: true, dispute: true,
+  });
+  persist(state.reactivationQueue);
+  console.log(`[Dispute] job ${jobId.substring(0, 8)} torn-down → queued + respawning for ${match.id}`);
+  await respawn(state);
+  return { respawned: true };
+}
+
 const REACTIVATION_MEM_MARGIN_BYTES = 512 * 1024 * 1024; // 0.5 GB host margin
 
 function hasMemoryHeadroom(freeBytes, perContainerBytes, marginBytes = REACTIVATION_MEM_MARGIN_BYTES) {
@@ -5648,7 +5702,7 @@ async function pollForJobs(state) {
         state.emitEvent?.('job.completed', { jobId, agentId: activeInfo.agentInfo?.id });
         state._lastSentStatus.set(jobId, currentJob.status);
       } else if (currentJob.status === 'disputed') {
-        sendToJobAgent(activeInfo, { type: 'dispute.filed', data: { jobId, reason: currentJob.dispute?.reason } });
+        await queueDisputedJobForRespawn(state, jobId, { agentId: activeInfo.agentInfo?.id, reason: currentJob.dispute?.reason });
         state._lastSentStatus.set(jobId, currentJob.status);
       } else if (currentJob.status === 'resolved' || currentJob.status === 'resolved_rejected') {
         sendToJobAgent(activeInfo, { type: 'dispute.resolved', data: { jobId, action: currentJob.dispute?.action } });
@@ -5961,11 +6015,7 @@ async function handleWebhookEvent(state, agentId, payload) {
     case 'job.disputed':
     case 'job.dispute.filed': {
       console.log(`[Webhook] ⚠️  Dispute filed for job ${jobId?.substring(0, 8)} by ${data?.disputedBy || '?'}: ${data?.reason || '?'}`);
-      // Forward to running job-agent via IPC
-      const activeJob = state.active.get(jobId);
-      if (activeJob?.process?.send) {
-        activeJob.process.send({ type: 'dispute.filed', data: { reason: data?.reason, disputedBy: data?.disputedBy } });
-      }
+      await queueDisputedJobForRespawn(state, jobId, { agentId, reason: data?.reason });
       break;
     }
 
@@ -8208,7 +8258,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, queueDisputedJobForRespawn };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
