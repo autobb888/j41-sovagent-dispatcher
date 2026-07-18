@@ -6218,6 +6218,44 @@ async function handleWebhookEvent(state, agentId, payload) {
   }
 }
 
+// Per-item inbox accept routing, extracted for testability. Returns
+// { accepted:true } on a real accept, { skip:true, reason } for a transient
+// job_record skip, { accepted:false } for an unhandled type. Throws bubble to
+// the caller's dead-letter handling.
+async function dispatchInboxAccept(agent, item, deps) {
+  if (item.type === 'review') {
+    console.log(`[Inbox] Processing review ${item.id}`);
+    await agent.acceptReview(item.id);
+    console.log(`[Inbox] ✅ Review accepted`);
+    return { accepted: true };
+  }
+  if (item.type === 'attestation') {
+    console.log(`[Inbox] Processing attestation ${item.id}`);
+    await agent.acceptAttestationTuple(item.id);
+    console.log(`[Inbox] ✅ Attestation accepted`);
+    return { accepted: true };
+  }
+  if (item.type === 'job_record') {
+    console.log(`[Inbox] Processing job record ${item.id}`);
+    const { data: inboxItemDetail } = await agent.client.getInboxItem(item.id);
+    const gateResult = await deps.verifyInboxJobRecord({
+      inboxItemDetail,
+      getJobWitness: (jobId) => agent.client.getJobWitness(jobId),
+      verifyWitness: deps.verifyWitness,
+      client: agent.client,
+      network: deps.network,
+    });
+    if (gateResult && gateResult.skip) {
+      console.log(`[Inbox] ⏭ Skipping job_record ${item.id} (transient): ${gateResult.reason}`);
+      return { skip: true, reason: gateResult.reason };
+    }
+    await agent.acceptJobRecord(item.id);
+    console.log(`[Inbox] ✅ Job record written on-chain`);
+    return { accepted: true };
+  }
+  return { accepted: false };
+}
+
 // Check for pending inbox items (reviews + job records) and process them
 async function checkPendingInbox(state) {
   if (!state._inboxFailures) state._inboxFailures = new Map(); // defensive: older state objects
@@ -6233,74 +6271,32 @@ async function checkPendingInbox(state) {
       const agent = await getAgentSession(state, agentInfo);
       const inbox = await agent.client.getInbox('pending', 20);
       const pending = (inbox?.data || []).filter(
-        item => item.type === 'review' || item.type === 'job_record'
+        item => item.type === 'review' || item.type === 'job_record' || item.type === 'attestation'
       );
       if (pending.length === 0) continue;
-
       console.log(`[Inbox] ${agentInfo.id}: ${pending.length} pending item(s)`);
 
+      const { verifyWitness } = require('@junction41/sovagent-sdk/dist/index.js');
       for (const item of pending) {
         seenInboxIds.add(item.id);
-        // Quarantined: repeatedly unacceptable (e.g. a review whose signature can
-        // never verify). Skip silently — the loud log already fired once on the
-        // dead-letter transition, and retrying every cycle is exactly the ~10k-spin
-        // failure this guards against.
         if (isDeadLettered(state._inboxFailures, item.id)) continue;
-
         try {
-          if (item.type === 'review') {
-            console.log(`[Inbox] Processing review ${item.id}`);
-            await agent.acceptReview(item.id);
-            console.log(`[Inbox] ✅ Review accepted for ${agentInfo.id}`);
-          } else if (item.type === 'job_record') {
-            console.log(`[Inbox] Processing job record ${item.id}`);
-
-            // ── Integrity ② — verify platform witness BEFORE writing on-chain ──
-            // Fetch the full inbox item so we can decode vdxfData + resolve jobId.
-            const { verifyWitness } = require('@junction41/sovagent-sdk/dist/index.js');
-            const { data: inboxItemDetail } = await agent.client.getInboxItem(item.id);
-            const network = J41_NETWORK;
-            const gateResult = await verifyInboxJobRecord({
-              inboxItemDetail,
-              getJobWitness: (jobId) => agent.client.getJobWitness(jobId),
-              verifyWitness,
-              client: agent.client,
-              network,
-            });
-
-            if (gateResult && gateResult.skip) {
-              console.log(`[Inbox] ⏭ Skipping job_record ${item.id} (transient): ${gateResult.reason}`);
-              continue;
-            }
-
-            // NOTE: acceptJobRecord re-fetches the inbox item; a platform serving different
-            // bytes between our verify-fetch and that write-fetch is moot — the platform is
-            // the witness signer (already the trust root). See verifyInboxJobRecord.
-            await agent.acceptJobRecord(item.id);
-            console.log(`[Inbox] ✅ Job record written on-chain for ${agentInfo.id}`);
-          }
-          // Reached only on a real accept (the transient job_record skip `continue`s
-          // above and is neither counted nor cleared). Clear any prior failure streak.
+          const r = await dispatchInboxAccept(agent, item, {
+            verifyInboxJobRecord, verifyWitness, network: J41_NETWORK,
+          });
+          if (r && r.skip) continue; // transient — neither counted nor cleared
           clearInboxFailure(state._inboxFailures, item.id);
         } catch (e) {
           const dl = recordInboxFailure(state._inboxFailures, item.id, e.message);
           if (dl.justDeadLettered) {
-            // Fail loud, exactly once, and surface into the agent health document so
-            // it's visible without grepping logs. This is the signal the ~10k silent
-            // retries never gave.
             console.error(
               `[Inbox] ☠️  DEAD-LETTER ${item.type} ${item.id.substring(0, 8)} for ${agentInfo.id} ` +
               `after ${dl.attempts} attempts — quarantined, will NOT retry until restart. Last error: ${e.message}`,
             );
-            state._agentErrors.set(
-              agentInfo.id,
-              `inbox ${item.type} ${item.id.substring(0, 8)} dead-lettered (${dl.attempts}x): ${String(e.message).slice(0, 100)}`,
-            );
+            state._agentErrors.set(agentInfo.id,
+              `inbox ${item.type} ${item.id.substring(0, 8)} dead-lettered (${dl.attempts}x): ${String(e.message).slice(0, 100)}`);
           } else {
-            console.error(
-              `[Inbox] ❌ Failed to process ${item.type} ${item.id.substring(0, 8)} ` +
-              `(attempt ${dl.attempts}/${MAX_INBOX_ATTEMPTS}): ${e.message}`,
-            );
+            console.error(`[Inbox] ❌ Failed to process ${item.type} ${item.id.substring(0, 8)} (attempt ${dl.attempts}/${MAX_INBOX_ATTEMPTS}): ${e.message}`);
           }
         }
       }
@@ -8212,7 +8208,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
