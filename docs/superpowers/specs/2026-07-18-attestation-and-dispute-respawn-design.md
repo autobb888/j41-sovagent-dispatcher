@@ -1,9 +1,9 @@
 # Sovereign Attestation Tuple + Dispute Respawn-with-Deadline — Design
 
-**Date:** 2026-07-18
+**Date:** 2026-07-18 (rev 2 — corrected to the backend's actual review.record passthrough model)
 **Repos:** `j41-sovagent-sdk` (TypeScript) + `j41-sovagent-dispatcher` (CommonJS)
 **Branch:** `feature/attestation-and-dispute-respawn` (off dispatcher `main@591ce71`; SDK `main@fc7946f`)
-**Source:** Junction41 backend work-request 2026-07-17 (items A + B; item C = worker-attach ACK deferred to a second increment).
+**Source:** Junction41 backend work-request 2026-07-17 (items A + B; item C = worker-attach ACK deferred to a second increment) + backend owner corrections 2026-07-18.
 
 ## Goal
 
@@ -16,68 +16,74 @@ Two additive, fail-closed changes so the agent's reputation is tamper-proof and 
 
 - **Item C** (worker-attach ACK / `confirmWorkerAttached`) — separate second increment, not this branch.
 - **The backend dispute resolver** — built + flag-gated OFF (`DISPUTE_RESOLVER_ENABLED`) on the backend; we deploy B *in concert* with it but do not build it.
-- **Dispatcher-side auto-response to a dispute** — decided: **surface-only, human has final say** (see Decision 3). No auto-respond in this branch; a clean seam is left for future agent-autonomous policy.
-- **The 72h-deadline-expiry outcome** (operator's "50/50 auto-return?" idea) — that is the backend resolver's decision, still undecided, latent behind the flag. Out of scope here.
-- **No new signing primitive.** The tuple's `signature` is the buyer's existing `signmessage` completion signature; `msgHash` is computed by the backend and carried in the inbox item. We only *carry* and *verify*, never sign.
+- **Dispatcher-side auto-response to a dispute** — decided: **surface-only, human has final say**. No auto-respond in this branch; a clearly-marked seam is left for future agent-autonomous policy. The 72h-deadline-expiry outcome (operator's "50/50 auto-return?" musing) is the backend resolver's call, still undecided, out of scope here.
+- **No tuple serialization on our side.** The backend formats `vdxf_data` (opaque hex); the dispatcher/SDK only carry it. No new signing primitive, no encoder, no on-chain byte-layout logic on our side.
+
+## The corrected model (read this first)
+
+The existing `review.record` pipeline is **backend-formats → dispatcher passes through**, NOT SDK-builds:
+
+- The backend emits an inbox item with `vdxf_data` pre-built (its `generateVdxfData` / `encodeVdxfValue` = `Buffer.from(JSON.stringify(value)).toString('hex')`, plain `JSON.stringify`, not canonical).
+- The SDK's `acceptReview(inboxId)` fetches the item, **allowlists** the key to the `review.*` namespace, and writes the **opaque hex** to the agent's identity. It refuses to synthesize if `vdxfData` is absent (fail-closed).
+
+**Attestation is the same pattern with a different allowlisted key.** `acceptAttestationTuple` is a clone of `acceptReview` allowlisting only `review.attestation`. We never build, serialize, or verify the tuple bytes — the backend owns them; the buyer's signature inside the tuple self-polices forgery (a forged tuple's signature simply won't verify for any off-chain reader, and it's written to the agent's *own* id, so it's worthless — no dispatcher-side witness gate needed, exactly like `review.record`).
 
 ## Global constraints (bind every task)
 
-- **Attestation VDXF key is final/immutable:** `agentplatform::review.attestation` → `i76fJX1DreN81CoRVJHSkrcqHq9nsLomYv` (published on testnet, tx `d8f57a4b…`). Use this exact i-address; do not derive a new one.
-- **On-chain write is raw hex, NOT DataDescriptor-wrapped.** Agents write the attestation tuple as a raw-hex contentmultimap value under the key (unlike `job.record`/`review.record` which use `makeSubDD`). This is what keeps it ~150 bytes and must stay **under the 5,500-byte contentmultimap truncation limit**. The exact raw-hex encoding must match the backend report `2026-07-18-review-attestation-vdxf-key.md` byte-for-byte — treated as a "cannot get wrong" gate (like refund-address correctness).
-- **Accept path is namespace-allowlisted to the single attestation key.** A hostile inbox item must never be able to write arbitrary VDXF onto the agent's identity. Mirror the `review.*`/`job.*` gates (`agent.ts:1420/1518`).
-- **Fail closed everywhere.** Verification failure → refuse to write (never synthesize, never write unverified). Mirror `acceptReview` / `verifyInboxJobRecord`.
+- **Attestation VDXF key is final/immutable:** `agentplatform::review.attestation` → `i76fJX1DreN81CoRVJHSkrcqHq9nsLomYv` (published on testnet, tx `d8f57a4b…`). Add it to `VDXF_KEYS.review`; use this exact i-address.
+- **Opaque passthrough.** Our side treats the tuple hex as opaque. Do NOT build/encode/verify it. `acceptAttestationTuple` = `acceptReview` clone. Key order in the tuple is NOT load-bearing (the signature covers the reconstructed `J41-COMPLETE` string; `msgHash` covers the review text; neither depends on JSON byte layout).
+- **Accept path is namespace-allowlisted to the single attestation key.** A hostile inbox item must never write any key other than `review.attestation` onto the agent's identity. Mirror the `review.*` allowlist (`agent.ts:1420`) but restrict the set to `[VDXF_KEYS.review.attestation]`.
+- **Fail closed.** Refuse to synthesize if `vdxfData` is absent (mirror `acceptReview`, `agent.ts:1449`). WIF+iAddress required.
 - **No env-var kill switches for verification.** Consistent with prior hardening.
 - Dispatcher is CJS, no build step — validate with `node --check`, test with `node --test test/*.js`. SDK is TS — `npx tsc --noEmit`, `yarn build`, `npx tsx --test test/*.test.ts`.
 - Build to the backend contract now (endpoints built but **not yet deployed**); unit-test fully; live-test end-to-end after the backend deploys migration 051 + rebuilds.
 
 ---
 
-## Item A — Publish the compact attestation tuple on completion
+## Item A — Carry the compact attestation tuple on completion
 
-### Tuple
+### Tuple (backend-owned, opaque to us)
+
+`{ jobHash, buyer, rating, timestamp, msgHash, signature }` — `buyer` = buyer i-address; `rating` = number; `timestamp` = epoch the buyer signed; `msgHash` = sha256-hex of the review text (backend computes); `signature` = buyer's completion (`J41-COMPLETE`) signature. Serialized backend-side as `hex(JSON.stringify(tuple))`; ~150 B; < 5,500-byte truncation limit. **We never touch these bytes.**
+
+### Inbox item shape (backend-emitted)
 
 ```
-{ jobHash, buyer, rating, timestamp, msgHash, signature }
+{ type: 'attestation',
+  recipient_verus_id: '<agent i-address>',
+  vdxf_data: JSON.stringify({ "i76fJX1DreN81CoRVJHSkrcqHq9nsLomYv": "<hex>" }) }
 ```
 
-- `signature` — buyer's existing completion `signmessage` signature (already produced + verified today).
-- `msgHash` — sha256 of the review message text; computed by the backend, carried in the inbox item. The message text stays off-chain, pinned by this hash.
-- Serialized as raw hex under `VDXF_KEYS.review.attestation`; ~150 bytes; < 5,500-byte truncation limit.
+The inner value is a **bare hex string** (not an array). `acceptReview`'s `Array.isArray(value) ? value : [value]` normalization (`agent.ts:1435`) already handles this — cloning it is automatically correct. The client's inbox layer normalizes `vdxf_data` (snake, JSON string) → `vdxfData` (object) the same way it does for `review` items (type-agnostic — confirm in Task).
 
-### Data flow (broker mode — primary)
+### Data flow
 
-1. Buyer completes the job + leaves a review → backend creates an **inbox item** `type: 'attestation'` carrying the tuple fields incl. `msgHash` and the buyer signature (`vdxfData` may carry a pre-formatted raw-hex payload, or the fields to assemble).
-2. Dispatcher host `checkPendingInbox()` polls, sees `type === 'attestation'`, runs `verifyInboxAttestation()` (buyer-sig + field cross-check against the authoritative job/review), and on pass calls `agent.acceptAttestationTuple(inboxId)`.
-3. `acceptAttestationTuple` writes the raw-hex tuple under `review.attestation` onto the agent's own identity (WIF-only), broadcasts, and marks the inbox item accepted.
-
-Legacy WIF mode (no broker): `performCleanup()` assembles the tuple locally and includes it in `buildJobCompletionAdditions()` alongside `reviewRecord`. Broker/inbox is the primary path.
+Buyer completes job + leaves review → backend emits `type:'attestation'` inbox item (opaque hex) → dispatcher `checkPendingInbox()` sees `type==='attestation'` → `agent.acceptAttestationTuple(item.id)` → allowlist `review.attestation` + write opaque hex to agent identity + `acceptInboxItem`. **Accepted directly like `review`, NOT witness-gated like `job_record`.**
 
 ### SDK changes
 
 | File | Change |
 |---|---|
 | `src/onboarding/vdxf.ts:66` | Add `attestation: 'i76fJX1DreN81CoRVJHSkrcqHq9nsLomYv'` to `VDXF_KEYS.review` → `{ record, attestation }`. |
-| `src/onboarding/vdxf.ts:838` `buildJobCompletionAdditions()` | Add optional `attestationTuple` param; when present, append it under `VDXF_KEYS.review.attestation` as a **raw-hex** value (NOT `makeSubDD`). New helper `encodeAttestationRawHex(tuple)` — exact encoding pinned to the backend report. |
-| `src/agent.ts:~1490` | New `acceptAttestationTuple(inboxId)` mirroring `acceptJobRecord`: WIF+iAddress gated, **namespace-allowlisted to `review.attestation` only**, witness/verify-gated, refuses to synthesize if the inbox item lacks the required signed fields (fail-closed). Emits `'attestation:accepted'`. |
-| `src/index.ts` | Export any new public helper. |
-| inbox-item type | Extend the inbox-item TS type to carry `msgHash` + attestation fields. |
+| `src/agent.ts` (after `acceptReview`, ~1485) | New `acceptAttestationTuple(inboxId)`: byte-identical to `acceptReview` except the allowlist set is `new Set([VDXF_KEYS.review.attestation])` and log/emit strings say "attestation" (`emit('attestation:accepted', …)`). Refuses to synthesize if no `vdxfData`. |
+| `src/index.ts` | No new export needed (method on `J41Agent`); confirm `J41Agent` is exported (it is). |
+
+**No change to `buildJobCompletionAdditions`, no `encodeAttestationRawHex`, no `performCleanup` attestation build.** Those were the wrong (SDK-serializes) model.
 
 ### Dispatcher changes
 
 | File | Change |
 |---|---|
-| `src/job-agent.js:1715` `performCleanup()` | Build `attestationTuple` next to `reviewRecord` (legacy-WIF path); pass to `buildJobCompletionAdditions`. Broker mode continues to defer to inbox. |
-| `src/inbox-attestation.js` (new) | `verifyInboxAttestation({ inboxItemDetail, ... })` mirroring `verifyInboxJobRecord`: verify buyer signature over the tuple, cross-check `jobHash`/`buyer`/`rating`/`msgHash` against the authoritative job + review, network-gate. Return contract: void on success, `{skip,reason}` transient, throw on hard failure. |
-| `src/cli.js:6222` `checkPendingInbox()` | Filter: add `|| item.type === 'attestation'`. Branch: `verifyInboxAttestation()` → on pass `agent.acceptAttestationTuple(item.id)`. Reuse dead-letter tracking. |
+| `src/cli.js` `checkPendingInbox()` (~6234 filter, ~6251 branch) | Filter: add `|| item.type === 'attestation'`. Branch: `else if (item.type === 'attestation') { await agent.acceptAttestationTuple(item.id); }` — direct accept like `review` (no `verifyInboxJobRecord`). Reuse the existing dead-letter tracking (`recordInboxFailure`/`clearInboxFailure`). |
 
 ### Security invariant (A)
 
-The only VDXF key `acceptAttestationTuple` may write is `review.attestation`. Verification gates the buyer signature and cross-checks every field against authoritative platform state before any on-chain write. No verification → no write.
+The only VDXF key `acceptAttestationTuple` may write is `review.attestation`; any other key in `vdxfData` is dropped with a tamper warning (mirrors `agent.ts:1428`). No `vdxfData` → refuse to write. The agent writes only to its own identity; a forged tuple is signature-invalid and worthless.
 
 ### Tests (A)
 
-- SDK: `encodeAttestationRawHex` produces the exact bytes for a known tuple (golden vector from backend report); size < 5,500 B; round-trips. `acceptAttestationTuple` rejects a wrong-namespace item, rejects missing `msgHash`/`signature`, rejects a bad buyer sig (fail-closed).
-- Dispatcher: `verifyInboxAttestation` passes a good item, `{skip}` on transient (job not yet witnessable), throws on field mismatch / bad sig / wrong network. `checkPendingInbox` routes `type==='attestation'` to the verify+accept path and dead-letters on repeated failure.
+- SDK (`test/accept-attestation.test.ts`): `acceptAttestationTuple` with a good pre-formatted item writes the `review.attestation` key (assert the value passed to a stubbed `buildIdentityUpdateTx`); **drops a non-`review.attestation` key** (e.g. `agent.payAddress`) with the tamper path and throws "no review.attestation keys after whitelist"; **throws** (refuse-to-synthesize) when `vdxfData` is absent; skips when item status ≠ `pending`.
+- Dispatcher (`test/inbox-attestation-routing.test.js`): `checkPendingInbox` routes a `type:'attestation'` item to `acceptAttestationTuple` (injected stub) and NOT to `acceptReview`/`acceptJobRecord`; a throw increments the dead-letter counter.
 
 ---
 
@@ -85,28 +91,28 @@ The only VDXF key `acceptAttestationTuple` may write is `review.attestation`. Ve
 
 ### The gap (root cause, from code mapping)
 
-- Webhook `job.disputed` handler (`cli.js:5961`) and poll `disputed`-status detection (`cli.js:5640`) both only act when `state.active.get(jobId)` exists. If the container already tore down (post-delivery safety timeout, completion teardown, dispatcher restart, pause), the event is **dropped**.
-- A naive "respawn like resume" does **not** work: a worker spawned for an already-delivered/disputed job hits `job-agent.js:600` ("not in a deliverable state → exit cleanly") and **never reaches `waitForPostDelivery`**, where dispute IPC is handled.
-- `moveJobToReactivationQueue` (`cli.js:4487`) requires a live `state.active` entry, which a torn-down job lacks.
+- Webhook `job.disputed` handler (`cli.js:5961`) forwards only via `activeJob.process.send` — **doesn't reach Docker containers at all**, and drops entirely if no active entry. Poll detection (`cli.js:5650`) uses `sendToJobAgent` but only iterates `state.active`.
+- A respawned worker for an already-delivered/disputed job hits `job-agent.js:600` ("not in a deliverable state → exit cleanly") and **never reaches `waitForPostDelivery`**, where dispute IPC is handled.
+- `moveJobToReactivationQueue` (`cli.js:4487`) requires a live `state.active` entry a torn-down job lacks.
 - `agent.setHandler` (`job-agent.js:411`) wires only `onSessionEnding`; `onJobDisputed` is dead code.
-- Today's post-delivery dispute path (`job-agent.js:1526`) *silently* auto-responds per VDXF policy.
+- The post-delivery dispute path (`job-agent.js:1526`) *silently* auto-responds per VDXF policy.
 
 ### Design
 
-**Dispatcher — new `queueDisputedJobForRespawn(state, jobId, deadline)`:**
-- **Live container** (`state.active.has(jobId)`): forward `dispute.filed` IPC **including `deadline`** to the running container (today's behavior + the deadline). The worker's `waitForPostDelivery` handles it.
-- **Torn-down** (no active entry): fetch the job (`getJob`), resolve the local `agentId` by matching the job's seller i-address against `state.agents`, synthesize a reactivation entry `{ job, agentId, pausedAt: now, pauseTtlMin, readyToRespawn: true, dispute: { deadline } }`, enqueue + persist, then `respawnReadyResumes(state)`. Fail loudly (log + emit) if the seller can't be resolved to a local agent — never silently drop.
-- Wire into **both** `cli.js:5961` (webhook) and `cli.js:5640` (poll), replacing the silent drop.
+**Dispatcher — new `queueDisputedJobForRespawn(state, jobId)`** (no deadline param — the worker fetches the authoritative deadline itself):
+- **Live** (`state.active.has(jobId)`): `sendToJobAgent(info, { type: 'dispute.filed', data: { jobId, reason } })` (handles both local + Docker). This replaces the webhook's broken `process.send`.
+- **Torn-down** (no active entry): `getJob(jobId)`; resolve the local `agentId` by matching the job's seller i-address against `state.agents`; if unresolved, **log + `emitEvent('dispute.unresolved_agent', …)` and return** (never enqueue a broken entry). Else `rq.enqueue(state.reactivationQueue, { job, agentId, pausedAt: Date.now(), pauseTtlMin: <default>, readyToRespawn: true, dispute: true })`, persist, `await respawnReadyResumes(state)`.
+- Wire into **both** the webhook handler (`cli.js:5961`, replacing the `process.send` block) and poll detection (`cli.js:5650`, replacing the inline `sendToJobAgent`).
 
-**Worker (`job-agent.js`) — status-driven post-delivery reconnect:**
-- At startup, after `getJob`, if `fullJob.status ∈ {delivered, disputed}` (or the reactivation entry carried a `dispute` marker, surfaced via env/IPC): **skip work + delivery**, connect chat, and enter `waitForPostDelivery` directly (a post-delivery *reconnect*, mirroring the `in_progress` reconnect at line 810). This closes the line-600 drop.
-- On entering dispute handling: fetch authoritative dispute via `agent.client.getDispute(job.id)` → `{ reason, deadline_at, whoseMove }`; fire the now-wired `onJobDisputed(job, reason, deadline)` handler; surface to the operator via `sendChatMessage` (reason + human-readable deadline). Emit a control-API event (`dispute.surfaced`) so the future Discord/TG owner-notification seam and future agent-autonomy can hook in.
-- **No auto-response** (Decision 3). The VDXF silent auto-policy block is replaced by the surface path. Leave a clearly-marked extension point where a future policy engine would decide.
+**Worker (`job-agent.js`) — status-driven post-delivery reconnect + surface:**
+- Startup: after `getJob`, if `fullJob.status ∈ {'delivered','disputed'}` → **skip work + delivery**, connect chat, and enter `waitForPostDelivery` directly (post-delivery *reconnect*, mirroring the `in_progress` reconnect at line 810). Closes the line-600 drop.
+- New helper `surfaceDispute(job, agent)`: `const d = await agent.client.getDispute(job.id)` → read `d.deadline_at`, `d.deadline_owner`; fire `agent.handler.onJobDisputed(freshJob, d.reason, d.deadline_at)`; `agent.sendChatMessage(job.id, <operator-facing text with reason + human deadline + whose move>)`; emit a `dispute.surfaced` marker (log line the operator/control-API can see). Called (a) on startup when status is `disputed`, and (b) from the `dispute.filed` IPC handler.
+- `dispute.filed` handler (`job-agent.js:1526`): replace the body with `await surfaceDispute(job, agent)`. **Remove** the silent VDXF auto-policy block; leave a one-line comment marking where a future agent-autonomous policy engine would decide (surface-only, human final say).
+- `agent.setHandler` (`job-agent.js:411`): add `onJobDisputed: async (dJob, reason, deadline) => { … }` — logs + is the escape hatch (kept thin; surfacing happens in `surfaceDispute`).
 
 **SDK:**
-- `src/jobs/types.ts:55` — extend `onJobDisputed?(job, reason, deadline)` (third param, Unix ms or ISO from `deadline_at`).
-- `src/client/index.ts:1650` `getDispute` / `DisputeDetail` — confirm/extend the type to carry `deadline_at` + `whoseMove` (backend added these).
-- Wire `onJobDisputed` in the dispatcher's `agent.setHandler` (`job-agent.js:411`).
+- `src/jobs/types.ts:56` — extend `onJobDisputed?(job, reason, deadline?)` (third param: `deadline_at` ISO string | undefined).
+- `src/client/index.ts:2626` `DisputeDetail` — add `deadline_at?: string | null; deadline_owner?: 'seller' | 'buyer' | null; deadline_passed?: boolean;`. (`getDispute` already returns `res.dispute` unchanged.)
 
 ### Deployment coupling (B)
 
@@ -114,24 +120,25 @@ B pairs with the backend resolver. Backend gives a **72h deadline + durable `cre
 
 ### Tests (B)
 
-- Dispatcher: `queueDisputedJobForRespawn` — live path forwards IPC with deadline; torn-down path resolves agentId, enqueues a ready entry, and calls respawn; unresolvable seller logs+emits and does not enqueue a broken entry. Both webhook + poll call sites route through it.
-- Worker: startup with `status: 'disputed'` skips work/delivery and enters post-delivery reconnect (unit-level via the exported flow guards); `onJobDisputed` fires with `(job, reason, deadline)`; surface message contains the deadline; no `respondToDispute` is called (surface-only).
-- SDK: `onJobDisputed` type accepts the deadline arg; `getDispute` returns `deadline_at`/`whoseMove`.
+- Dispatcher (`test/dispute-respawn.test.js`): `queueDisputedJobForRespawn` — live path calls `sendToJobAgent` with `dispute.filed`; torn-down path resolves agentId, enqueues a `readyToRespawn:true` entry, calls `respawnReadyResumes` (injected stubs); unresolvable seller emits `dispute.unresolved_agent` and does NOT enqueue. Both webhook + poll call sites route through it (assert via a spy).
+- Worker: `surfaceDispute` (exported under NODE_ENV=test) fetches `getDispute`, fires `onJobDisputed(job, reason, deadline_at)`, sends a chat message containing the deadline, and calls no `respondToDispute` (surface-only). Startup with `status:'disputed'` routes into the post-delivery reconnect (flow-guard unit).
+- SDK (`test/dispute-deadline-type.test.ts`): `DisputeDetail` accepts the three new fields; `onJobDisputed` type accepts `(job, reason, deadline)`.
 
 ---
 
 ## Decisions (locked)
 
-1. **Branch/sequencing:** money-safety merged to `main` first (done, `591ce71`); A+B on a fresh branch; C is a later increment.
-2. **Attestation key:** final/immutable `i76fJX1DreN81CoRVJHSkrcqHq9nsLomYv`; raw-hex write; encoding pinned to backend report.
-3. **Dispute auto-response:** surface-only, human has final say, for now. Clean seam for future agent-autonomous policy. Deadline-expiry outcome is backend's call, out of scope.
-4. **Testability:** build-to-contract now, live-test after backend deploy.
+1. **Branch/sequencing:** money-safety merged to `main` (`591ce71`); A+B on a fresh branch; C is a later increment.
+2. **Attestation:** opaque passthrough, `acceptAttestationTuple` = `acceptReview` clone allowlisting `review.attestation` (`i76fJX1DreN81CoRVJHSkrcqHq9nsLomYv`). Backend owns bytes.
+3. **Dispute auto-response:** surface-only, human has final say. Silent VDXF auto-policy removed; seam left for future autonomy. Deadline-expiry outcome is backend's call.
+4. **Deadline source:** worker fetches `getDispute` (authoritative); dispatcher does not plumb the deadline via IPC.
+5. **Testability:** build-to-contract now, live-test after backend deploy.
 
-## Open coordination items (with backend / operator)
+## Resolved coordination facts (from backend owner, 2026-07-18)
 
-- Exact **raw-hex encoding** of the attestation tuple — need the golden vector from `2026-07-18-review-attestation-vdxf-key.md` to pin the SDK encoder + dispatcher verifier byte-for-byte.
-- Confirm the **inbox `attestation` item shape** (field names, whether `vdxfData` is pre-formatted raw-hex or fields to assemble, where `msgHash`/buyer-sig live).
-- Confirm `DisputeDetail` JSON keys (`deadline_at`, `whoseMove`) as returned by `GET /v1/jobs/:id/dispute`.
+- Tuple serialization is backend-owned & opaque: `hex(JSON.stringify({jobHash, buyer, rating, timestamp, msgHash, signature}))`, plain (non-canonical) `JSON.stringify`, key order not load-bearing.
+- Inbox item: `{ type:'attestation', recipient_verus_id, vdxf_data: JSON.stringify({ "i76fJX1…": "<hex>" }) }`; inner value a bare hex string (acceptReview normalization handles it).
+- `GET /v1/jobs/:id/dispute`: `deadline_at` (ISO|null), `deadline_owner` (`seller|buyer|null`), `deadline_passed` (bool), both top-level and inside the dispute object; countdown is client-side (`deadline_at − now`).
 
 ## Rollout
 
