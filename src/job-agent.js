@@ -128,6 +128,19 @@ function isPostDeliveryReconnect(status) {
   return status === 'delivered' || status === 'disputed';
 }
 
+// Item C — worker self-reports attach to the platform. Gated on non-reconnect
+// (a dispute/delivered respawn would hit the backend's 409 STATE_CONFLICT) and
+// fail-open (advisory telemetry — never block or kill the job).
+async function selfReportAttach(agent, jobId, { isReconnect, failed, reason } = {}) {
+  if (isReconnect) return;
+  try {
+    if (failed) await agent.client.reportWorkerAttachFailed(jobId, reason || 'attach-failed');
+    else await agent.client.confirmWorkerAttached(jobId);
+  } catch (e) {
+    console.error(`[ATTACH] ${failed ? 'attach-failed' : 'attached'} report failed (non-fatal): ${e.message}`);
+  }
+}
+
 /**
  * Construct the right signer for this container. In broker mode the
  * `SignChannelClient` is built from the bind-mounted channel directory and
@@ -388,7 +401,9 @@ async function main() {
   try {
     await agent.connectChat();
     console.log('✅ Connected to SovGuard\n');
+    await selfReportAttach(agent, job.id, { isReconnect: _isPostDeliveryReconnect });
   } catch (chatErr) {
+    await selfReportAttach(agent, job.id, { isReconnect: _isPostDeliveryReconnect, failed: true, reason: 'chat-connect-failed: ' + chatErr.message });
     if (_isPostDeliveryReconnect) {
       console.error('❌ Chat connect failed on post-delivery reconnect — continuing to post-delivery wait:', chatErr.message);
     } else {
@@ -1931,5 +1946,5 @@ if (require.main === module) {
 // Export testable helpers when running under NODE_ENV=test.
 // Avoids shipping a test seam in production while keeping coverage honest.
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute };
+  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach };
 }
