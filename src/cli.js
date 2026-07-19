@@ -6683,6 +6683,20 @@ function readJobFileNoFollow(p, enc = 'utf8') {
   try { return fs.readFileSync(fd, enc); } finally { fs.closeSync(fd); }
 }
 
+// Item C — host reports the one attach failure the container can't: it never
+// spawned. Gated on non-reconnect status (a dispute/delivered respawn would 409)
+// and fail-open (advisory — never affect the failure-cleanup path).
+async function reportSpawnAttachFailed(state, agentInfo, job, reason, deps = {}) {
+  if (job.status === 'delivered' || job.status === 'disputed') return;
+  const getSession = deps.getAgentSession || getAgentSession;
+  try {
+    const agent = await getSession(state, agentInfo);
+    await agent.client.reportWorkerAttachFailed(job.id, reason);
+  } catch (e) {
+    console.error(`[ATTACH] host spawn-fail report failed (non-fatal): ${e.message}`);
+  }
+}
+
 // Start a job container
 async function startJobContainer(state, job, agentInfo) {
   if (!isValidJobId(job.id)) { console.error(`[security] Refusing job with invalid id: ${String(job.id).slice(0,40)}`); return; }
@@ -6996,6 +7010,7 @@ async function startJobContainer(state, job, agentInfo) {
 
   } catch (e) {
     console.error(`❌ Failed to start container for ${job.id}:`, e.message);
+    await reportSpawnAttachFailed(state, agentInfo, job, 'spawn-error: ' + e.message);
     // Clean up broker/signer resources that were allocated before the failure
     // (state.active was never set, so stopJobContainer would early-return)
     try { if (signerHost) await signerHost.destroy(); } catch {}
@@ -7334,6 +7349,7 @@ async function startJobLocal(state, job, agentInfo) {
 
   } catch (e) {
     console.error(`❌ Failed to start local process for ${job.id}:`, e.message);
+    await reportSpawnAttachFailed(state, agentInfo, job, 'spawn-error: ' + e.message);
     state.available.push(agentInfo);
   }
 }
@@ -8272,7 +8288,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, queueDisputedJobForRespawn };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, queueDisputedJobForRespawn, reportSpawnAttachFailed };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
