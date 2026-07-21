@@ -131,13 +131,64 @@ function isPostDeliveryReconnect(status) {
 // Item C — worker self-reports attach to the platform. Gated on non-reconnect
 // (a dispute/delivered respawn would hit the backend's 409 STATE_CONFLICT) and
 // fail-open (advisory telemetry — never block or kill the job).
-async function selfReportAttach(agent, jobId, { isReconnect, failed, reason } = {}) {
+//
+// ACK delivery robustness: the success-path confirmation retries with backoff so
+// a transient POST failure (an egress blip lasting longer than the SDK client's
+// own ~7s internal retry window) doesn't leave a genuinely-worked job reading
+// worker_attached_at=null — the exact false-positive the platform's never-attached
+// refund path must never hit. The SDK client already retries 429/5xx/network per
+// call; this outer loop bridges longer blips and STOPS on any terminal state (4xx
+// except 429 — 409 job-moved-on, 403, 404 — where retrying cannot help). At the
+// success call site it runs fire-and-forget so it never delays the worker's real
+// work. The failed path stays a single best-effort call (the worker is exiting,
+// and a lost failure signal is self-consistent: the job reads never-attached
+// either way) — no retry loop that could outlive the process.
+const ATTACH_CONFIRM_BACKOFF_MS = [5000, 15000, 30000, 60000];
+
+function isTerminalAttachError(e) {
+  const sc = e && e.statusCode;
+  // No statusCode → network-level error → transient, keep retrying.
+  // 4xx except 429 → the job is no longer attachable; retrying can't help.
+  return typeof sc === 'number' && sc >= 400 && sc < 500 && sc !== 429;
+}
+
+// Safe message extraction — a non-Error thrown value (null, string) must not
+// let `e.message` throw inside a catch and break the fail-open guarantee.
+function attachErrMsg(e) {
+  return (e && e.message) || String(e);
+}
+
+function realSleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function selfReportAttach(agent, jobId, { isReconnect, failed, reason, sleep = realSleep, backoffs = ATTACH_CONFIRM_BACKOFF_MS } = {}) {
   if (isReconnect) return;
-  try {
-    if (failed) await agent.client.reportWorkerAttachFailed(jobId, reason || 'attach-failed');
-    else await agent.client.confirmWorkerAttached(jobId);
-  } catch (e) {
-    console.error(`[ATTACH] ${failed ? 'attach-failed' : 'attached'} report failed (non-fatal): ${e.message}`);
+  if (failed) {
+    try {
+      await agent.client.reportWorkerAttachFailed(jobId, reason || 'attach-failed');
+    } catch (e) {
+      console.error(`[ATTACH] attach-failed report failed (non-fatal): ${attachErrMsg(e)}`);
+    }
+    return;
+  }
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await agent.client.confirmWorkerAttached(jobId);
+      if (attempt > 0) console.log(`[ATTACH] attached confirmed after ${attempt} retr${attempt === 1 ? 'y' : 'ies'}`);
+      return;
+    } catch (e) {
+      if (isTerminalAttachError(e)) {
+        console.error(`[ATTACH] attached report hit terminal state (HTTP ${e.statusCode}) — job no longer attachable, not retrying: ${attachErrMsg(e)}`);
+        return;
+      }
+      if (attempt >= backoffs.length) {
+        console.error(`[ATTACH] attached report failed after ${attempt + 1} attempts (non-fatal) — giving up: ${attachErrMsg(e)}`);
+        return;
+      }
+      console.error(`[ATTACH] attached report failed (attempt ${attempt + 1}, non-fatal) — retrying in ${backoffs[attempt]}ms: ${attachErrMsg(e)}`);
+      await sleep(backoffs[attempt]);
+    }
   }
 }
 
@@ -401,7 +452,9 @@ async function main() {
   try {
     await agent.connectChat();
     console.log('✅ Connected to SovGuard\n');
-    await selfReportAttach(agent, job.id, { isReconnect: _isPostDeliveryReconnect });
+    // Fire-and-forget: the attach confirmation (with its background retry loop)
+    // must never block the worker from starting real work — fail-open telemetry.
+    selfReportAttach(agent, job.id, { isReconnect: _isPostDeliveryReconnect }).catch(() => {});
   } catch (chatErr) {
     await selfReportAttach(agent, job.id, { isReconnect: _isPostDeliveryReconnect, failed: true, reason: 'chat-connect-failed: ' + chatErr.message });
     if (_isPostDeliveryReconnect) {
@@ -1946,5 +1999,5 @@ if (require.main === module) {
 // Export testable helpers when running under NODE_ENV=test.
 // Avoids shipping a test seam in production while keeping coverage honest.
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach };
+  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach, isTerminalAttachError, ATTACH_CONFIRM_BACKOFF_MS };
 }
