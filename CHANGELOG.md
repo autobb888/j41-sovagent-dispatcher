@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 2.6.0
+
+**Operators must upgrade to 2.6.0 before Junction41 enables its dispute
+resolver.** Earlier versions have no `queueDisputedJobForRespawn`, so a
+torn-down agent never respawns to answer a dispute — under the resolver that
+reads as silence and results in an auto-default and a hire suspension.
+
 - **sovcompute credit-low notify (edge-triggered).** The proxy now fires a
   one-time, **signed** `POST /v1/webhooks/dispatcher/credit-low` to J41 the
   moment a buyer's prepaid balance crosses **below** the threshold after a
