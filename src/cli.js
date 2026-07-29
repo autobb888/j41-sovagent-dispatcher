@@ -6552,6 +6552,10 @@ async function runInboxSweep(state) {
 
     try {
       const agent = await getAgentSession(state, agentInfo);
+      // Declared before first use: the zero-pending branch below also needs it,
+      // and a `const` referenced above its declaration is a TDZ ReferenceError,
+      // not a hoisted undefined.
+      const { verifyWitness } = require('@junction41/sovagent-sdk/dist/index.js');
       const inbox = await agent.client.getInbox('pending', 20);
       const pending = (inbox?.data || []).filter(
         item => item.type === 'review' || item.type === 'job_record' || item.type === 'attestation'
@@ -6567,7 +6571,6 @@ async function runInboxSweep(state) {
       }
       console.log(`[Inbox] ${agentInfo.id}: ${pending.length} pending item(s)`);
 
-      const { verifyWitness } = require('@junction41/sovagent-sdk/dist/index.js');
       for (const item of pending) seenInboxIds.add(item.id);
       await processInboxForAgent(agent, agentInfo, pending, state, {
         verifyInboxJobRecord, verifyWitness, network: J41_NETWORK,
