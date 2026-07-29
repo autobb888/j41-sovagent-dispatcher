@@ -26,6 +26,10 @@ const {
   clearInboxFailure,
   pruneInboxFailures,
   MAX_INBOX_ATTEMPTS,
+  classifyInboxFailure,
+  shouldDeferForPendingWrite,
+  recordBatchFailure,
+  clearBatchFailure,
 } = require('./inbox-deadletter.js');
 const log = require('./logger');
 const { loadDispatcherConfig, fileConfiguredNetwork } = require('./config-loader.js');
@@ -6320,9 +6324,195 @@ async function dispatchInboxAccept(agent, item, deps) {
   return { accepted: false };
 }
 
+/**
+ * Process one agent's pending inbox items in a single identity transaction.
+ *
+ * Replaces the old per-item loop, which wrote N transactions to the same VerusID
+ * back-to-back: the first spends the identity prevOutput and sits in the mempool
+ * while the platform keeps serving the last *confirmed* prevOutput, so every tx
+ * after it double-spends and is rejected. Observed live on 3/3 agents.
+ *
+ * Retry semantics, by bucket:
+ *  - acked / alreadyDone → clear the failure record
+ *  - rejected            → count it; 5 strikes dead-letters that item alone
+ *  - deferred / ackFailed→ neither counted nor cleared (the existing skip contract)
+ *  - batch-level throw   → not attributable to one item, so uncounted — but
+ *                          bounded by recordBatchFailure so nothing spins forever
+ *
+ * `deps` is injected so the whole function is testable with no daemon or chain.
+ */
+async function processInboxForAgent(agent, agentInfo, pending, state, deps = {}) {
+  const now = deps.now || Date.now;
+  const noteFailure = (id, type, err) => {
+    const dl = recordInboxFailure(state._inboxFailures, id, err, undefined, { agentId: agentInfo.id, type, firstFailedAt: now() });
+    if (dl.justDeadLettered) {
+      console.error(
+        `[Inbox] ☠️  DEAD-LETTER ${type} ${String(id).substring(0, 8)} for ${agentInfo.id} ` +
+        `after ${dl.attempts} attempts — quarantined, will NOT retry until restart or 'ctl inbox-redrive'. Last error: ${err}`,
+      );
+      state._agentErrors.set(agentInfo.id,
+        `inbox ${type} ${String(id).substring(0, 8)} dead-lettered (${dl.attempts}x): ${String(err).slice(0, 100)}`);
+      if (typeof state.emitEvent === 'function') {
+        state.emitEvent('inbox.dead_lettered', { agentId: agentInfo.id, itemId: id, type, attempts: dl.attempts });
+      }
+    } else {
+      console.error(`[Inbox] ❌ Failed to process ${type} ${String(id).substring(0, 8)} (attempt ${dl.attempts}/${MAX_INBOX_ATTEMPTS}): ${err}`);
+    }
+  };
+
+  // ── Pending-write gate ────────────────────────────────────────────────────
+  // Never build a second identity tx while the previous one is unconfirmed —
+  // that IS the double-spend. Evaluated even when there is nothing pending, so
+  // a confirmed gate cannot linger in /health as a stale pendingWrite forever.
+  const lastWrite = state._inboxLastWrite.get(agentInfo.id);
+  if (lastWrite) {
+    let prevOutTxid = null;
+    let chainHeight = null;
+    try {
+      const { data: idRaw } = await agent.client.getIdentityRaw();
+      prevOutTxid = idRaw && idRaw.prevOutput ? idRaw.prevOutput.txid : null;
+      const ci = await agent.client.getChainInfo();
+      chainHeight = ci ? ci.blockHeight : null;
+    } catch {
+      // Can't tell — assume still pending. Deferring is always the safe choice.
+    }
+    const gate = shouldDeferForPendingWrite(lastWrite, prevOutTxid, chainHeight, now());
+    if (gate.defer) {
+      console.log(`[Inbox] ⏸ ${agentInfo.id}: last identity write ${String(lastWrite.txid).slice(0, 8)} not yet confirmed — deferring this cycle`);
+      return { deferredAgent: true, reason: gate.reason };
+    }
+    if (gate.reason !== 'confirmed') {
+      console.warn(`[Inbox] ${agentInfo.id}: pending-write gate released by ${gate.reason} (tx ${String(lastWrite.txid).slice(0, 8)} — likely a concurrent writer or an expired tx)`);
+      if (typeof state.emitEvent === 'function') {
+        state.emitEvent('inbox.pending_write_expired', { agentId: agentInfo.id, txid: lastWrite.txid, reason: gate.reason });
+      }
+    }
+    state._inboxLastWrite.delete(agentInfo.id);
+  }
+
+  if (!pending || pending.length === 0) return { empty: true };
+
+  // ── Build the batch ───────────────────────────────────────────────────────
+  const batch = [];
+  for (const it of pending) {
+    if (isDeadLettered(state._inboxFailures, it.id)) continue;
+
+    // job_record keeps its dispatcher-side witness gate: it needs getJobWitness +
+    // verifyWitness + network policy, which the SDK batch has no business doing.
+    if (it.type === 'job_record' && deps.verifyInboxJobRecord) {
+      try {
+        const gateResult = await deps.verifyInboxJobRecord({
+          inboxItemDetail: it,
+          getJobWitness: (jobId) => agent.client.getJobWitness(jobId),
+          verifyWitness: deps.verifyWitness,
+          client: agent.client,
+          network: deps.network,
+        });
+        if (gateResult && gateResult.skip) {
+          console.log(`[Inbox] ⏭ Skipping job_record ${String(it.id).substring(0, 8)} (transient): ${gateResult.reason}`);
+          continue;
+        }
+      } catch (e) {
+        // Only a real verification failure is the item's fault. A network blip is
+        // not — counting it would let 5 API hiccups dead-letter a healthy record.
+        if (classifyInboxFailure(e) === 'hard') noteFailure(it.id, 'job_record', e.message);
+        else console.warn(`[Inbox] job_record ${String(it.id).substring(0, 8)} gate transient (uncounted): ${e.message}`);
+        continue;
+      }
+    }
+    batch.push({ id: it.id, type: it.type });
+  }
+  if (batch.length === 0) return { empty: true };
+
+  // ── Legacy fallback: SDK older than the batch API ─────────────────────────
+  if (typeof agent.acceptInboxBatch !== 'function') {
+    for (const ref of batch) {
+      try {
+        await dispatchInboxAccept(agent, ref, {
+          verifyInboxJobRecord: deps.verifyInboxJobRecord, verifyWitness: deps.verifyWitness, network: deps.network,
+        });
+        clearInboxFailure(state._inboxFailures, ref.id);
+      } catch (e) {
+        // Even on the old path, contention must not burn the budget.
+        if (classifyInboxFailure(e) === 'contention') {
+          console.warn(`[Inbox] ${ref.type} ${String(ref.id).substring(0, 8)}: chain contention (uncounted) — ${e.message}`);
+        } else {
+          noteFailure(ref.id, ref.type, e.message);
+        }
+      }
+    }
+    return { legacy: true };
+  }
+
+  // ── Batched path ──────────────────────────────────────────────────────────
+  let res;
+  try {
+    res = await agent.acceptInboxBatch(batch);
+  } catch (e) {
+    const cls = classifyInboxFailure(e);
+    const bf = recordBatchFailure(state._inboxBatchFailures, agentInfo.id, batch.map(b => b.id), cls);
+    state._agentErrors.set(agentInfo.id, `inbox batch ${cls} (${bf.consecutive}x): ${String(e.message).slice(0, 100)}`);
+    if (cls === 'contention') {
+      console.warn(`[Inbox] ${agentInfo.id}: chain contention — waiting for confirmation (uncounted, attempt ${bf.consecutive})`);
+    } else {
+      console.error(`[Inbox] ${agentInfo.id}: batch failed (${cls}, ${bf.consecutive}x): ${e.message}`);
+    }
+    if (bf.escalate) {
+      // Uncounted must not mean unbounded. The same batch has failed
+      // non-contention N times, so start counting its items individually — they
+      // can then dead-letter instead of retrying forever.
+      console.error(`[Inbox] ${agentInfo.id}: batch failed ${bf.consecutive}x with the same items — escalating to per-item counting`);
+      if (typeof state.emitEvent === 'function') {
+        state.emitEvent('inbox.batch_escalated', { agentId: agentInfo.id, items: batch.map(b => b.id), classification: cls });
+      }
+      for (const ref of batch) noteFailure(ref.id, ref.type, e.message);
+    }
+    return { batchError: cls };
+  }
+
+  clearBatchFailure(state._inboxBatchFailures, agentInfo.id);
+
+  if (res.txid) {
+    state._inboxLastWrite.set(agentInfo.id, {
+      txid: res.txid, at: now(), expiryHeight: deps.expiryHeight ?? null,
+    });
+  }
+  for (const id of res.acked) clearInboxFailure(state._inboxFailures, id);
+  for (const id of res.alreadyDone) clearInboxFailure(state._inboxFailures, id);
+  for (const r of res.rejected) noteFailure(r.id, r.type, r.error);
+  for (const d of res.deferred) {
+    console.log(`[Inbox] ⏭ ${d.type} ${String(d.id).substring(0, 8)} deferred (uncounted): ${d.reason}`);
+  }
+  for (const f of res.ackFailed) {
+    console.warn(`[Inbox] ${String(f.id).substring(0, 8)} written on-chain but ack failed (uncounted): ${f.error}`);
+  }
+  if (res.acked.length > 0) {
+    console.log(`[Inbox] ✅ ${agentInfo.id}: ${res.acked.length} item(s) accepted${res.txid ? ` in tx ${String(res.txid).slice(0, 8)}` : ' (already on-chain)'}`);
+  }
+  return res;
+}
+
 // Check for pending inbox items (reviews + job records) and process them
 async function checkPendingInbox(state) {
+  // Reentrancy guard: safeInterval is a plain setInterval, so a sweep slower than
+  // the 60s floor would overlap the next one — two concurrent batches per agent,
+  // racing _inboxLastWrite and re-creating the contention this all exists to stop.
+  if (state._inboxSweepRunning) {
+    console.warn('[Inbox] previous sweep still running — skipping this cycle');
+    return;
+  }
+  state._inboxSweepRunning = true;
+  try {
+    return await runInboxSweep(state);
+  } finally {
+    state._inboxSweepRunning = false;
+  }
+}
+
+async function runInboxSweep(state) {
   if (!state._inboxFailures) state._inboxFailures = new Map(); // defensive: older state objects
+  if (!state._inboxLastWrite) state._inboxLastWrite = new Map();
+  if (!state._inboxBatchFailures) state._inboxBatchFailures = new Map();
   const seenInboxIds = new Set(); // every pending id observed this cycle (for pruning)
   let completeView = true; // false if any agent failed to poll — then we prune nothing
 
@@ -6341,29 +6531,10 @@ async function checkPendingInbox(state) {
       console.log(`[Inbox] ${agentInfo.id}: ${pending.length} pending item(s)`);
 
       const { verifyWitness } = require('@junction41/sovagent-sdk/dist/index.js');
-      for (const item of pending) {
-        seenInboxIds.add(item.id);
-        if (isDeadLettered(state._inboxFailures, item.id)) continue;
-        try {
-          const r = await dispatchInboxAccept(agent, item, {
-            verifyInboxJobRecord, verifyWitness, network: J41_NETWORK,
-          });
-          if (r && r.skip) continue; // transient — neither counted nor cleared
-          clearInboxFailure(state._inboxFailures, item.id);
-        } catch (e) {
-          const dl = recordInboxFailure(state._inboxFailures, item.id, e.message);
-          if (dl.justDeadLettered) {
-            console.error(
-              `[Inbox] ☠️  DEAD-LETTER ${item.type} ${item.id.substring(0, 8)} for ${agentInfo.id} ` +
-              `after ${dl.attempts} attempts — quarantined, will NOT retry until restart. Last error: ${e.message}`,
-            );
-            state._agentErrors.set(agentInfo.id,
-              `inbox ${item.type} ${item.id.substring(0, 8)} dead-lettered (${dl.attempts}x): ${String(e.message).slice(0, 100)}`);
-          } else {
-            console.error(`[Inbox] ❌ Failed to process ${item.type} ${item.id.substring(0, 8)} (attempt ${dl.attempts}/${MAX_INBOX_ATTEMPTS}): ${e.message}`);
-          }
-        }
-      }
+      for (const item of pending) seenInboxIds.add(item.id);
+      await processInboxForAgent(agent, agentInfo, pending, state, {
+        verifyInboxJobRecord, verifyWitness, network: J41_NETWORK,
+      });
     } catch (e) {
       completeView = false; // this agent's pending set is unknown → don't prune its items
       state.agentSessions.delete(agentInfo.id);
@@ -8288,7 +8459,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, queueDisputedJobForRespawn, reportSpawnAttachFailed };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reportSpawnAttachFailed };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
