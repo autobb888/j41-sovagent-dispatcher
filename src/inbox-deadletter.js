@@ -104,9 +104,14 @@ const CONTENTION_PATTERNS = [
   'txn-mempool-conflict',
 ];
 
+// Anchored deliberately. A bare 'network' substring would swallow the hard config
+// error "invalid/absent network '...' — refusing to accept" (inbox-job-record.js),
+// classifying a permanent misconfiguration as transient — uncounted and retried
+// every cycle forever, the exact pathology this module forbids.
 const TRANSIENT_PATTERNS = [
   'socket hang up', 'timed out', 'timeout', 'econnreset', 'econnrefused',
-  'enotfound', 'etimedout', 'network', 'fetch failed', 'temporarily unavailable',
+  'enotfound', 'etimedout', 'network error', 'network request failed',
+  'fetch failed', 'temporarily unavailable',
 ];
 
 /**
@@ -201,11 +206,27 @@ function batchCompositionKey(itemIds) {
 function recordBatchFailure(batchFailures, agentId, itemIds, classification, maxFailures = MAX_BATCH_FAILURES) {
   const compositionKey = batchCompositionKey(itemIds);
   const prev = batchFailures.get(agentId);
-  const consecutive = prev && prev.compositionKey === compositionKey ? prev.consecutive + 1 : 1;
-  batchFailures.set(agentId, { compositionKey, consecutive, classification });
-  // Contention resolves on its own once the earlier tx confirms — never escalate.
-  const escalate = classification !== 'contention' && consecutive >= maxFailures;
-  return { consecutive, escalate };
+  const sameComposition = prev && prev.compositionKey === compositionKey;
+  const consecutive = sameComposition ? prev.consecutive + 1 : 1;
+
+  // Escalation counts ONLY 'hard' failures, and counts them separately from the
+  // overall consecutive tally. Two reasons:
+  //
+  //  - Contention must not inflate the counter. A restart while a batch tx is in
+  //    the mempool loses _inboxLastWrite, so several contention cycles are normal
+  //    (the platform's confirmed view was live-observed stale for >=5 min). If
+  //    contention incremented the shared counter, a single later blip would
+  //    escalate and strike every healthy item in the batch.
+  //  - Transient (5xx / network) must not strike items either. An unfunded wallet
+  //    or a flapping broadcast endpoint is environmental; quarantining the whole
+  //    inbox for it is what the SDK's control-build fix exists to prevent. Those
+  //    surface as a persistent degraded-health signal instead.
+  const prevHard = sameComposition ? (prev.hardConsecutive || 0) : 0;
+  const hardConsecutive = classification === 'hard' ? prevHard + 1 : prevHard;
+
+  batchFailures.set(agentId, { compositionKey, consecutive, hardConsecutive, classification });
+  const escalate = classification === 'hard' && hardConsecutive >= maxFailures;
+  return { consecutive, hardConsecutive, escalate };
 }
 
 /** A successful batch clears the agent's consecutive-failure record. */

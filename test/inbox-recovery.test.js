@@ -204,3 +204,48 @@ test('meta is optional — existing 3-arg callers keep working unchanged', () =>
   const out = listInboxFailures(f);
   assert.strictEqual(out.retrying[0].agentId, null);
 });
+
+// ---------------------------------------------------------------------------
+// Review findings — escalation must count ONLY hard failures
+// ---------------------------------------------------------------------------
+
+test('REVIEW FIX: contention does not inflate the escalation counter', () => {
+  const m = new Map();
+  // Realistic: a restart while a batch tx is in the mempool loses _inboxLastWrite,
+  // so several contention cycles are normal (platform staleness observed >=5min).
+  for (let i = 0; i < MAX_BATCH_FAILURES; i++) recordBatchFailure(m, 'agent-1', ['i1'], 'contention');
+  const r = recordBatchFailure(m, 'agent-1', ['i1'], 'transient');
+  assert.strictEqual(r.escalate, false, 'a blip after contention must not strike healthy items');
+});
+
+test('REVIEW FIX: transient (environmental) failures never escalate to item strikes', () => {
+  const m = new Map();
+  let r;
+  for (let i = 0; i < MAX_BATCH_FAILURES * 3; i++) r = recordBatchFailure(m, 'agent-1', ['i1'], 'transient');
+  assert.strictEqual(r.escalate, false, 'an unfunded wallet must not quarantine the whole inbox');
+});
+
+test('REVIEW FIX: sustained hard failures still escalate (the bound is intact)', () => {
+  const m = new Map();
+  let r;
+  for (let i = 0; i < MAX_BATCH_FAILURES; i++) r = recordBatchFailure(m, 'agent-1', ['i1'], 'hard');
+  assert.strictEqual(r.escalate, true);
+});
+
+test('REVIEW FIX: hard failures interleaved with contention still reach the bound', () => {
+  const m = new Map();
+  let r;
+  for (let i = 0; i < MAX_BATCH_FAILURES; i++) {
+    recordBatchFailure(m, 'agent-1', ['i1'], 'contention');
+    r = recordBatchFailure(m, 'agent-1', ['i1'], 'hard');
+  }
+  assert.strictEqual(r.escalate, true, 'hard failures accumulate across intervening contention');
+});
+
+test('REVIEW FIX: a hard config error is not misread as transient', () => {
+  // inbox-job-record.js throws "invalid/absent network '...' — refusing to accept".
+  // A bare 'network' transient pattern would make a permanent misconfiguration
+  // uncounted and retried forever.
+  assert.strictEqual(classifyInboxFailure(new Error("invalid/absent network 'bogus' — refusing to accept")), 'hard');
+  assert.strictEqual(classifyInboxFailure(new Error('network error while connecting')), 'transient');
+});

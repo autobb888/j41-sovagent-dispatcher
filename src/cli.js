@@ -6401,8 +6401,17 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
     // verifyWitness + network policy, which the SDK batch has no business doing.
     if (it.type === 'job_record' && deps.verifyInboxJobRecord) {
       try {
+        // Verify against the DETAIL, not the getInbox list row. Every previously
+        // live-proven path used getInboxItem, and jobDetails is detail-only — a
+        // list row missing vdxfData would make decodeInboxJobRecord throw, which
+        // classifies HARD and would dead-letter every job_record in 5 cycles.
+        let detail = it;
+        if (agent.client && typeof agent.client.getInboxItem === 'function') {
+          const res = await agent.client.getInboxItem(it.id);
+          detail = (res && res.data) || it;
+        }
         const gateResult = await deps.verifyInboxJobRecord({
-          inboxItemDetail: it,
+          inboxItemDetail: detail,
           getJobWitness: (jobId) => agent.client.getJobWitness(jobId),
           verifyWitness: deps.verifyWitness,
           client: agent.client,
@@ -6428,9 +6437,13 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
   if (typeof agent.acceptInboxBatch !== 'function') {
     for (const ref of batch) {
       try {
-        await dispatchInboxAccept(agent, ref, {
+        const r = await dispatchInboxAccept(agent, ref, {
           verifyInboxJobRecord: deps.verifyInboxJobRecord, verifyWitness: deps.verifyWitness, network: deps.network,
         });
+        // Preserve the original contract: a transient skip is neither counted NOR
+        // cleared. Clearing would wipe accumulated attempts, so a flapping item
+        // could never reach the dead-letter threshold.
+        if (r && r.skip) continue;
         clearInboxFailure(state._inboxFailures, ref.id);
       } catch (e) {
         // Even on the old path, contention must not burn the budget.
@@ -6474,7 +6487,7 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
 
   if (res.txid) {
     state._inboxLastWrite.set(agentInfo.id, {
-      txid: res.txid, at: now(), expiryHeight: deps.expiryHeight ?? null,
+      txid: res.txid, at: now(), expiryHeight: res.expiryHeight ?? deps.expiryHeight ?? null,
     });
   }
   for (const id of res.acked) clearInboxFailure(state._inboxFailures, id);
@@ -6488,12 +6501,14 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
   // a console line, while each retry cycle could rebroadcast at 10,000 sats.
   if (!state._inboxAckFailures) state._inboxAckFailures = new Map();
   for (const id of res.acked) state._inboxAckFailures.delete(id);
+  for (const id of res.alreadyDone) state._inboxAckFailures.delete(id);
   for (const f of res.ackFailed) {
     const ref = batch.find(b => b.id === f.id);
     const prev = state._inboxAckFailures.get(f.id);
     state._inboxAckFailures.set(f.id, {
       agentId: agentInfo.id,
       type: ref ? ref.type : null,
+      txid: res.txid || null,
       consecutive: (prev ? prev.consecutive : 0) + 1,
       lastError: String(f.error).slice(0, 200),
     });
@@ -6541,7 +6556,15 @@ async function runInboxSweep(state) {
       const pending = (inbox?.data || []).filter(
         item => item.type === 'review' || item.type === 'job_record' || item.type === 'attestation'
       );
-      if (pending.length === 0) continue;
+      if (pending.length === 0) {
+        // Still evaluate the pending-write gate: it is what clears a confirmed
+        // write out of state (and out of /health.pendingWrites). Skipping it here
+        // would leave a permanently stale entry once an inbox empties.
+        await processInboxForAgent(agent, agentInfo, [], state, {
+          verifyInboxJobRecord, verifyWitness, network: J41_NETWORK,
+        });
+        continue;
+      }
       console.log(`[Inbox] ${agentInfo.id}: ${pending.length} pending item(s)`);
 
       const { verifyWitness } = require('@junction41/sovagent-sdk/dist/index.js');
@@ -7779,8 +7802,9 @@ program
 // ── Control Plane Client ──
 program
   .command('ctl <command>')
-  .description('Send command to running dispatcher: status, jobs, agents, resources, earnings, history, providers, shutdown, canary')
+  .description('Send command to running dispatcher: status, jobs, agents, resources, earnings, history, providers, inbox, inbox-redrive, shutdown, canary')
   .option('--agent <id>', 'Agent ID (for canary command)')
+  .option('--item <id>', 'Inbox item ID (for inbox-redrive; omit to redrive ALL dead letters)')
   .option('--json', 'Raw JSON output')
   .action(async (command, options) => {
     const { sendCommand } = require('./control');
@@ -7788,6 +7812,10 @@ program
     try {
       const cmd = { action: command };
       if (options.agent) cmd.agentId = options.agent;
+      // Without this, `ctl inbox-redrive <id>` silently drops the id (commander
+      // allows excess args) and redrives EVERY dead letter — an operator would
+      // hand fresh budgets to genuinely poisoned items believing they targeted one.
+      if (options.item) cmd.itemId = options.item;
 
       const result = await sendCommand(cmd);
 
