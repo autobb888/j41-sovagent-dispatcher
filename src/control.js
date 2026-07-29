@@ -294,6 +294,43 @@ function getVersionStamp() {
   return { ..._verBase, jobAgentImage: _imgId };
 }
 
+/**
+ * Structured read model of inbox health.
+ *
+ * The pre-existing surface was a single per-agent `lastError` string, overwritten
+ * by each new failure — so a dead-lettered review whose data never reached the
+ * chain was invisible the moment anything else failed. Silent loss of on-chain
+ * reputation data is exactly what must not be quiet, hence a non-lossy list.
+ *
+ * Pure read model: no mutation, tolerant of a state object predating these maps.
+ */
+function buildInboxSurface(state) {
+  const { listInboxFailures } = require('./inbox-deadletter.js');
+  const failures = state._inboxFailures || new Map();
+  const { deadLettered, retrying } = listInboxFailures(failures);
+
+  const now = Date.now();
+  const pendingWrites = [...(state._inboxLastWrite || new Map()).entries()].map(([agentId, w]) => ({
+    agentId,
+    txid: w.txid,
+    ageMs: typeof w.at === 'number' ? now - w.at : null,
+    expiryHeight: w.expiryHeight ?? null,
+  }));
+
+  // Items written on-chain whose backend ack keeps failing. They sit in no other
+  // bucket (never counted, never dead-lettered), so without this they are
+  // invisible apart from a console warning.
+  const ackFailed = [...(state._inboxAckFailures || new Map()).entries()].map(([itemId, a]) => ({
+    itemId,
+    agentId: a.agentId || null,
+    type: a.type || null,
+    consecutive: a.consecutive || 0,
+    lastError: a.lastError || null,
+  }));
+
+  return { deadLettered, retrying, ackFailed, pendingWrites };
+}
+
 function buildHealthDocument(state, startedAt) {
   const uptime = Date.now() - startedAt;
 
@@ -325,8 +362,13 @@ function buildHealthDocument(state, startedAt) {
 
   const agentsBusy = agents.filter((a) => a.status !== 'available').length;
 
+  const inbox = buildInboxSurface(state);
+
   return {
-    status: containersUnhealthy > 0 ? 'degraded' : 'ok',
+    // A dead-lettered inbox item means on-chain reputation data silently did not
+    // land, which is a degraded dispatcher even when every container is healthy.
+    status: (containersUnhealthy > 0 || inbox.deadLettered.length > 0) ? 'degraded' : 'ok',
+    inbox,
     uptime,
     version: getVersionStamp(),
     agents,
@@ -363,6 +405,17 @@ async function handleCommand(cmd, state, handlers, startedAt) {
 
     case 'upstream_health':
       return buildUpstreamHealth(state);
+
+    case 'inbox':
+      return buildInboxSurface(state);
+
+    case 'inbox-redrive': {
+      // Clear dead-letter quarantine without a restart, granting a fresh full
+      // budget. Deliberate operator action — nothing calls this automatically.
+      const { redriveDeadLetters } = require('./inbox-deadletter.js');
+      const redriven = redriveDeadLetters(state._inboxFailures || new Map(), cmd.itemId);
+      return { redriven, itemId: cmd.itemId || null };
+    }
 
     case 'shutdown': {
       if (handlers.onShutdown) {
@@ -569,5 +622,7 @@ module.exports = {
   buildUpstreamHealth,
   buildEarnings,
   buildHealthDocument,
+  buildInboxSurface,
+  handleCommand,
   getVersionStamp,
 };

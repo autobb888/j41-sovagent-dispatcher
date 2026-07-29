@@ -6483,7 +6483,20 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
   for (const d of res.deferred) {
     console.log(`[Inbox] ⏭ ${d.type} ${String(d.id).substring(0, 8)} deferred (uncounted): ${d.reason}`);
   }
+  // Track consecutive ack failures. These items sit in no other bucket — never
+  // counted, never dead-lettered — so without this they are invisible apart from
+  // a console line, while each retry cycle could rebroadcast at 10,000 sats.
+  if (!state._inboxAckFailures) state._inboxAckFailures = new Map();
+  for (const id of res.acked) state._inboxAckFailures.delete(id);
   for (const f of res.ackFailed) {
+    const ref = batch.find(b => b.id === f.id);
+    const prev = state._inboxAckFailures.get(f.id);
+    state._inboxAckFailures.set(f.id, {
+      agentId: agentInfo.id,
+      type: ref ? ref.type : null,
+      consecutive: (prev ? prev.consecutive : 0) + 1,
+      lastError: String(f.error).slice(0, 200),
+    });
     console.warn(`[Inbox] ${String(f.id).substring(0, 8)} written on-chain but ack failed (uncounted): ${f.error}`);
   }
   if (res.acked.length > 0) {
@@ -6513,6 +6526,7 @@ async function runInboxSweep(state) {
   if (!state._inboxFailures) state._inboxFailures = new Map(); // defensive: older state objects
   if (!state._inboxLastWrite) state._inboxLastWrite = new Map();
   if (!state._inboxBatchFailures) state._inboxBatchFailures = new Map();
+  if (!state._inboxAckFailures) state._inboxAckFailures = new Map();
   const seenInboxIds = new Set(); // every pending id observed this cycle (for pruning)
   let completeView = true; // false if any agent failed to poll — then we prune nothing
 
