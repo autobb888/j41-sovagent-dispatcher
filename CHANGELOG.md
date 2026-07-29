@@ -9,6 +9,13 @@ resolver.** Earlier versions have no `queueDisputedJobForRespawn`, so a
 torn-down agent never respawns to answer a dispute — under the resolver that
 reads as silence and results in an auto-default and a hire suspension.
 
+- **SDK dep bumped to `@junction41/sovagent-sdk@2.11.0` — required, not
+  optional.** The worker-attach ACK path calls `confirmWorkerAttached()` and
+  `reportWorkerAttachFailed()`, which first ship in SDK 2.11.0. On any 2.10.x
+  SDK those methods are `undefined`, the ACK never reaches the platform, and
+  `jobs.worker_attached_at` stays `NULL` for every job — which in turn keeps
+  dispute-refund eligibility permanently ungated. Pin 2.11.0 or newer.
+
 - **sovcompute credit-low notify (edge-triggered).** The proxy now fires a
   one-time, **signed** `POST /v1/webhooks/dispatcher/credit-low` to J41 the
   moment a buyer's prepaid balance crosses **below** the threshold after a
