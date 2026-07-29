@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+## 2.7.0
+
+**Inbox writes are now batched — one identity transaction per agent per poll
+cycle.** Requires `@junction41/sovagent-sdk@2.12.0`.
+
+The old loop accepted inbox items one at a time, writing N transactions to the
+same VerusID back-to-back. The first spends the identity `prevOutput` and sits in
+the mempool, but the platform API keeps serving the last *confirmed* `prevOutput`
+— so every transaction after it is built spending an already-spent output and the
+daemon rejects it as a double-spend. Live-observed on 3 of 3 agents: an
+attestation landed, the review that followed milliseconds later was rejected five
+times and dead-lettered, and its on-chain reputation data never arrived. The
+platform's confirmed view was measured stale for **over five minutes**, past the
+confirming block's own timestamp — so no block-time estimate is safe as a retry
+horizon.
+
+- **Batching** via the SDK's `acceptInboxBatch`, with per-item failure handling:
+  a poisoned item is rejected alone while healthy items still write.
+- **Pending-write gate** — never build a second identity transaction while the
+  previous one is unconfirmed. Releases on observing `prevOutput` become our
+  txid, or on chain height passing the transaction's `expiryHeight`; a 4h
+  wall-clock backstop covers a concurrent writer confirming on top of ours.
+- **Failure classification** — chain contention no longer consumes the terminal
+  dead-letter budget. Burning five attempts on a self-resolving condition is
+  exactly how the three reviews were quarantined.
+- **Bounded escalation** — batch-level failures are not attributable to one item
+  so they are uncounted, but *uncounted must not mean unbounded*: five
+  consecutive same-composition **hard** failures start counting items
+  individually. Contention and transient/environmental faults never escalate, so
+  an unfunded wallet cannot quarantine an inbox.
+- **Structured `/health` inbox block** (`deadLettered`, `retrying`, `ackFailed`,
+  `pendingWrites`) plus `ctl inbox` and `ctl inbox-redrive [--item <id>]`.
+  `status` becomes `degraded` while anything is dead-lettered — **note for
+  monitoring: anything alerting on `status != ok` will now fire on dead
+  letters.** Redrive clears quarantine without a restart. The previous surface
+  was a single per-agent `lastError` string that lost every failure but the
+  newest.
+- **Reentrancy guard** on the inbox sweep — `safeInterval` is a plain
+  `setInterval`, so a sweep slower than the 60s floor would overlap the next one
+  and race the gate.
+
+Skew-safe: running against an SDK without `acceptInboxBatch` falls back to the
+per-item path, still with contention classification — strictly better than 2.6.0
+even mis-paired.
+
+
 ## 2.6.0
 
 **Operators must upgrade to 2.6.0 before Junction41 enables its dispute

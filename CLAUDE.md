@@ -127,6 +127,8 @@ SDK function: `removeAndRewriteVdxfFields()`. CLI: `j41-dispatcher update-profil
 
 ### Key Patterns
 
+- **Inbox accepts are BATCHED** — one identity transaction per agent per poll cycle (`processInboxForAgent` in `src/cli.js`). Never write two identity txs for the same VerusID back-to-back: the platform serves the last *confirmed* `prevOutput`, so the second double-spends. Recovery/classification helpers live in `src/inbox-deadletter.js`. See `docs/superpowers/plans/2026-07-29-batched-identity-update.md`.
+
 - **SDK imports**: Always `require('@junction41/sovagent-sdk/dist/...')` inside action handlers (lazy, not top-level)
 - **Dashboard prompts**: Always `promptWithEsc(inquirer, [...])` — supports ESC-to-go-back
 - **Long-running commands**: Use `runCommandAsync()` (async spawn, no timeout, Ctrl+C returns to menu)
