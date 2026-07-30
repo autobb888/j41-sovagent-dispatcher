@@ -6341,6 +6341,9 @@ async function dispatchInboxAccept(agent, item, deps) {
  *
  * `deps` is injected so the whole function is testable with no daemon or chain.
  */
+/** The only inbox types that result in an on-chain write. */
+const INBOX_ACTIONABLE_TYPES = ['review', 'attestation', 'job_record'];
+
 async function processInboxForAgent(agent, agentInfo, pending, state, deps = {}) {
   const now = deps.now || Date.now;
   const noteFailure = (id, type, err) => {
@@ -6556,7 +6559,13 @@ async function runInboxSweep(state) {
       // and a `const` referenced above its declaration is a TDZ ReferenceError,
       // not a hoisted undefined.
       const { verifyWitness } = require('@junction41/sovagent-sdk/dist/index.js');
-      const inbox = await agent.client.getInbox('pending', 20);
+      // Filter server-side to the three types that cause chain writes. Informational
+      // items (job_accepted / job_delivered / notification) are never consumed and
+      // accumulate — the platform returns newest-first, so a large informational
+      // backlog would push a genuine review past the 20-row window and make it
+      // invisible with no error anywhere. A backend without the filter ignores the
+      // param, so this is safe to ship ahead of it.
+      const inbox = await agent.client.getInbox('pending', 20, INBOX_ACTIONABLE_TYPES);
       const pending = (inbox?.data || []).filter(
         item => item.type === 'review' || item.type === 'job_record' || item.type === 'attestation'
       );
