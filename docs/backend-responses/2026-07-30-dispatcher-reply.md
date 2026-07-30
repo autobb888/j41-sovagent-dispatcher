@@ -24,7 +24,7 @@
 > The one thing that IS worth aligning on: **reading history requires
 > `getidentityhistory`, and nothing exposes it today** — not the SDK, not the platform
 > API (only `GET /v1/me/identity/raw`, which returns current state only,
-> `client/index.ts:712-714`). Any consumer that reconstructs an agent's full review
+> `client/index.ts:744-745`). Any consumer that reconstructs an agent's full review
 > history needs that endpoint. That is a feature gap to scope, not a bug to fix.
 >
 > **The superseded sections have been rewritten in place** — §5b, the §2 coordination
@@ -104,7 +104,7 @@ of this document.
 ## §3a — already shipped, deployed, and live-proven. Your report predates it by hours.
 
 - **SDK 2.12.0** (commit `d219674`): `J41Agent.acceptInboxBatch()` — all of an agent's pending review/attestation/job_record items merged into **one** `updateidentity` tx, each item gated against its own type allowlist before merging, per-item failure buckets (rejected/deferred/ackFailed/alreadyDone).
-- **Dispatcher 2.7.0** (commit `d45a668`): `processInboxForAgent` orchestrates the batch, plus a **per-identity pending-write confirmation gate** — no second identity tx is built until the platform serves our last txid as `prevOutput` (or the tx provably expired by chain height). Chain contention never burns the dead-letter budget; batch-level failures are bounded with escalation; dead-letter state is surfaced structurally in `/health` and via `ctl inbox` / `ctl inbox-redrive`.
+- **Dispatcher 2.7.0** (release commit `16829ad`, plus fix `d45a668`): `processInboxForAgent` orchestrates the batch, plus a **per-identity pending-write confirmation gate** — no second identity tx is built until the platform serves our last txid as `prevOutput` (or the tx provably expired by chain height). Chain contention never burns the dead-letter budget; batch-level failures are bounded with escalation; dead-letter state is surfaced structurally in `/health` and via `ctl inbox` / `ctl inbox-redrive`.
 - Live-proven the same day: your three dead-lettered reviews (`f0e45735`/w2, `fe619b0b`/w5, `ce8a421b`/w7) recovered and wrote (the deploy's restart cleared the process-lifetime dead-letter map, re-queued them, and the batch path landed them — consistent with your §5.0 observation, though your parallel manual re-submits from §5a were in flight the same afternoon, so we won't claim which write won for each item), and per-item independence held: a poisoned item was rejected alone while a healthy one still wrote.
 - Your citation "`cli.js:6344-6349` ... no per-identity confirmation gate" described the pre-2.7.0 code; those lines are now the gate.
 
@@ -163,7 +163,9 @@ A restart costs at most 5 no-fee gate attempts per poisoned item before re-quara
 
 ## §2 — good change, nothing needed from us
 
-Verify-by-presence is the right call (our ack txid is best-effort and you're right not to trust your own insert). Two things, both already flagged above: decode the **full array** under `review.record`, and be aware of the pre-fix replace race when a presence check fails for an older review.
+Verify-by-presence is the right call (our ack txid is best-effort and you're right not to trust your own insert). **Ship it as designed — no coordination with us needed.**
+
+One behavioural note, not a defect: because it checks *current* state, it will confirm the newest review and will correctly fail to find one that has since been overwritten by a later review under the same key. That's the designed latest-wins behaviour (see §5b), not a race. Verifying a *historical* review needs the `getidentityhistory` endpoint requested at the end of this document.
 
 ---
 
