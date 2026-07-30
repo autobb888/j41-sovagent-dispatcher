@@ -11,7 +11,8 @@
 | Claim | Evidence |
 |---|---|
 | **Multi-item batch → ONE tx** | `Inbox batch written on-chain (3 item(s)): d1ccda06…`, and `(2 item(s)): 5aca76cb…` |
-| **Key-collision defers, never clobbers** | 3 deferrals (`e99c94ae` job_record, `ee32d2dc` attestation, `ca06df1d` review) |
+| **Attestation + review in ONE tx** (the brief's pass criterion) | `5aca76cb` — cycle 3 opened with exactly the 2 deferred items (`ee32d2dc` attestation, `ca06df1d` review) and wrote both together |
+| **Same-key collision defers, never clobbers** | 3 deferrals (`e99c94ae` job_record, `ee32d2dc` attestation, `ca06df1d` review) |
 | **Deferred item writes next cycle** | `e99c94ae` deferred cycle 1 → written cycle 2, no dead-letter |
 | **No contention / no rejections** | zero `Transaction rejected by the network` all run |
 | **History reconstruction** | 33 snapshots, 4 reviews decoded on agent-7 |
@@ -46,19 +47,38 @@ would have been a guaranteed double-spend rejection. The pending-write gate sequ
 
 ---
 
-## Honest caveat on the pass criterion
+## The pass criterion WAS met — correcting an earlier reading of this run
 
-The round-2 brief asked for *attestation + review merged into one tx*. What actually
-happened: that pair was **deferred to separate cycles** because their keys were already
-claimed by items in the same batch. So:
+An earlier version of this document claimed the attestation+review pair "still lands in
+consecutive transactions" and never merged. **That was wrong.** Re-reading the log line by
+line:
 
-- Batching is proven (3 items, 1 tx) ✅
-- The specific attestation+review pair still lands in consecutive transactions, by design
+```
+1684  [Inbox] agent-7: 5 pending item(s)
+1690  [Inbox] ⏭ attestation ee32d2dc deferred (uncounted): key-collision
+1691  [Inbox] ⏭ review      ca06df1d deferred (uncounted): key-collision
+1692  [Inbox] ✅ agent-7: 3 item(s) accepted in tx d1ccda06
+...
+1708  [Inbox] agent-7: 2 pending item(s)
+1714  [Inbox] ✅ agent-7: 2 item(s) accepted in tx 5aca76cb
+```
 
-That is correct and safe — the gate sequences them so neither double-spends — but it is a
-more nuanced result than "2 items in one tx", and worth stating plainly rather than
-claiming a cleaner win. The collision rule is *why*: one item per VDXF key per batch,
-because `buildIdentityUpdateTx` replaces a key's array rather than appending.
+`ee32d2dc` and `ca06df1d` appear exactly once each in the whole log — deferred at cycle 2.
+Cycle 3 then opened with exactly **2** pending and wrote **2 items in one transaction**.
+Those two items can only be that attestation and that review. So:
+
+- **`5aca76cb` is one attestation + one review in a single `updateidentity`.** ✅
+- Batching of three mixed items is separately proven by `d1ccda06`. ✅
+
+What defers is a **same-key** second item within one cycle (two reviews, two attestations),
+not the attestation/review pair — those occupy different VDXF keys and merge cleanly. The
+collision rule is *why*: one item per VDXF key per batch, because `buildIdentityUpdateTx`
+replaces a key's array rather than appending.
+
+**Remaining honest limit:** the log does not record jobHashes on those lines, so we cannot
+prove the merged attestation and review came from the *same* review event rather than two
+different jobs. The brief's criterion — an agent holding both types at once, written in one
+tx — is met either way.
 
 ---
 

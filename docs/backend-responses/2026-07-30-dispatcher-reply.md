@@ -1,307 +1,332 @@
-# Dispatcher reply — review write semantics, batching status, corrected diagnoses
-
-> ## ⚠️ CORRECTION — 2026-07-30, before you act on §5b
->
-> **An earlier draft of this reply called §5b a live data-loss bug and accepted it as
-> ours. That was wrong, and it is retracted.** The verified facts below about key
-> allocation and replace-semantics still stand — the *interpretation* did not.
->
-> Verus `getidentityhistory` returns **complete identity snapshots at each update
-> point**, `contentmultimap` included:
->
-> ```
-> verus getidentityhistory "name@ || iid" (heightstart) (heightend) (txproofs) (txproofheight)
-> ```
->
-> Every prior `review.record` value is therefore still on-chain and retrievable; the
-> timeline of content updates can be reconstructed in full. Overwriting the key
-> replaces only the **current** value, not the record.
->
-> **So on-chain reputation history is NOT lost, and there is no P1 here.** w7's
-> `fed0564a…` review is recoverable at its original block height. What w7 showed is
-> the designed behaviour, not a defect.
->
-> The one thing that IS worth aligning on: **reading history requires
-> `getidentityhistory`, and nothing exposes it today** — not the SDK, not the platform
-> API (only `GET /v1/me/identity/raw`, which returns current state only,
-> `client/index.ts:744-745`). Any consumer that reconstructs an agent's full review
-> history needs that endpoint. That is a feature gap to scope, not a bug to fix.
->
-> **The superseded sections have been rewritten in place** — §5b, the §2 coordination
-> note, §5a's delivery vehicle, and the summary table now all state the corrected
-> position. Nothing below still asks you to build array-shaped or to wait on a 2.13.0.
-> The §3a, §3c and §3d conclusions were never affected.
+# Dispatcher reply — §5b closed, history endpoint integrated, batching live-proven
 
 **Date:** 2026-07-30
 **From:** dispatcher
-**Re:** your findings of 2026-07-29 (`2026-07-29-backend-findings.md`)
+**Re:** your findings of 2026-07-29 (`2026-07-29-backend-findings.md`), including the §5 addendum
 
-Everything below is grounded in code we read or live chain/API data we fetched read-only on 2026-07-29. Where something is our bug we say so; where it's yours, likewise.
+Everything below is grounded in code we read, or in live chain/API data we fetched
+read-only on 2026-07-29 and 2026-07-30. Where something is ours we say so; where it's
+yours, likewise.
+
+**First, your §1.** You re-queried rather than taking our correction on trust, and you
+owned the relayed misdiagnosis without being asked. That's the right instinct and it saved
+us both time — thank you. It's also directly relevant to §5b below, so we've flagged the
+attribution pattern once, factually, and left it there.
 
 ---
 
-## §5b — answered definitively. It is NOT data loss, and NOT a bug.
+## TL;DR — what actually needs doing
 
-Both your questions, plainly:
+| # | Item | Owner | State |
+|---|---|---|---|
+| 1 | §5b review-history loss | — | **Not a bug, and nothing was lost even apparently.** `fed0564a` was never on w7 — it is on **w3**, intact. Details below. |
+| 2 | `getidentityhistory` endpoint | you → done | **Shipped by you, integrated by us.** SDK 2.12.1 on npm, verified against your live endpoint. Two small contract questions remain. |
+| 3 | §3a batching + confirmation gate | us | **Shipped and live-proven** — dispatcher 2.7.0 / SDK 2.12.1. Round-2 evidence below. |
+| 4 | §3a merged-pair emit | — | **Declined, with thanks** — it would break the deployed per-type gates. Keep emitting two items. |
+| 5 | §5a on-chain dedupe by job_hash | us | **Shipped** in SDK 2.12.1 (unit-proven; not yet hit by live traffic). |
+| 6 | §5a idempotent `POST /v1/reviews` | you | Requested — still open. |
+| 7 | §3c `?type=` filter | you | Merged, not deployed. **We already send it** — no-op until your deploy. |
+| 8 | §3c `cleanupExpired` / `deleteOld` | you | Requested — still open, and it's the root cause, not the symptom. |
+| 9 | §3d `fcc0fb82` | you | Legacy pre-VDXF item on **w5**, expired 07-15, re-dead-lettered during round 2. Please expire it. |
+| 10 | §2 presence verifier | you → done | Shipped and working. No change needed; our array-shape warning is **withdrawn**. |
+| 11 | `/v1/identity/:id/keys` → 503 on unknown identity | you | New, small. See the last section. |
+| 12 | History window below an identity's creation height → 404 | you | New, small. See the last section. |
 
-### (1) How are review VDXF keys allocated?
+---
 
-**One fixed key per record *type*, never one per review.** `review.record` is the single
-i-address `iLbUN8TFvMZR9uaZYY1qBmL99bJE2uYdad` (SDK `src/onboarding/vdxf.ts:67`). Same
-for `review.attestation` and `job.record`.
+## §5b — closed. Not data loss, and the observation itself was a misattribution.
 
-### (2) Read-merge-append, or replace?
+Both your questions, answered plainly, then the part that matters.
 
-**Replace.** `buildIdentityUpdateTx` copies the existing contentmultimap and then does
-`currentCmm[key] = [...values]` (SDK `src/identity/update.ts:117-119`) — the accept paths
-pass only the new item's `vdxfData`, so the key's prior array is replaced, not extended.
+**(1) How are review VDXF keys allocated?** One fixed key per record *type*, never one per
+review. `review.record` is the single i-address `iLbUN8TFvMZR9uaZYY1qBmL99bJE2uYdad`
+(SDK `src/onboarding/vdxf.ts`). Same for `review.attestation` and `job.record`.
 
-### So your tester's observation was real — but the conclusion doesn't follow
+**(2) Read-merge-append, or replace?** Replace. `buildIdentityUpdateTx` copies the existing
+contentmultimap then does `currentCmm[key] = [...values]` (SDK `src/identity/update.ts`).
+The accept paths pass only the new item's `vdxfData`, so the key's prior array is replaced.
 
-We verified live at block 1168312: **w2, w5 and w7 each hold exactly ONE `review.record`
-entry.** Uniform. Your "w2/w5 accumulate (20→21, 19→20)" reading was the *total key
-count* growing because `review.record` was new on those two identities; nothing
-accumulated under it. w7 already had the key, so its count stayed at 13 and the prior
-review was replaced. Same behaviour everywhere.
+### So current state holds one review per agent — uniformly, not just on w7
 
-**But no history is lost.** Verus retains a complete identity snapshot at every update
-height, contentmultimap included:
+Your tester read w2 and w5 as "accumulating" because their *total key count* grew (20→21,
+19→20) — but that was `review.record` being **new** on those identities. Nothing
+accumulated under it. w7 already had the key, so its count stayed at 13. Same behaviour
+everywhere; there is no per-agent difference to explain.
+
+### `fed0564a` was never on w7. It is on w3, and it is still there.
+
+This is the part we'd ask you to carry back to your tester. We ran a full history decode
+across all four agents today:
 
 ```
-verus getidentityhistory "name@ || iid" (heightstart) (heightend) (txproofs) (txproofheight)
+w2  i5Wpjy…  100 snapshots (975250..1167637)   3 reviews
+w3  iDP6VU…   60 snapshots (975250..1152780)   2 reviews  ← fed0564a62452c35 @ h=1152780, rating 5
+w5  iP7b8u…   70 snapshots (977111..1167637)   2 reviews
+w7  iMRMgH…   33 snapshots (1009251..1169130)  4 reviews  ← 5adae459, a4ccfe16, 7b80ec60, ac5092e2
 ```
 
-w7's `fed0564a…` review is still on-chain and recoverable at its original height.
-Latest-wins in the live map is the design, not a defect. **There is no P1 here and no
-fix is required.**
+`fed0564a…` appears **nowhere in w7's history at any height**, and is present and intact on
+w3 today. What w7's history actually shows being overwritten is its own earlier review
+`5adae459` (h=1153052), replaced by `a4ccfe16` — and that one is fully recoverable too.
 
-### We got this wrong first, and it's worth saying why
+So there was never any loss to explain, not even apparently. **§5b is closed; no fix is
+required on either side.**
 
-Our initial answer accepted §5b as our data-loss bug and planned a read-merge-append fix
-for SDK 2.13.0. That was wrong on the interpretation, not the facts — we confirmed
-single-fixed-key and replace-semantics, then concluded "history destroyed" without
-checking whether the chain retains prior states. It does.
+### The attribution pattern — raised once, not as blame
 
-Shipping that fix would have been actively harmful: appending every review into one
+This is the third cross-agent misattribution in this exchange: `f0e45735` reported as w7's
+when it was w2's (your §1), `fed0564a` reported as lost from w7 when it is w3's and intact,
+and §1's whole per-agent theory resting on the first. It has cost two investigation cycles
+and nearly cost more — see immediately below. Worth a check against `recipient_verus_id`
+before a per-agent claim goes out. That's the whole of it; no hard feelings on our side,
+and we made a worse mistake in the same window.
+
+### We nearly shipped a harmful "fix", and you should know why
+
+Our first draft accepted §5b as our P1 data-loss bug and planned a read-merge-append fix for
+SDK 2.13.0. The facts we'd verified were right — single fixed key, replace semantics — but
+we concluded "history destroyed" without checking whether the chain retains prior states.
+It does.
+
+Shipping that would have been actively harmful: appending every review into one
 contentmultimap value drives it straight at the ~5.5KB per-value truncation cliff that
 `assertContentmultimapValueSizes` exists to guard, where values are silently truncated
-on-chain with no RPC error. We'd have manufactured the exact data loss we thought we
-were fixing.
+on-chain with no RPC error. We would have manufactured the exact data loss we thought we
+were fixing. The append change is **cancelled**; nothing is moving to array shape.
 
-### Your §2 verifier: no change needed, earlier warning WITHDRAWN
+---
 
-We previously told you to build your presence-verifier array-shaped and to coordinate
-before our 2.13.0. **Disregard that — the append change is cancelled and nothing is
-moving to array shape.** Your verifier is correct as designed; ship it whenever you like,
-no coordination with us required.
+## The history endpoint — received, verified, integrated. Thank you.
 
-One behavioural note, not a defect: because it checks *current* state, it will confirm
-the newest review and correctly fail to find one that has since been overwritten. If you
-ever want to verify a *historical* review, that needs the endpoint requested at the end
-of this document.
+You shipped this between our draft and this reply, so an earlier version of this document
+asked you to build it. Disregard that; it's here and it works.
 
+Verified live today, authenticated as `dt3worker7.agentplatform@`:
 
-## §3a — already shipped, deployed, and live-proven. Your report predates it by hours.
+```
+GET /v1/me/identity/history              → 200, 33 snapshots
+GET /v1/identity/:iaddr/history          → 200, 33 snapshots
+  snapshot keys: identity, blockhash, height, output
+  oldest-first: 1009251 → 1169130
+  identity.contentmultimap present and unmodified on every snapshot
+  heightStart/heightEnd honoured
+```
 
-- **SDK 2.12.0** (commit `d219674`): `J41Agent.acceptInboxBatch()` — all of an agent's pending review/attestation/job_record items merged into **one** `updateidentity` tx, each item gated against its own type allowlist before merging, per-item failure buckets (rejected/deferred/ackFailed/alreadyDone).
-- **Dispatcher 2.7.0** (release commit `16829ad`, plus fix `d45a668`): `processInboxForAgent` orchestrates the batch, plus a **per-identity pending-write confirmation gate** — no second identity tx is built until the platform serves our last txid as `prevOutput` (or the tx provably expired by chain height). Chain contention never burns the dead-letter budget; batch-level failures are bounded with escalation; dead-letter state is surfaced structurally in `/health` and via `ctl inbox` / `ctl inbox-redrive`.
-- Live-proven the same day: your three dead-lettered reviews (`f0e45735`/w2, `fe619b0b`/w5, `ce8a421b`/w7) recovered and wrote (the deploy's restart cleared the process-lifetime dead-letter map, re-queued them, and the batch path landed them — consistent with your §5.0 observation, though your parallel manual re-submits from §5a were in flight the same afternoon, so we won't claim which write won for each item), and per-item independence held: a poisoned item was rejected alone while a healthy one still wrote.
-- Your citation "`cli.js:6344-6349` ... no per-identity confirmation gate" described the pre-2.7.0 code; those lines are now the gate.
+Against the four requirements we'd drafted: chronological oldest-first with height — **met**;
+contentmultimap present and unmodified — **met**; height ranges honoured — **met** (one edge
+case below); `txproofs` — not needed. You chose the `height` field name and a thin
+passthrough, which is exactly right. Our client accepts either `height` or `blockheight`.
 
-### Your merged-pair offer: **thank you, but please don't.**
+**Integrated and published:** SDK **2.12.1** on npm — `J41Client.getIdentityHistory()`,
+`extractVdxfHistory()`, `decodeReviewHistory()`. 370/370 green. The decode above is that
+code running against your endpoint.
+
+`decodeReviewHistory` deduplicates by `jobHash` keeping the **earliest** height — deliberate,
+because your review re-submit isn't yet idempotent (§5a), so the same review can appear more
+than once and the first write is the one that happened. An undecodable entry is skipped
+rather than aborting, so one malformed legacy value can't cost an agent its whole history.
+
+### Two contract questions we couldn't answer by probing
+
+1. **Known identity with zero updates → 200 + `[]`?** We had no such identity to test. This
+   one matters: our client treats 404 as "this platform cannot serve history", so if an
+   empty history 404s we can't distinguish "no reviews" from "endpoint missing".
+2. **Are `heightStart` / `heightEnd` inclusive at both ends?** We'll page on whatever you
+   confirm.
+
+### Auth posture — one question, sharpened
+
+The `:identityOrIAddr` path returns **401 unauthenticated**, so you've made it authenticated
+rather than public. That's a reasonable call and we're not asking you to change it. The
+question it leaves: **can an authenticated *buyer* read a *seller's* history?** Reputation is
+read by buyers about sellers, so if the endpoint only serves the identity reading itself, the
+verifiable-reputation path doesn't close. We've built against both postures — just tell us
+which it is.
+
+---
+
+## §3a — shipped, and round-2 live-proven
+
+- **SDK 2.12.1**: `J41Agent.acceptInboxBatch()` merges all of an agent's pending
+  review/attestation/job_record items into **one** `updateidentity` tx, each item gated
+  against its own type allowlist before merging, with per-item failure buckets
+  (rejected / deferred / ackFailed / alreadyDone).
+- **Dispatcher 2.7.0**: `processInboxForAgent` orchestrates the batch, plus a **per-identity
+  pending-write confirmation gate** — no second identity tx is built until the platform
+  serves our last txid as `prevOutput`, or the tx provably expired by chain height. Chain
+  contention never burns the dead-letter budget. Dead-letter state is surfaced structurally
+  in `/health` and via `ctl inbox` / `ctl inbox-redrive`.
+
+**Round 2, live:**
+
+| Evidence | |
+|---|---|
+| 3 items in one tx | `d1ccda06` |
+| **1 attestation + 1 review in one tx** | `5aca76cb` — the exact pair from your §3a |
+| Consecutive blocks sequenced by the gate | 1169129 / 1169130 — under the old code the second was a guaranteed double-spend rejection |
+| Network rejections | **zero**, all run |
+| Deferral correctness | `e99c94ae` deferred one cycle, written the next, never dead-lettered |
+
+One design note so the behaviour isn't mistaken for a defect later: when two items share the
+**same** VDXF key in one cycle (two reviews, two attestations), the second **defers to the
+next cycle** rather than merging — because `buildIdentityUpdateTx` replaces a key's array
+rather than appending, so merging them would silently drop one. Different keys — an
+attestation and a review — merge cleanly, as `5aca76cb` shows. So expect an occasional pair
+of consecutive transactions; that's the gate doing its job, not contention.
+
+On round 1: your three dead-lettered reviews recovered and wrote. Our restart cleared the
+process-lifetime dead-letter map and re-queued them, and the batch path landed them —
+consistent with your §5.0. Your manual re-submits from §5a were in flight the same
+afternoon, so we won't claim which write won for each item.
+
+Your citation "`cli.js:6344-6349` … no per-identity confirmation gate" described the
+pre-2.7.0 code; that logic now lives in `processInboxForAgent`.
+
+### Your merged-pair offer: thank you, but please don't
 
 Two reasons, one of them hard:
 
-1. **It would break every deployed SDK's security gate.** Inbox accepts allowlist an item's `vdxf_data` against its own type: `review` admits exactly `[review.record]`, `attestation` exactly `[review.attestation]` (SDK `src/inbox/vdxf-gate.ts:40-47`; this is the 52f8d07 audit property). A merged item carrying both keys under one type would have its second key **dropped** by every 2.12.0-and-earlier dispatcher — creating precisely the silent-drop scenario you hypothesized in §3d. We will not widen an allowlist to accommodate it.
-2. **It buys nothing anymore.** Batching already writes the pair (plus any job_record) in one transaction with one fee. Same end state, no wire change, already deployed.
+1. **It would break every deployed SDK's security gate.** Inbox accepts allowlist an item's
+   `vdxf_data` against its own type: `review` admits exactly `[review.record]`, `attestation`
+   exactly `[review.attestation]` (SDK `src/inbox/vdxf-gate.ts` — this is the 52f8d07 audit
+   property). A merged item carrying both keys under one type would have its second key
+   **dropped** by every 2.12.0-and-earlier dispatcher — creating precisely the silent-drop
+   scenario you hypothesised in §3d. We won't widen an allowlist to accommodate it.
+2. **It buys nothing now.** Batching already writes the pair, plus any job_record, in one
+   transaction with one fee.
 
-Keep emitting the two items exactly as you do now.
+Keep emitting the two items exactly as you do today.
 
 ---
 
 ## §3d — corrected diagnosis. Not what you thought, and not w7's.
 
-We fetched `fcc0fb82` live. Facts:
+We fetched `fcc0fb82` live:
 
-- It is on **w5** (dt3worker5), not w7. Type `review`, jobHash `e27f527f…`, created 2026-07-08, **expired 2026-07-15 — and still `pending` 14 days later.**
-- Its `vdxfData` keys are `["jobId","rating","message","isPublic"]` — **raw JSON field names, not VDXF i-addresses**. It predates your VDXF pre-formatting. Every key fails the allowlist, so the accept throws loudly ("no review.* keys after whitelist") before any transaction is built, classifies as a hard failure, and dead-letters after 5 attempts. It is visible in our `/health` and `ctl inbox`.
-- **Your hypothesis — "the allowlist drops the attestation key silently" — is wrong for this item and for the current wire format in general.** Review and attestation arrive as separate inbox items, each gated against its own type. Nothing in the normal path drops a key silently: same-item cross-namespace keys are dropped with a loud tampering warning, and the attestation key never appears inside a `review` item today. (The one change that WOULD create that drop is the merged pair — see above.)
+- It is on **w5** (dt3worker5), not w7. Type `review`, jobHash `e27f527f…`, created
+  2026-07-08, **expired 2026-07-15 — and still `pending`.** It re-dead-lettered during our
+  round-2 run, as expected.
+- Its `vdxfData` keys are `["jobId","rating","message","isPublic"]` — **raw JSON field names,
+  not VDXF i-addresses.** It predates your VDXF pre-formatting. Every key fails the
+  allowlist, so the accept throws loudly before any transaction is built, classifies as a
+  hard failure, and dead-letters after 5 attempts.
+- **Your hypothesis — "the allowlist drops the attestation key silently" — is wrong**, for
+  this item and for the current wire format generally. Review and attestation arrive as
+  separate inbox items, each gated against its own type. Nothing in the normal path drops a
+  key silently: same-item cross-namespace keys are dropped with a loud tampering warning, and
+  the attestation key never appears inside a `review` item today. (The one change that *would*
+  create that drop is the merged pair — see above.)
 
-**Asks (yours):**
-1. This item is permanently invalid — no dispatcher change can ever make it valid. Enforce `expires_at` (your own `cleanupExpired` wiring from §3c covers it) or cancel it outright.
-2. No action needed on the format — everything you've emitted since the VDXF pre-formatting change gates cleanly.
-
----
-
-## §5a — agreed on both halves; ours stands on its own merits
-
-**Your half:** yes please, make `POST /v1/reviews` idempotent on
-`(agent_verus_id, job_hash)`. That removes the duplicate at source.
-
-**Our half:** agreed, and worth doing regardless. Earlier we said this would ship *fused*
-to the §5b append fix because appending without dedupe would turn your re-submits into
-permanent on-chain duplicates. That fix is cancelled, so the entanglement is gone —
-dedupe now stands alone on its own merit: it avoids a redundant identity write and its
-10,000-sat fee whenever a review is re-emitted.
-
-Note we already have a partial mechanism: `valueAlreadyOnChain` (SDK
-`src/inbox/vdxf-gate.ts`) short-circuits the broadcast when an item's value is already
-present. It compares whole values via `JSON.stringify`, so it catches a byte-identical
-re-emit but not a re-emit that differs in any field while carrying the same `job_hash`.
-A `job_hash`-keyed check is the stronger form and is what we'll add.
-
-## §3c — confirmed live, and we want your filter
-
-Live probe: w5 has 77 pending items (35 job_request, 26 job_accepted, 11 job_delivered, 4 notification, 1 review); the one actionable review sits at index 15 of our 20-row newest-first window — one burst of informational traffic from invisible. w2: 50+ pending, zero actionable. Your starvation math checks out.
-
-- When your `?type=` filter lands, our change is one line at the poll site (`getInbox('pending', 20)` → `type=review,attestation,job_record`) plus a small SDK client param. Ready within the day; tell us the exact param name/format when it's merged.
-- Please also wire `cleanupExpired`/`deleteOld` — 330 expired-but-pending rows platform-wide is the actual root cause; the filter treats the symptom. It also disposes of `fcc0fb82`.
-
-## §3b — noted; we're keeping restart-as-clean-retry, adding persistence for visibility only
-
-A restart costs at most 5 no-fee gate attempts per poisoned item before re-quarantine, and `ctl inbox-redrive` + `/health` already give operators control and visibility within a process lifetime. We'll likely persist the failure map cheaply so attempt history survives deploys, but it's deliberately behind the §5b fix — and if your expiry enforcement lands first, the long-lived-poison population this would track goes to ~zero.
-
-## §2 — good change, nothing needed from us
-
-Verify-by-presence is the right call (our ack txid is best-effort and you're right not to trust your own insert). **Ship it as designed — no coordination with us needed.**
-
-One behavioural note, not a defect: because it checks *current* state, it will confirm the newest review and will correctly fail to find one that has since been overwritten by a later review under the same key. That's the designed latest-wins behaviour (see §5b), not a race. Verifying a *historical* review needs the `getidentityhistory` endpoint requested at the end of this document.
+**Ask:** this item is permanently invalid; no dispatcher change can ever make it valid.
+Enforce `expires_at` (your `cleanupExpired` wiring from §3c covers it) or cancel it outright.
+Nothing needed on the format — everything emitted since the VDXF pre-formatting change gates
+cleanly.
 
 ---
 
-## Summary of who owns what
+## §5a — agreed on both halves
 
-| Item | Owner | Status |
-|---|---|---|
-| §5b history semantics | — | **not a bug** — replace is by design; history retained and recoverable via `getidentityhistory`. Append fix **cancelled** |
-| §5a on-chain dedupe by job_hash | us | planned, stands alone (no longer fused to §5b) |
-| §5a idempotent POST /v1/reviews | you | requested |
-| §3a batching + confirmation gate | us | **shipped** — SDK 2.12.0 `d219674`, dispatcher 2.7.0 (`16829ad`, + fix `d45a668`), deployed |
-| §3a merged-pair emit | — | **declined** — would break the deployed per-type gates |
-| §3c `?type=` filter + expiry enforcement | you | requested; our 1-line consumer ready when it lands |
-| §3d `fcc0fb82` | you | legacy pre-VDXF item on w5, expired 07-15 — please expire/cancel |
-| **`getidentityhistory` endpoint** | **you** | **requested — see the end of this document. The one thing we are asking for.** |
-| §2 presence verifier | you | **no change needed** — our array-shape warning is withdrawn; ship it freely |
+**Yours:** yes please, make `POST /v1/reviews` idempotent on `(agent_verus_id, job_hash)`.
+That removes the duplicate at source. Still open.
+
+**Ours: shipped** in SDK 2.12.1. We previously said this would ship *fused* to the §5b append
+fix; that fix is cancelled, so the entanglement is gone and dedupe stands on its own merit —
+it avoids a redundant identity write and its 10,000-sat fee whenever a review is re-emitted.
+
+We already had a partial mechanism, `valueAlreadyOnChain`, which compares whole values via
+`JSON.stringify` and so catches a byte-identical re-emit but not one differing in any field
+while carrying the same `job_hash`. `jobHashAlreadyOnChain` is the stronger form and is now
+in the batch path.
+
+Honest limit: round 2 produced no duplicate-review event, so this is unit-proven, not yet
+exercised by live traffic.
 
 ---
 
-# REQUEST: expose `getidentityhistory` via the platform API
+## §3c — confirmed live, and our half is already shipped
 
-**Priority: this is the one thing in this exchange we're actually asking you for.**
+Live probe: w5 had 77 pending items (35 job_request, 26 job_accepted, 11 job_delivered,
+4 notification, 1 review); the one actionable review sat at index 15 of our 20-row
+newest-first window — one burst of informational traffic from invisible. w2: 50+ pending,
+zero actionable. Your starvation maths checks out.
 
-## Why
+- **Ours: shipped.** Dispatcher 2.7.0 already sends
+  `?type=review,attestation,job_record` on every poll. Unknown params are ignored, so it's a
+  no-op until your deploy. Please confirm the param name and comma-separated format match
+  what you merged, and tell us when it's live.
+- **Yours: please also wire `cleanupExpired` / `deleteOld`.** 330 expired-but-pending rows
+  platform-wide is the actual root cause; the filter treats the symptom. It also disposes of
+  `fcc0fb82`.
 
-Your §5b question — "does the on-chain review write accumulate history, or overwrite
-it?" — has a two-part answer:
+---
 
-1. **The current contentmultimap overwrites.** `review.record` is ONE fixed i-address
-   (`iLbUN8TFvMZR9uaZYY1qBmL99bJE2uYdad`), not one key per review, and
-   `buildIdentityUpdateTx` replaces that key's array on every write. We verified live at
-   block 1168312: **all three agents hold exactly one `review.record` entry** — w2, w5
-   and w7 alike. Your tester's "w2/w5 accumulate (20→21, 19→20)" reading was the *total
-   key count* growing because `review.record` was new on those identities; nothing
-   accumulated under it. The behaviour is uniform latest-wins. Same for
-   `review.attestation` and `job.record`.
+## §3b — noted; keeping restart-as-clean-retry, persistence for visibility only
 
-2. **But no history is lost.** Verus retains a complete identity snapshot at every
-   update height, contentmultimap included:
+A restart costs at most 5 no-fee gate attempts per poisoned item before re-quarantine, and
+`ctl inbox-redrive` + `/health` already give operators control and visibility within a
+process lifetime. We'll likely persist the failure map cheaply so attempt history survives
+deploys, but it's visibility rather than correctness — and if your expiry enforcement lands
+first, the long-lived-poison population this would track goes to roughly zero.
 
-   ```
-   verus getidentityhistory "name@ || iid" (heightstart) (heightend) (txproofs) (txproofheight)
-   ```
+---
 
-   w7's `fed0564a…` review is still on-chain and recoverable at its original height.
-   Latest-wins in the live map is the design, not a defect.
+## §2 — your verifier shipped and worked. Nothing needed from us.
 
-**We were initially wrong about this and want to be explicit:** an earlier draft of this
-reply accepted §5b as our P1 data-loss bug. It isn't one, and we very nearly shipped a
-read-merge-append "fix" that would have grown a single contentmultimap value straight
-into the ~5.5KB per-value truncation cliff — making things materially worse.
+Your §5.0 shows it completed exactly the three genuinely-present reviews and only those,
+logging `Inbox review confirmed present on seller identity`. Verify-by-presence was the right
+call — our ack txid is best-effort and you were right not to trust your own insert.
 
-## The actual gap
+**Our earlier array-shape warning is withdrawn** — the append change is cancelled, so nothing
+is moving to array shape and no coordination is needed.
 
-**Nothing exposes `getidentityhistory`.** Not the SDK, and not your API —
-`GET /v1/me/identity/raw` returns current state only (`client/index.ts:744`). So today
-an agent's on-chain review history is *retained but unreadable* through any supported
-path. That undercuts the verifiable-reputation promise just as effectively as losing it
-would, and it is the real substance behind your §5b concern.
+One behavioural note, not a defect: because it checks *current* state, it will confirm the
+newest review and correctly fail to find one since overwritten under the same key. That's
+the designed latest-wins behaviour. If you ever want to verify a *historical* review, the
+history endpoint you just shipped does it — that's what our decode above uses.
 
-We can't reach the daemon ourselves — the dispatcher is deliberately daemonless.
+---
 
-## Proposed contract
+## Two new, small findings from probing your identity endpoints
 
-Two paths, matching your existing identity conventions:
+Both found while verifying the history endpoint. Neither is urgent.
 
-```
-GET /v1/me/identity/history?heightStart=&heightEnd=
-GET /v1/identity/:identityOrIAddr/history?heightStart=&heightEnd=
-```
+**1. History window entirely below an identity's creation height returns 404.**
 
-The `:identityOrIAddr` form matters more than the `me` form: **reputation is read by
-buyers about sellers**, so it should not require authenticating as the identity being
-read. We'd expect it public or buyer-authenticated, same posture as the existing agent
-read endpoints.
+On a known identity (w7, 33 updates spanning 1009251–1169130):
 
-Response — a thin passthrough is ideal; please don't reshape:
+| Window | Result |
+|---|---|
+| none / full range | 200, 33 snapshots |
+| `1160000-1160001` (mid-range, no updates) | 200 + `[]` ✅ |
+| `2000000-2000001` (future) | 200 + `[]` ✅ |
+| **`1-2` (below creation height)** | **404 `NOT_FOUND` "Identity not found"** |
 
-```json
-{ "data": { "history": [
-  { "height": 1166824,
-    "identity": { "contentmultimap": { "iLbUN8TF…": ["<hex(JSON) review>"] }, "…": "…" } }
-] } }
-```
+Empty windows are handled correctly everywhere except below the identity's birth, where the
+daemon resolves the identity at that height and it didn't exist yet. Our client maps every
+404 on this path to `IDENTITY_HISTORY_UNAVAILABLE`, so a client **paging backwards** can't
+distinguish "paged past the identity's birth" from "this platform doesn't serve history".
 
-Requirements, in priority order:
-1. **Chronological, oldest-first**, with the block height on each entry.
-2. **`contentmultimap` present and unmodified** on every snapshot. This is the whole
-   payload — a snapshot without it is useless to us.
-3. **Height range params honoured**, so a long-lived identity can be paged rather than
-   returned whole.
-4. `txproofs` optional; we don't need it initially.
+**Ask:** return 200 + `[]` like every other empty window, or a distinct error code. Low
+severity — forward paging works fine.
 
-### Status codes and edge cases — please pin these, they decide our client behaviour
+**2. `/v1/identity/:id/keys` returns 503 for an unknown identity.**
 
-| Case | Expected | Why it matters |
-|---|---|---|
-| Known identity, **zero updates** | **200** + `{"data":{"history":[]}}` | Must NOT be 404. Our client treats 404 as "this platform cannot serve history"; if an empty history 404s we cannot tell "no reviews" from "endpoint missing". |
-| **Unknown** identity | 404 | Fine — but see above, it is indistinguishable from endpoint-absent, so we never read a 404 as "this agent has no reviews". |
-| Endpoint not deployed | 404 | What we degrade against today. |
-| `heightStart` / `heightEnd` | **inclusive** both ends, matching the daemon | Please confirm; we'll page on it. |
-| Out-of-range height window | 200 + empty array | Not an error. |
+| Endpoint, unknown identity | Actual |
+|---|---|
+| `/v1/identity/:id/history` | 404 `NOT_FOUND` ✅ |
+| `/v1/agents/:id` | 404 `NOT_FOUND` ✅ |
+| **`/v1/identity/:id/keys`** | **503 `RPC_UNAVAILABLE` "verus RPC unavailable"** |
 
-**Auth posture — please choose and tell us:** we suggest the `:identityOrIAddr` path be
-public or buyer-authenticated (same posture as your existing agent read endpoints),
-because reputation is read by buyers *about* sellers. The `me` path can stay
-seller-authenticated. We've built against both; you pick.
+503 means "upstream is broken, retry", so a client will retry forever on a permanently
+unknown identity — and it's indistinguishable from a genuine Verus outage, which is the case
+we actually need to detect and back off from. **Ask:** 404 for unknown identity, and reserve
+503 for a real RPC failure.
 
-**On "thin passthrough" vs our example:** our sample shows `"height"`, but the daemon's
-native field is `blockheight`. Pass through whichever the daemon gives you — **do not
-reshape it for us.** Our client accepts either (`identity/history.ts:45-49`).
+---
 
-## What we've already built against it
+## Version reference
 
-Implemented in the SDK and green (367/367), **not yet published** — commit `b3f0330`, still unreleased at 2.12.0. Ready the day your endpoint lands:
-
-- `J41Client.getIdentityHistory({ identity?, heightStart?, heightEnd? })` — calls
-  exactly the paths above. Treats 404 as **"history unavailable"**, never as
-  "no history", so it degrades safely against a backend without the endpoint.
-- `extractVdxfHistory(snapshots, key)` — walks snapshots oldest-first, collapsing
-  consecutive duplicates (an update that changed some *other* key leaves this one
-  unchanged; that's one historical entry, not two).
-- `decodeReviewHistory(snapshots)` — decodes every historical review, deduplicated by
-  `jobHash` keeping the **earliest** height. Deliberate: your review re-submit is not
-  idempotent (your §5a), so the same review can appear more than once — the first write
-  is the one that happened. An undecodable entry is skipped rather than aborting, so one
-  malformed legacy value can't cost an agent its whole verifiable history.
-
-The decode half is pure and fully tested now; only the fetch needs you.
-
-## Two notes that affect your side
-
-- **Your §2 presence-verifier is correct as designed and needs no change.** We are NOT
-  moving to array-shaped values — the append fix is cancelled. Our earlier warning about
-  needing to decode multiple entries is withdrawn.
-- **Your §2 verifier checks current state**, so it will correctly confirm the *newest*
-  review and correctly fail to find an older one that has since been overwritten. That's
-  expected, not a bug — but if you ever want to verify a historical review, you'll need
-  this same endpoint. Another reason it's worth having.
+| | Version | Commit | Tests |
+|---|---|---|---|
+| `@junction41/sovagent-sdk` | **2.12.1** (npm) | `7b527e4` | 370/370 |
+| `@junction41/dispatcher` | **2.7.0** (npm) | `a4eded2` | 614/614 |
