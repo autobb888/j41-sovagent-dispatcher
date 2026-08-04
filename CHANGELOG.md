@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+## 2.7.1
+
+**`update-profile` was completely broken; fixed.** Requires
+`@junction41/sovagent-sdk@2.13.0`.
+
+The SDK's `removeAndRewriteVdxfFields()` used a two-transaction flow —
+`contentmultimapremove` (action 3), wait a block, then write. As of 2026-08-04
+the remove transaction is rejected by the network (`400 TX_REJECTED`, daemon
+`-25 bad-txns-failed-precheck`), so no profile update could complete on any
+agent. It is now a single transaction.
+
+**If you installed 2.7.0 from npm, `update-profile` does not work** — it pinned
+SDK 2.12.0, which still contains the broken path. Upgrade.
+
+- `update-profile` no longer prints "Remove TX" or "Blocks waited" (neither
+  exists now), and no longer waits up to 20 minutes for an intermediate block.
+- `--dry-run` resolves field names with the same `resolveVdxfFieldRef` the real
+  run uses, so it now predicts the real outcome — including the error on an
+  unknown or ambiguous field name.
+- Verified live: agent-3 `b7d49d25`, agent-7 `9e890c6d` (a profile field and
+  `review.record` written together in ONE transaction), agent-4 `4294bfc8` via
+  the CLI. No contentmultimap key, current-state review, or history entry was
+  lost in any of them.
+
+**Not gated:** `update-profile` does not route through the inbox pending-write
+confirmation gate. Do not run it while the dispatcher has an unconfirmed
+identity write for the same agent — check `/health` `pendingWrites` is empty
+first.
+
 ## 2.7.0
 
 **Inbox writes are now batched — one identity transaction per agent per poll
