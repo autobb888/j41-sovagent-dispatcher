@@ -15,6 +15,29 @@ const path = require('path');
 const crypto = require('crypto');
 const { createExecutor, EXECUTOR_TYPE } = require('./executors/index.js');
 const { createJobSigner } = require('./job-signer.js');
+const {
+  signAndSubmitDeletionAttestation,
+  releaseCanary,
+  resolveCanaryId,
+  purgeStaleCanaries,
+} = require('./job-agent-teardown.js');
+
+/** SovGuard canary id for this job, resolved after registration. */
+let _canaryId = null;
+
+/**
+ * Token usage for attestations, or null. The shutdown handlers cannot see
+ * `performCleanup`'s local `_usageRecord` — reading it as a free variable threw
+ * ReferenceError on every attestation path and was invisible to structural
+ * tests. Everything is passed explicitly now; this is the shared accessor.
+ */
+function _tokenUsageOrNull() {
+  try {
+    return _executor && typeof _executor.getTokenUsage === 'function'
+      ? { ..._executor.getTokenUsage(), extensions: _extensionLog }
+      : null;
+  } catch { return null; }
+}
 const { SignChannelClient } = require('./sign-channel-client.js');
 const log = require('./logger.js');
 const { scanUntrusted } = require('./sovguard-context.js');
@@ -413,10 +436,31 @@ async function main() {
   // Register canary token with SovGuard so it watches for leaks in chat
   if (CANARY_TOKEN) {
     try {
-      await agent.client.registerCanary({ token: CANARY_TOKEN, format: 'sovguard-canary-v1' });
+      try {
+        await agent.client.registerCanary({ token: CANARY_TOKEN, format: 'sovguard-canary-v1' });
+      } catch (regErr) {
+        // Cap reached: every slot is held by a FINISHED job (one canary is minted
+        // per job), because nothing released them until now. Free them and retry
+        // once — without this the fix cannot bootstrap on any existing agent.
+        if (/maximum .* canary tokens/i.test(regErr.message || '')) {
+          const freed = await purgeStaleCanaries({ client: agent.client, keepToken: CANARY_TOKEN });
+          console.log(`[CANARY] Registration cap hit — purged ${freed} stale registration(s), retrying`);
+          await agent.client.registerCanary({ token: CANARY_TOKEN, format: 'sovguard-canary-v1' });
+        } else {
+          throw regErr;
+        }
+      }
+      // Do NOT trust the register response shape for the id — it is typed
+      // `{ status }`. Match on the token via the typed list endpoint instead.
+      _canaryId = await resolveCanaryId(agent.client, CANARY_TOKEN);
       console.log('[CANARY] Registered with SovGuard');
     } catch (e) {
-      console.warn(`[CANARY] SovGuard registration failed (non-fatal): ${e.message}`);
+      // "non-fatal" is true for job EXECUTION and misleading for security posture:
+      // SovGuard-side leak detection is off for this job. The in-process
+      // checkForCanaryLeak guard still runs. Registrations were leaking slots
+      // (nothing ever released them), so every agent hit the 5-token cap and
+      // every job past its 5th ran unwatched — see releaseCanary() below.
+      console.warn(`[CANARY] ⚠️  SovGuard registration failed — SovGuard-side leak detection is DISABLED for this job (local check still active): ${e.message}`);
     }
   }
 
@@ -427,10 +471,24 @@ async function main() {
   // ─────────────────────────────────────────
   // Accept job — dispatcher may have already accepted during prepay flow
   console.log('→ Accepting job...');
-  const fullJob = await agent.client.getJob(job.id);
-  if (!fullJob || !fullJob.jobHash || !fullJob.buyerVerusId) {
-    throw new Error(`Invalid job data from API for ${job.id}: missing jobHash or buyerVerusId`);
-  }
+  // Retry, like authenticate() above. A degraded platform returns incomplete job
+  // payloads: five containers were killed this way on 2026-07-31 / 08-04, both
+  // clusters inside CHAIN_SYNCING windows, and each left a paid job with no
+  // worker. Without a retry a momentary bad response is permanently fatal.
+  // The validation lives INSIDE the retried function on purpose. The observed
+  // failure was a RESOLVED response with a missing jobHash/buyerVerusId — no
+  // exception — so validating after withRetry() returns would let the first bad
+  // response kill the container exactly as before, while the error text claimed
+  // retries had happened. Five containers died this way, each stranding a paid
+  // job, both clusters inside CHAIN_SYNCING windows — which last far longer than
+  // the default ~7s of backoff, hence the wider knobs.
+  const fullJob = await withRetry(async () => {
+    const j = await agent.client.getJob(job.id);
+    if (!j || !j.jobHash || !j.buyerVerusId) {
+      throw new Error(`incomplete job data for ${job.id} (missing jobHash or buyerVerusId)`);
+    }
+    return j;
+  }, 'getJob', { maxAttempts: 5, baseDelayMs: 3000 });
 
   const _isPostDeliveryReconnect = isPostDeliveryReconnect(fullJob.status);
 
@@ -1431,20 +1489,26 @@ process.on('SIGTERM', async () => {
 
     // Submit deletion attestation. In broker mode we have no keys.json — use
     // the file-channel signer directly. In legacy mode read the WIF as before.
-    const attestTimestamp = Math.floor(Date.now() / 1000);
     try {
       if (_agent) {
-        const { message: attestMessage } = await _agent.client.getDeletionAttestationMessage(JOB_ID, attestTimestamp);
         const sigtermSigner = SIGNING_BROKER_ENABLED
           ? createJobSigner({ channelClient: new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR }), brokerEnabled: true })
           : createJobSigner({ wif: JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8')).wif, network: J41_NETWORK, brokerEnabled: false });
-        const attestSig = await sigtermSigner.signMessage(attestMessage);
-        fs.writeFileSync(
-          path.join(JOB_DIR, 'deletion-attestation-sigterm.json'),
-          JSON.stringify({ jobId: JOB_ID, message: attestMessage, signature: attestSig, timestamp: attestTimestamp }, null, 2)
-        );
-        await _agent.client.submitDeletionAttestation(JOB_ID, attestSig, attestTimestamp);
-        console.log('✅ SIGTERM attestation submitted');
+        const r = await signAndSubmitDeletionAttestation({
+          client: _agent._client || _agent.client,
+          signer: sigtermSigner,
+          jobId: JOB_ID,
+          containerId: CONTAINER_ID,
+          jobDir: JOB_DIR,
+          identityName: _agent.identityName,
+          usageRecord: _tokenUsageOrNull(),
+          outFile: 'deletion-attestation-sigterm.json',
+          extra: { terminatedBy: 'SIGTERM' },
+        });
+        console.log(`✅ SIGTERM attestation ${r.submitted ? 'submitted' : 'signed (submit failed: ' + r.error + ')'}`);
+        // Canary release LAST: the privacy proof matters more, and the SIGTERM
+        // grace period can be as short as 5s.
+        await releaseCanary({ client: _agent.client || _agent._client, token: CANARY_TOKEN, canaryId: _canaryId });
       }
     } catch (e) {
       console.error('⚠️  SIGTERM attestation failed:', e.message);
@@ -1492,8 +1556,6 @@ if (require.main === module) {
       const timeoutSigner = SIGNING_BROKER_ENABLED
         ? createJobSigner({ channelClient: new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR }), brokerEnabled: true })
         : createJobSigner({ wif: keys.wif, network: J41_NETWORK, brokerEnabled: false });
-      const attestTimestamp = Math.floor(Date.now() / 1000);
-
       // Try to use the platform's canonical attestation flow (J4)
       // M14 fix: reuse existing _agent if available
       try {
@@ -1509,16 +1571,19 @@ if (require.main === module) {
 
         // If using existing agent, skip re-authenticate (already authed)
         if (!_agent) await agent.authenticate();
-        const { message: attestMessage } = await agent.client.getDeletionAttestationMessage(JOB_ID, attestTimestamp);
-        const attestSig = await timeoutSigner.signMessage(attestMessage);
-
-        fs.writeFileSync(
-          path.join(JOB_DIR, 'deletion-attestation-timeout.json'),
-          JSON.stringify({ jobId: JOB_ID, message: attestMessage, signature: attestSig, timestamp: attestTimestamp }, null, 2)
-        );
-
-        const result = await agent.client.submitDeletionAttestation(JOB_ID, attestSig, attestTimestamp);
-        console.log(`✅ Timeout attestation submitted (verified: ${result.signatureVerified})`);
+        const r = await signAndSubmitDeletionAttestation({
+          client: agent._client || agent.client,
+          signer: timeoutSigner,
+          jobId: JOB_ID,
+          containerId: CONTAINER_ID,
+          jobDir: JOB_DIR,
+          identityName: agent.identityName,
+          usageRecord: _tokenUsageOrNull(),
+          outFile: 'deletion-attestation-timeout.json',
+          extra: { terminatedBy: 'timeout' },
+        });
+        console.log(`✅ Timeout attestation ${r.submitted ? 'submitted' : 'signed (submit failed: ' + r.error + ')'}`);
+        await releaseCanary({ client: agent.client || agent._client, token: CANARY_TOKEN, canaryId: _canaryId });
         agent.stop();
       } catch (apiErr) {
         // Fallback: sign locally and save to disk only
@@ -1812,45 +1877,22 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult, signer) 
   // `getDeletionAttestationMessage` → raw `signMessage(J41-DELETE-...)` flow
   // was correctly refused by the broker; this avoids it.
   try {
-    const {
-      generateAttestationPayload,
-      signAttestationWith,
-    } = require('@junction41/sovagent-sdk/dist/privacy/attestation.js');
-
-    const now = new Date().toISOString();
-    const payload = generateAttestationPayload({
+    // Same helper the SIGTERM and timeout paths use — ONE implementation, so a
+    // future caller cannot drift back onto the broker-refused J41-DELETE flow.
+    const r = await signAndSubmitDeletionAttestation({
+      client: agent._client || agent.client,
+      signer,
       jobId: JOB_ID,
       containerId: CONTAINER_ID,
-      createdAt: now,
-      destroyedAt: now,
-      dataVolumes: [JOB_DIR],
-      attestedBy: agent.identityName,
-      // WP-D4 #6: usage is now inside the signed bytes (attestation schema v2).
-      ...(_usageRecord ? { tokenUsage: _usageRecord } : {}),
+      jobDir: JOB_DIR,
+      identityName: agent.identityName,
+      usageRecord: _usageRecord,
+      outFile: 'deletion-attestation.json',
+      extra: { disputeOutcome: postDeliveryResult.disputeOutcome || null },
     });
-    const attestation = await signAttestationWith(payload, (msg) => signer.signMessage(msg));
-
-    // The spread keeps the SIGNED, normalized tokenUsage from `attestation`
-    // intact — do NOT overwrite it with _usageRecord, or the file's signature
-    // would no longer verify against its own tokenUsage. The richer,
-    // unsigned detail (model, amountUsd, timestamps the SDK normalizer drops)
-    // is filed separately under tokenUsageDetail for local audit only.
-    fs.writeFileSync(
-      path.join(JOB_DIR, 'deletion-attestation.json'),
-      JSON.stringify({
-        ...attestation,
-        disputeOutcome: postDeliveryResult.disputeOutcome || null,
-        ...(_usageRecord ? { tokenUsageDetail: _usageRecord } : {}),
-      }, null, 2)
-    );
-    log.info('Deletion attestation signed', { jobId: JOB_ID, sigLength: attestation.signature?.length });
-
-    try {
-      await agent._client.submitAttestation(attestation);
-      log.info('Deletion attestation submitted', { jobId: JOB_ID });
-    } catch (submitErr) {
-      console.log('⚠️  Submit failed (local attestation file still written):', submitErr.message);
-    }
+    log.info('Deletion attestation signed', { jobId: JOB_ID, submitted: r.submitted });
+    if (!r.submitted) console.log('⚠️  Submit failed (local artifact written):', r.error);
+    await releaseCanary({ client: agent.client || agent._client, token: CANARY_TOKEN, canaryId: _canaryId });
   } catch (e) {
     console.log('⚠️  Could not build/sign attestation:', e.message);
   }
