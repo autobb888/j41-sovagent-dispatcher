@@ -2237,6 +2237,38 @@ program
     console.log(`\n✅ Done: ${succeeded} deactivated, ${failed} failed`);
   });
 
+/**
+ * The standard dispute policy — identical to what `setup`/`quickstart` writes at
+ * onboarding (see the interactive defaults above), so `--dispute-policy default`
+ * lands an agent in the same state a fresh setup would.
+ */
+const DEFAULT_DISPUTE_POLICY = {
+  defaultAction: 'rework',
+  maxRefundPercent: 100,
+  maxReworkCycles: 2,
+  reworkBudgetPercent: 30,
+  escalateAfter: 'max_rework',
+  systemCrashRefund: 100,
+};
+
+/**
+ * Returns an error string, or null when the policy is well-formed.
+ * Deliberately strict: the dispatcher reads `defaultAction` and acts on it, so a
+ * typo'd enum would silently change dispute behaviour rather than fail loudly.
+ */
+function validateDisputePolicy(p) {
+  if (!p || typeof p !== 'object' || Array.isArray(p)) return 'must be a JSON object';
+  const ACTIONS = ['rework', 'refund', 'reject'];
+  const ESCALATE = ['max_rework', '2nd_dispute', 'never'];
+  if (!ACTIONS.includes(p.defaultAction)) return `defaultAction must be one of ${ACTIONS.join(' | ')}`;
+  if (!ESCALATE.includes(p.escalateAfter)) return `escalateAfter must be one of ${ESCALATE.join(' | ')}`;
+  for (const [f, max] of [['maxRefundPercent', 100], ['reworkBudgetPercent', 100], ['systemCrashRefund', 100]]) {
+    if (!Number.isFinite(p[f]) || p[f] < 0 || p[f] > max) return `${f} must be a number 0-${max}`;
+  }
+  if (!Number.isInteger(p.maxReworkCycles) || p.maxReworkCycles < 0) return 'maxReworkCycles must be an integer >= 0';
+  return null;
+}
+
 // Update profile — single-transaction VDXF write. buildIdentityUpdateTx copies
 // every existing key forward and replaces only those named, so other fields
 // (incl. review.record) are untouched. NOT gated: do not run while an inbox
@@ -2257,6 +2289,7 @@ program
   .option('--network-capabilities <csv>', 'Capabilities (comma-separated)')
   .option('--network-endpoints <csv>', 'Endpoints (comma-separated URLs)')
   .option('--network-protocols <csv>', 'Protocols (comma-separated)')
+  .option('--dispute-policy <json|default>', 'Dispute policy JSON, or "default" for the standard policy')
   .option('--dry-run', 'Print payloads without broadcasting')
   .action(async (agentId, options) => {
     await ensureKeystoreUnlockedIfEncrypted();
@@ -2287,6 +2320,21 @@ program
     if (options.networkCapabilities) fieldsToUpdate.networkCapabilities = JSON.stringify(options.networkCapabilities.split(',').map(s => s.trim()));
     if (options.networkEndpoints) fieldsToUpdate.networkEndpoints = JSON.stringify(options.networkEndpoints.split(',').map(s => s.trim()));
     if (options.networkProtocols) fieldsToUpdate.networkProtocols = JSON.stringify(options.networkProtocols.split(',').map(s => s.trim()));
+    if (options.disputePolicy) {
+      // A malformed policy on-chain is worse than none: the dispatcher would load
+      // it and act on garbage, where an absent one degrades to log-only. Validate
+      // fully before writing.
+      let policy;
+      if (options.disputePolicy === 'default') {
+        policy = { ...DEFAULT_DISPUTE_POLICY };
+      } else {
+        try { policy = JSON.parse(options.disputePolicy); }
+        catch (e) { console.error(`❌ --dispute-policy is not valid JSON: ${e.message}`); process.exit(1); }
+      }
+      const err = validateDisputePolicy(policy);
+      if (err) { console.error(`❌ --dispute-policy invalid: ${err}`); process.exit(1); }
+      fieldsToUpdate.disputePolicy = JSON.stringify(policy);
+    }
 
     if (Object.keys(fieldsToUpdate).length === 0) {
       console.error('❌ No fields specified. Use --display-name, --description, etc.');

@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 2.7.2
+
+**Requires `@junction41/sovagent-sdk@2.13.1`** — 2.7.1 pinned 2.13.0, which did NOT
+contain the contentmultimap key-ordering fix. On a daemon that enforces canonical
+key order, 2.7.1 cannot write any VDXF key an identity does not already have:
+`update-profile` fails, and so does the first `review.record` / `review.attestation`
+/ `job.record` write to a fresh agent. Upgrade.
+
+- `update-profile` gains `--dispute-policy <json|default>`. Validated before
+  broadcast (enum values, ranges, integer cycles) — a malformed policy on-chain is
+  worse than none, since the dispatcher loads it and acts on it, whereas an absent
+  one degrades to log-only. `default` writes the same policy `setup` does.
+- All 9 test agents now carry an on-chain dispute policy; previously every one
+  logged `no dispute policy on-chain — disputes will log only`, because adding the
+  key was impossible.
+
 ## 2.7.1
 
 **`update-profile` was completely broken; fixed.** Requires

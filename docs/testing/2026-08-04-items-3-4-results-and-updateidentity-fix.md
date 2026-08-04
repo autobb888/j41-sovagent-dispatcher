@@ -1,5 +1,39 @@
 # Items 3 & 4 verified on-chain — plus a broken `update-profile`, now fixed
 
+> ## ⛔ CORRECTION — 2026-08-04, later the same day. Read this first.
+>
+> **The root-cause analysis below is WRONG and is retracted.** This document says the
+> action-3 remove transaction is "a path the network stopped accepting" and frames it as a
+> daemon/consensus change to be raised with the backend. It is **our bug**, and it was in
+> `buildIdentityUpdateTx` the whole time.
+>
+> **Verus requires `contentmultimap` keys in ascending hash160 order.** It returns them that
+> way; our builder copied them into a JS object (insertion order) and then *appended* any new
+> key at the end, breaking the ordering. The daemon rejects that with a bare
+> `-25 - bad-txns-failed-precheck`, which names nothing. So:
+> - **REPLACING** an existing key preserved the order by accident → accepted.
+> - **ADDING** a key the identity lacked → rejected.
+>
+> The action-3 remove failed because `MULTIMAPREMOVE_KEY` is itself a *new* key on those
+> identities. One root cause, and the "network changed" story explains nothing that ordering
+> does not explain better.
+>
+> **Proof:** pre-inserting a new key in sorted position made the otherwise-identical
+> transaction succeed (agent-1 tx `68875887`). After fixing the builder to sort, all nine
+> agents gained a `disputePolicy` key they had never had, via plain `update-profile`.
+>
+> **The single-transaction rewrite is still correct** — it is simpler, cheaper, and avoids a
+> 20-minute block wait. Only the explanation of *why the old path broke* was wrong.
+>
+> **Wider consequence, still under investigation:** until this fix, **no identity could ever
+> gain a VDXF key it did not already have.** That means the first-ever `review.record`,
+> `review.attestation`, or `job.record` write to any agent would have been rejected — which
+> may be the real cause of the backend's §4 finding that reviews were "accepted but never
+> landed". Do not act on §4 until that is settled.
+>
+> Nothing below this banner has been edited; it is left intact as the record of what we
+> believed and why. Sections on items 3 and 4 themselves (the on-chain results) remain valid.
+
 **Date:** 2026-08-04
 **From:** dispatcher
 **Re:** the buyer tester's 23-item report (`2026-08-01-buyer-23-item-results.md`), items 3 and 4
