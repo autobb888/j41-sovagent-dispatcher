@@ -98,7 +98,7 @@ Defined in `src/executors/local-llm.js` → `LLM_PRESETS`. Each preset has `base
 
 ### VDXF Update (On-Chain Profile Editing)
 
-**⚠️ contentmultimap keys must be hash160-sorted** or the daemon rejects with a bare `-25 bad-txns-failed-precheck`. Fixed in the SDK 2026-08-04; before that **no identity could gain a VDXF key it did not already have** (dispute policies, new profile fields, first-ever review/attestation/job-record writes). If an on-chain write "silently never landed", suspect this.
+**⚠️ contentmultimap keys must be hash160-sorted** or the daemon rejects with a bare `-25 bad-txns-failed-precheck`. Fixed in **SDK 2.13.1** — requires that version or later. Our payloads were never canonical, but the daemon only began enforcing between 2026-07-31 and 08-04; in that window no identity could gain a new VDXF key. If an on-chain write "silently never landed", suspect this, and note `TX_REJECTED` classifies as `contention` in `inbox-deadletter.js`, which never escalates — so it retries forever, invisibly.
 
 **Single transaction.** `buildIdentityUpdateTx()` copies the identity's entire existing contentmultimap forward and replaces only the keys it is given, so a profile edit is one write and every other key — including `review.record` — survives untouched. Prior values stay retrievable via `getidentityhistory`.
 
@@ -106,7 +106,7 @@ SDK function: `removeAndRewriteVdxfFields()` (name kept for compatibility; no lo
 
 **Do NOT reintroduce the old two-transaction remove+rewrite.** It is unnecessary — a single write replaces a key's value, and per wiki.autobb.app `contentmultimapremove` operations process *before* additions **in the same transaction**, so even a genuine removal never needed two blocks.
 
-Why it appeared to "stop working" on 2026-08-04: the action-3 payload writes `MULTIMAPREMOVE_KEY`, which is a **new key** on those identities, so it tripped the hash160-ordering bug above. An earlier version of this file blamed a network/consensus change — that was wrong. Verified fixed live: agent-3 `b7d49d25`, agent-7 `9e890c6d` (profile + review in ONE tx), agent-4 `4294bfc8` via the CLI, and all 9 agents gaining a `disputePolicy` key after the ordering fix.
+Why it "stopped working" on 2026-08-04: the action-3 payload writes `MULTIMAPREMOVE_KEY`, a **new key** on those identities, so it tripped the hash160-ordering bug above once the daemon began enforcing. Both halves are real — our payload was never canonical, and enforcement changed. **A SORTED action-3 remove may well be accepted now; that has not been retested.** Verified fixed live: agent-3 `b7d49d25`, agent-7 `9e890c6d` (profile + review in ONE tx), agent-4 `4294bfc8` via the CLI, and all 9 agents gaining a `disputePolicy` key after the ordering fix.
 
 **Not gated.** `update-profile` does NOT route through the inbox pending-write confirmation gate. Running it while an inbox identity tx for the same agent is unconfirmed can double-spend the same `prevOutput`. Check `ctl inbox` / `/health` `pendingWrites` is empty first.
 

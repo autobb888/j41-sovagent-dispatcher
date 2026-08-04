@@ -2,10 +2,11 @@
 
 > ## ⛔ CORRECTION — 2026-08-04, later the same day. Read this first.
 >
-> **The root-cause analysis below is WRONG and is retracted.** This document says the
-> action-3 remove transaction is "a path the network stopped accepting" and frames it as a
-> daemon/consensus change to be raised with the backend. It is **our bug**, and it was in
-> `buildIdentityUpdateTx` the whole time.
+> **The root-cause analysis below is INCOMPLETE. There are TWO causes, not one.**
+>
+> This document frames the action-3 failure as purely "the network stopped accepting it".
+> A first correction then swung the other way and called it purely our bug. Both were
+> one-sided. Chain history settles it:
 >
 > **Verus requires `contentmultimap` keys in ascending hash160 order.** It returns them that
 > way; our builder copied them into a JS object (insertion order) and then *appended* any new
@@ -14,9 +15,20 @@
 > - **REPLACING** an existing key preserved the order by accident → accepted.
 > - **ADDING** a key the identity lacked → rejected.
 >
-> The action-3 remove failed because `MULTIMAPREMOVE_KEY` is itself a *new* key on those
-> identities. One root cause, and the "network changed" story explains nothing that ordering
-> does not explain better.
+> **1. Ours:** our payload was never canonically ordered.
+> **2. Theirs:** the daemon tolerated that for four months, then began enforcing.
+>
+> Proof it was tolerated — unsorted new-key ADDs that were ACCEPTED on-chain:
+> `agent-2` h=997979 (`review.record`, its first) and h=1005598 (`job.record`); `agent-7`
+> h=1153049-52; and **`agent-6` h=1170503 / h=1170504 — round 3's own txs `d2f30678` and
+> `51b309df`, on 2026-07-31.** First proven rejection is 08-04, so enforcement flipped inside
+> h=(1170504, ~1175944).
+>
+> The action-3 remove failed because `MULTIMAPREMOVE_KEY` is itself a *new* key — the same
+> ordering trip, once enforcement was live.
+>
+> **Ask the backend for their verusd version/upgrade log in that window.** Undocumented
+> policy tightening with exact before/after heights is also worth telling the Verus lead.
 >
 > **Proof:** pre-inserting a new key in sorted position made the otherwise-identical
 > transaction succeed (agent-1 tx `68875887`). After fixing the builder to sort, all nine
@@ -25,11 +37,16 @@
 > **The single-transaction rewrite is still correct** — it is simpler, cheaper, and avoids a
 > 20-minute block wait. Only the explanation of *why the old path broke* was wrong.
 >
-> **Wider consequence, still under investigation:** until this fix, **no identity could ever
-> gain a VDXF key it did not already have.** That means the first-ever `review.record`,
-> `review.attestation`, or `job.record` write to any agent would have been rejected — which
-> may be the real cause of the backend's §4 finding that reviews were "accepted but never
-> landed". Do not act on §4 until that is settled.
+> **Blast radius: the 08-01 → 08-04 window only**, and it self-healed — `TX_REJECTED`
+> classifies as `contention`, which never escalates, so those writes retried silently and
+> drained once the fix landed. Zero dead-letter events in the ring.
+>
+> **NOT caused by this bug, checked:** the backend's §4 "reviews accepted but never landed"
+> (all that activity predates enforcement, and no accept path acks a rejected broadcast —
+> that shape is the 07-29 double-spend already fixed in 2.12.0), and agent-11/url2's
+> single-key state (an April onboarding gap; profile was never published).
+>
+> Fixed in **SDK 2.13.1** — note 2.13.0 shipped *without* it.
 >
 > Nothing below this banner has been edited; it is left intact as the record of what we
 > believed and why. Sections on items 3 and 4 themselves (the on-chain results) remain valid.
