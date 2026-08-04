@@ -3862,10 +3862,40 @@ program
     // Initial poll (catch-up for anything missed while offline)
     await pollForJobs(state);
 
+    // ── Shutdown state, declared BEFORE the control plane ──
+    //
+    // The control server can request a shutdown the moment it binds, but the
+    // graceful handler's state used to be declared ~80 lines further down. A
+    // `ctl shutdown` arriving during startup therefore hit a TDZ on
+    // `shuttingDown`, which as an unhandled async rejection left the process
+    // running while claiming to stop. Declare first, and refuse to run the
+    // graceful path until startup has actually finished.
+    let shuttingDown = false;
+    let readyForShutdown = false;
+
+    // gracefulShutdown is async. If it rejects, the rejection is unhandled and
+    // the process keeps running while having ANNOUNCED that it stopped. Every
+    // caller must attach this.
+    function onShutdownFailed(e) {
+      console.error(`\n❌ Graceful shutdown failed: ${e && e.message}`);
+      console.error('   Exiting anyway — a half-stopped dispatcher must never keep polling.');
+      process.exit(1);
+    }
+
+    function requestShutdown(signal) {
+      if (!readyForShutdown) {
+        // Nothing is running yet worth draining, and the graceful path's state
+        // is not initialised. Exit immediately rather than hang.
+        console.error(`\n⚠️  Shutdown requested during startup (${signal}) — exiting immediately.`);
+        process.exit(1);
+      }
+      return gracefulShutdown(signal).catch(onShutdownFailed);
+    }
+
     // ── Start control plane ──
     const { startControlServer, stopControlServer } = require('./control');
     const controlServer = startControlServer(state, {
-      onShutdown: (source) => gracefulShutdown(`control-plane (${source})`),
+      onShutdown: (source) => requestShutdown(`control-plane (${source})`),
       getAgentSession,
     });
 
@@ -3942,7 +3972,6 @@ program
     console.log('\n✅ Dispatcher running. Press Ctrl+C to stop.\n');
 
     // ── Graceful shutdown handler ──
-    let shuttingDown = false;
 
     async function gracefulShutdown(signal) {
       if (shuttingDown) {
@@ -3951,6 +3980,32 @@ program
         process.exit(1);
       }
       shuttingDown = true;
+
+      // Watchdog: shutdown MUST terminate the process.
+      //
+      // Live failure 2026-08-04: `ctl shutdown` logged "✅ No active jobs.
+      // Shutting down." and then kept polling for 27 more cycles with /health
+      // still serving 200. A cleanup step below threw, and because this function
+      // is async that became an unhandled rejection — process.exit was never
+      // reached and the operator got a success message either way.
+      //
+      // That is worse than a crash: a "restart" that leaves the old process alive
+      // gives you two dispatchers polling the same agents and writing identity
+      // transactions against the same prevOutput — the double-spend class this
+      // release exists to prevent. Never let shutdown be best-effort.
+      const HARD_EXIT_MS = 30000;
+      const hardExit = setTimeout(() => {
+        console.error(`\n⚠️  Graceful shutdown did not complete within ${HARD_EXIT_MS / 1000}s — forcing exit.`);
+        process.exit(1);
+      }, HARD_EXIT_MS);
+      hardExit.unref?.(); // must not itself keep the loop alive if we exit cleanly
+
+      /** Run a cleanup step so one failure can never strand the process. */
+      const safely = (label, fn) => {
+        try { return fn(); }
+        catch (e) { console.error(`   ⚠️  shutdown: ${label} failed (continuing): ${e && e.message}`); }
+      };
+
       log.warn('Graceful shutdown starting (drain mode)', { signal, activeJobs: state.active.size });
       console.log(`\n🔄 Draining: ${state.active.size} active job(s). Waiting for containers to finish...`);
       console.log('   Press Ctrl+C again for emergency exit.\n');
@@ -3991,11 +4046,12 @@ program
       // 3. If no active jobs, exit immediately
       if (state.active.size === 0) {
         console.log('\n✅ No active jobs. Shutting down.\n');
-        persistActiveJobs(state.active);
+        safely('persistActiveJobs', () => persistActiveJobs(state.active));
         try { if (state.egressProxy) await state.egressProxy.stop(); } catch { /* best-effort */ }
-        stopControlServer(controlServer);
-        stopControlApi(controlApi);
-        stopVrscRatePoller();
+        safely('stopControlServer', () => stopControlServer(controlServer));
+        safely('stopControlApi', () => stopControlApi(controlApi));
+        safely('stopVrscRatePoller', () => stopVrscRatePoller());
+        clearTimeout(hardExit);
         process.exit(0);
       }
 
@@ -4009,11 +4065,12 @@ program
           clearInterval(drainInterval);
           console.log('\n✅ All jobs finished. Shutting down.\n');
           state.active.clear();
-          persistActiveJobs(state.active);
+          safely('persistActiveJobs', () => persistActiveJobs(state.active));
           if (state.egressProxy) state.egressProxy.stop().catch(() => {});
-          stopControlServer(controlServer);
-          stopControlApi(controlApi);
-          stopVrscRatePoller();
+          safely('stopControlServer', () => stopControlServer(controlServer));
+          safely('stopControlApi', () => stopControlApi(controlApi));
+          safely('stopVrscRatePoller', () => stopVrscRatePoller());
+          clearTimeout(hardExit);
           process.exit(0);
         }
 
@@ -4022,16 +4079,24 @@ program
           console.log(`\n⚠️  Drain timeout (${Math.round(drainTimeoutMs / 60000)}min) — remaining ${state.active.size} job(s) will be refunded on next startup.`);
           // Don't clear active-jobs.json — crash recovery will handle refunds
           if (state.egressProxy) state.egressProxy.stop().catch(() => {});
-          stopControlServer(controlServer);
-          stopControlApi(controlApi);
-          stopVrscRatePoller();
+          safely('stopControlServer', () => stopControlServer(controlServer));
+          safely('stopControlApi', () => stopControlApi(controlApi));
+          safely('stopVrscRatePoller', () => stopVrscRatePoller());
+          clearTimeout(hardExit);
           process.exit(1);
         }
       }, 10000);
     }
 
-    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    process.on('SIGINT', () => requestShutdown('SIGINT'));
+    process.on('SIGTERM', () => requestShutdown('SIGTERM'));
+
+    // Startup is complete — the graceful drain path is now safe to enter.
+    // Logged because "Ready agents: N" appears much earlier (before the on-chain
+    // activation pass), so it is NOT a reliable "safe to stop" marker. Anything
+    // scripting a restart should wait for this line.
+    readyForShutdown = true;
+    console.log('✅ Startup complete — graceful shutdown enabled.');
     // Zeroize the in-memory master key on any exit (after all WIF use is done).
     process.on('exit', () => { try { keystore.lock(); } catch (_) {} });
 

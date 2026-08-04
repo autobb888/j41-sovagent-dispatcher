@@ -29,6 +29,65 @@ test('classifies a machine code TX_REJECTED as contention even if the prose chan
   assert.strictEqual(classifyInboxFailure(e), 'contention');
 });
 
+// ---------------------------------------------------------------------------
+// TX_REJECTED is not one condition — classify on the daemon's `error.detail`.
+//
+// Regression cover for the pathology that hid the contentmultimap key-ordering
+// bug for days: TX_REJECTED returned 'contention' unconditionally, contention
+// never counts and never escalates, so a PERMANENTLY malformed transaction
+// retried every cycle forever with no dead letter and no health signal.
+// ---------------------------------------------------------------------------
+
+const rejected = (detail) => Object.assign(
+  new Error('Transaction rejected by the network'),
+  { code: 'TX_REJECTED', statusCode: 400, ...(detail === undefined ? {} : { detail }) },
+);
+
+test('TX_REJECTED with a spent-inputs detail is still contention', () => {
+  // Someone else spent the output first — self-resolving, must not burn budget.
+  assert.strictEqual(classifyInboxFailure(rejected('-26 - bad-txns-inputs-spent')), 'contention');
+  assert.strictEqual(classifyInboxFailure(rejected('-26 - txn-mempool-conflict')), 'contention');
+});
+
+test('TX_REJECTED with a malformed-tx detail is HARD, not contention', () => {
+  // -25 bad-txns-failed-precheck is the real reason an unsorted contentmultimap
+  // was refused. Retrying the identical payload can never succeed, so it must
+  // dead-letter loudly instead of spinning.
+  assert.strictEqual(classifyInboxFailure(rejected('-25 - bad-txns-failed-precheck')), 'hard');
+  assert.strictEqual(classifyInboxFailure(rejected('-26 - bad-txns-oversize')), 'hard');
+});
+
+test('TX_REJECTED with an UNRECOGNISED detail is hard, not silently retried', () => {
+  // The daemon named a reason and it is not a known contention one. Defaulting
+  // to hard matches this module's stated rule: a misclassified hard error merely
+  // dead-letters loudly, a misclassified contention retries forever in silence.
+  assert.strictEqual(classifyInboxFailure(rejected('-99 - some-future-rule')), 'hard');
+});
+
+test('TX_REJECTED with NO detail keeps the pre-2.13.0 contention behaviour', () => {
+  // Older platforms do not send `detail`. Must not regress the 2.12.0 fix that
+  // stopped chain contention from quarantining reviews.
+  assert.strictEqual(classifyInboxFailure(rejected(undefined)), 'contention');
+});
+
+test('a hard TX_REJECTED actually escalates to a dead letter (contention never would)', () => {
+  const failures = new Map();
+  let last;
+  for (let i = 0; i < 5; i++) {
+    last = recordBatchFailure(failures, 'agent-1', ['a', 'b'],
+      classifyInboxFailure(rejected('-25 - bad-txns-failed-precheck')));
+  }
+  assert.strictEqual(last.escalate, true, 'permanent rejection must eventually escalate');
+
+  const contended = new Map();
+  let c;
+  for (let i = 0; i < 20; i++) {
+    c = recordBatchFailure(contended, 'agent-2', ['a', 'b'],
+      classifyInboxFailure(rejected('-26 - bad-txns-inputs-spent')));
+  }
+  assert.strictEqual(c.escalate, false, 'contention must never escalate, however long it runs');
+});
+
 test('classifies network/5xx/timeout as transient (uncounted, but not contention)', () => {
   assert.strictEqual(classifyInboxFailure(Object.assign(new Error('boom'), { statusCode: 503 })), 'transient');
   assert.strictEqual(classifyInboxFailure(Object.assign(new Error('boom'), { statusCode: 429 })), 'transient');

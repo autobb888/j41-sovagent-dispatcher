@@ -104,6 +104,34 @@ const CONTENTION_PATTERNS = [
   'txn-mempool-conflict',
 ];
 
+// ---------------------------------------------------------------------------
+// TX_REJECTED is not one condition. The platform relays the daemon's actual
+// reason in `error.detail` (SDK >= 2.13.0, backend 7ffd3fb) — classify on THAT,
+// not on the code alone.
+//
+// Why this matters: `TX_REJECTED` used to return 'contention' unconditionally,
+// and contention never counts and never escalates. So a PERMANENT rejection
+// retried every cycle forever, silently — no dead letter, no health signal,
+// nothing in the event ring. That is exactly what hid the contentmultimap
+// key-ordering bug (`-25 bad-txns-failed-precheck`) for days while every
+// new-key write on every agent failed.
+//
+// Daemon reject reasons split cleanly:
+//   -26 bad-txns-inputs-spent / txn-mempool-conflict → someone else spent the
+//        output first. Self-resolving. CONTENTION, must not burn the budget.
+//   -25 bad-txns-failed-precheck → the transaction itself is malformed.
+//        Retrying an identical payload can never succeed. HARD.
+// ---------------------------------------------------------------------------
+
+/** Daemon detail substrings meaning "the tx is malformed" — retry cannot help. */
+const PERMANENT_REJECT_PATTERNS = [
+  'failed-precheck',
+  'bad-txns-oversize',
+  'scriptpubkey',
+  'bad-txns-undersize',
+  'version',
+];
+
 // Anchored deliberately. A bare 'network' substring would swallow the hard config
 // error "invalid/absent network '...' — refusing to accept" (inbox-job-record.js),
 // classifying a permanent misconfiguration as transient — uncounted and retried
@@ -118,17 +146,32 @@ const TRANSIENT_PATTERNS = [
  * Classify a failure as 'contention' | 'transient' | 'hard'.
  *
  * - contention → self-resolving; never counted, never escalated.
- * - transient  → environmental; not counted, but CAN escalate if it repeats
- *                forever (see recordBatchFailure) so nothing spins unbounded.
- * - hard       → item's own fault (bad shape, bad signature); counted normally.
+ * - transient  → environmental; never counted and never escalated either.
+ * - hard       → item's own fault (bad shape, bad signature); counted, and the
+ *                ONLY class that escalates to a dead letter.
  *
  * Defaults to 'hard' on anything unrecognised: a misclassified hard error merely
- * dead-letters an item loudly, while a misclassified transient could retry
- * forever — the pathology this module exists to stop.
+ * dead-letters an item loudly, while a misclassified contention/transient retries
+ * forever and silently — the pathology this module exists to stop.
  */
 function classifyInboxFailure(err) {
   const code = err && typeof err === 'object' ? err.code : undefined;
-  if (code === 'TX_REJECTED') return 'contention';
+  if (code === 'TX_REJECTED') {
+    // Prefer the daemon's own reason when the platform gives it to us.
+    const detail = err && typeof err === 'object' && typeof err.detail === 'string'
+      ? err.detail.toLowerCase()
+      : '';
+    if (detail) {
+      if (CONTENTION_PATTERNS.some(p => detail.includes(p))) return 'contention';
+      if (PERMANENT_REJECT_PATTERNS.some(p => detail.includes(p))) return 'hard';
+      // The daemon named a reason and it is not a known contention one. Blindly
+      // retrying is how a permanent failure hides; dead-letter it loudly instead.
+      return 'hard';
+    }
+    // No detail (older platform): keep the pre-2.13.0 behaviour rather than
+    // regress the fix that stopped chain contention from quarantining reviews.
+    return 'contention';
+  }
 
   const msg = String((err && err.message) || err || '').toLowerCase();
   if (CONTENTION_PATTERNS.some(p => msg.includes(p))) return 'contention';
