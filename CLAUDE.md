@@ -98,12 +98,13 @@ Defined in `src/executors/local-llm.js` → `LLM_PRESETS`. Each preset has `base
 
 ### VDXF Update (On-Chain Profile Editing)
 
-Two-transaction process required by Verus daemon:
-1. Remove old values via `contentmultimapremove` (action 3)
-2. **Wait for block confirmation** (must be in earlier block)
-3. Write new values
+**Single transaction.** `buildIdentityUpdateTx()` copies the identity's entire existing contentmultimap forward and replaces only the keys it is given, so a profile edit is one write and every other key — including `review.record` — survives untouched. Prior values stay retrievable via `getidentityhistory`.
 
-SDK function: `removeAndRewriteVdxfFields()`. CLI: `j41-dispatcher update-profile <agent-id> --field value`.
+SDK function: `removeAndRewriteVdxfFields()` (name kept for compatibility; no longer removes anything). CLI: `j41-dispatcher update-profile <agent-id> --field value`.
+
+**Do NOT reintroduce the old two-transaction remove+rewrite.** It worked when built (2026-04-09) but as of **2026-08-04 the action-3 remove tx is rejected by the network** (`400 TX_REJECTED`), which broke `update-profile` completely on every agent. Verified fixed live: agent-3 `b7d49d25`, agent-7 `9e890c6d` (profile + review in ONE tx), agent-4 `4294bfc8` via the CLI.
+
+**Not gated.** `update-profile` does NOT route through the inbox pending-write confirmation gate. Running it while an inbox identity tx for the same agent is unconfirmed can double-spend the same `prevOutput`. Check `ctl inbox` / `/health` `pendingWrites` is empty first.
 
 **Critical**: `buildIdentityUpdateTx()` filters out `MULTIMAPREMOVE_KEY` from existing CMM to prevent stale removal entries persisting on-chain.
 

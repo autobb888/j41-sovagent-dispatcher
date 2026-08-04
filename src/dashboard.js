@@ -2852,7 +2852,7 @@ async function apiEndpointSetupScreen(inquirer) {
 
   // 3. Update VDXF on-chain (type + endpoints + models)
   if (publicUrl) {
-    console.log('  → Updating on-chain VDXF (this takes 1-3 minutes)...');
+    console.log('  → Updating on-chain VDXF (single transaction)...');
     try {
       const { removeAndRewriteVdxfFields } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
       const agent = await createAgent(agentKeys);

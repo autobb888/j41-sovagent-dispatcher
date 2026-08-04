@@ -2237,10 +2237,13 @@ program
     console.log(`\n✅ Done: ${succeeded} deactivated, ${failed} failed`);
   });
 
-// Update profile — remove old VDXF values and write new ones (two-block transaction)
+// Update profile — single-transaction VDXF write. buildIdentityUpdateTx copies
+// every existing key forward and replaces only those named, so other fields
+// (incl. review.record) are untouched. NOT gated: do not run while an inbox
+// identity tx for this agent is unconfirmed (see /health pendingWrites).
 program
   .command('update-profile <agent-id>')
-  .description('Update on-chain VDXF profile fields (two-transaction remove + rewrite)')
+  .description('Update on-chain VDXF profile fields (single transaction; other fields preserved). Do not run while the dispatcher has an unconfirmed identity write for this agent.')
   .option('--display-name <name>', 'Agent display name')
   .option('--description <desc>', 'Agent description')
   .option('--type <type>', 'Agent type (autonomous|assisted|hybrid|tool)')
@@ -2297,15 +2300,21 @@ program
     console.log('');
 
     if (options.dryRun) {
-      const { buildContentMultimapRemove, VDXF_KEYS } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
-      const iAddrs = Object.keys(fieldsToUpdate).map(f => {
-        for (const [, keys] of Object.entries(VDXF_KEYS)) { if (keys[f]) return keys[f]; }
-        return f;
-      });
-      console.log('── Remove Payload (dry-run) ──');
-      console.log(JSON.stringify(buildContentMultimapRemove(keys.identity, iAddrs), null, 2));
-      console.log('\n── Write Values (dry-run) ──');
-      console.log(JSON.stringify(fieldsToUpdate, null, 2));
+      // Resolve with the SAME function the real run uses, so a dry-run predicts
+      // the real outcome including a throw on an unknown/ambiguous field.
+      const { resolveVdxfFieldRef } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+      let resolved;
+      try {
+        resolved = Object.fromEntries(Object.entries(fieldsToUpdate).map(
+          ([f, v]) => [`${f} (${resolveVdxfFieldRef(f)})`, v]));
+      } catch (e) {
+        console.error(`\n❌ ${e.message}`);
+        process.exit(1);
+      }
+      console.log('── Single-transaction write (dry-run) ──');
+      console.log('Only these VDXF keys are replaced; every other key on the identity');
+      console.log('is copied forward untouched, and prior values stay in identity history.\n');
+      console.log(JSON.stringify(resolved, null, 2));
       return;
     }
 
@@ -2333,9 +2342,7 @@ program
       });
 
       console.log(`\n✅ VDXF update complete!`);
-      console.log(`  Remove TX: ${result.removeTxid}`);
       console.log(`  Write TX:  ${result.writeTxid}`);
-      console.log(`  Blocks waited: ${result.blocksWaited}`);
     } catch (e) {
       console.error(`\n❌ Update failed: ${e.message}`);
       process.exit(1);
