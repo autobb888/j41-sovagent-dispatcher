@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+## 2.8.0
+
+**Round-4 prep: three job-container defects fixed.** Requires
+`@junction41/sovagent-sdk@2.14.0`.
+
+- **Deletion attestations are produced on SIGTERM and timeout again.** Both
+  shutdown handlers used the older `getDeletionAttestationMessage()` →
+  `signMessage("J41-DELETE-…")` flow, which the signing broker CORRECTLY refuses.
+  Only the normal-completion path had been migrated, so **every abnormally
+  terminated job silently produced no privacy proof** for `private`/`sovereign`
+  tiers — swallowed by a bare catch. All three paths now share one implementation.
+
+- **A transient startup response no longer kills the container permanently.**
+  `getJob` is retried (5 attempts, 3s base), with the completeness check *inside*
+  the retried call — the observed failure was a resolved response with missing
+  fields, which never throws. Five containers died this way, each stranding a
+  paid job; both clusters landed inside `CHAIN_SYNCING` windows.
+
+- **SovGuard canary registrations are released on teardown.** Nothing ever called
+  `deleteCanary`, and the cap is 5 per agent, so **every agent past its 5th job
+  ever ran with SovGuard-side leak detection silently off** (one slot was still
+  held from 2026-03-15). Release happens *after* the attestation — the SIGTERM
+  grace period can be 5s and `deleteCanary` can hang for 30s, and the privacy
+  proof matters more. Abandoned slots (older than 25h) are purged so registration
+  can recover on agents already at the cap; a canary belonging to a **concurrent**
+  job is never touched. Registration failure now says leak detection is DISABLED
+  for that job rather than a bland "non-fatal".
+
+- New `src/job-agent-teardown.js` with explicit dependencies, so container
+  teardown is behaviourally testable instead of regex-asserted.
+
+**Known, unchanged:** idle-pause/respawn churn (deferred — bounded, needs a
+container/host shared-state design). Note it interacts with the attestation fix:
+each respawn now submits its own deletion attestation, truthful per container
+instance, so a job may produce several.
+
 ## 2.7.3
 
 **Two failures that reported success while the real outcome was silent.**
