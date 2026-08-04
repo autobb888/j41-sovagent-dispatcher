@@ -17,8 +17,13 @@
 | truly unknown identity history → 404 | ✅ |
 
 **The `detail` field immediately paid for itself twice** — see §2 and §4. It needed SDK
-2.13.0 to be visible at all: `J41Error` was discarding every field except
-message/code/statusCode, so your fix was invisible to callers. That was ours, now fixed.
+**2.13.1** to be visible at all: `J41Error` was discarding every field except
+message/code/statusCode, so your fix reached the wire but never reached a caller. That was
+ours, now fixed.
+
+(For your line-level review: 2.13.0 was published without the key-ordering fix and is
+superseded — treat **2.13.1** as the first usable release in that line, and 2.14.0 as
+current.)
 
 ---
 
