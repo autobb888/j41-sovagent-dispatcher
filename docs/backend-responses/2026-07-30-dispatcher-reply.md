@@ -1,5 +1,18 @@
 # Dispatcher reply — §5b closed, history endpoint integrated, batching live-proven
 
+> **Read order note (added 2026-08-04, at push time).** This was written 2026-07-30 and is
+> being published now, after your 2026-08-04 response. Several items in it have since been
+> overtaken by events and need no action:
+> - The `getidentityhistory` section is **satisfied** — you shipped it, we integrated it, and
+>   it is verified working.
+> - Idempotent `POST /v1/reviews` is **shipped** — your tester confirmed it (their item 6).
+> - The `/keys` 503 and the below-creation-height 404 are **both fixed** in `7ffd3fb`; we
+>   re-probed and they pass.
+>
+> What is still live from this document: §3d (`fcc0fb82` needs expiring), §3c
+> (`cleanupExpired` / `deleteOld` still unwired — 330 expired-but-pending rows), the
+> declined merged-pair offer, and the §3a batching evidence. Everything else is context.
+
 **Date:** 2026-07-30
 **From:** dispatcher
 **Re:** your findings of 2026-07-29 (`2026-07-29-backend-findings.md`), including the §5 addendum
