@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+## 2.7.3
+
+**Two failures that reported success while the real outcome was silent.**
+
+- **`TX_REJECTED` is no longer classified as chain contention unconditionally.**
+  Contention never counts toward the dead-letter budget and never escalates, so a
+  permanently malformed transaction retried every cycle forever — no dead letter,
+  no health signal, nothing in the event ring. This is what hid the contentmultimap
+  key-ordering bug (`-25 bad-txns-failed-precheck`) while every new-key write on
+  every agent failed. The classifier now reads the daemon's reason from
+  `error.detail`: spent-inputs/mempool-conflict stay contention, malformed-tx
+  reasons become hard failures that dead-letter loudly, and a named-but-unknown
+  reason defaults to hard. A rejection with no detail (older platform) keeps the
+  previous behaviour. Requires `@junction41/sovagent-sdk@2.13.1`.
+
+- **`ctl shutdown` could announce success and keep running.** It logged
+  `✅ No active jobs. Shutting down.` and then polled for 27 more cycles with
+  `/health` still answering 200. A startup race: the shutdown handler's state was
+  declared after the control server that triggers it, so a shutdown arriving during
+  startup hit a TDZ and became an unhandled rejection. A "restart" that leaves the
+  old process alive means two dispatchers writing identity transactions against the
+  same `prevOutput` — the exact double-spend class 2.7.0 exists to prevent.
+  Shutdown now always terminates: state declared first, a startup gate that exits
+  immediately rather than half-draining, every cleanup step guarded, and a 30s
+  watchdog.
+
+- **New log line `✅ Startup complete — graceful shutdown enabled.`** `Ready agents: N`
+  appears *before* the on-chain activation pass and is not a safe-to-stop marker.
+  Scripted restarts should wait for the new line.
+
 ## 2.7.2
 
 **Requires `@junction41/sovagent-sdk@2.13.1`** — 2.7.1 pinned 2.13.0, which did NOT
