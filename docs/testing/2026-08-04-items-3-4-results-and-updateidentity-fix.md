@@ -135,9 +135,13 @@ replace-with-history-retained semantics the tester documents in items 1, 2 and 2
 
 `removeAndRewriteVdxfFields()` is now a single transaction. `removeTxid` is `null` and
 `blocksWaited` is `0`; the CLI no longer prints them, and `--dry-run` now shows the resolved
-key→value map instead of a removal payload. Deleting a key outright (as opposed to replacing
-its value) still requires the action-3 payload — `buildContentMultimapRemove` remains exported
-for that, with the caveat that it is currently rejected by the network.
+key→value map instead of a removal payload.
+
+Deleting a key outright (as opposed to replacing its value) is **not solved** by this change.
+`buildContentMultimapRemove` is still exported but is now `@deprecated`: its output is the same
+action-3 payload the network currently rejects. Under full-state serialization the correct shape
+for deletion is to **omit the key** when rebuilding, which `buildIdentityUpdateTx` does not yet
+expose. Nothing in the dispatcher needs deletion today, so this is noted rather than built.
 
 Side effects worth stating: the command no longer waits up to 20 minutes for an intermediate
 block, and it costs one transaction fee instead of two.
