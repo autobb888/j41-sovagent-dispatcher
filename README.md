@@ -701,12 +701,22 @@ On mainnet (`platform.network = 'verus'`) the dispatcher refuses to start if any
 - `J41_SKIP_STATUS_CHECK=1` — skips agent platform-status checks
 - `J41_ALLOW_LEGACY_REVOKE=1` — accepts replayable legacy revoke webhooks
 - `J41_WITNESS_VERIFY=off` — disables platform-witness verification of on-chain job records
+- `J41_DEPOSIT_ALLOW_AUTH_ONLY=1` — credits deposits on signature auth alone; re-opens the self-credit risk closed by the 2026-06 audit
+- `J41_ALLOW_UNPRICED_JOBS=1` — admits jobs with no payment record at all
+- `J41_SCAN_BUYER_CHAT=0` — disables SovGuard scanning of inbound buyer messages
+- `J41_ALLOW_INSECURE=1` — permits plaintext HTTP; credentials cross the wire in the clear
+- `J41_LOCAL_SIGNER_TEST_MODE=1` — lets the local signer sign a deliver without the authoritative jobHash
+- `J41_TRUST_PLATFORM_RESOLUTION=1` — trusts platform identity resolution instead of verifying locally
+
+`J41_PLATFORM_SIGNER` is not in this list because the SDK already refuses to run on mainnet without it.
 
 The mainnet check is sticky — `J41_NETWORK` cannot downgrade a mainnet config file to testnet to dodge the gate.
 
 ### Legacy opt-outs (do not set)
 
-These exist for platform-transition compatibility only. Each one downgrades a security default. The dispatcher never requires them.
+These exist for platform-transition compatibility only. Each one downgrades a security
+default. The dispatcher never requires them, and **both are refused outright on mainnet**
+by the gate above — they are usable on testnet and nowhere else.
 
 - `J41_DEPOSIT_ALLOW_AUTH_ONLY=1` — credits API-endpoint deposits on signature auth alone when the platform omits sender verification. This re-opens the self-credit risk closed by the 2026-06 audit (M-funds-1): anyone observing a public funding tx could claim its credit. Do not set. Left in place only for platforms that cannot return `senderVerified` yet.
 - `J41_TRUST_PLATFORM_RESOLUTION=1` (SDK flag) — trusts platform-supplied identity resolution instead of verifying locally. Legacy behavior; default is local verification. Do not set.

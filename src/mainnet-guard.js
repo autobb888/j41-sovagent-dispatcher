@@ -2,6 +2,18 @@
 
 /**
  * List insecure flags that must not be set when running on mainnet.
+ *
+ * The rule for what belongs here: a flag qualifies if setting it makes the
+ * dispatcher LESS safe than its default. Flags that only tighten behaviour, and
+ * flags already enforced elsewhere, do not belong — e.g. `J41_PLATFORM_SIGNER`
+ * is deliberately absent because the SDK already refuses to run on mainnet
+ * without it (audit H9, client/index.ts), so duplicating it here would only
+ * create a second place to forget.
+ *
+ * Both dispatcher-side and SDK-side flags are checked. The dispatcher's env is
+ * what gets forwarded into job containers, so an SDK bypass set here reaches the
+ * containers too.
+ *
  * Pure: depends only on its arguments; never throws; no I/O.
  * @param {object} env - process.env (or a test double)
  * @param {{devUnsafe?: boolean}} [opts] - parsed start options
@@ -18,6 +30,24 @@ function findMainnetSecurityViolations(env, opts) {
   if (e.J41_SKIP_STATUS_CHECK === '1') v.push('J41_SKIP_STATUS_CHECK=1 — skips agent platform-status checks');
   if (e.J41_ALLOW_LEGACY_REVOKE === '1') v.push('J41_ALLOW_LEGACY_REVOKE=1 — accepts replayable legacy revoke webhooks');
   if (e.J41_WITNESS_VERIFY === 'off') v.push('J41_WITNESS_VERIFY=off — disables platform-witness verification of on-chain job records');
+
+  // ── Added 2026-08-05 after an audit asked why the list stopped where it did ──
+  // Each of these downgrades a default that exists because something went wrong
+  // once. The gate's job is to make "temporarily loosened for a testnet debug
+  // session" impossible to carry into a mainnet deployment by accident.
+  //
+  // Money:
+  if (e.J41_DEPOSIT_ALLOW_AUTH_ONLY === '1') v.push('J41_DEPOSIT_ALLOW_AUTH_ONLY=1 — credits deposits on signature auth alone when the platform omits sender verification; re-opens the self-credit risk closed by the 2026-06 audit (M-funds-1), where anyone observing a public funding tx could claim its credit');
+  if (e.J41_ALLOW_UNPRICED_JOBS === '1') v.push('J41_ALLOW_UNPRICED_JOBS=1 — admits jobs with no payment record at all; the agent does the work and may never be paid');
+
+  // Prompt-injection / untrusted input:
+  if (e.J41_SCAN_BUYER_CHAT === '0') v.push('J41_SCAN_BUYER_CHAT=0 — disables SovGuard scanning of inbound buyer messages before they reach the executor');
+
+  // Transport and signing:
+  if (e.J41_ALLOW_INSECURE === '1') v.push('J41_ALLOW_INSECURE=1 — permits plaintext HTTP to the platform; credentials cross the wire in the clear');
+  if (e.J41_LOCAL_SIGNER_TEST_MODE === '1') v.push('J41_LOCAL_SIGNER_TEST_MODE=1 — lets the local signer sign a deliver message without the authoritative jobHash; a test-only path that must never reach production');
+  if (e.J41_TRUST_PLATFORM_RESOLUTION === '1') v.push('J41_TRUST_PLATFORM_RESOLUTION=1 — trusts platform-supplied identity resolution instead of verifying locally, so the platform decides where a payment goes');
+
   return v;
 }
 

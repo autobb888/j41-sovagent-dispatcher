@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+## 2.11.0
+
+**Mainnet security gate: six missing bypass flags.** An audit asked why the gate's
+list stopped where it did — `J41_DEPOSIT_ALLOW_AUTH_ONLY` was absent while being
+exactly the class of flag it exists to catch. Auditing the rest of the env
+surface found five more in the same position. All six now refuse a mainnet start:
+
+| Flag | What it downgrades |
+|---|---|
+| `J41_DEPOSIT_ALLOW_AUTH_ONLY=1` | Credits deposits on signature auth alone — re-opens the self-credit risk closed by the 2026-06 audit (M-funds-1) |
+| `J41_ALLOW_UNPRICED_JOBS=1` | Admits jobs with no payment record at all |
+| `J41_SCAN_BUYER_CHAT=0` | Disables SovGuard scanning of inbound buyer messages |
+| `J41_ALLOW_INSECURE=1` | Permits plaintext HTTP; credentials cross the wire in the clear |
+| `J41_LOCAL_SIGNER_TEST_MODE=1` | Lets the local signer sign a deliver without the authoritative jobHash |
+| `J41_TRUST_PLATFORM_RESOLUTION=1` | Trusts platform identity resolution instead of verifying locally |
+
+The last three are SDK flags, checked here because the dispatcher's environment
+is what gets forwarded into job containers.
+
+`J41_PLATFORM_SIGNER` is deliberately **not** added: the SDK already refuses to
+run on mainnet without the pin (audit H9), and a second copy of that rule would
+only be a second place to forget it.
+
+**Breaking on mainnet, by design.** A mainnet deployment currently setting any of
+these will refuse to start until the flag is removed. That is the point — each
+one loosens a default that exists because something went wrong once, and the
+gate's job is to make "temporarily loosened for a debug session" impossible to
+carry into production by accident. Testnet is unaffected.
+
+Every flag is pinned in both directions: the bypass value blocks, and the safe
+value does **not**. A gate that fires on a safe value teaches operators to
+disable it.
+
+786 tests.
+
 ## 2.10.0
 
 **`wallet` — the manual money surface.** 2.9.0 made agents refill their own fee
