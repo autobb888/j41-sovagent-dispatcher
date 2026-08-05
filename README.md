@@ -8,7 +8,9 @@ Multi-agent orchestration system that manages a pool of pre-registered AI agents
 - Each job runs in an **ephemeral Docker container** with security hardening (seccomp, AppArmor, gVisor/bwrap).
 - **Interactive TUI dashboard** -- run `j41-dispatcher dashboard` for an 18-item menu (agents, services, executors, security, status & health, bounties, API endpoint proxy setup) with arrow-key navigation and ESC-to-go-back.
 - **Two operating modes:**
-  - **Poll mode** (default) -- periodically polls the J41 API. Staggered 500ms between agents, dynamic interval scaling for 100+ agents.
+  - **Poll mode** (default) -- periodically polls the J41 API. Staggered 500ms between agents, with the
+    interval scaling as `max(60s, agents x 1s)`. See [Scale](#scale) for the measured ceiling — the
+    practical limit is API latency, not the interval.
   - **Webhook mode** -- event-driven via HTTP webhooks. Requires a publicly reachable URL.
 - **PID file** -- prevents duplicate dispatcher processes. New instance auto-kills previous.
 - **TOML config** -- reads `~/.j41/dispatcher/config.toml` at startup (mode 0600). Legacy `.env` files are auto-migrated on first start.
@@ -318,6 +320,49 @@ transaction is dead.
 > `null` vs `0` is deliberate throughout. `0` means "we queried and the tank is empty";
 > `—`/`null` means "this agent has no identity, so we never queried". Treating the second as
 > the first is how an operator sends a second unnecessary transfer.
+
+## Scale
+
+**Fee-tank checks scale comfortably — measured.** `checkFeeTanks` costs roughly
+one API call per agent, against a 30-minute interval:
+
+| agents | round trip | cycle time |
+|---|---|---|
+| 10 | 50 ms | 0.6 s |
+| 100 | 50 ms | 5.6 s |
+| 100 | 500 ms | 50 s |
+| 100 | 1.5 s | 151 s |
+
+Even the worst of those uses 8% of its interval. No practical ceiling.
+
+**The poll loop is the constraint — derived, not yet measured end to end.** Its
+budget is `max(60s, agents x 1s)`, and a cycle costs `(agents-1) x 500ms` of
+stagger plus one round trip per agent (auth + job fetch). The stagger alone never
+exceeds the budget at any agent count, so the limit is API latency. From that
+arithmetic, overrun begins around:
+
+| round trip | overruns from about |
+|---|---|
+| 250 ms | ~90 agents |
+| 500 ms | ~60 agents |
+| 1.5 s | **~30 agents** |
+
+Treat those as estimates. The reliable signal is the skip counter below, which
+reports the condition directly whatever your latency turns out to be.
+
+When a cycle overruns, the next one is skipped by the reentrancy guard. That is
+safe but it means the fleet is looking for work less often than it appears to be,
+so it is reported rather than hidden: a `[Poll]` / `[FeeTank]` warning naming the
+count, and `poll_cycles_skipped` / `fee_tank_cycles_skipped` in `/health`.
+
+**If you see skipped cycles**, you have more agents than the interval allows at
+your API latency. Raise the interval or run a second dispatcher against a
+different subset of agents; a second instance on the same host needs
+`J41_HEALTH_PORT`, `J41_CONTROL_API_PORT` and `J41_EGRESS_PROXY_PORT` set to free
+values.
+
+Skipped cycles do **not** mark the daemon unhealthy — they are a capacity signal
+to tune, not a fault.
 
 ## Configuration
 

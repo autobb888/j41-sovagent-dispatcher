@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+## 2.11.5
+
+Scale pass (plan 4). The finding is not a throughput number — it is that **a
+dispatcher which cannot keep up looked completely healthy.**
+
+Each loop guards against reentrancy, but two of the three returned **silently**
+when the previous cycle was still running:
+
+| loop | on overrun (before) |
+|---|---|
+| `pollForJobs` | silent — the fleet stops looking for work |
+| `checkFeeTanks` | silent — tanks stop being watched |
+| `checkPendingInbox` | warned |
+
+The second is the dangerous one: a fee-tank check that quietly stops running is
+exactly how agent-6 drained to zero and went silent on-chain on 2026-08-05.
+
+Both now log with a running count, and both expose a counter on `/health`
+(`poll_cycles_skipped`, `fee_tank_cycles_skipped`) — a log line nobody greps is
+not observability. Skipped cycles deliberately do **not** mark the daemon
+unhealthy: they are a capacity signal to tune, not a fault.
+
+**Measured:** `checkFeeTanks` costs ~one API call per agent — 0.6s at 10 agents,
+5.6s at 100 (50ms round trips), 50s at 100 (500ms), 151s at 100 (1.5s). Against a
+30-minute interval the worst of those uses 8% of its budget. No practical ceiling.
+
+**Corrected an unsubstantiated README claim.** It advertised "dynamic interval
+scaling for 100+ agents". The poll loop's budget is only `max(60s, agents x 1s)`
+while a cycle costs `(agents-1) x 500ms` of stagger plus a round trip per agent,
+so overrun begins around 30 agents at a 1.5s round trip — not 100. A new
+**Scale** section carries the numbers, and is explicit about which are measured
+(the fee-tank table) and which are derived from the interval arithmetic (the poll
+thresholds). Advertising a scale that has not been tested is itself a defect.
+
+831 tests (827 before).
+
 ## 2.11.4
 
 Fault-injection pass (plan 1). Three silent failures, all of the same shape: a

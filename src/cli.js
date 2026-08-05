@@ -5963,8 +5963,21 @@ function queueInsertByPriority(queue, job) {
 // Poll for new jobs — check ALL agents, not just available ones
 // (an agent with an active job can still have new jobs queued for it)
 let _polling = false;
+/** Cycles the poll loop skipped because the previous one overran. Surfaced on /health. */
+let _pollSkips = 0;
 async function pollForJobs(state) {
-  if (_polling) return; // guard against concurrent polls
+  if (_polling) {
+    // A skipped cycle is the symptom of the poll loop taking longer than its own
+    // interval — at N agents that is (N-1)*500ms of stagger plus N API round
+    // trips against a max(60s, N*1s) budget, so it bites from ~30 agents at a
+    // 1.5s round trip. Returning silently means the fleet quietly stops looking
+    // for work with nothing in the log and nothing on /health. Count it and say
+    // so; a dispatcher that cannot keep up must not look idle.
+    _pollSkips++;
+    state._pollSkips = _pollSkips; // mirror onto state so /health can report it
+    console.warn(`[Poll] previous cycle still running — skipping this one (${_pollSkips} skipped). The poll interval is shorter than a full sweep of ${state.agents.length} agent(s).`);
+    return;
+  }
   _polling = true;
   try {
   for (let i = 0; i < state.agents.length; i++) {
@@ -6974,7 +6987,14 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
  * this costs one getUtxos per agent, and the inbox cycle runs every 60s.
  */
 async function checkFeeTanks(state) {
-  if (state._feeSweepRunning) return;           // same reentrancy hazard as the inbox sweep
+  if (state._feeSweepRunning) {
+    // Same reentrancy hazard as the inbox sweep — but silence here is worse than
+    // for polling. A fee-tank check that quietly stops running is precisely how
+    // agent-6 drained to zero and went silent on-chain on 2026-08-05.
+    state._feeSweepSkips = (state._feeSweepSkips || 0) + 1;
+    console.warn(`[FeeTank] previous check still running — skipping this cycle (${state._feeSweepSkips} skipped). Tanks are not being watched while this persists.`);
+    return;
+  }
   if (!state._feeSweepPending) state._feeSweepPending = new Map();
   if (!state._feeTankLast) state._feeTankLast = new Map(); // defensive: older state objects
   state._feeSweepRunning = true;
