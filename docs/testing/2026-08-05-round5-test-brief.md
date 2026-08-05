@@ -1,7 +1,7 @@
 # Round 5 — test brief
 
 **Date:** 2026-08-05
-**Live:** dispatcher **2.10.0**, SDK **2.14.1**, MCP 2.2.3 — all on npm.
+**Live:** dispatcher **2.11.0**, SDK **2.14.1**, MCP 2.2.3 — all on npm.
 **Fleet:** 9/9 available, inbox clean, every fee tank funded.
 **Runway:** the daily auth outage starts ~04:00 UTC and lasts 50–90 min. **Don't start a
 run after ~03:00 UTC** — round 3's wave was swallowed by it and produced no signal.
@@ -17,11 +17,12 @@ wrongly quarantined. Root cause: job payments land at an agent's **i-address**, 
 transaction fees are payable only from its **R-address**, and nothing moved funds between
 them. The R-address only drains. Three of nine agents had already hit zero.
 
-Two releases came out of that:
+Three releases came out of that:
 
 - **2.9.0** — agents sweep their own earnings i→R automatically below ~100 writes.
 - **2.10.0** — a `wallet` command, because when an agent *can't* self-fund (it has never
   earned, so there's nothing to sweep) there was previously no CLI path at all.
+- **2.11.0** — six missing flags added to the mainnet security gate.
 
 Plus a dead-letter classifier fix: a dry wallet is environmental, so it no longer strikes
 the items that happen to be queued when it happens.
@@ -96,6 +97,21 @@ The round-4 defect, directly. Point an agent at an empty tank while a review is 
    pending stamp.
 8. **A real conversation job.** Still true from round 4: most jobs have had zero buyer
    messages, so the executor path is barely exercised. Send several messages before ending.
+9. **The mainnet security gate (2.11.0).** Six bypass flags now refuse a mainnet start.
+   You can exercise this on testnet **without touching mainnet** — the check is pure:
+
+   ```bash
+   node -e "console.log(require('./src/mainnet-guard.js')
+     .findMainnetSecurityViolations({J41_ALLOW_UNPRICED_JOBS:'1'},{}))"
+   ```
+
+   - **PASS:** each of `J41_DEPOSIT_ALLOW_AUTH_ONLY=1`, `J41_ALLOW_UNPRICED_JOBS=1`,
+     `J41_SCAN_BUYER_CHAT=0`, `J41_ALLOW_INSECURE=1`, `J41_LOCAL_SIGNER_TEST_MODE=1`,
+     `J41_TRUST_PLATFORM_RESOLUTION=1` yields exactly one violation naming the flag.
+   - **PASS equally important:** the *safe* value of each (`=0`, or `=1` for
+     `SCAN_BUYER_CHAT`) yields **zero** violations. A gate that fires on a safe value is
+     worse than the gap — it teaches operators to switch it off.
+   - **Do not** try this by pointing a real deployment at mainnet.
 
 ---
 
@@ -145,7 +161,7 @@ tail -f <log> | grep -E "FeeTank|FEE TANK|item\(s\) accepted|DEAD-LETTER|swept"
 curl -s http://127.0.0.1:9842/health | jq '.summary, .agents[] | {id, feeTank}'
 ```
 
-Tests: 771 passing (669 before this work).
+Tests: 786 passing (669 before this work).
 
 **One caution.** `wallet sweep` and `wallet send` broadcast irreversible transactions.
 Use `--dry-run` first when you're unsure — but note the tool says so itself: *a successful

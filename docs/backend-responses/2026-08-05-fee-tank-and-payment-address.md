@@ -1,16 +1,17 @@
-# For backend — the two-address problem, one question for you, and where round 4 stands
+# For backend — two things we need, plus what we fixed and where round 4 stands
 
 **Date:** 2026-08-05
-**Shipped:** dispatcher **2.10.0** (SDK 2.14.1 unchanged — nothing here needs an SDK release)
+**Shipped:** dispatcher **2.11.0** (SDK 2.14.1 unchanged — nothing here needs an SDK release)
 **Fleet:** 9/9 available, inbox clean, no dead letters
 
-Two things happened since the round-4 report. One is a defect class we own and have
-fixed. The other is a platform-side inconsistency we'd like you to reconcile, and it is
-the only thing in this document that needs work from you.
+Two things happened since the round-4 report. Most of it is a defect class we own and
+have fixed. **Two items need work from you** — §1 is a platform inconsistency to
+reconcile, §2 is a hard dependency we've just created for mainnet. Everything else is
+context.
 
 ---
 
-## 1. The one thing we need from you
+## 1. `getAgentPaymentAddress` disagrees with where money lands
 
 `getAgentPaymentAddress` advertises the **R-address**, but job payments demonstrably
 arrive at the **i-address**.
@@ -45,7 +46,39 @@ undercounts actual receipts. Worth knowing if anyone treats it as a balance.
 
 ---
 
-## 2. What we fixed on our side (no action needed)
+## 2. `senderVerified` is now a mainnet blocker for you
+
+**This one is new as of 2.11.0 and it is the item most likely to bite.**
+
+Since the 2026-06 audit our deposit watcher has **refused** to credit a deposit on
+signature auth alone when your `verifyPayment` response omits `senderVerified` — the
+self-credit risk (M-funds-1): anyone observing a public funding tx could otherwise claim
+its credit. `J41_DEPOSIT_ALLOW_AUTH_ONLY=1` was the escape hatch that restored the old
+behaviour.
+
+In **2.11.0 that escape hatch is refused on mainnet.** The dispatcher will not start with
+it set on `network = verus`.
+
+The consequence for you: **on mainnet, if `verifyPayment` does not return
+`senderVerified`, deposits will not be credited at all, and there is no longer a flag to
+work around it.** That is deliberate — it is the fail-closed behaviour — but it means
+shipping `senderVerified` is now a prerequisite for mainnet, not a nice-to-have.
+
+Testnet is unaffected; the flag still works there.
+
+**What we need:** confirmation of whether `verifyPayment` returns `senderVerified` today,
+and if not, whether it is on the path to mainnet. If it is not going to happen, tell us
+and we will reconsider the gate rather than have you discover this at cutover.
+
+Five other flags were added to the same mainnet gate in 2.11.0 (unpriced-job admission,
+disabling buyer-chat scanning, plaintext HTTP, a test-mode signer path, and trusting
+platform identity resolution). None of the others create a dependency on you — they are
+all dispatcher- or SDK-side debug hatches. This one does, which is why it is called out
+separately.
+
+---
+
+## 3. What we fixed on our side (no action needed)
 
 **The outage.** On 2026-08-05 agent-6's R-address hit zero, it stopped being able to
 write anything on-chain, and **three valid inbox items** — an attestation, a review and
@@ -73,7 +106,7 @@ matched the chain exactly.
 
 ---
 
-## 3. Still open from round 4 — unchanged, still yours
+## 4. Still open from round 4 — unchanged, still yours
 
 `DISPUTE_RESOLVER_ENABLED` is blocked on two answers we asked for on 2026-08-05 and
 haven't had yet:
@@ -97,7 +130,7 @@ Worth checking its provenance in the hire flow.
 
 ---
 
-## 4. One thing worth flagging for your own codebase
+## 5. One thing worth flagging for your own codebase
 
 While auditing ours, we found a pattern worth checking on your side: our sweep took its
 destination from the platform's `getUtxos().address` **in preference to** the local key
