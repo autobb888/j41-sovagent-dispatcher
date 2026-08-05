@@ -77,7 +77,7 @@ const { isValidJobId } = require('./job-id.js');
 const { verifyInboxJobRecord } = require('./inbox-job-record.js');
 const { writeKeysFile, readKeysFile } = require('./keys-file.js');
 const keystore = require('./keystore.js');
-const { encryptAllKeys, decryptAllKeys } = require('./keys-migrate.js');
+const { encryptAllKeys, decryptAllKeys, listPlaintextKeys } = require('./keys-migrate.js');
 const { preflightAllowsAccept } = require('./preflight-gate.js');
 const crypto = require('crypto');
 
@@ -457,7 +457,13 @@ function loadFinalizeState(agentId) {
   if (!fs.existsSync(p)) return null;
   try {
     return JSON.parse(fs.readFileSync(p, 'utf8'));
-  } catch {
+  } catch (e) {
+    // Same absent-vs-corrupt distinction as loadSeenJobs. null here reads as
+    // "this agent was never finalized", which can send an operator back through
+    // a registration flow that writes on-chain and costs money. If the file
+    // exists but cannot be parsed, that is a fault, not a fresh agent.
+    console.error(`[State] ⚠️  ${p} exists but is unreadable (${e.message}) — treating ${agentId} as NOT finalized.`);
+    console.error('[State]    If it was previously finalized, inspect that file before re-running finalize.');
     return null;
   }
 }
@@ -479,15 +485,38 @@ function loadSeenJobs() {
       return map;
     }
     return new Map(Object.entries(data));
-  } catch {
+  } catch (e) {
+    // A CORRUPT file is not the same as an ABSENT one, and conflating them is
+    // dangerous: `state.seen` is what stops an already-handled job being picked
+    // up again, so returning an empty Map here silently re-opens every job the
+    // dispatcher has ever completed. Truncation is reachable — this file used to
+    // be written non-atomically, so any crash mid-write produced exactly this.
+    //
+    // Absent → legitimately empty, stay quiet. Corrupt → say so, loudly, and
+    // preserve the evidence rather than overwriting it on the next save.
+    const quarantine = `${SEEN_JOBS_PATH}.corrupt.${Date.now()}`;
+    try { fs.renameSync(SEEN_JOBS_PATH, quarantine); } catch { /* best effort */ }
+    console.error(`[State] ⚠️  ${SEEN_JOBS_PATH} is unreadable (${e.message}).`);
+    console.error(`[State]    Moved to ${quarantine}. Jobs completed before now may be re-processed`);
+    console.error('[State]    once each — they are re-checked against the platform before any work starts.');
     return new Map();
   }
 }
 
 function saveSeenJobs(seen) {
   const obj = Object.fromEntries(seen);
-  fs.writeFileSync(SEEN_JOBS_PATH, JSON.stringify(obj, null, 2));
-  try { fs.chmodSync(SEEN_JOBS_PATH, 0o600); } catch {}
+  // Atomic: write to a temp file in the same directory, then rename. A crash
+  // mid-write previously left a truncated file that loadSeenJobs read as "no
+  // jobs seen". rename(2) is atomic, so a reader sees either the old file or
+  // the complete new one, never a partial.
+  const tmp = `${SEEN_JOBS_PATH}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, SEEN_JOBS_PATH);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* nothing to clean */ }
+    console.error(`[State] Could not persist seen-jobs: ${e.message}`);
+  }
 }
 
 /**
@@ -4186,8 +4215,40 @@ program
   .description('Encrypt all agent WIFs at rest with a passphrase (opt-in)')
   .action(async () => {
     if (fs.existsSync(MASTER_KEY_PATH)) {
-      console.error('❌ Keys are already encrypted (master-key.json exists). Use change-passphrase.');
-      process.exit(1);
+      // A master key alone does not mean the pool is encrypted. encrypt-keys
+      // writes the master key first and then re-encrypts each agent in turn, so
+      // a crash mid-loop leaves stragglers in the clear. Refusing outright left
+      // those WIFs plaintext forever while reporting the pool as protected.
+      const stragglers = listPlaintextKeys(AGENTS_DIR);
+      if (stragglers.length === 0) {
+        console.error('❌ Keys are already encrypted (master-key.json exists). Use change-passphrase.');
+        process.exit(1);
+      }
+      console.error(`⚠️  Encryption is INCOMPLETE: ${stragglers.length} key file(s) are still plaintext.`);
+      console.error(`   (${stragglers.join(', ')}) — most likely a previous run was interrupted.`);
+      console.error('   Unlocking with the EXISTING passphrase to finish the job.\n');
+      let pass;
+      try {
+        pass = await keystore.resolvePassphrase({ promptFn: () => keystore.promptHidden('Existing passphrase: ') });
+      } catch (e) {
+        console.error(`❌ ${e.message}`);
+        console.error('   Nothing changed; those key files are still plaintext.');
+        process.exit(1);
+      }
+      if (!pass) {
+        console.error('❌ No passphrase given. Nothing changed; those key files are still plaintext.');
+        process.exit(1);
+      }
+      try { keystore.unlock(pass, MASTER_KEY_PATH); }
+      catch (e) {
+        console.error(`❌ ${e.message}`);
+        console.error('   Nothing changed; those key files are still plaintext.');
+        process.exit(1);
+      }
+      const done = encryptAllKeys(AGENTS_DIR);
+      keystore.lock();
+      console.log(`\n🔐 Completed encryption for ${done} remaining key file(s).`);
+      return;
     }
     // Setting a NEW passphrase is deliberate, so it is not read from the
     // environment — but a non-TTY must fail loudly rather than silently leave
@@ -10007,7 +10068,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, refundInflightPath };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');

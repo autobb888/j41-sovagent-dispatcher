@@ -41,4 +41,24 @@ function decryptAllKeys(agentsDir) {
   return loaded.length;
 }
 
-module.exports = { listAgentDirs, encryptAllKeys, decryptAllKeys };
+/**
+ * Agent ids whose keys.json is still PLAINTEXT (v1).
+ *
+ * Needed because encrypt-keys is interruptible: it writes master-key.json first,
+ * then re-encrypts each agent in turn. A crash mid-loop leaves a master key
+ * present with some keys still in the clear — and the command then refused to
+ * run again ("already encrypted"), so those WIFs stayed plaintext permanently
+ * while the operator believed the pool was protected.
+ */
+function listPlaintextKeys(agentsDir) {
+  const out = [];
+  for (const id of listAgentDirs(agentsDir)) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(agentsDir, id, 'keys.json'), 'utf8'));
+      if (raw.v !== 2) out.push(id);
+    } catch { /* unreadable — report separately, not as plaintext */ }
+  }
+  return out;
+}
+
+module.exports = { listAgentDirs, encryptAllKeys, decryptAllKeys, listPlaintextKeys };

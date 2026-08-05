@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+## 2.11.4
+
+Fault-injection pass (plan 1). Three silent failures, all of the same shape: a
+crash leaves the system in a state it then misreads as normal.
+
+**A crash mid-write made the dispatcher forget every job it had completed.**
+`seen-jobs.json` was written with a bare `writeFileSync`, so an interrupted write
+truncated it — and `loadSeenJobs` read a corrupt file as an empty Map, exactly as
+if this were a first run. `state.seen` is what stops an already-handled job being
+picked up again, so the consequence is every previously-completed job looking new.
+Writes are now atomic (temp + `rename`), and a corrupt file is reported loudly and
+quarantined rather than silently replaced. Absent stays quiet — a first run is not
+a fault.
+
+**A corrupt `finalize-state.json` read as "never finalized".** Same
+absent-vs-corrupt conflation, but the consequence is worse than amnesia: it can
+send an operator back through a registration flow that writes on-chain and costs
+money. It now names the agent and the file instead of quietly returning null.
+
+**An interrupted `encrypt-keys` left WIFs in plaintext, permanently.** The command
+writes `master-key.json` first and then re-encrypts each agent in turn. A crash
+mid-loop leaves a master key present with some keys still in the clear — and the
+command then *refused to run again* ("already encrypted"), so those keys stayed
+plaintext forever while the operator believed the pool was protected.
+`encryptAllKeys` was already resumable (it skips `v === 2`); only the guard was
+wrong. `encrypt-keys` now detects stragglers, names them, unlocks with the
+existing passphrase and finishes the job. Verified end to end against a real
+master key: 1 encrypted / 2 plaintext → all 3 encrypted.
+
+**Also verified rather than assumed:** the egress-proxy port collision that
+blocked all scratch-daemon testing is real — `172.18.0.1:9847` (the bridge
+gateway, not localhost) returns `EADDRINUSE` while a live daemon holds it, and
+`J41_EGRESS_PROXY_PORT` resolves it.
+
+**Honest limitation:** the remaining kill points (mid-broadcast, mid-inbox-batch,
+mid-container) need a *registered* agent, which means chain writes and real
+money. A scratch daemon exits at "no agents registered" before reaching them.
+Those are documented as a manual procedure rather than automated, and the
+money-critical one of the set — a crash between a refund broadcast and its
+record — was already closed in 2.11.2 with a pre-broadcast intent marker.
+
+827 tests (817 before).
+
 ## 2.11.3
 
 **The send lock admitted many holders at once.** `acquireSendLock` guards
