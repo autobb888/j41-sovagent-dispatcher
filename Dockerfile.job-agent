@@ -59,6 +59,12 @@ COPY src/broker-executors.js ./
 # crashes the worker at startup with MODULE_NOT_FOUND.
 COPY src/message-dedup.js ./
 COPY src/message-poll.js ./
+
+# Container teardown: deletion attestation + SovGuard canary release.
+# job-agent.js requires this at module load — omitting it crashes every
+# container instantly. Extracted from job-agent.js so the teardown paths are
+# behaviourally testable (the entrypoint has no exports).
+COPY src/job-agent-teardown.js ./
 RUN chmod +x container-entry.sh
 
 # ─────────────────────────────────────────

@@ -64,6 +64,9 @@ cp "$DISPATCHER_DIR/src/broker-executors.js" .build-temp/src/
 # Message reliability — required by job-agent.js at module load (top-level require).
 cp "$DISPATCHER_DIR/src/message-dedup.js" .build-temp/src/
 cp "$DISPATCHER_DIR/src/message-poll.js" .build-temp/src/
+# Container teardown (deletion attestation + canary release) — required by
+# job-agent.js at module load. Omitting it crashes every container instantly.
+cp "$DISPATCHER_DIR/src/job-agent-teardown.js" .build-temp/src/
 cp "$DISPATCHER_DIR/src/executors/"*.js .build-temp/src/executors/
 cp "$DISPATCHER_DIR/Dockerfile.job-agent" .build-temp/Dockerfile
 

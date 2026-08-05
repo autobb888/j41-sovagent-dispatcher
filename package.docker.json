@@ -1,6 +1,6 @@
 {
   "name": "j41-job-agent",
-  "version": "2.2.4",
+  "version": "2.3.0",
   "description": "Ephemeral job agent runtime for Junction41",
   "main": "job-agent.js",
   "scripts": {
@@ -8,7 +8,7 @@
   },
   "dependencies": {
     "@iarna/toml": "^2.2.5",
-    "@junction41/sovagent-sdk": "2.10.0",
+    "@junction41/sovagent-sdk": "2.14.1",
     "bn.js": "^5.2.0",
     "undici": "^5.29.0"
   }
