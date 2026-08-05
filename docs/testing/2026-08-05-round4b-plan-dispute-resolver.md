@@ -1,9 +1,23 @@
 # Round 4b — prove the container fixes, then the dispute mechanism, then flip the flag
 
+> ## STATUS as of 2026-08-05 06:35 UTC
+>
+> | Phase | Result |
+> |---|---|
+> | 0 preconditions | ✅ **PASS** |
+> | 1 container fixes | ⏳ **NEEDS THE TESTER** — requires a buyer to hire and then let a job idle out |
+> | **2 manual dispute response** | ✅ **PASS — the gate is cleared** |
+> | 3 flip the flag | **Ready**, pending two answers from backend (below) |
+> | 4 verify | not started |
+>
+> **Phase 2 succeeded on the live dispute for job `0ac21f76`** — the first time a dispute
+> response has ever gone through. Details in the Phase 2 section.
+
 **Date:** 2026-08-05
 **Live:** dispatcher 2.8.1, SDK 2.14.1, job-agent image `f3b83fee` (rebuilt, SDK 2.14.1 inside)
 **Fleet:** 9/9 available, inbox empty, 9/9 dispute policies loaded
-**Window:** the daily auth outage starts ~04:00 UTC. **Phases 1-2 must finish before ~03:15.**
+**Window:** the daily auth outage (~04:00-05:30 UTC) has already passed for today — roughly
+21 hours of clean runway. No time pressure; the next window is 2026-08-06 ~04:00 UTC.
 
 ---
 
@@ -93,11 +107,38 @@ moves no money, so a mechanism test cannot become a money incident.
 **This is the step that has never succeeded.** If it passes, the resolver is automating a
 proven mechanism.
 
+### ✅ RESULT — PASS (2026-08-05 06:35 UTC)
+
+Ran exactly the command above. State before → after:
+
+| field | before | after |
+|---|---|---|
+| `action` | `pending` | **`rework`** |
+| `deadline_owner` | `seller` | **`buyer`** |
+| `rework_cost` | — | `0` |
+| seller response | none | full statement recorded |
+| `refund_txid` / `refund_owed` | null | **null — no money moved** |
+| `outcome` | `pending` | `pending` |
+| `resolved_at` | null | null |
+
+Everything the state machine should do, it did: the signed seller response was accepted, the
+action matches the agent's on-chain policy, **the deadline passed to the buyer**, and funds
+were untouched. `outcome` and `resolved_at` stay pending because the buyer must now accept or
+reject the rework — correct, not a stall.
+
+**The dispute-response mechanism is proven.** The resolver would be automating this, not
+something unproven.
+
+**Retracting an earlier blocker:** I previously cited "`respondToDispute`: 0 successes, 10
+failures" against flipping the flag. Those ten were the *refund sweep* failing during the
+04:00 outage — a different path with a different job (auto-refunding paid-and-got-nothing).
+That measurement never said anything about dispute responses. It does now, and it passes.
+
 ---
 
 ## Phase 3 — flip `DISPUTE_RESOLVER_ENABLED` (backend, operator call)
 
-Only after Phase 2 passes.
+**Phase 2 has passed, so this is unblocked from our side.**
 
 **Before flipping, get two answers from backend:**
 1. With `defaultAction: rework`, can the resolver **move funds**, or only offer rework? If it
