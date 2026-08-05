@@ -5038,13 +5038,38 @@ function markRefundInflight(jobId, meta) {
   fs.renameSync(tmp, p); // atomic: the marker either exists complete or not at all
 }
 
+/**
+ * Record that the send FAILED after the marker was written.
+ *
+ * The marker still stands — we genuinely cannot tell whether the broadcast left
+ * — but it now carries why, so the operator sees a diagnosable blocked refund
+ * rather than a bare "in flight" for a process that never died.
+ */
+function noteRefundInflightFailure(jobId, message) {
+  const cur = readRefundInflight(jobId);
+  if (!cur) return;
+  try {
+    markRefundInflight(jobId, { ...cur, failedAt: Date.now(), lastError: String(message || '').slice(0, 300) });
+  } catch { /* best effort — the marker itself is what matters */ }
+}
+
 function clearRefundInflight(jobId) {
   try { fs.unlinkSync(refundInflightPath(jobId)); } catch { /* already gone */ }
 }
 
 function readRefundInflight(jobId) {
-  try { return JSON.parse(fs.readFileSync(refundInflightPath(jobId), 'utf8')); }
-  catch { return null; }
+  let p;
+  try { p = refundInflightPath(jobId); } catch { return null; }
+  if (!fs.existsSync(p)) return null; // genuinely no marker
+  try {
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch (e) {
+    // The file EXISTS but cannot be read. Returning null here would mean "no
+    // marker" and the drain would pay — resolving an unreadable record of a
+    // possible payment by making another one. Fail closed, same standard as the
+    // steal gate: an unusable marker still blocks.
+    return { unreadable: true, error: String(e && e.message).slice(0, 200) };
+  }
 }
 
 const REFUND_LOCK_STALE_MS = 120000;
@@ -5058,6 +5083,14 @@ const STEAL_GATE_STALE_MS = 30000;
  * older than REFUND_LOCK_STALE_MS (or unparseable) the lock is stolen.
  */
 function acquireSendLock(jobId) {
+  // A lock is only a lock if it names one job. `undefined`/'' would stringify to
+  // a single shared file, so unrelated sends would serialise against each other
+  // while concurrent sends for the SAME job would not — the opposite of the
+  // intent. Also keeps the filename inside the locks directory.
+  if (typeof jobId !== 'string' || !jobId || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(jobId)) {
+    console.error(`  [refund] refusing to lock an invalid job id: ${JSON.stringify(jobId)}`);
+    return false;
+  }
   fs.mkdirSync(REFUND_LOCKS_DIR, { recursive: true, mode: 0o700 });
   const lockPath = path.join(REFUND_LOCKS_DIR, `${jobId}.lock`);
   try {
@@ -5265,7 +5298,28 @@ async function attemptPendingRefund(state, jobId, entry, ledgerPath = PENDING_RE
 
     return true;
   } catch (e) {
-    console.error(`  [refund] ❌ Refund TX failed for ${jobId.substring(0, 8)}: ${e.message} — will retry on next start`);
+    // A throw here is one of two very different things, and the marker must not
+    // treat them alike:
+    //
+    //  - PRE-broadcast (an empty fee tank, a validation refusal): sendCurrency
+    //    failed while building, nothing left the host. Retrying is correct and
+    //    safe, so the marker must be cleared or the refund is wedged forever.
+    //    That was the 2.11.2 regression — a routine dry tank during a drain
+    //    turned an owed refund into a permanently unpaid one, while the log
+    //    promised a retry that could never happen.
+    //  - AMBIGUOUS (a timeout, a dropped connection mid-request): the broadcast
+    //    may well have landed. Keep the marker; paying again to resolve the
+    //    doubt is the one outcome we cannot undo.
+    if (isFundingFailure(e)) {
+      clearRefundInflight(jobId);
+      console.error(`  [refund] ❌ ${jobId.substring(0, 8)}: send failed BEFORE broadcast (${e.message}).`);
+      console.error('  [refund]    Nothing was sent. Fund the agent and it will retry on the next drain.');
+    } else {
+      noteRefundInflightFailure(jobId, e.message);
+      console.error(`  [refund] ⛔ ${jobId.substring(0, 8)}: send failed and we CANNOT tell whether it broadcast: ${e.message}`);
+      console.error('  [refund]    BLOCKED to avoid paying twice. Verify the buyer address on-chain, then:');
+      console.error(`  [refund]      j41-dispatcher refunds unblock ${jobId}   (after confirming it did NOT arrive)`);
+    }
     return false;
   } finally {
     releaseSendLock(jobId);
@@ -5297,9 +5351,10 @@ async function drainPendingRefunds(state, opts = {}) {
   const inflightIds = jobIds.filter(id => !!readRefundInflight(id));
   for (const id of inflightIds) {
     const m = readRefundInflight(id) || {};
-    console.error(`  [refund] 🛑 ${id.substring(0, 8)}: a refund of ${m.amount} ${m.currency || ''} to ${m.buyerAddress} was IN FLIGHT when the process died.`);
-    console.error('           NOT re-sending — it may already be on-chain. Verify that address, then either');
-    console.error(`           mark it done or delete ${refundInflightPath(id)} to allow a retry.`);
+    const why = m.lastError ? `failed mid-send (${m.lastError})` : 'was interrupted mid-send';
+    console.error(`  [refund] ⛔ ${id.substring(0, 8)}: a refund of ${m.amount} ${m.currency || ''} to ${m.buyerAddress} ${why}.`);
+    console.error('           NOT re-sending — it may already be on-chain. Verify that address, then:');
+    console.error(`             j41-dispatcher refunds unblock ${id}   (only after confirming it did NOT arrive)`);
   }
 
   const approvedIds = jobIds.filter(id => pending[id].status === 'approved' && !readRefundInflight(id));
@@ -5448,9 +5503,24 @@ async function sweepDisputesForRefund(state) {
 function refundsList(state, opts = {}, ledgerPath) {
   const ledger = loadPendingRefunds(ledgerPath);
   const entries = Object.entries(ledger).map(([jobId, entry]) => ({ jobId, ...entry }));
+  // A refund blocked by an in-flight marker is `approved`, so the default filter
+  // hid it entirely and `refunds list` printed "No pending refunds." while money
+  // was stuck. A blocked refund needs a human more urgently than a pending one.
+  const blocked = entries.filter(e => !!readRefundInflight(e.jobId));
+  const blockedIds = new Set(blocked.map(e => e.jobId));
   const visible = opts.all
     ? entries
-    : entries.filter(e => e.status === 'pending_approval' || e.status === 'needs_review');
+    : entries.filter(e => blockedIds.has(e.jobId) || e.status === 'pending_approval' || e.status === 'needs_review');
+
+  if (blocked.length) {
+    console.log(`\n⛔ ${blocked.length} refund(s) BLOCKED — a send failed and we cannot tell whether it broadcast.`);
+    for (const e of blocked) {
+      const m = readRefundInflight(e.jobId) || {};
+      console.log(`   ${e.jobId.substring(0, 8)}  ${m.amount} ${m.currency || ''} → ${m.buyerAddress}`);
+      if (m.lastError) console.log(`      last error: ${m.lastError}`);
+      console.log(`      verify on-chain, then: j41-dispatcher refunds unblock ${e.jobId}`);
+    }
+  }
 
   if (visible.length === 0) {
     console.log('No pending refunds.');
@@ -5465,6 +5535,7 @@ function refundsList(state, opts = {}, ledgerPath) {
   console.log('─'.repeat(100));
 
   for (const e of visible) {
+    const isBlocked = blockedIds.has(e.jobId);
     const age = e.enqueuedAt
       ? Math.round((Date.now() - new Date(e.enqueuedAt).getTime()) / 60000) + 'm'
       : '?';
@@ -5476,7 +5547,7 @@ function refundsList(state, opts = {}, ledgerPath) {
       `${(e.jobId || '').substring(0, 10).padEnd(W.job)} ` +
       `${(e.agentInfoId || '').substring(0, 8).padEnd(W.agent)} ` +
       `${amount.padEnd(W.amt)} ` +
-      `${(e.status || '').padEnd(W.status)} ` +
+      `${(isBlocked ? 'BLOCKED-inflight' : (e.status || '')).padEnd(W.status)} ` +
       `${age.padEnd(W.age)} ${buyer}`
     );
     if (e.reason) console.log(`  ${e.reason.substring(0, 80)}`);
@@ -9985,7 +10056,7 @@ function buildRefundsState() {
 // "refunds". One `refunds [action] [job-id]` command dispatches on the action.
 program
   .command('refunds [action] [job-id]')
-  .description('Refund approval queue — actions: list (default) | approve <job-id>|--all | reject <job-id>')
+  .description('Refund approval queue — actions: list (default) | approve <job-id>|--all | reject <job-id> | unblock <job-id>')
   .option('--all', 'list: include refunded/rejected; approve: approve every pending_approval entry')
   .option('--yes', 'approve: skip the interactive confirmation prompt')
   .option('--reason <text>', 'reject: rejection reason', 'owner-rejected')
@@ -9997,7 +10068,7 @@ program
 
     // Owner types short jobId prefixes from `refunds list` — resolve to the full
     // ledger key. Refuse on ambiguity so a prefix can never approve the wrong job.
-    if (jobId && (action === 'approve' || action === 'reject')) {
+    if (jobId && (action === 'approve' || action === 'reject' || action === 'unblock')) {
       const led = loadPendingRefunds();
       if (!led[jobId]) {
         const matches = Object.keys(led).filter(k => k.startsWith(jobId));
@@ -10012,6 +10083,33 @@ program
 
     if (action === 'list') {
       refundsList(state, { all: options.all });
+      return;
+    }
+
+    if (action === 'unblock') {
+      // Clears a marker left by a send whose outcome we could not determine.
+      // Deliberately manual and deliberately loud: the marker exists because
+      // paying twice is unrecoverable, so only a human who has checked the chain
+      // may decide the money never arrived.
+      if (!jobId) { console.error('❌ Provide a <job-id> to unblock'); process.exit(1); }
+      const m = readRefundInflight(jobId);
+      if (!m) { console.error(`❌ ${jobId.substring(0, 8)} is not blocked — no in-flight marker.`); process.exit(1); }
+      console.log(`\n[refunds] Blocked refund for ${jobId}`);
+      console.log(`  Amount:  ${m.amount} ${m.currency || ''}`);
+      console.log(`  To:      ${m.buyerAddress}`);
+      console.log(`  Marked:  ${new Date(m.at).toISOString()}${m.failedAt ? ` (failed ${new Date(m.failedAt).toISOString()})` : ''}`);
+      if (m.lastError) console.log(`  Error:   ${m.lastError}`);
+      console.log('\n  Unblocking allows this refund to be SENT AGAIN on the next drain.');
+      console.log(`  Confirm on-chain that ${m.buyerAddress} did NOT receive ${m.amount} before continuing.\n`);
+      if (!options.yes) {
+        const ok = await new Promise((resolve) => {
+          const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout });
+          rl.question('  Verified it did NOT arrive? Type "yes" to unblock: ', (a) => { rl.close(); resolve(a.trim() === 'yes'); });
+        });
+        if (!ok) { console.log('  Left blocked.'); return; }
+      }
+      clearRefundInflight(jobId);
+      console.log(`✅ ${jobId.substring(0, 8)} unblocked — it will be retried on the next drain.`);
       return;
     }
 
@@ -10088,7 +10186,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');

@@ -19,12 +19,29 @@ function listAgentDirs(agentsDir) {
 
 function encryptAllKeys(agentsDir) {
   let count = 0;
+  const skipped = [];
   for (const id of listAgentDirs(agentsDir)) {
     const p = path.join(agentsDir, id, 'keys.json');
-    const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
+    let raw;
+    try {
+      raw = JSON.parse(fs.readFileSync(p, 'utf8'));
+    } catch (e) {
+      // One unreadable file must not abort the loop. It used to throw uncaught,
+      // stopping mid-pool — which in the new-passphrase path manufactured the
+      // exact half-encrypted state this function exists to repair, and in the
+      // resume path left every agent sorted after it plaintext forever, with a
+      // stack trace as the only explanation.
+      skipped.push(`${id} (${e.message})`);
+      continue;
+    }
     if (raw.v === 2) continue; // already encrypted
     writeKeysFile(p, raw); // keystore unlocked → writes v2
     count++;
+  }
+  if (skipped.length) {
+    console.error(`⚠️  ${skipped.length} key file(s) could NOT be read and remain unencrypted:`);
+    for (const s of skipped) console.error(`     ${s}`);
+    console.error('   Fix or remove them, then re-run encrypt-keys to finish the pool.');
   }
   return count;
 }

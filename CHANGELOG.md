@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+## 2.11.7
+
+Post-audit fixes. The audit of the day's work found that **one of yesterday's
+fixes had introduced a regression, and the test guarding it proved nothing.**
+
+**A failed refund send was wedged forever (regression from 2.11.2).** The
+pre-broadcast intent marker was written before `sendCurrency` and cleared only on
+success — so *any* throw left it behind. A dry fee tank during a drain, which
+this fleet has had, permanently converted an owed refund into an unpaid one. Both
+log messages were false: the catch promised "will retry on next start" (it could
+not) and the drain reported the process had died (it had not). `refunds approve`
+could not unwedge it either, because the entry was already `approved`.
+
+Failures are now split by what they can prove:
+- **pre-broadcast** (an empty fee tank — `sendCurrency` fails while building, so
+  nothing left the host): marker cleared, retried on the next drain
+- **ambiguous** (timeout, dropped connection — the broadcast may have landed):
+  marker kept and annotated with the error, because paying again to resolve the
+  doubt is the one outcome that cannot be undone
+
+**A blocked refund is now visible.** It was `approved`, so the default
+`refunds list` filtered it out and printed *"No pending refunds"* while money was
+stuck — the only signal was a log line every five minutes. Blocked entries now
+head the list with amount, payee, last error and the exact command to resolve
+them, and are marked `BLOCKED-inflight` in the status column. New
+`refunds unblock <job-id>`: deliberately manual, deliberately loud, and it makes
+you type `yes` after confirming on-chain that the money never arrived.
+
+**The test for all of this asserted nothing.** It wired `state._testAttemptRefund`
+— a hook that does not exist in `src/cli.js` — so the array it inspected could
+never be populated and the test passed with the marker check deleted. Replaced
+with assertions against the drain's real output and the surviving ledger, and
+**mutation-tested**: removing the marker filter, or re-hiding blocked entries from
+the list, each fails a test.
+
+**Two of three rows in my scale table were wrong.** Because the poll budget grows
+1s per agent while cost grows `500ms + round-trip`, a round trip at or under
+500ms **never** overruns at any agent count. My "250ms → ~90 agents" and
+"500ms → ~60 agents" came from solving against a fixed 60s budget and ignoring
+the scaling. The table now states the real model: it is a latency question, not
+an agent-count question.
+
+**Also:** one corrupt `keys.json` no longer aborts `encryptAllKeys` mid-pool
+(which in the new-passphrase path manufactured the exact half-encrypted state
+2.11.4 fixed); an unreadable in-flight marker fails **closed** rather than reading
+as "no marker" and paying; and `acquireSendLock` refuses a missing or malformed
+job id instead of creating one shared `undefined.lock` that serialises unrelated
+sends while failing to serialise identical ones.
+
+850 tests (844 before).
+
 ## 2.11.6
 
 TUI pass (plan 2). The valuable half was automated; the rest is an honest manual
@@ -64,6 +115,11 @@ so overrun begins around 30 agents at a 1.5s round trip — not 100. A new
 **Scale** section carries the numbers, and is explicit about which are measured
 (the fee-tank table) and which are derived from the interval arithmetic (the poll
 thresholds). Advertising a scale that has not been tested is itself a defect.
+
+*(Corrected in 2.11.7: two rows of that derived table were wrong. Because the
+budget grows 1s per agent while cost grows 500ms + round-trip, a round trip at or
+under 500ms never overruns at any N — the 250ms and 500ms thresholds I published
+came from solving against a fixed 60s budget and ignoring the scaling.)*
 
 831 tests (827 before).
 

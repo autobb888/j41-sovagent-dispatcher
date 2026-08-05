@@ -335,20 +335,28 @@ one API call per agent, against a 30-minute interval:
 
 Even the worst of those uses 8% of its interval. No practical ceiling.
 
-**The poll loop is the constraint — derived, not yet measured end to end.** Its
-budget is `max(60s, agents x 1s)`, and a cycle costs `(agents-1) x 500ms` of
-stagger plus one round trip per agent (auth + job fetch). The stagger alone never
-exceeds the budget at any agent count, so the limit is API latency. From that
-arithmetic, overrun begins around:
+**The poll loop is the constraint, and it depends on latency rather than agent
+count — derived from the interval arithmetic, not measured end to end.** Its
+budget is `max(60s, agents x 1s)`; a cycle costs `(agents-1) x 500ms` of stagger
+plus one round trip per agent.
 
-| round trip | overruns from about |
+Above 60 agents the budget grows by 1s per agent while the cost grows by
+`500ms + round-trip`, so **a round trip at or under 500ms never overruns, at any
+agent count**:
+
+| round trip | behaviour |
 |---|---|
-| 250 ms | ~90 agents |
-| 500 ms | ~60 agents |
-| 1.5 s | **~30 agents** |
+| 250 ms | never overruns (~75% of budget, flat) |
+| 500 ms | never overruns, but ~99% of budget — no headroom for jitter |
+| 750 ms | overruns from ~49 agents |
+| 1 s | overruns from ~41 agents |
+| 1.5 s | overruns from ~31 agents |
 
-Treat those as estimates. The reliable signal is the skip counter below, which
-reports the condition directly whatever your latency turns out to be.
+So the question is not "how many agents can I run" but "how slow is my API". If
+your round trip is under half a second, agent count is not your limit.
+
+Treat these as arithmetic, not measurements. The reliable signal is the skip
+counter below, which reports the condition directly whatever your latency is.
 
 When a cycle overruns, the next one is skipped by the reentrancy guard. That is
 safe but it means the fleet is looking for work less often than it appears to be,

@@ -26,7 +26,7 @@ const j41Dir = path.join(TEST_HOME, '.j41');
 const dispDir = path.join(j41Dir, 'dispatcher');
 fs.mkdirSync(dispDir, { recursive: true });
 
-const { refundsList, refundsApprove, refundsReject, refundsApproveAll } = require('../src/cli.js');
+const { refundsList, refundsApprove, refundsReject, refundsApproveAll, acquireSendLock, releaseSendLock } = require('../src/cli.js');
 
 // Valid Verus i-addresses (from refund-target.test.js)
 const BUYER_I = 'iC6bdkugcFbRuPXFsFcK3utr7custBw52i';
@@ -376,8 +376,8 @@ test('refundsApprove: yes=true with no confirmFn skips confirmation and sends', 
 
 const {
   markRefundInflight, clearRefundInflight, readRefundInflight, refundInflightPath,
-  drainPendingRefunds,
-} = require('../src/cli.js');
+  noteRefundInflightFailure, drainPendingRefunds,
+} = require('../src/cli.js');  // refundsList is imported at the top of this file
 
 test('an in-flight marker survives to be found by the next drain', () => {
   clearRefundInflight('job-crash');
@@ -415,21 +415,124 @@ test('a job id cannot escape the locks directory via its filename', () => {
 });
 
 test('drainPendingRefunds REFUSES a job whose refund was in flight', async () => {
+  // NOTE: the previous version of this test wired `state._testAttemptRefund`,
+  // a hook that does not exist in src/cli.js. `attempted` could never be
+  // populated, so the assertion passed even with the marker check deleted — the
+  // only automated proof of the money fix proved nothing. It now observes the
+  // real gate: what drainPendingRefunds SAYS about each job, and which entries
+  // survive in the ledger.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-inflight-'));
   const ledger = path.join(dir, 'pending-refunds.json');
   fs.writeFileSync(ledger, JSON.stringify({
-    'job-inflight': { status: 'approved', amount: 2, buyerVerusId: 'b@' },
-    'job-clean': { status: 'approved', amount: 2, buyerVerusId: 'b@' },
+    'job-inflight': { status: 'approved', refundAmount: 2, buyerAddress: 'RBuyer', orphan: {} },
+    'job-clean': { status: 'approved', refundAmount: 2, buyerAddress: 'RBuyer', orphan: {} },
   }));
+  markRefundInflight('job-inflight', { buyerAddress: 'RBuyer', amount: 2, currency: 'VRSCTEST' });
 
-  markRefundInflight('job-inflight', { buyerAddress: 'RBuyer', amount: 2 });
+  const said = [];
+  const err = console.error; const log = console.log;
+  console.error = (...a) => said.push(a.join(' '));
+  console.log = (...a) => said.push(a.join(' '));
+  try {
+    await drainPendingRefunds({ agents: [], agentSessions: new Map() }, { ledgerPath: ledger });
+  } finally { console.error = err; console.log = log; }
 
-  const attempted = [];
-  const state = { agents: [], agentSessions: new Map(), _testAttemptRefund: (id) => { attempted.push(id); return false; } };
-  await drainPendingRefunds(state, { ledgerPath: ledger });
+  const text = said.join('\n');
+  assert.match(text, /job-inf.*NOT re-sending|NOT re-sending/s,
+    'the blocked job must be reported as not re-sent');
+  assert.match(text, /1 approved refund\(s\) to send/,
+    'exactly one job (job-clean) may be attempted — the blocked one is filtered out');
+  assert.ok(readRefundInflight('job-inflight'), 'the marker must survive the drain');
 
-  assert.ok(!attempted.includes('job-inflight'),
-    'a job that may already have been paid must NOT be re-sent');
   clearRefundInflight('job-inflight');
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// B1 (audit): the marker must not wedge a send that never left.
+//
+// 2.11.2 wrote the marker before broadcasting and cleared it only on success, so
+// ANY throw — an empty fee tank, a dropped connection — left it behind forever.
+// The catch logged "will retry on next start" (it could not) and the drain then
+// reported the process had died (it had not). A routine dry tank during a drain
+// silently converted an owed refund into a permanently unpaid one.
+// ---------------------------------------------------------------------------
+
+test('a PRE-BROADCAST failure clears the marker so the refund can retry', () => {
+  // A dry fee tank fails inside sendCurrency while building — nothing left the
+  // host, so retrying is both safe and required.
+  const { classifyInboxFailure } = require('../src/inbox-deadletter.js');
+  const dry = new Error('No spendable R-address UTXOs for fee. Fund RWoe... with at least 0.0001 VRSC.');
+  assert.equal(classifyInboxFailure(dry), 'transient',
+    'the same predicate the refund catch uses to decide "never broadcast"');
+
+  markRefundInflight('job-dry', { buyerAddress: 'RBuyer', amount: 1 });
+  assert.ok(readRefundInflight('job-dry'));
+  clearRefundInflight('job-dry'); // what the pre-broadcast branch does
+  assert.equal(readRefundInflight('job-dry'), null, 'a retryable failure must leave no marker');
+});
+
+test('an AMBIGUOUS failure keeps the marker and records why', () => {
+  markRefundInflight('job-timeout', { buyerAddress: 'RBuyer', amount: 3, currency: 'VRSCTEST' });
+  noteRefundInflightFailure('job-timeout', 'socket hang up');
+  const m = readRefundInflight('job-timeout');
+  assert.ok(m, 'an ambiguous failure must NOT clear the marker — the tx may have landed');
+  assert.equal(m.lastError, 'socket hang up', 'and it must record why, for the operator');
+  assert.ok(Number.isFinite(m.failedAt));
+  assert.equal(m.buyerAddress, 'RBuyer', 'the original payee must survive the update');
+  assert.equal(m.amount, 3);
+  clearRefundInflight('job-timeout');
+});
+
+test('noteRefundInflightFailure on a job with no marker does nothing', () => {
+  noteRefundInflightFailure('job-none', 'whatever');
+  assert.equal(readRefundInflight('job-none'), null, 'it must not manufacture a marker');
+});
+
+test('refunds list SURFACES a blocked refund instead of saying "No pending refunds"', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-blocked-'));
+  const ledger = path.join(dir, 'pending-refunds.json');
+  // status 'approved' is filtered out of the default list view — which is exactly
+  // how a blocked refund became invisible while money was stuck.
+  fs.writeFileSync(ledger, JSON.stringify({
+    'job-blocked': { status: 'approved', refundAmount: 4, buyerAddress: 'RBuyer', orphan: {} },
+  }));
+  markRefundInflight('job-blocked', { buyerAddress: 'RBuyer', amount: 4, currency: 'VRSCTEST' });
+
+  const said = [];
+  const log = console.log;
+  console.log = (...a) => said.push(a.join(' '));
+  try { refundsList({}, {}, ledger); } finally { console.log = log; }
+
+  const text = said.join('\n');
+  assert.ok(!/No pending refunds/.test(text), 'a blocked refund must never read as "nothing to do"');
+  assert.match(text, /BLOCKED/);
+  assert.match(text, /refunds unblock job-blocked/, 'and it must say how to resolve it');
+
+  clearRefundInflight('job-blocked');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('an invalid job id cannot take a lock — a shared "undefined" lock is not a lock', () => {
+  // A stray refund-locks/undefined.lock was found on a live host. Whatever
+  // produced it, the shape is wrong: every caller with a missing id would share
+  // one file, serialising unrelated sends against each other while NOT
+  // serialising concurrent sends for the same job.
+  for (const bad of [undefined, null, '', 0, {}, '../escape', '.hidden', 'has space']) {
+    assert.equal(acquireSendLock(bad), false, `took a lock for ${JSON.stringify(bad)}`);
+  }
+  assert.equal(acquireSendLock('job-valid'), true, 'a real job id still works');
+  releaseSendLock('job-valid');
+});
+
+test('an UNREADABLE marker still blocks — it must not read as "no marker"', () => {
+  // Returning null for a corrupt marker would mean the drain pays: resolving an
+  // unreadable record of a possible payment by making another one.
+  markRefundInflight('job-unreadable', { buyerAddress: 'RBuyer', amount: 1 });
+  fs.writeFileSync(refundInflightPath('job-unreadable'), '{ truncated');
+  const m = readRefundInflight('job-unreadable');
+  assert.ok(m, 'an unreadable marker must not vanish');
+  assert.equal(m.unreadable, true);
+  clearRefundInflight('job-unreadable');
+  assert.equal(readRefundInflight('job-unreadable'), null, 'and an absent one is still absent');
 });

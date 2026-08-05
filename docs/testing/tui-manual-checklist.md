@@ -10,7 +10,7 @@ worse than an honest manual step.
 
 What was worth automating has been automated. The Earnings screen's arithmetic
 was extracted into `buildEarningsRow()` in `src/wallet.js` and is pinned by
-`test/earnings-row.test.js` (11 cases). That is the part where a **wrong number**
+`test/earnings-row.test.js` (13 cases). That is the part where a **wrong number**
 could hide. A pty test would not have caught a wrong number anyway: in a sandbox
 the agents are unregistered and unfunded, so every money path renders its
 degraded branch and the assertion degenerates to `—` equals `—`.
