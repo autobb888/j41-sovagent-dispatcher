@@ -484,11 +484,91 @@ function resolveOwnRAddress({ derived, platformAddress, agentId }) {
   return { ok: true, rAddress: derived };
 }
 
+/**
+ * One row of the TUI's Earnings screen, as data.
+ *
+ * Extracted from dashboard.js because that file runs `main()` on require and
+ * drives Inquirer against a TTY, so nothing inside it can be imported under
+ * `node --test`. The arithmetic that decides what an operator reads about their
+ * money was therefore untestable by construction — the screen could show a wrong
+ * number forever and no suite would notice. Same precedent as buildWalletRow:
+ * the numbers live here and are pinned; the view keeps only layout.
+ *
+ * `utxoRes` is a raw getUtxos() response, or null when that call failed. The
+ * distinction is load-bearing: a failed lookup yields `null` balances and
+ * "(unavailable)", NEVER zero. "We could not look" must not read as "the tank is
+ * empty" — that is how an operator funds an agent twice, or ignores one that is
+ * genuinely dry.
+ */
+function buildEarningsRow({
+  agentId,
+  identity = null,
+  balance = null,
+  jobs = null,
+  utxoRes = null,
+  floorWrites = DEFAULT_FLOOR_WRITES,
+} = {}) {
+  const list = Array.isArray(jobs) ? jobs : [];
+  const completed = list.filter((j) => j && (j.status === 'completed' || j.status === 'delivered'));
+  // parseFloat on a missing/garbage amount yields NaN, which would poison the
+  // total for every other job on the row.
+  const earned = completed.reduce((sum, j) => {
+    const n = parseFloat(j && j.amount);
+    return sum + (Number.isFinite(n) ? n : 0);
+  }, 0);
+
+  const b = balance || {};
+  const balances = Array.isArray(b.balances) && b.balances.length
+    ? b.balances
+    : (b.balance != null ? [{ amount: b.balance, currency: b.currency || 'VRSCTEST' }] : []);
+  const balanceText = balances.map((x) => `${x.amount} ${x.currency}`).join(', ') || '0';
+
+  const usable = utxoRes && typeof utxoRes === 'object' && utxoRes.address;
+  if (!usable) {
+    return {
+      agentId, identity, balanceText, completedCount: completed.length, earned,
+      earnedText: formatEarned(earned),
+      feeSats: null, writes: null, sweepableSats: null,
+      tankText: 'Tank: (unavailable)',
+    };
+  }
+
+  const split = summarizeUtxos(utxoRes.utxos, utxoRes.address);
+  const writes = writesAffordable(split.feeSats);
+  let tankText = `Tank: ${formatVrsc(split.feeSats)} (${writes} writes)`;
+  if (writes === 0) tankText += ` EMPTY — fund ${utxoRes.address}`;
+  else if (writes < floorWrites) tankText += ' LOW';
+  if (split.sweepableSats > 0) tankText += ` [${formatVrsc(split.sweepableSats)} sweepable]`;
+
+  return {
+    agentId, identity, balanceText, completedCount: completed.length, earned,
+    earnedText: formatEarned(earned),
+    feeSats: split.feeSats, writes, sweepableSats: split.sweepableSats, tankText,
+  };
+}
+
+/**
+ * Render an earnings total without hiding it.
+ *
+ * `toFixed(2)` was rounding a real 0.005 VRSCTEST job to "0.01" — and anything
+ * under half a cent to "0.00", i.e. earnings displayed as nothing. Agent job
+ * prices on this platform are routinely in the thousandths, so two decimals is
+ * the wrong resolution for the column. 8dp matches the tank figure beside it,
+ * with trailing zeros trimmed so the common cases stay readable.
+ */
+function formatEarned(n) {
+  if (!Number.isFinite(n)) return '0';
+  if (n === 0) return '0';
+  const s = n.toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
+  return s;
+}
+
 module.exports = {
   parseVrscAmount,
   formatVrsc,
   resolveOwnRAddress,
   buildWalletRow,
+  buildEarningsRow,
   summarizeFleet,
   planManualSweep,
   planFleetSend,

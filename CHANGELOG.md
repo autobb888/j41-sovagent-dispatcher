@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+## 2.11.6
+
+TUI pass (plan 2). The valuable half was automated; the rest is an honest manual
+checklist rather than a flaky test.
+
+**The Earnings screen's arithmetic is now testable.** It lived inline in
+`dashboard.js`, which runs `main()` on require and drives Inquirer against a TTY
+— so it could not be imported under `node --test` and was untestable *by
+construction*. A wrong number on the money screen would have shown forever with
+no suite noticing. Extracted to `buildEarningsRow()` in `src/wallet.js`, beside
+`buildWalletRow`; `dashboard.js` keeps only layout. 13 tests.
+
+**Earnings were being rounded away.** `toFixed(2)` displayed a real 0.005
+VRSCTEST job as `0.01`, and anything under half a cent as `0.00` — earnings shown
+as nothing. Agent prices here are routinely in the thousandths, so two decimals
+was the wrong resolution. Now 8dp with trailing zeros trimmed, matching the tank
+figure beside it. Found by rendering a real fixture, not by review.
+
+**The pty smoke test was attempted and abandoned.** The harness hung for two
+minutes without rendering. A flaky test everyone learns to ignore is worse than a
+documented manual step, and it would not have caught a wrong number anyway: in a
+sandbox the agents are unregistered and unfunded, so every money path renders its
+degraded branch and the assertion degenerates to `—` equals `—`.
+`docs/testing/tui-manual-checklist.md` covers what automation cannot — including
+that **[7] Start and [8] Stop act the moment Enter is pressed, with no
+confirmation**, which the original plan had wrong.
+
+844 tests (831 before).
+
 ## 2.11.5
 
 Scale pass (plan 4). The finding is not a throughput number — it is that **a
