@@ -358,3 +358,78 @@ test('refundsApprove: yes=true with no confirmFn skips confirmation and sends', 
   assert.equal(sendCalls.length, 1, 'sendCurrency must be called when yes=true');
   assert.equal(result.status, 'refunded', 'status must be refunded');
 });
+
+// ---------------------------------------------------------------------------
+// Crash-safe refund intent (fault-injection review, 2026-08-05).
+//
+// attemptPendingRefund broadcasts to an EXTERNAL buyer address and THEN records
+// it. A SIGKILL between those two leaves the job status:'approved', so the next
+// startup drain sends a SECOND confirmed refund. It is the only place in the
+// codebase where money can leave the fleet twice, and the old code dismissed the
+// window as needing "a hardware fault between two syscalls" — a plain crash,
+// OOM kill or deploy reaches it.
+//
+// Intent is now written BEFORE the broadcast. A marker at drain time means "we
+// may already have paid and cannot tell", which must never be resolved by paying
+// again.
+// ---------------------------------------------------------------------------
+
+const {
+  markRefundInflight, clearRefundInflight, readRefundInflight, refundInflightPath,
+  drainPendingRefunds,
+} = require('../src/cli.js');
+
+test('an in-flight marker survives to be found by the next drain', () => {
+  clearRefundInflight('job-crash');
+  assert.equal(readRefundInflight('job-crash'), null, 'no marker to start');
+
+  markRefundInflight('job-crash', { buyerAddress: 'RBuyer', amount: 1.5, currency: 'VRSCTEST' });
+  const m = readRefundInflight('job-crash');
+  assert.ok(m, 'marker must persist — this is the crash evidence');
+  assert.equal(m.buyerAddress, 'RBuyer');
+  assert.equal(m.amount, 1.5);
+  assert.ok(Number.isFinite(m.at) && m.at > 0, 'must record when');
+  assert.equal(m.pid, process.pid, 'must record who');
+
+  clearRefundInflight('job-crash');
+  assert.equal(readRefundInflight('job-crash'), null, 'cleared once the send is recorded');
+});
+
+test('the marker file is 0600 — it names a payee and an amount', () => {
+  markRefundInflight('job-perm', { buyerAddress: 'RBuyer', amount: 1 });
+  const mode = fs.statSync(refundInflightPath('job-perm')).mode & 0o777;
+  assert.equal(mode, 0o600, `expected 0600, got ${mode.toString(8)}`);
+  clearRefundInflight('job-perm');
+});
+
+test('a job id cannot escape the locks directory via its filename', () => {
+  // The sanitiser maps separators to underscores, so the RESULT may legitimately
+  // contain '..' as ordinary characters. The property that matters is that the
+  // resolved path never leaves the locks directory.
+  const locksDir = path.dirname(refundInflightPath('probe'));
+  for (const evil of ['../../../etc/passwd', '..\\..\\win', 'a/b/c', '/abs/path', '.']) {
+    const resolved = path.resolve(refundInflightPath(evil));
+    assert.ok(resolved.startsWith(path.resolve(locksDir) + path.sep),
+      `escaped the locks dir with ${JSON.stringify(evil)}: ${resolved}`);
+  }
+});
+
+test('drainPendingRefunds REFUSES a job whose refund was in flight', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-inflight-'));
+  const ledger = path.join(dir, 'pending-refunds.json');
+  fs.writeFileSync(ledger, JSON.stringify({
+    'job-inflight': { status: 'approved', amount: 2, buyerVerusId: 'b@' },
+    'job-clean': { status: 'approved', amount: 2, buyerVerusId: 'b@' },
+  }));
+
+  markRefundInflight('job-inflight', { buyerAddress: 'RBuyer', amount: 2 });
+
+  const attempted = [];
+  const state = { agents: [], agentSessions: new Map(), _testAttemptRefund: (id) => { attempted.push(id); return false; } };
+  await drainPendingRefunds(state, { ledgerPath: ledger });
+
+  assert.ok(!attempted.includes('job-inflight'),
+    'a job that may already have been paid must NOT be re-sent');
+  clearRefundInflight('job-inflight');
+  fs.rmSync(dir, { recursive: true, force: true });
+});

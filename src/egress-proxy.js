@@ -8,7 +8,15 @@ const dns = require('node:dns').promises;
 // two egress paths can't drift out of sync.
 const { isPrivateIp } = require('./proxy-handler.js');
 
-const EGRESS_PROXY_PORT = 9847;
+// Overridable so a scratch/test daemon can run alongside a live one. The live
+// daemon holds this port on the shared j41-isolated bridge, and `start` treats a
+// bind failure as FATAL — without an override, a second dispatcher on the same
+// host cannot start at all, which blocks fault-injection and scale testing.
+const EGRESS_PROXY_PORT = (() => {
+  const raw = process.env.J41_EGRESS_PROXY_PORT;
+  const n = raw === undefined ? NaN : parseInt(raw, 10);
+  return Number.isInteger(n) && n > 0 && n < 65536 ? n : 9847;
+})();
 
 /** Parse the job's configured URLs into a Set of "host:port" the proxy will allow. */
 function deriveAllowedHosts(env) {

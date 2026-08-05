@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+## 2.11.2
+
+Two money bugs, found by adversarially reviewing a set of test plans **before**
+executing them. Both would have been certified green by the tests as originally
+designed.
+
+**A live lock holder could be robbed mid-prompt, and both processes would
+broadcast.** `acquireSendLock` stole any lock older than `REFUND_LOCK_STALE_MS`
+(2 minutes). `wallet send` deliberately holds its lock *across the interactive
+confirmation prompt*, so an operator who takes longer than two minutes to answer
+`Send? (y/N)` looked identical to a crashed process: a second invocation stole
+the lock and both broadcast. That is precisely the double-send the lock exists
+to prevent, reachable by nothing more exotic than reading the prompt carefully.
+
+The lock now tests whether the holder is **dead**, not whether it is **slow** —
+`process.kill(pid, 0)`, with `EPERM` treated as alive. Age remains only as the
+fallback for a lock whose owner cannot be identified. A live holder is never
+robbed however long it takes; a dead one is reclaimed immediately instead of
+after two minutes.
+
+**A crash mid-refund sent the money twice, to an external address.**
+`attemptPendingRefund` broadcast to a buyer address and *then* recorded it. A
+kill between those two lines left the job `status: 'approved'`, so the next
+startup drain sent a **second confirmed refund**. This is the only place in the
+codebase where money can leave the fleet twice. The prior comment called the
+window "a hardware fault between two syscalls" — it is not: any crash, OOM kill,
+deploy or Ctrl-C reaches it.
+
+Intent is now written **before** the broadcast and cleared after the send is
+recorded. A marker found at drain time means "we may already have paid and
+cannot tell", which is never resolved by paying again — the drain refuses,
+names the address and amount, and asks for on-chain verification. Fail closed:
+a false positive costs one manual check, a false negative is unrecoverable.
+
+**`J41_EGRESS_PROXY_PORT`.** `EGRESS_PROXY_PORT` was a hard constant, and a bind
+failure is fatal at startup, so a second dispatcher could not run on one host at
+all — blocking fault-injection, scale and upgrade testing. Now overridable,
+defaulting to 9847 and ignoring malformed values.
+
+802 tests (798 before).
+
 ## 2.11.1
 
 **Clean-room install testing + property tests for the money layer.** Everything

@@ -4945,6 +4945,47 @@ function markJobRefunded(jobId) {
   }
 }
 
+/**
+ * Crash-safe intent marker for an irreversible refund send.
+ *
+ * `sendCurrency` broadcasts to an EXTERNAL buyer address; `markJobRefunded`
+ * records that it happened. A SIGKILL between the two leaves the job
+ * `status: 'approved'` in pending-refunds.json, so the next startup drain sends
+ * a SECOND confirmed refund to that address. This is the only place in the
+ * codebase where money can leave the fleet twice.
+ *
+ * The old comment called the window "a hardware fault between two syscalls".
+ * It is not: any crash, OOM kill, deploy or Ctrl-C in that gap does it, and
+ * fault-injection reaches it trivially.
+ *
+ * So we write intent BEFORE broadcasting and clear it after the send is
+ * recorded. A marker found at drain time means "we may already have paid this,
+ * and we cannot tell" — which must never be resolved by paying again. The drain
+ * refuses and asks for on-chain verification instead. Fail closed: the cost of
+ * a false positive is one manual check; the cost of a false negative is a
+ * duplicate payment we cannot claw back.
+ */
+function refundInflightPath(jobId) {
+  return path.join(REFUND_LOCKS_DIR, `${String(jobId).replace(/[^A-Za-z0-9._-]/g, '_')}.inflight.json`);
+}
+
+function markRefundInflight(jobId, meta) {
+  fs.mkdirSync(REFUND_LOCKS_DIR, { recursive: true, mode: 0o700 });
+  const p = refundInflightPath(jobId);
+  const tmp = `${p}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({ jobId, at: Date.now(), pid: process.pid, ...meta }, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, p); // atomic: the marker either exists complete or not at all
+}
+
+function clearRefundInflight(jobId) {
+  try { fs.unlinkSync(refundInflightPath(jobId)); } catch { /* already gone */ }
+}
+
+function readRefundInflight(jobId) {
+  try { return JSON.parse(fs.readFileSync(refundInflightPath(jobId), 'utf8')); }
+  catch { return null; }
+}
+
 const REFUND_LOCK_STALE_MS = 120000;
 
 /**
@@ -4963,16 +5004,40 @@ function acquireSendLock(jobId) {
     return true;
   } catch (e) {
     if (e.code !== 'EEXIST') throw e;
-    // Lock exists — check staleness
+    // Lock exists. Decide whether the holder is DEAD, not merely SLOW.
+    //
+    // Age alone is the wrong test. `wallet send` holds this lock across an
+    // interactive confirmation prompt, so a human who takes longer than
+    // REFUND_LOCK_STALE_MS to answer looks identical to a crashed process — the
+    // lock gets stolen from a live holder and BOTH broadcast. That is the exact
+    // double-send this lock exists to prevent, reachable by nothing more exotic
+    // than reading the prompt carefully.
+    //
+    // So: liveness first (`kill(pid, 0)` — signal 0 tests existence without
+    // delivering anything), age only as the fallback for a lock whose owner we
+    // cannot identify. A live holder is never robbed, however long it takes.
     let stale = false;
+    let holderPid = null;
     try {
       const content = fs.readFileSync(lockPath, 'utf8');
-      const ts = parseInt(content.split(':')[1], 10);
-      stale = !ts || (Date.now() - ts) > REFUND_LOCK_STALE_MS;
+      const [pidStr, tsStr] = content.split(':');
+      holderPid = parseInt(pidStr, 10);
+      const ts = parseInt(tsStr, 10);
+      if (Number.isInteger(holderPid) && holderPid > 0) {
+        let alive = true;
+        try { process.kill(holderPid, 0); } catch (err) { alive = (err.code === 'EPERM'); }
+        // EPERM means it exists but belongs to another user — still alive.
+        stale = !alive;
+      } else {
+        stale = !ts || (Date.now() - ts) > REFUND_LOCK_STALE_MS;
+      }
     } catch {
       stale = true; // unreadable → treat as stale
     }
     if (stale) {
+      // Steal atomically: unlink then exclusive-create. Two contenders can both
+      // see the same stale lock, so whoever loses the create must NOT proceed —
+      // and must not unlink the winner's fresh lock on the way out.
       try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
       try {
         const fd = fs.openSync(lockPath, 'wx');
@@ -5035,6 +5100,10 @@ async function attemptPendingRefund(state, jobId, entry, ledgerPath = PENDING_RE
     }
 
     console.log(`  [refund] 💸 Sending ${refundPercent}% refund: ${refundAmount} ${orphan.currency || 'VRSC'} to ${buyerAddress} (job ${jobId.substring(0, 8)})`);
+    // Intent BEFORE the irreversible broadcast — see refundInflightPath. If we
+    // die after this line, the next drain finds the marker and refuses to pay
+    // again rather than guessing.
+    markRefundInflight(jobId, { buyerAddress, amount: refundAmount, currency: orphan.currency || 'VRSC' });
     const txid = await agent.sendCurrency(buyerAddress, refundAmount);
     // Mark refunded immediately after the irreversible on-chain send, BEFORE any
     // platform-record step that could fail and leave the platform reporting the
@@ -5045,6 +5114,7 @@ async function attemptPendingRefund(state, jobId, entry, ledgerPath = PENDING_RE
     // original software bug (requires a hardware fault between two syscalls);
     // unavoidable without a transactional FS / distributed lock.
     markJobRefunded(jobId);
+    clearRefundInflight(jobId); // the send is now recorded; intent resolved
     console.log(`  [refund] ✅ Refund TX: ${txid}`);
 
     // Persist txid to the ledger BEFORE the platform call that follows, so a crash
@@ -5100,7 +5170,18 @@ async function drainPendingRefunds(state, opts = {}) {
   const jobIds = Object.keys(pending);
   if (jobIds.length === 0) return;
 
-  const approvedIds = jobIds.filter(id => pending[id].status === 'approved');
+  // Refuse anything that was mid-broadcast when we died. The marker means the
+  // money MAY already have left; paying again to resolve the ambiguity is the
+  // one outcome we cannot undo. Surface it for on-chain verification instead.
+  const inflightIds = jobIds.filter(id => !!readRefundInflight(id));
+  for (const id of inflightIds) {
+    const m = readRefundInflight(id) || {};
+    console.error(`  [refund] 🛑 ${id.substring(0, 8)}: a refund of ${m.amount} ${m.currency || ''} to ${m.buyerAddress} was IN FLIGHT when the process died.`);
+    console.error('           NOT re-sending — it may already be on-chain. Verify that address, then either');
+    console.error(`           mark it done or delete ${refundInflightPath(id)} to allow a retry.`);
+  }
+
+  const approvedIds = jobIds.filter(id => pending[id].status === 'approved' && !readRefundInflight(id));
   const skippedCount = jobIds.length - approvedIds.length;
 
   console.log(`\n⚠️  Startup drain: ${approvedIds.length} approved refund(s) to send` +
@@ -9866,7 +9947,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, refundInflightPath };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
