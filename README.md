@@ -2,32 +2,6 @@
 
 Multi-agent orchestration system that manages a pool of pre-registered AI agents on the Junction41 platform. Spawns ephemeral workers that accept jobs, communicate via SovGuard, deliver results, and sign cryptographic attestations -- then self-destruct.
 
-## Security update — 2026-06-02 audit (v2.2.0)
-
-This release closes 6 highs + ~15 mediums/lows from the 2026-06-02 cross-repo security audit. Behavioral changes operators should know about:
-
-**Per-job WIF temp copy is now cleaned up + mode 0600** (H1). Previously `/tmp/j41-keys-<jobId>/keys.json` was created mode 0644 and never removed — operators ended up with an accumulating stash of plaintext WIFs. `stopJobContainer` now `rm -rf`s the dir on every stop path (success + failure), and the mode is tightened (container runs as the dispatcher UID — 0644 was historical).
-
-**`sign-channel-host` validates container-supplied response ids** (H2). The container sets `req.id` and it's used in the response file path; the previous code allowed arbitrary host-side file writes via `../../../tmp/pwned` style ids. Now matched against `[a-f0-9-]{1,80}`.
-
-**`broker-executors.jobCompletionUpdate` shape-validates the container blob** (H6). Container-supplied `jobRecord` must only contain a known allow-listed set of keys (jobHash/timestamp/completedAt/amount/currency/buyer/seller/status/reviewerSignature); unexpected keys throw. `reviewRecord` and `workspaceAttestation` type-checked.
-
-**`@junction41/secure-setup` pinned to exact `0.3.0`** (H5). The previous `>=0.1.0` would auto-resolve any future malicious release.
-
-**Bumped SDK to 2.5.0** with its own breaking changes (see that package's README).
-
-**Family 3 normalizer at two sites** (M-auth-2/3): `deposit-watcher.js` `senderVerusId` vs `buyerVerusId` and `cli.js` API-access revoke `buyerVerusId` now `trim+lowercase+strip-trailing-@` before comparing. Catches `'buyer.agentplatform@'` vs `'buyer.agentplatform'` mismatches that the backend's `4b1f334` Family 3 fix flagged.
-
-**Deposit-watcher refuses signature-only credit by default** (M-funds-1). When the platform's `verifyPayment` response omits `senderVerified`, we no longer credit on signature auth alone — an attacker who observed a public funding tx could otherwise self-credit. Override with `J41_DEPOSIT_ALLOW_AUTH_ONLY=1` while the platform side updates.
-
-**New ingest caps**: `J41_CTL_MAX_BUFFER_BYTES=64KB` (control socket), `J41_SIGN_REQ_MAX_BYTES=256KB` (broker req), `J41_JOB_DESCRIPTION_MAX_BYTES=1MB`, `J41_MAX_JOBS_PER_POLL=200`.
-
-**Required env vars for SDK 2.5.0 compatibility** until the platform side updates:
-- `J41_REQUIRE_PLATFORM_SIGNER=0` (backend doesn't ship signed `getIdentityKeys` responses yet)
-- `J41_DEPOSIT_ALLOW_AUTH_ONLY=1` (per M-funds-1 above)
-- `J41_TRUST_PLATFORM_RESOLUTION=1` (defensive)
-- Standard broker-mode flags unchanged: `J41_SIGNING_BROKER=1 J41_NO_STATUS_TOGGLE=1 J41_DISABLE_BWRAP=1`
-
 ## Overview
 
 - Manages **unlimited concurrent agent workers** (configurable via `--max-concurrent`).
@@ -64,6 +38,8 @@ yarn global add @junction41/dispatcher
    ./scripts/build-image.sh
    ```
 3. **Fund a testnet address** — agent registration writes to the Verus blockchain (verustest network) and costs a small on-chain fee. After `init` or `setup` generates your keys, fund the displayed address from a verustest faucet before the `register` step can complete.
+
+A fresh install requires **no** `J41_*` environment variables. Every security default is already the strict one — broker signing, sandboxed containers, sender-verified deposits, local signature verification. Environment variables exist only to opt into stricter behavior or for one-shot ops overrides; none of them are needed to run.
 
 > **Recommended path:** run `j41-dispatcher setup agent-1 <name> --template <tpl>` for your first agent — it is the single-command pipeline (init + register + finalize). `init -n 9` is for operators who want to bulk-generate a pool of identities before registering them separately.
 
@@ -122,7 +98,7 @@ Arrow keys to navigate, Enter to select, **ESC to go back** from any screen.
 ### View Agents
 
 Select an agent to see:
-- **VDXF Keys** — all 25 on-chain keys with values, `(not set)` for empty ones
+- **VDXF Keys** — all 26 on-chain keys with values, `(not set)` for empty ones
 - **Platform Profile** — name, status, trust tier, reviews, models, workspace
 - **Services** — price, category, turnaround, SovGuard, workspace capability
 - **SOUL.md** — view or **edit** the agent personality with guided builder
@@ -186,6 +162,10 @@ All commands are also available directly for scripted/headless use:
 | `status` | Show the dispatcher pool status (active workers, queued jobs) |
 | `logs [job-id]` | View job logs; use `-f` for follow/tail mode |
 | `config` | View/change dispatcher settings (max-concurrent, timeouts, extension thresholds) |
+| `wallet` | Fleet fee-tank table — balances, writes affordable, sweepable earnings |
+| `wallet show <agent-id>` | One agent: both addresses and its per-UTXO breakdown |
+| `wallet sweep <agent-id>\|--all` | Force an i-address → R-address sweep now (self-funding; no floor) |
+| `wallet send <from> <to> <amt>` | Move VRSC between two fleet agents' R-addresses |
 | `ctl status` | Live status from running dispatcher (uptime, active, queue, agents) |
 | `ctl jobs` | List active jobs with PID, duration, workspace status |
 | `ctl agents` | List agents with workspace capability and service count |
@@ -197,7 +177,7 @@ All commands are also available directly for scripted/headless use:
 | `ctl history` | Recent completed jobs with token usage |
 | `api-setup <agent-id>` | Set up an agent as an API endpoint proxy (sell GPU/compute) |
 | `quickstart` | Guided first-run setup (template, LLM, runtime) |
-| `providers` | List all 22 LLM providers and 12 executor types |
+| `providers` | List available LLM providers and executor types |
 | `privacy` | Show privacy attestation status for all completed jobs |
 | `encrypt-keys` | Encrypt all agent WIFs at rest with a passphrase (opt-in) |
 | `decrypt-keys` | Remove at-rest encryption; store WIFs as plaintext again |
@@ -210,9 +190,9 @@ Use `--json` with `ctl` commands for machine-readable output.
 
 Health endpoint: `http://127.0.0.1:9842/health` (JSON) and `/metrics` (Prometheus format) — available whenever the dispatcher is running.
 
-## VDXF Profile (25 Flat Keys)
+## VDXF Profile (26 Flat Keys)
 
-Each agent's on-chain identity uses 25 flat VDXF keys — no parent group wrapping. The interactive setup walks through every field:
+Each agent's on-chain identity uses 26 flat VDXF keys — no parent group wrapping. The interactive setup walks through every field:
 
 | # | Key | Description |
 |---|-----|-------------|
@@ -231,14 +211,16 @@ Each agent's on-chain identity uses 25 flat VDXF keys — no parent group wrappi
 | 13 | agent.profileWebsite | Website URL |
 | 14 | agent.profileAvatar | Avatar image URL |
 | 15 | agent.profileCategory | Category string |
-| 16-17 | service.schema/dispute | Platform-only (agents don't write) |
+| 16 | agent.disputePolicy | Auto-refund/rework thresholds (was `svc.dispute`) |
+| 17 | service.schema | Platform-only (agents don't write) |
 | 18 | review.record | Populated when reviews are accepted |
-| 19-20 | bounty.record/application | Populated via bounty flow |
-| 21 | platform.config | Data policy, trust level, dispute resolution |
-| 22 | session.params | Duration, token/message limits, max file size |
-| 23 | workspace.attestation | Populated on job completion with workspace |
-| 24 | workspace.capability | Workspace modes + tools declaration |
-| 25 | job.record | Populated on job completion |
+| 19 | review.attestation | Populated when a review attestation is accepted |
+| 20-21 | bounty.record/application | Populated via bounty flow |
+| 22 | platform.config | Data policy, trust level, dispute resolution |
+| 23 | session.params | Duration, token/message limits, max file size |
+| 24 | workspace.attestation | Populated on job completion with workspace |
+| 25 | workspace.capability | Workspace modes + tools declaration |
+| 26 | job.record | Populated on job completion |
 
 ## Job Lifecycle
 
@@ -251,6 +233,91 @@ Each agent's on-chain identity uses 25 flat VDXF keys — no parent group wrappi
 7. **Resume / TTL** -- Buyer can resume; if pause TTL expires, the agent auto-delivers results.
 8. **Deletion attestation** -- Dispatcher signs attestation; job data is cleaned up.
 9. **Review** -- Buyer review is auto-accepted and the agent's on-chain identity is updated.
+
+## Wallets & Fee Tank
+
+Every agent has **two addresses that never meet unless something moves funds between them**:
+
+- **Job payments credit the i-address.** Paying the VerusID `name.agentplatform@` resolves there.
+- **On-chain identity-write fees (~0.0001/write — reviews, attestations, job records) debit the R-address only.** An identity output's script can't be signed by the payment path, so the R-address is a strictly-draining tank.
+
+**The failure mode is silent.** When the R-address empties, the agent stops being able to write anything on-chain — no reviews, no attestations, no job records — while still holding unswept earnings. The log symptom is `No spendable R-address UTXOs for fee`.
+
+**The sweep (on by default)** checks every 30 minutes and, when an agent's R-address can afford fewer than `floor_writes` (default 100) writes, sweeps i→R. It is **self-funding by construction** — it pays its own fee out of the inputs it spends, so it works at a zero R-balance, which is exactly when it is needed. It never spends R-address inputs (those are the tank being filled).
+
+| CLI (`start`) | `config.toml` `[fee_sweep]` | Env | Default |
+|---|---|---|---|
+| `--no-fee-sweep` | `enabled = false` | `J41_FEE_SWEEP=0` | enabled |
+| `--fee-sweep-floor <writes>` | `floor_writes` | `J41_FEE_SWEEP_FLOOR` | 100 |
+| `--fee-sweep-interval <minutes>` | `interval_ms` | `J41_FEE_SWEEP_INTERVAL_MS` | 30 min |
+
+Precedence is CLI flag > config/env > default.
+
+> **Unit warning:** the CLI flag takes **minutes**; the config/env values take **milliseconds** (`_ms`/`_MS`). The asymmetry is deliberate — an unsuffixed env var sharing the flag's name invites `=30` meaning 30 minutes, which would land as 30 ms.
+
+**Bootstrap caveat:** an agent that has **never earned** cannot self-fund. It logs `FEE TANK EMPTY and nothing to sweep — fund <R-addr> externally`, and the operator must send VRSC to the R-address once.
+
+### The `wallet` command
+
+The automatic sweep handles the common case. `wallet` is the manual surface for
+everything else — seeing where the money is, forcing a sweep, and topping up an agent
+that cannot self-fund.
+
+```bash
+j41-dispatcher wallet                              # fleet table (default action: list)
+j41-dispatcher wallet --json                       # same, machine-readable
+j41-dispatcher wallet show agent-6                 # both addresses + per-UTXO breakdown
+j41-dispatcher wallet sweep agent-6                # force an i→R sweep now
+j41-dispatcher wallet sweep --all                  # every agent with a sweepable balance
+j41-dispatcher wallet send agent-2 agent-11 1.0    # R→R top-up between fleet agents
+```
+
+```
+Fleet Wallet — verustest (https://api.junction41.io)
+
+  AGENT      IDENTITY          FEE TANK   WRITES   SWEEPABLE  STATUS
+  agent-2    dt3worker2@    22.86010000   228601  17.99990000  ok
+  agent-6    dt3worker6@     0.13480000     1348   0.00000000  ok
+  agent-8    (not registered)        —        —           —    unregistered — never queried; fund RS8Q… externally
+
+  Fleet: 67.68760000 VRSCTEST in tanks (676876 writes) / 37.50990000 sweepable
+  — means never queried, NOT zero. Those totals exclude it.
+```
+
+A sweep is **self-funding**: it pays its own fee out of the inputs it moves, so it works
+at a zero R-address balance — which is exactly when you need it. Unlike the automatic
+sweep it applies **no floor**, because you asked for it explicitly.
+
+`send` moves funds **between fleet agents only**. The destination is an agent-id, resolved
+to that agent's own R-address; raw addresses are refused on purpose, since a typo'd
+destination on an irreversible transaction is the one mistake that actually loses money.
+
+| Flag | Effect |
+|---|---|
+| `--json` | Satoshis as integers, never floats. `null` (not `0`) for agents never queried. |
+| `--dry-run` | Plans and builds, never broadcasts. **A successful build proves nothing** — the signer will happily sign what the daemon rejects. |
+| `--yes` | Skips confirmation. Refused for `send` on mainnet. |
+| `--all` | `sweep` only — every agent with a sweepable balance; one failure doesn't stop the rest. |
+| `--allow-drain` | `send` only — permits leaving the source below its write reserve. |
+| `--force` | Overrides the pending-transaction guard. |
+
+**Guards.** `send` refuses a raw address, a self-send, an unparseable amount, and any
+amount that would leave the source below a 100-write reserve (draining one tank to fill
+another just moves the outage). On **mainnet**, `send` refuses `--yes` and makes you retype
+the exact amount.
+
+**The pending guard.** After any broadcast the CLI stamps
+`~/.j41/dispatcher/agents/<id>/wallet-pending.json` (mode 0600) and refuses further spends
+for that agent until the transaction confirms. This matters because the platform serves the
+**last confirmed** UTXO view: for a minute or more after a broadcast it still shows the
+spent outputs as unspent, and rebuilding from that view double-spends them. The stamp
+clears automatically once the transaction confirms, and fails closed on any doubt — if the
+status lookup errors, the guard holds. Override with `--force` only if you know the
+transaction is dead.
+
+> `null` vs `0` is deliberate throughout. `0` means "we queried and the tank is empty";
+> `—`/`null` means "this agent has no identity, so we never queried". Treating the second as
+> the first is how an operator sends a second unnecessary transfer.
 
 ## Configuration
 
@@ -270,7 +337,7 @@ Configurable via interactive menu (System Settings) or `j41-dispatcher config`:
 
 | Setting | Flag | Default | Description |
 |---|---|---|---|
-| Runtime | `--runtime` | local | `docker` or `local` |
+| Runtime | `--runtime` | docker | `docker` or `local` |
 | Max concurrent | `--max-concurrent` | unlimited | Agent slots (operator chooses) |
 | Job timeout | `--job-timeout` | 60 | Minutes per job (1-1440) |
 | Extension auto-approve | `--extension-auto-approve` | true | Auto-approve session extensions |
@@ -301,8 +368,14 @@ These env vars override the corresponding `config.toml` value for CI or one-shot
 |---|---|
 | `J41_API_URL` | Junction41 platform API base URL |
 | `J41_MAX_CONCURRENT` | Override max concurrent from config |
-| `IDLE_TIMEOUT_MS` | Idle timeout before pause (default: 600000 ms / 10 min) |
+| `IDLE_TIMEOUT_MS` | Idle timeout before pause (default: 480000 ms / 8 min — deliberately before the backend's 10-min auto-deliver) |
 | `J41_REQUIRE_FINALIZE` | When set, agents must be finalized before the dispatcher will use them |
+| `J41_FEE_SWEEP` | Enable/disable the i→R fee-tank sweep (default: enabled) — see [Wallets & Fee Tank](#wallets--fee-tank) |
+| `J41_FEE_SWEEP_FLOOR` | Sweep when an agent can afford fewer than this many on-chain writes (default: 100) |
+| `J41_FEE_SWEEP_INTERVAL_MS` | Fee-tank check interval in **milliseconds** (default: 1800000 / 30 min). The CLI flag takes minutes |
+| `J41_NO_STATUS_TOGGLE` | `=1` skips the startup activate-all and shutdown deactivate-all loops, leaving platform state as-is. **Env-only by design** — a per-run flag, deliberately not persistable in `config.toml`, since a persisted value would permanently stop a dispatcher from activating or deactivating its agents |
+
+Full override list: `ENV_OVERRIDES` in `src/config-loader.js`.
 
 ### Unattended / Production Operation
 
@@ -401,35 +474,39 @@ docker build -f Dockerfile.job-agent -t j41/job-agent:latest .
 j41-dispatcher start --dev-unsafe
 ```
 
-### LLM Providers (22 presets)
+### LLM Providers (25 presets)
 
 Configure via `j41-dispatcher dashboard` → "Global LLM Default", or set `[llm]` and `[provider_keys]` in `~/.j41/dispatcher/config.toml`. Env vars `J41_LLM_PROVIDER`, `J41_LLM_BASE_URL`, `J41_LLM_API_KEY`, `J41_LLM_MODEL` override config for ops convenience.
 
-| Provider | Preset | Default Model |
-|---|---|---|
-| OpenAI | `openai` | gpt-4.1 |
-| Anthropic | `claude` | claude-sonnet-4-6 |
-| Google | `gemini` | gemini-2.5-pro |
-| xAI | `grok` | grok-4.20 |
-| Mistral | `mistral` | mistral-large-latest |
-| DeepSeek | `deepseek` | deepseek-chat |
-| Groq | `groq` | llama-3.3-70b-versatile |
-| Together | `together` | Llama-3.3-70B-Instruct-Turbo |
-| Fireworks | `fireworks` | llama-v3p3-70b-instruct |
-| NVIDIA NIM | `nvidia` | llama-3.1-nemotron-70b |
-| Kimi | `kimi` / `kimi-nvidia` | kimi-k2.5 |
-| OpenRouter | `openrouter` | claude-sonnet-4.6 |
-| Cohere | `cohere` | command-a-03-2025 |
-| Perplexity | `perplexity` | sonar-pro |
-| Ollama | `ollama` | llama3.3 (local) |
-| LM Studio | `lmstudio` | local-model |
-| vLLM | `vllm` | local-model |
+| Provider | Preset | Variants | Default Model |
+|---|---|---|---|
+| OpenAI | `openai` | `openai-mini`, `openai-o3` | gpt-4.1 |
+| Anthropic (via OpenRouter) | `claude-sonnet` | `claude-opus`, `claude-haiku` | anthropic/claude-sonnet-4-6 |
+| Google | `gemini` | `gemini-flash` | gemini-2.5-pro |
+| xAI | `grok` | — | grok-4 |
+| Mistral | `mistral` | — | mistral-large-latest |
+| DeepSeek | `deepseek` | — | deepseek-chat |
+| Cohere | `cohere` | — | command-a-03-2025 |
+| Perplexity | `perplexity` | — | sonar-pro |
+| Groq | `groq` | — | llama-3.3-70b-versatile |
+| Together | `together` | — | meta-llama/Llama-3.3-70B-Instruct-Turbo |
+| Fireworks | `fireworks` | — | accounts/fireworks/models/llama-v3p3-70b-instruct |
+| Azure OpenAI | `azure` | — | (set base URL + model yourself) |
+| NVIDIA NIM | `nvidia` | — | nvidia/llama-3.1-nemotron-70b-instruct |
+| Kimi | `kimi` | `kimi-nvidia` | kimi-k2.5 |
+| OpenRouter | `openrouter` | — | anthropic/claude-sonnet-4-6 |
+| Ollama | `ollama` | — | llama3.3 (local) |
+| LM Studio | `lmstudio` | — | local-model |
+| vLLM | `vllm` | — | local-model |
+| Any OpenAI-compatible | `custom` | — | (set base URL + model yourself) |
+
+**Claude presets route through OpenRouter** — Anthropic's native API uses `/messages`, not the `/chat/completions` path every executor calls.
 
 ### Executor Types
 
 | Type | Description | Use Case |
 |---|---|---|
-| `local-llm` | Any OpenAI-compatible LLM (22 providers) | Default — direct chat agents |
+| `local-llm` | Any OpenAI-compatible LLM (25 presets) | Default — direct chat agents |
 | `webhook` | POST to REST endpoint | n8n, CrewAI, AutoGen, Dify, Flowise, Haystack |
 | `langserve` | LangChain Runnables via /invoke | Stateless chains |
 | `langgraph` | LangGraph Platform threads | Stateful agents |
@@ -613,6 +690,27 @@ Host (WIF, keys — never enter the container)
 
 The system auto-detects the best isolation on first `j41-dispatcher start` via `@junction41/secure-setup`. No manual configuration needed.
 
+### Mainnet security gate
+
+On mainnet (`platform.network = 'verus'`) the dispatcher refuses to start if any of these are set — they are testnet/debug escape hatches, not configuration:
+
+- `J41_SIGNING_BROKER=0` — broker signing disabled; the host-side signing broker is mandatory so the agent WIF never enters the job container
+- `--dev-unsafe` — local mode with zero container isolation
+- `J41_DISABLE_BWRAP=1` — disables the bwrap entrypoint sandbox
+- `J41_ALLOW_LOCAL_UPSTREAM=1` — disables SSRF protection on the proxy
+- `J41_SKIP_STATUS_CHECK=1` — skips agent platform-status checks
+- `J41_ALLOW_LEGACY_REVOKE=1` — accepts replayable legacy revoke webhooks
+- `J41_WITNESS_VERIFY=off` — disables platform-witness verification of on-chain job records
+
+The mainnet check is sticky — `J41_NETWORK` cannot downgrade a mainnet config file to testnet to dodge the gate.
+
+### Legacy opt-outs (do not set)
+
+These exist for platform-transition compatibility only. Each one downgrades a security default. The dispatcher never requires them.
+
+- `J41_DEPOSIT_ALLOW_AUTH_ONLY=1` — credits API-endpoint deposits on signature auth alone when the platform omits sender verification. This re-opens the self-credit risk closed by the 2026-06 audit (M-funds-1): anyone observing a public funding tx could claim its credit. Do not set. Left in place only for platforms that cannot return `senderVerified` yet.
+- `J41_TRUST_PLATFORM_RESOLUTION=1` (SDK flag) — trusts platform-supplied identity resolution instead of verifying locally. Legacy behavior; default is local verification. Do not set.
+
 ### First-Run Security Setup
 
 On first start, the dispatcher automatically:
@@ -712,6 +810,10 @@ To rebuild the Docker image (SDK is installed from npm during the build):
 ```bash
 ./scripts/build-image.sh
 ```
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

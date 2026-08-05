@@ -82,5 +82,16 @@ fallback_token_budget = 50000   # budget when the job can't be priced
 warning_percent = 80            # budget % that triggers an extension request
 extension_wait_ms = 600000      # exhausted + unapproved this long → deliver partial
 
+[fee_sweep]
+# Agents pay on-chain fees (~0.0001/write) from their R-address, but job
+# payments land at their i-address — so the R-address only drains and the agent
+# eventually goes silent on-chain while holding unswept earnings. This sweeps
+# i-address -> R-address automatically. It is self-funding: the sweep pays its
+# own fee out of the inputs it moves, so it works at a zero R-address balance.
+enabled = true                  # on by default; the failure it prevents is silent
+floor_writes = 100              # sweep when the tank affords fewer writes than this
+interval_ms = 1800000           # how often to check (30 min). NOTE: the CLI flag
+                                # --fee-sweep-interval takes MINUTES; this takes ms.
+
 [debug]
 chat = false                # enables [chat] event log when true (privacy-sensitive)

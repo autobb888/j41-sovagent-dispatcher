@@ -331,8 +331,45 @@ function buildInboxSurface(state) {
   return { deadLettered, retrying, ackFailed, pendingWrites };
 }
 
+/**
+ * Read model of one agent's fee tank, from the sample `checkFeeTanks` records in
+ * `state._feeTankLast` each cycle. Read side only — nothing here fetches UTXOs.
+ *
+ * The R-address is the only address that can pay a transaction fee, and it only
+ * ever drains. When it empties the agent silently stops writing on-chain (no
+ * reviews, no attestations, no job records) while still holding unswept
+ * earnings — which is exactly how 2026-08-05 went unnoticed. Balance had no
+ * surface anywhere; now it has one.
+ *
+ * Null-tolerant like the inbox surface: a state object predating the map, or an
+ * agent the sweep loop has not reached yet (it runs on its own 30-min timer, so
+ * every agent reads null for the first ~15s of a run), yields null rather than
+ * a zero that would read as "empty tank".
+ */
+function buildFeeTank(state, agentId, now) {
+  const last = state._feeTankLast;
+  const t = (last && typeof last.get === 'function') ? last.get(agentId) : null;
+  if (!t || typeof t !== 'object') return null;
+
+  const { writesAffordable } = require('./fee-tank.js');
+  const numOrNull = (n) => (typeof n === 'number' && Number.isFinite(n) ? n : null);
+  const feeSats = numOrNull(t.feeSats);
+  // Trust the recorded count; derive it only when the sample lacks one, so the
+  // fees-per-write constant stays owned by fee-tank.js either way.
+  const writes = numOrNull(t.writes) ?? (feeSats === null ? null : writesAffordable(feeSats));
+
+  return {
+    feeSats,
+    writes,
+    sweepableSats: numOrNull(t.sweepableSats),
+    reason: t.reason || null,
+    ageMs: typeof t.at === 'number' && Number.isFinite(t.at) ? now - t.at : null,
+  };
+}
+
 function buildHealthDocument(state, startedAt) {
   const uptime = Date.now() - startedAt;
+  const now = Date.now();
 
   const agents = state.agents.map((a) => {
     const busyEntry = [...state.active.entries()].find(([, v]) => v.agentId === a.id);
@@ -342,6 +379,7 @@ function buildHealthDocument(state, startedAt) {
       status: busyEntry ? (busyEntry[1].paused ? 'paused' : 'busy') : 'available',
       currentJob: busyEntry ? busyEntry[0] : null,
       lastError: state._agentErrors?.get(a.id) || null,
+      feeTank: buildFeeTank(state, a.id, now),
     };
   });
 
@@ -364,6 +402,12 @@ function buildHealthDocument(state, startedAt) {
 
   const inbox = buildInboxSurface(state);
 
+  // Sampled tanks that cannot afford even one on-chain write. Deliberately NOT
+  // folded into `status`: `_agentErrors` already carries FEE TANK EMPTY into
+  // `agents[].lastError`, and an empty tank on a freshly-created agent is normal
+  // during onboarding — not a degraded dispatcher.
+  const feeTanksEmpty = agents.filter((a) => a.feeTank && a.feeTank.writes === 0).length;
+
   return {
     // A dead-lettered inbox item means on-chain reputation data silently did not
     // land, which is a degraded dispatcher even when every container is healthy.
@@ -383,6 +427,7 @@ function buildHealthDocument(state, startedAt) {
       agents_available: state.available.length,
       containers_total: containers.length,
       containers_unhealthy: containersUnhealthy,
+      fee_tanks_empty: feeTanksEmpty,
       jobs_active: state.active.size,
       jobs_queued: state.queue.length,
       jobs_seen: state.seen.size,

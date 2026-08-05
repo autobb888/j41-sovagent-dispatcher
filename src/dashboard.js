@@ -3052,17 +3052,42 @@ async function main() {
       case 'earnings': await withBack(async () => {
         console.clear();
         console.log('\n  ═══ Earnings Summary ═══\n');
+        // The fee tank is money, so it belongs on the money screen. It is the
+        // R-address balance: the ONLY address that can pay the ~0.0001 fee for an
+        // on-chain write. It only drains, and an agent whose tank hits zero goes
+        // silently mute on-chain (no reviews, attestations or job records) while
+        // still holding unswept earnings — see src/fee-tank.js.
+        const { summarizeUtxos, writesAffordable } = require('./fee-tank.js');
+        // Use the shared formatter rather than a local one: the local version did
+        // `Math.round(sats || 0)`, which renders a null balance as "0.00000000" —
+        // the exact null-vs-zero conflation the rest of this feature is built to
+        // avoid ("we never queried" must never read as "the tank is empty").
+        const { formatVrsc: vrsc } = require('./wallet.js');
         const agents = getAgents();
         for (const a of agents) {
           try {
             const agent = await createAgent(a);
-            let bal, result;
-            try { bal = await agent.client.getBalance(); result = await agent.client.getMyJobs({ role: 'seller' }); } finally { agent.stop(); }
+            let bal, result, utxoRes = null;
+            try {
+              bal = await agent.client.getBalance();
+              result = await agent.client.getMyJobs({ role: 'seller' });
+              // Own try: a getUtxos failure must degrade the tank column only,
+              // not throw away the earnings we already fetched for this agent.
+              try { utxoRes = await agent.client.getUtxos(); } catch { utxoRes = null; }
+            } finally { agent.stop(); }
             const completed = (result.data || []).filter(j => j.status === 'completed' || j.status === 'delivered');
             const total = completed.reduce((s, j) => s + (parseFloat(j.amount) || 0), 0);
             const balances = bal.balances || (bal.balance != null ? [{ amount: bal.balance, currency: bal.currency || 'VRSCTEST' }] : []);
             const balStr = balances.map(b => `${b.amount} ${b.currency}`).join(', ') || '0';
-            console.log(`  ${a.id.padEnd(10)} ${(a.identity || '').padEnd(30)} Balance: ${balStr.padEnd(20)} Jobs: ${completed.length} (${total.toFixed(2)} earned)`);
+            let tankStr = 'Tank: (unavailable)';
+            if (utxoRes && utxoRes.address) {
+              const s = summarizeUtxos(utxoRes.utxos, utxoRes.address);
+              const writes = writesAffordable(s.feeSats);
+              tankStr = `Tank: ${vrsc(s.feeSats)} (${writes} writes)`;
+              if (writes === 0) tankStr += ` EMPTY — fund ${utxoRes.address}`;
+              if (s.sweepableSats > 0) tankStr += ` [${vrsc(s.sweepableSats)} sweepable]`;
+            }
+            console.log(`  ${a.id.padEnd(10)} ${(a.identity || '').padEnd(30)} Balance: ${balStr.padEnd(20)} Jobs: ${completed.length} (${total.toFixed(2)} earned)  ${tankStr}`);
           } catch(e) {
             console.log(`  ${a.id.padEnd(10)} ${(a.identity || '').padEnd(30)} Error: ${e.message.substring(0, 40)}`);
           }

@@ -24,7 +24,7 @@ j41-dispatcher post-bounty agent-1 --title "Fix API" --amount 5 --description ".
 
 | File | Purpose |
 |------|---------|
-| `src/cli.js` | Commander.js CLI — all commands (`setup`, `register`, `finalize`, `start`, `update-profile`, `post-bounty`, etc.). ~5400 lines. |
+| `src/cli.js` | Commander.js CLI — all commands (`setup`, `register`, `finalize`, `start`, `update-profile`, `post-bounty`, `wallet`, etc.). ~9700 lines. |
 | `src/dashboard.js` | Interactive TUI (Inquirer v9, ESM dynamic import). Menu screens, agent management, bounties. ~1900 lines. |
 | `src/job-agent.js` | Ephemeral job runtime — runs INSIDE Docker containers. Handles chat, workspace, canary, delivery, attestation. |
 | `src/executors/index.js` | Executor factory — `createExecutor()` based on `J41_EXECUTOR` env var. |
@@ -38,6 +38,7 @@ j41-dispatcher post-bounty agent-1 --title "Fix API" --amount 5 --description ".
 | `src/sovguard-context.js` | **Prompt-injection guard.** `scanUntrusted(text, source)` wraps the vendored `scanContext` from `@junction41/sovagent-sdk` (≥2.6.0). local-llm.js + mcp.js scan job descriptions + tool results through it (source-trust; strips/quarantines injections, never muzzles `user`). See `docs/sovguard-context-integration.md`. |
 | `src/token-budget.js` | **Token budget math (WP-D4).** The ONE VRSC↔USD↔tokens conversion point: model-id normalization to the SDK pricing table, rate staleness checks, initial-budget derivation, extension pricing from observed input:output ratio. All paths fail closed (fallback budget, null price) — never unlimited, never invented numbers. job-agent.js enforces via `setBudget`/`isBudgetExhausted`; executors gate every LLM call. |
 | `src/fee-tank.js` | **Fee-tank sweep.** Job payments land at the agent's **i-address**; identity-update fees are payable only from its **R-address**, so the R-address only ever drains and the agent silently stops being able to write on-chain. `planFeeSweep()` (pure) decides when to sweep; `executeFeeSweep()` broadcasts i→R. **Self-funding by construction** — it pays its own fee out of the swept inputs, so it works at a zero R-balance, which is exactly when it's needed. Refuses R-address inputs. Wired as `checkFeeTanks()` in cli.js on its own 30-min timer. |
+| `src/wallet.js` | **Fleet wallet decisions.** Operator-side counterpart of `fee-tank.js`, behind the `wallet` CLI command. `parseVrscAmount` (decimal-string → satoshis with BigInt — **never** `parseFloat(x) * 1e8`), `formatVrsc`, `buildWalletRow`/`summarizeFleet` (fleet table), `planManualSweep` (no floor gate — the operator asked; keeps the pending + dust gates), `planFleetSend` (reserve floor, self-send, pending), `executeSend` (R→R; refuses every input that is not the source R-address, address-less included — the mirror of `executeFeeSweep`'s refusal of R-inputs). Pure, no fs/network/SDK/clock; nothing throws. |
 | `src/config.js` | Runtime detection, config persistence. |
 | `src/control.js` | IPC control socket for `j41-dispatcher ctl status/jobs/agents`, plus the open `/health` + `/metrics` HTTP server on `:9842`. Exports the shared **read-model builders** (`buildStatus`/`buildJobs`/`buildJob`/`buildAgents`/`buildEarnings`/`buildHealthDocument`) consumed by both the socket and the control API. |
 | `src/control-api.js` | **Headless control API (WP-D1/D2).** Token-gated HTTP surface on `:9843` (`GET /v1/status\|agents\|jobs\|jobs/:id\|earnings\|events`). Bearer token at `~/.j41/dispatcher/control.token` (0600, auto-created). File-backed event ring buffer (`events.jsonl`, monotonic `seq`, survives restart). `state.emitEvent(type, data)` is wired in cli.js at job/container/extension/agent lifecycle points. |
@@ -63,7 +64,7 @@ j41-dispatcher start --fee-sweep-floor 250       # sweep below 250 writes (defau
 j41-dispatcher start --fee-sweep-interval 10     # check every 10 min (default 30)
 ```
 
-Or in `config.toml` / env (`J41_FEE_SWEEP`, `J41_FEE_SWEEP_FLOOR`, `J41_FEE_SWEEP_INTERVAL`):
+Or in `config.toml` / env (`J41_FEE_SWEEP`, `J41_FEE_SWEEP_FLOOR`, `J41_FEE_SWEEP_INTERVAL_MS`):
 
 ```toml
 [fee_sweep]
@@ -73,6 +74,25 @@ interval_ms = 1800000
 ```
 
 Precedence is CLI flag > config/env > default. An agent that has **never earned** cannot self-fund — it logs `FEE TANK EMPTY and nothing to sweep — fund <R-addr> externally` and needs an operator transfer.
+
+#### `wallet` — the operator's surface on the same problem
+
+```bash
+j41-dispatcher wallet                      # = wallet list — fleet table (READ-ONLY, the default is the safe verb)
+j41-dispatcher wallet show agent-6         # addresses, per-UTXO breakdown, pending stamp
+j41-dispatcher wallet sweep agent-6        # manual i→R sweep (works at a zero tank — fee comes out of the swept inputs)
+j41-dispatcher wallet sweep --all          # every registered agent; per-agent failures do not stop the loop
+j41-dispatcher wallet send agent-2 agent-11 1.0   # R→R between FLEET AGENTS
+```
+
+Rules that are enforced in code, not just documented:
+
+- **`send` destinations are fleet agent-ids, never raw addresses.** The id resolves to that agent's own R-address from its `keys.json`; a typed address is refused. External payouts have their own hardened path (`refunds` + `financial-allowlist.json`). Agent-ids match **exactly** — no prefix resolution, unlike `refunds`' job-ids.
+- **Mainnet** (`IS_MAINNET`, sticky): `send` refuses `--yes` and requires the operator to **retype the exact amount**; `sweep` keeps plain y/N because a sweep's destination is derived from the agent's own keys, so funds cannot leave the agent.
+- **Reserve floor:** a `send` leaving the source below `fee_sweep.floor_writes` (default 100 writes) is refused without `--allow-drain` — refilling one tank by draining another just moves the outage.
+- **Pending stamp** at `~/.j41/dispatcher/agents/<id>/wallet-pending.json` (0600, `{txid, at, kind}`) is written after every broadcast and consulted before the next; younger than 30 min blocks unless `--force`. A malformed stamp **fails closed**. Same hazard as the inbox pending-write gate: the platform serves the *confirmed* UTXO view.
+- **`--dry-run`** builds and signs (so signing errors surface) but never broadcasts, and says so: a successful build proves nothing about acceptance.
+- Balances for an agent that could not be queried render as `—`, **never `0`** — "we never looked" and "we looked and it is empty" prescribe opposite actions.
 
 ### Configuration
 

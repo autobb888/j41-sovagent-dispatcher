@@ -2,6 +2,115 @@
 
 ## Unreleased
 
+## 2.10.0
+
+**`wallet` — the manual money surface.** 2.9.0 made agents refill their own fee
+tanks automatically, but an operator who saw `FEE TANK EMPTY and nothing to
+sweep` still had no CLI path: no balance view anywhere (not in `inspect`,
+`status`, `/health` or the TUI), no way to force a sweep, no way to fund an agent
+that has never earned. Those operations were being done with hand-written
+scripts. Now:
+
+```
+j41-dispatcher wallet                            # fleet tank table
+j41-dispatcher wallet show <agent-id>            # addresses + per-UTXO detail
+j41-dispatcher wallet sweep <agent-id>|--all     # force an i-to-R sweep
+j41-dispatcher wallet send <from> <to> <amount>  # R-to-R between fleet agents
+```
+
+- `send` moves funds **between fleet agents only** — the destination is an
+  agent-id resolved to that agent's own R-address. Raw addresses are refused: a
+  typo'd destination on an irreversible transaction is the one mistake that
+  actually loses money.
+- Guards: reserve floor (a send may not leave the source under 100 writes
+  without `--allow-drain`), self-send refusal, integer-only amount parsing, and
+  a per-agent pending stamp that blocks a second spend until the first confirms
+  (the platform serves the last *confirmed* UTXO view, so rebuilding from it
+  double-spends). On mainnet, `send` refuses `--yes` and requires the amount to
+  be retyped.
+- Fee tanks now appear in `/health` per agent (`feeTank`) and on the TUI's
+  Earnings screen. An empty tank does **not** degrade global `status` — an agent
+  mid-onboarding legitimately has one.
+- `null` vs `0` is preserved end to end: an agent that was never queried reports
+  `—`/`null`, never `0`. Treating "we didn't look" as "the tank is empty" is how
+  a second unnecessary transfer gets sent.
+
+**Security fix — sweep destinations no longer trust the platform.** The sweep
+took its destination as `u.address || keys.address`, *preferring* the platform's
+`getUtxos()` response over local key material. Because `summarizeUtxos` decides
+what is sweepable by comparing against that value, a wrong address reclassifies
+every UTXO — R-address and i-address alike — as sweepable, the executor's
+address-class guard passes (nothing matches), and the entire balance is signed
+away to it. The daemon's auto-sweep broadcasts unattended every 30 minutes. The
+benign variant is equally bad: an i-address returned here makes every sweep run
+backwards, draining the fee tank and recreating the outage the sweep prevents.
+
+Destinations are now derived from the WIF (`wifToAddress`) — the key that
+actually signs — with the platform's value accepted only as corroboration and
+any disagreement a hard refusal. Applied to the manual sweep, the daemon
+auto-sweep, the send source, and the read path. This mirrors the SDK's existing
+rule for identity updates, which already refuses a doctored API response.
+
+**Other fixes from the same audit:** a per-agent lock so two concurrent CLI
+invocations cannot both pass the stamp gate and double-spend; amounts capped at
+2^50 satoshis, below the range where the SDK's `sats -> VRSC -> Math.round`
+handoff is lossy (65,782 of the top 200,000 values under `MAX_SAFE_INTEGER` come
+back off by 1-4 satoshis); `--all` and failed dry-run builds no longer exit 0;
+`wallet show` resolves a pending stamp instead of reporting a confirmed tx as
+pending; the TUI reuses the shared money formatter instead of a local one that
+rendered `null` as `0.00000000`.
+
+**Docs.** README's front page was a two-month-old security changelog instructing
+new users to set four environment variables — one of which no longer exists, and
+one of which (`J41_DISABLE_BWRAP=1`) the mainnet gate refuses to start with. That
+block is gone; a fresh install requires no `J41_*` variables at all. Also
+corrected: runtime default (`docker`, not `local`), 25 LLM presets (not 22), 26
+VDXF keys (not 25, and `service.dispute` never existed), `IDLE_TIMEOUT_MS`
+(480000, not 600000).
+
+771 tests.
+
+## 2.9.0
+
+**Agents fund their own fees.** Job payments credit an agent's **i-address**;
+identity-update fees are payable only from its **R-address**, so the R-address
+only ever drained — at 0.0001/write — and nothing refilled it. An agent that ran
+dry went silent on-chain (no reviews, attestations or job records) while still
+holding unswept earnings. Observed live on agent-6, which dead-lettered three
+valid inbox items for it.
+
+- **`src/fee-tank.js` (new) — i→R sweep, on by default.** Checks every 30 min and
+  sweeps when an agent can afford fewer than `floor_writes` (default 100) writes.
+  **Self-funding by construction**: it pays its own fee out of the inputs it
+  spends, so it works at a zero R-balance — which is exactly when it is needed.
+  Refuses R-address inputs. Runs in both poll and webhook mode, with a startup
+  pass so a dispatcher restarted *because* an agent ran dry does not stay dry for
+  another half hour. Flags `--no-fee-sweep`, `--fee-sweep-floor <writes>`,
+  `--fee-sweep-interval <minutes>`; `[fee_sweep]` in `config.toml`; env
+  `J41_FEE_SWEEP`, `J41_FEE_SWEEP_FLOOR`, `J41_FEE_SWEEP_INTERVAL_MS`. See
+  README → "Wallets & Fee Tank".
+- **The `_MS` suffix on the interval env var is load-bearing.** The CLI flag takes
+  **minutes**; the config/env value takes **milliseconds**. An unsuffixed name
+  invited `=30` meaning 30 minutes, which would have landed as 30 ms and clamped
+  to a 1-minute cadence — 30× the fleet-wide `getUtxos`/auth traffic.
+- **`J41_FEE_SWEEP=true` silently disabled the sweep.** The `bool1` override kind
+  is `raw === '1'`. Default-ON safety features now use a word-tolerant `bool`.
+- **A dry fee tank no longer dead-letters valid work.** The SDK throws it as a
+  bare `Error` — no code, no statusCode — so `inbox-deadletter.js` classified it
+  `hard` and burned the per-item dead-letter budget. It is now `transient`, with
+  `isFundingFailure()` giving the operator the address and the remedy instead of
+  a generic batch-failure line. The legacy non-batched inbox path exempted only
+  `contention`, so it reproduced the incident verbatim wherever
+  `acceptInboxBatch` is unavailable; it now exempts everything but `hard`.
+- **Fee alerts retract.** Two different prefixes described one condition and
+  nothing cleared `_agentErrors` but a successful activation. Unified, cleared on
+  tank recovery and on batch success, prefix-scoped so it cannot erase another
+  subsystem's error. Funding failures now also reach the control-API event ring.
+
+An agent that has **never earned** cannot self-fund — it logs `FEE TANK EMPTY and
+nothing to sweep — fund <R-addr> externally` and needs a one-time operator
+transfer to its R-address.
+
 ## 2.8.2
 
 **Container teardown is now observable.** Requires the rebuilt `j41/job-agent` image.
@@ -237,6 +346,28 @@ reads as silence and results in an auto-default and a hire suspension.
   `2026-06-12-vdxf-v2-schema-design` §3b. When the flag is on, behaviour is
   unchanged.
 
+## 2.2.0 — 2026-06-02 security audit
+
+This release closes 6 highs + ~15 mediums/lows from the 2026-06-02 cross-repo security audit. Behavioral changes operators should know about:
+
+**Per-job WIF temp copy is now cleaned up + mode 0600** (H1). Previously `/tmp/j41-keys-<jobId>/keys.json` was created mode 0644 and never removed — operators ended up with an accumulating stash of plaintext WIFs. `stopJobContainer` now `rm -rf`s the dir on every stop path (success + failure), and the mode is tightened (container runs as the dispatcher UID — 0644 was historical).
+
+**`sign-channel-host` validates container-supplied response ids** (H2). The container sets `req.id` and it's used in the response file path; the previous code allowed arbitrary host-side file writes via `../../../tmp/pwned` style ids. Now matched against `[a-f0-9-]{1,80}`.
+
+**`broker-executors.jobCompletionUpdate` shape-validates the container blob** (H6). Container-supplied `jobRecord` must only contain a known allow-listed set of keys (jobHash/timestamp/completedAt/amount/currency/buyer/seller/status/reviewerSignature); unexpected keys throw. `reviewRecord` and `workspaceAttestation` type-checked.
+
+**`@junction41/secure-setup` pinned to exact `0.3.0`** (H5). The previous `>=0.1.0` would auto-resolve any future malicious release.
+
+**Bumped SDK to 2.5.0** with its own breaking changes (see that package's README).
+
+**Family 3 normalizer at two sites** (M-auth-2/3): `deposit-watcher.js` `senderVerusId` vs `buyerVerusId` and `cli.js` API-access revoke `buyerVerusId` now `trim+lowercase+strip-trailing-@` before comparing. Catches `'buyer.agentplatform@'` vs `'buyer.agentplatform'` mismatches that the backend's `4b1f334` Family 3 fix flagged.
+
+**Deposit-watcher refuses signature-only credit by default** (M-funds-1). When the platform's `verifyPayment` response omits `senderVerified`, we no longer credit on signature auth alone — an attacker who observed a public funding tx could otherwise self-credit. Override with `J41_DEPOSIT_ALLOW_AUTH_ONLY=1` while the platform side updates.
+
+**New ingest caps**: `J41_CTL_MAX_BUFFER_BYTES=64KB` (control socket), `J41_SIGN_REQ_MAX_BYTES=256KB` (broker req), `J41_JOB_DESCRIPTION_MAX_BYTES=1MB`, `J41_MAX_JOBS_PER_POLL=200`.
+
+*Historical note:* this release documented temporary compatibility env vars for the platform transition. They are obsolete: `J41_REQUIRE_PLATFORM_SIGNER` no longer exists in any package, and the remaining flags are legacy security opt-outs documented (and discouraged) in README → Security → Legacy opt-outs.
+
 ## 2.1.15 — 2026-05-26
 
 **Broker file-channel transport — opt-in.** The new `J41_SIGNING_BROKER=1` env var routes all in-container signing through a file-IPC channel to a host-side `SignChannelHost`, keeping the agent WIF on the dispatcher host and out of the job-agent container's filesystem entirely. Default remains off; the legacy `keys.json` bind mount is still the only behaviour you get without the flag. Cuts the in-container blast radius — a fully-compromised job-agent cannot exfiltrate the WIF or forge identity-bearing signatures for other jobs (broker rebuilds canonical accept/deliver/dispute message bytes from authoritative platform state and refuses container-supplied protocol-formatted text).
@@ -452,3 +583,7 @@ All of these accept matching `J41_*` environment variable overrides:
 - Removed `J41_SKIP_SIG_VERIFY` env-var bypass entirely.
 - `[CHAT-DEBUG]` log gated behind `J41_DEBUG_CHAT=1`, content-bytes logging removed (privacy fix).
 - Dashboard Status & Health screen rewritten with backend feature-flag check + per-agent api-endpoint summary.
+
+---
+
+Intermediate releases: see git history and npm versions.

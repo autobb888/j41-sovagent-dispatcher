@@ -38,7 +38,22 @@ const {
   planFeeSweep,
   executeFeeSweep,
   DEFAULT_FLOOR_WRITES,
+  FEE_SATS,
+  SWEEP_PENDING_BACKSTOP_MS,
 } = require('./fee-tank.js');
+// Operator-side counterpart of fee-tank.js, behind the `wallet` command. Every
+// decision about whether money may move lives there or in fee-tank.js; this file
+// only parses arguments, loads keys, prompts, renders and records.
+const {
+  parseVrscAmount,
+  formatVrsc,
+  resolveOwnRAddress,
+  buildWalletRow,
+  summarizeFleet,
+  planManualSweep,
+  planFleetSend,
+  executeSend,
+} = require('./wallet.js');
 
 /**
  * Single prefix for every "this agent cannot pay fees" alert, shared by the
@@ -3248,6 +3263,10 @@ program
       _devUnsafe, // security: allows local mode when true
       llmHealth: new Map(), // agentId -> { ok, at } — preflight probe cache (ok-only, 30s TTL)
       _feeSweepPending: new Map(), // agentId -> { txid, at } — guards re-sweeping an unconfirmed sweep
+      // agentId -> { feeSats, writes, sweepableSats, reason, at } — the last tank
+      // observation, for /health. Free: checkFeeTanks already fetches every
+      // agent's UTXOs each cycle, so this is a Map.set on data we threw away.
+      _feeTankLast: new Map(),
       // Fee-tank sweep config. Precedence: CLI flag > config.toml/env > default.
       // Commander sets feeSweep=TRUE when --no-fee-sweep is absent (not
       // undefined), so the check must be `=== false` to mean "explicitly
@@ -6742,6 +6761,7 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
 async function checkFeeTanks(state) {
   if (state._feeSweepRunning) return;           // same reentrancy hazard as the inbox sweep
   if (!state._feeSweepPending) state._feeSweepPending = new Map();
+  if (!state._feeTankLast) state._feeTankLast = new Map(); // defensive: older state objects
   state._feeSweepRunning = true;
   try {
     const { buildPayment } = require('@junction41/sovagent-sdk/dist/index.js');
@@ -6753,7 +6773,21 @@ async function checkFeeTanks(state) {
       try {
         const agent = await getAgentSession(state, agentInfo);
         const u = await agent.client.getUtxos();
-        const rAddress = u.address;
+        // Derive the destination from OUR key, never from the platform response —
+        // see resolveOwnRAddress. This loop auto-broadcasts with no operator
+        // prompt, so a trusted-but-wrong address here would drain the fleet.
+        const { wifToAddress } = require('@junction41/sovagent-sdk/dist/index.js');
+        const own = resolveOwnRAddress({
+          derived: wifToAddress(agentInfo.wif, J41_NETWORK),
+          platformAddress: u.address,
+          agentId: agentInfo.id,
+        });
+        if (!own.ok) {
+          state._agentErrors.set(agentInfo.id, own.error);
+          console.error(`[FeeTank] 🛑 ${own.error}`);
+          continue;
+        }
+        const rAddress = own.rAddress;
         const s = summarizeUtxos(u.utxos, rAddress);
 
         const plan = planFeeSweep({
@@ -6762,6 +6796,19 @@ async function checkFeeTanks(state) {
           floorWrites: cfg.floorWrites,
           pending: state._feeSweepPending.get(agentInfo.id) || null,
           now,
+        });
+
+        // Record BEFORE the branches, so every outcome is observable — including
+        // the two that `continue` (needs-external-funding, sweep-pending) and the
+        // healthy above-floor case. A snapshot that only existed on the sweep
+        // path would show nothing precisely when nothing is wrong, and nothing
+        // when an agent is stuck.
+        state._feeTankLast.set(agentInfo.id, {
+          feeSats: s.feeSats,
+          writes: writesAffordable(s.feeSats),
+          sweepableSats: s.sweepableSats,
+          reason: plan.reason,
+          at: now,
         });
 
         if (plan.reason === 'needs-external-funding') {
@@ -8686,6 +8733,1002 @@ program
     }
   });
 
+// ── Fleet wallet commands ─────────────────────────────────────────────────────
+//
+// The operator's half of the two-address problem `fee-tank.js` solves for the
+// daemon: payments land at the i-address, fees debit only the R-address, so a
+// tank strictly drains and an agent eventually goes silent on-chain while
+// holding unswept earnings.
+//
+// NOTHING HERE DECIDES WHETHER MONEY MOVES. What is sweepable, what a send
+// costs, whether the reserve survives it, whether a broadcast is still in
+// flight — all of that is `src/wallet.js` / `src/fee-tank.js`, pure and tested.
+// This section is the impure rind: argument parsing, key loading, sessions,
+// confirmation prompts, rendering, and the pending-stamp file.
+
+/** Per-agent record of the last transaction THIS CLI broadcast. */
+const WALLET_PENDING_FILENAME = 'wallet-pending.json';
+
+/** Human currency label. Only ever cosmetic — never used in arithmetic. */
+function walletCoin() {
+  return IS_MAINNET ? 'VRSC' : 'VRSCTEST';
+}
+
+/**
+ * The reserve a `send` may not breach, taken from the same config knob the
+ * daemon's sweep floor uses so the two surfaces cannot disagree about what
+ * "low" means. Never a fresh hardcoded number.
+ */
+function walletFloorWrites() {
+  const v = parseInt(cfg.fee_sweep && cfg.fee_sweep.floor_writes, 10);
+  return Number.isFinite(v) && v > 0 ? v : DEFAULT_FLOOR_WRITES;
+}
+
+function walletPendingPath(agentId) {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(agentId) || agentId.includes('..')) {
+    throw new Error(`Invalid agent ID format: ${agentId}`);
+  }
+  return path.join(AGENTS_DIR, agentId, WALLET_PENDING_FILENAME);
+}
+
+/**
+ * Read the stamp written after every broadcast.
+ *
+ * Returns null when nothing is recorded, the record when it is readable, and a
+ * deliberately UNUSABLE record (`at: null`) when the file exists but cannot be
+ * read or parsed. `isPendingBlocked` in wallet.js treats a record without a
+ * numeric `at` as blocking, so a corrupt stamp defers instead of being ignored:
+ * "something was broadcast but we cannot tell when" is the worst possible state
+ * in which to broadcast again.
+ */
+function loadWalletPending(agentId) {
+  let p;
+  try {
+    p = walletPendingPath(agentId);
+  } catch {
+    return { at: null, malformed: true };
+  }
+  if (!fs.existsSync(p)) return null;
+  try {
+    const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { at: null, malformed: true };
+    return raw;
+  } catch {
+    return { at: null, malformed: true };
+  }
+}
+
+/** Record a broadcast. Atomic rename so a reader never sees a half-written stamp. */
+/**
+ * Drop a pending stamp whose transaction has actually confirmed.
+ *
+ * The stamp exists to stop us rebuilding a second transaction from the platform's
+ * CONFIRMED view while the first is still in the mempool. Once the tx confirms
+ * that hazard is gone — but a pure wall-clock backstop keeps blocking for the
+ * full 30 minutes anyway, and tells the operator the tx is "unconfirmed" when it
+ * demonstrably is not. Found by live-testing the sweep: agent-1's tx confirmed in
+ * ~90s and the next command still refused.
+ *
+ * Fails CLOSED: any doubt (no txid, lookup error, zero/absent confirmations) keeps
+ * the stamp. Costs one getTxStatus, and only when a stamp is actually present.
+ */
+async function resolveWalletPending(client, agentId, stamp) {
+  if (!stamp || stamp.malformed) return stamp;
+  const txid = stamp.txid;
+  if (!txid || typeof txid !== 'string') return stamp;
+  if (!client || typeof client.getTxStatus !== 'function') return stamp;
+  try {
+    const st = await client.getTxStatus(txid);
+    const confs = st && typeof st.confirmations === 'number' ? st.confirmations : 0;
+    if (confs > 0) {
+      try { fs.unlinkSync(walletPendingPath(agentId)); } catch { /* already gone — fine */ }
+      return null;
+    }
+  } catch {
+    return stamp; // lookup failed: keep the guard rather than guess
+  }
+  return stamp;
+}
+
+function saveWalletPending(agentId, record) {
+  const p = walletPendingPath(agentId);
+  fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
+  const tmp = `${p}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(record, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, p);
+}
+
+/**
+ * Best-effort look at what a RUNNING dispatcher has in flight.
+ *
+ * The platform serves the CONFIRMED UTXO view, so a manual tx built while the
+ * daemon's own identity write is unconfirmed can spend the same inputs twice.
+ * One of the two broadcasts is then rejected at zero cost — a nuisance, not a
+ * loss — which is why this is a check and not a lock.
+ *
+ * No pid file → nothing is running → no warning, proceed. Pid file but an
+ * unreachable socket → warn once and proceed, because the residual race costs a
+ * rejected broadcast, not money.
+ */
+async function walletPendingWrites() {
+  const pidFile = path.join(DISPATCHER_DIR, 'dispatcher.pid');
+  const empty = { running: false, reachable: false, byAgent: new Map(), warned: false };
+  if (!fs.existsSync(pidFile)) return empty;
+  try {
+    const { sendCommand } = require('./control');
+    const surface = await sendCommand({ action: 'inbox' });
+    const byAgent = new Map();
+    for (const w of (surface && surface.pendingWrites) || []) {
+      if (!w || !w.agentId) continue;
+      // An unknown age is treated as "just now" — fail closed.
+      byAgent.set(w.agentId, typeof w.ageMs === 'number' && Number.isFinite(w.ageMs) ? w.ageMs : 0);
+    }
+    return { running: true, reachable: true, byAgent, warned: false };
+  } catch (e) {
+    return { running: true, reachable: false, error: e.message, byAgent: new Map(), warned: false };
+  }
+}
+
+/** Should we defer to the running daemon for this agent? Prints its own reasons. */
+function walletDaemonBlocks(daemon, agentId, force) {
+  if (!daemon || !daemon.running) return false;
+  if (!daemon.reachable) {
+    if (!daemon.warned) {
+      daemon.warned = true;
+      console.warn(`⚠️  A dispatcher pid file exists but its control socket did not answer (${daemon.error || 'unreachable'}).`);
+      console.warn('   Proceeding without the in-flight check — worst case one broadcast is rejected at no cost.');
+    }
+    return false;
+  }
+  const age = daemon.byAgent.get(agentId);
+  if (age === undefined) return false;
+  if (age >= SWEEP_PENDING_BACKSTOP_MS) return false;
+  if (force) {
+    console.warn(`⚠️  ${agentId}: the running dispatcher has an identity write in flight (${Math.round(age / 1000)}s ago) — proceeding anyway because --force was given.`);
+    return false;
+  }
+  console.error(`❌ ${agentId}: the running dispatcher broadcast an identity write ${Math.round(age / 1000)}s ago and it is not confirmed yet.`);
+  console.error('   Building from the confirmed UTXO view now would double-spend its inputs. Wait, or pass --force.');
+  return true;
+}
+
+/**
+ * Every agent that has keys, registered or not, plus an empty session cache —
+ * the same shape `buildRefundsState` produces.
+ *
+ * Unregistered agents are KEPT, not filtered out: one still has an R-address
+ * that can be funded, and hiding it is how an operator concludes an agent does
+ * not exist and funds it twice.
+ */
+function buildWalletState() {
+  const agents = [];
+  for (const id of listRegisteredAgents()) {
+    const keys = loadAgentKeys(id);
+    if (keys) agents.push({ id, ...keys });
+  }
+  return { agents, agentSessions: new Map() };
+}
+
+function walletIsRegistered(a) {
+  return !!(a && a.identity && a.wif && a.iAddress);
+}
+
+/**
+ * Resolve a command-line token to a fleet agent. EXACT match only.
+ *
+ * No prefix matching, ever: the `refunds` precedent resolves job-id prefixes,
+ * but a prefix must never pick a money destination. Raw addresses are refused
+ * outright — `send` funds a fleet agent by id, and the one failure mode that
+ * actually loses money is a typo'd address on an irreversible transaction.
+ */
+function walletResolveAgent(state, token, what) {
+  if (!token) {
+    console.error(`❌ Missing ${what} agent-id.`);
+    return null;
+  }
+  const hit = state.agents.find(a => a.id === token);
+  if (hit) return hit;
+
+  if (/^[Ri][A-Za-z0-9]{25,}$/.test(token)) {
+    console.error(`❌ ${what}: '${token}' looks like a raw address.`);
+    console.error("   `wallet send` resolves a FLEET AGENT-ID to that agent's own R-address and refuses raw");
+    console.error('   addresses on purpose. Use an id from `j41-dispatcher wallet list`.');
+  } else {
+    const known = state.agents.map(a => a.id).join(', ') || '(none)';
+    console.error(`❌ ${what}: unknown agent '${token}'. Known agents: ${known}`);
+  }
+  return null;
+}
+
+/**
+ * The SDK's payment builder, lazily required (repo convention) and overridable
+ * in tests only — same shape and same NODE_ENV gate as `getAgentSession`.
+ */
+function walletBuildPayment(state) {
+  if (process.env.NODE_ENV === 'test' && state && state._testBuildPayment) return state._testBuildPayment;
+  return require('@junction41/sovagent-sdk/dist/index.js').buildPayment;
+}
+
+/**
+ * --dry-run broadcaster: captures the signed hex and returns without touching
+ * the network. Injected in place of the real broadcast so the dry run still
+ * goes through the executor's address-class invariant — the guard is the part
+ * most worth exercising.
+ */
+function walletDryRunBroadcast(sink) {
+  return async (hex) => {
+    sink.hex = hex;
+    return { txid: 'dry-run-not-broadcast' };
+  };
+}
+
+const DRY_RUN_CAVEAT =
+  'NOTE: a successful build proves NOTHING about acceptance — utxo-lib will happily sign what the daemon rejects.';
+
+/** Print a satoshi count, or the em dash that means "we never looked". */
+function walletSats(v) {
+  return formatVrsc(v);
+}
+
+function walletWrites(v) {
+  return typeof v === 'number' && Number.isFinite(v) ? String(v) : '—';
+}
+
+/**
+ * `dt3worker1.agentplatform@` → `dt3worker1@` for the fleet table only. Every
+ * agent shares the parent, so it is column width spent on nothing; the full
+ * name is still printed by `wallet show` and by `--json`.
+ */
+function walletShortIdentity(identity) {
+  const m = /^([^.@]+)\.[^@]*@$/.exec(String(identity || ''));
+  return m ? `${m[1]}@` : String(identity || '');
+}
+
+/**
+ * Query every agent. Balances are null — never 0 — for any agent we could not
+ * ask (unregistered, or the query failed). Zero means "we looked and the tank
+ * is empty"; null means "we could not look", and printing 0 for the second is
+ * how a second, unnecessary transfer gets sent.
+ */
+async function walletCollect(state) {
+  const floorWrites = walletFloorWrites();
+  const rows = [];
+  for (const a of state.agents) {
+    if (!walletIsRegistered(a)) {
+      rows.push({
+        ...buildWalletRow({
+          agentId: a.id,
+          identity: a.identity || null,
+          registered: false,
+          rAddress: a.address || null,
+          iAddress: a.iAddress || null,
+        }),
+        error: null,
+        utxos: [],
+      });
+      continue;
+    }
+    try {
+      const agent = await getAgentSession(state, a);
+      const u = await agent.client.getUtxos();
+      // Same provenance rule as the spend paths: our key is authoritative, the
+      // platform's value is only corroboration. This path moves no money, but a
+      // disputed address would mis-classify every UTXO as sweepable and show the
+      // operator a table that is confidently wrong.
+      const { wifToAddress: _w2a } = require('@junction41/sovagent-sdk/dist/index.js');
+      const ownRow = resolveOwnRAddress({
+        derived: a.wif ? _w2a(a.wif, J41_NETWORK) : a.address,
+        platformAddress: u.address,
+        agentId: a.id,
+      });
+      if (!ownRow.ok) {
+        rows.push({
+          ...buildWalletRow({ agentId: a.id, identity: a.identity || null, registered: false,
+            rAddress: a.address || null, iAddress: a.iAddress || null }),
+          status: 'error', error: ownRow.error, utxos: [],
+        });
+        continue;
+      }
+      const rAddress = ownRow.rAddress;
+      rows.push({
+        ...buildWalletRow({
+          agentId: a.id,
+          identity: a.identity,
+          registered: true,
+          rAddress,
+          iAddress: u.iAddress || a.iAddress || null,
+          utxos: u.utxos,
+          floorWrites,
+        }),
+        error: null,
+        utxos: Array.isArray(u.utxos) ? u.utxos : [],
+      });
+    } catch (e) {
+      rows.push({
+        agentId: a.id,
+        identity: a.identity || null,
+        rAddress: a.address || null,
+        iAddress: a.iAddress || null,
+        feeSats: null,
+        writes: null,
+        sweepableSats: null,
+        sweepableCount: null,
+        status: 'error',
+        error: e.message,
+        utxos: [],
+      });
+    }
+  }
+  return rows;
+}
+
+/** Last column of the fleet table: what this row means and what to do about it. */
+function walletStatusText(r) {
+  switch (r.status) {
+    case 'ok':
+      return 'ok';
+    case 'low':
+      return r.sweepableSats > 0
+        ? `LOW — run: j41-dispatcher wallet sweep ${r.agentId}`
+        : `LOW — nothing to sweep; j41-dispatcher wallet send <from-agent> ${r.agentId} <amount>`;
+    case 'empty-sweepable':
+      return `EMPTY — earnings are at the i-address; run: j41-dispatcher wallet sweep ${r.agentId}`;
+    case 'empty-unfunded':
+      // Full address, not a truncation: this line exists to be copied.
+      return `EMPTY — never earned; fund ${r.rAddress || '(no address)'} externally`;
+    case 'unregistered':
+      return `unregistered — never queried; fund ${r.rAddress || '(no address)'} externally`;
+    case 'error':
+      return `error — ${r.error}`;
+    default:
+      return String(r.status);
+  }
+}
+
+function walletRowJson(r) {
+  return {
+    id: r.agentId,
+    identity: r.identity,
+    rAddress: r.rAddress,
+    iAddress: r.iAddress,
+    feeSats: r.feeSats,
+    writesAffordable: r.writes,
+    sweepableSats: r.sweepableSats,
+    sweepableCount: r.sweepableCount,
+    status: r.status,
+    error: r.error || null,
+  };
+}
+
+/** `wallet list` — the safe default. Read-only; broadcasts nothing. */
+async function walletList(state, opts = {}) {
+  const rows = await walletCollect(state);
+  const totals = summarizeFleet(rows);
+  const floorWrites = walletFloorWrites();
+
+  if (opts.json) {
+    // Sats as integers only — money never leaves this program as a float.
+    console.log(JSON.stringify({
+      network: J41_NETWORK,
+      apiUrl: J41_API_URL,
+      floorWrites,
+      agents: rows.map(walletRowJson),
+      totals: {
+        feeSats: totals.totalFeeSats,
+        sweepableSats: totals.totalSweepableSats,
+        counts: totals.counts,
+      },
+    }, null, 2));
+    return { rows, totals };
+  }
+
+  console.log(`\nFleet Wallet — ${J41_NETWORK} (${J41_API_URL})\n`);
+  // Widths follow the data. Agent ids are NEVER truncated: the id in this column
+  // is what the operator types into `wallet sweep`, and a clipped one cannot be.
+  const label = r => (r.identity ? walletShortIdentity(r.identity) : '(not registered)');
+  const W = {
+    agent: Math.max(5, ...rows.map(r => String(r.agentId).length)),
+    identity: Math.max(8, ...rows.map(r => label(r).length)),
+    tank: 14, writes: 8, sweep: 14,
+  };
+  console.log(
+    `  ${'AGENT'.padEnd(W.agent)} ${'IDENTITY'.padEnd(W.identity)} ${'FEE TANK'.padStart(W.tank)} ` +
+    `${'WRITES'.padStart(W.writes)} ${'SWEEPABLE'.padStart(W.sweep)}  STATUS`
+  );
+  for (const r of rows) {
+    console.log(
+      `  ${String(r.agentId).padEnd(W.agent)} ${label(r).padEnd(W.identity)} ` +
+      `${walletSats(r.feeSats).padStart(W.tank)} ${walletWrites(r.writes).padStart(W.writes)} ` +
+      `${walletSats(r.sweepableSats).padStart(W.sweep)}  ${walletStatusText(r)}`
+    );
+  }
+
+  const coin = walletCoin();
+  console.log(
+    `\n  Fleet: ${walletSats(totals.totalFeeSats)} ${coin} in tanks ` +
+    `(${writesAffordable(totals.totalFeeSats)} writes) / ${walletSats(totals.totalSweepableSats)} sweepable`
+  );
+  const c = totals.counts;
+  const bits = [];
+  if (c.empty) bits.push(`${c.empty} tank${c.empty === 1 ? '' : 's'} empty`);
+  if (c.low) bits.push(`${c.low} low`);
+  if (c.unregistered) bits.push(`${c.unregistered} unregistered`);
+  const errored = rows.filter(r => r.status === 'error').length;
+  if (errored) bits.push(`${errored} unreadable`);
+  console.log(`  ${bits.length ? bits.join(', ') + ' ' : ''}(floor ${floorWrites} writes)`);
+  if (rows.some(r => r.feeSats === null)) {
+    console.log('  — means never queried, NOT zero. Those totals exclude it.');
+  }
+  console.log('');
+  return { rows, totals };
+}
+
+/** `wallet show <agent-id>` — per-agent detail, including the pending stamp. */
+async function walletShow(state, agentId, opts = {}) {
+  const a = walletResolveAgent(state, agentId, 'show');
+  if (!a) return null;
+
+  const single = { agents: [a], agentSessions: state.agentSessions, _testAgentSession: state._testAgentSession };
+  const rows = await walletCollect(single);
+  const r = rows[0];
+  // Resolve, don't just load: reporting "pending" for a tx that confirmed ten
+  // minutes ago is the same stale-information defect resolveWalletPending was
+  // written to kill on the sweep/send paths, and `show` is what an operator
+  // reads before deciding whether to --force.
+  let showClient = null;
+  try { showClient = walletIsRegistered(a) ? (await getAgentSession(state, a)).client : null; } catch { showClient = null; }
+  const pending = await resolveWalletPending(showClient, a.id, loadWalletPending(a.id));
+
+  // Classify by asking summarizeUtxos, never by re-deriving the rule here: it
+  // also drops UTXOs with no usable value (a 0-satoshi identity output, a string
+  // amount), and a renderer that called those "sweepable" would contradict the
+  // count printed one line above it.
+  const split = summarizeUtxos(r.utxos, r.rAddress);
+  const feeSet = new Set(split.feeUtxos);
+  const sweepSet = new Set(split.sweepableUtxos);
+  const utxoClass = (u) => (feeSet.has(u) ? 'R (fee)' : sweepSet.has(u) ? 'i (sweepable)' : 'ignored — no spendable value');
+
+  if (opts.json) {
+    console.log(JSON.stringify({
+      ...walletRowJson(r),
+      utxos: r.utxos.map(u => ({ txid: u.txid, vout: u.vout, satoshis: u.satoshis, address: u.address || null, class: utxoClass(u) })),
+      pending: pending || null,
+    }, null, 2));
+    return r;
+  }
+
+  console.log(`\nAgent ${r.agentId} — ${r.identity || '(not registered)'}`);
+  console.log(`  R-address (pays fees):    ${r.rAddress || '(none)'}`);
+  console.log(`  i-address (receives pay): ${r.iAddress || '(none)'}`);
+  console.log(`  Fee tank:  ${walletSats(r.feeSats)} ${walletCoin()} (${walletWrites(r.writes)} writes)`);
+  console.log(`  Sweepable: ${walletSats(r.sweepableSats)} across ${r.sweepableCount === null ? '—' : r.sweepableCount} UTXO(s)`);
+  console.log(`  Status:    ${walletStatusText(r)}`);
+  if (r.utxos.length) {
+    console.log('\n  UTXOs:');
+    for (const u of r.utxos) {
+      console.log(`    ${String(u.txid).substring(0, 16)}:${u.vout}  ${walletSats(u.satoshis).padStart(14)}  ${utxoClass(u)}`);
+    }
+  }
+  if (pending) {
+    const age = typeof pending.at === 'number' ? `${Math.round((Date.now() - pending.at) / 60000)}m ago` : 'UNKNOWN AGE — treated as in flight';
+    console.log(`\n  Pending ${pending.kind || 'tx'} ${String(pending.txid || '(no txid)').substring(0, 12)}, broadcast ${age}`);
+  }
+  console.log('');
+  return r;
+}
+
+/**
+ * Sweep one agent's i-address earnings into its own R-address.
+ *
+ * Destination is derived from the agent's own keys, so funds cannot leave the
+ * agent — which is why a sweep is allowed a plain y/N even on mainnet. Never
+ * throws: `--all` loops the fleet and one agent's failure must not abort the
+ * rest.
+ */
+async function walletSweepOne(state, agentInfo, opts = {}) {
+  const id = agentInfo.id;
+  const out = { agentId: id, swept: false, dryRun: false, txid: null, amountSats: 0, reason: null };
+  try {
+    if (walletDaemonBlocks(opts.daemon, id, opts.force)) {
+      out.reason = 'daemon-write-pending';
+      return out;
+    }
+
+    const agent = await getAgentSession(state, agentInfo);
+    const u = await agent.client.getUtxos();
+    // Destination comes from OUR key, not the platform's response — see
+    // resolveOwnRAddress. A disputed address is a hard refusal.
+    const { wifToAddress } = require('@junction41/sovagent-sdk/dist/index.js');
+    const own = resolveOwnRAddress({
+      derived: agentInfo.wif ? wifToAddress(agentInfo.wif, J41_NETWORK) : agentInfo.address,
+      platformAddress: u.address,
+      agentId: id,
+    });
+    if (!own.ok) {
+      out.reason = 'address-mismatch';
+      console.error(`❌ ${own.error}`);
+      return out;
+    }
+    const rAddress = own.rAddress;
+    const s = summarizeUtxos(u.utxos, rAddress);
+
+    const stamp = await resolveWalletPending(agent.client, id, loadWalletPending(id));
+    if (stamp && opts.force) {
+      console.warn(`⚠️  ${id}: ignoring the pending stamp for ${String(stamp.txid || '?').substring(0, 12)} because --force was given.`);
+    }
+    const plan = planManualSweep({
+      feeSats: s.feeSats,
+      sweepableSats: s.sweepableSats,
+      pending: opts.force ? null : stamp,
+      now: Date.now(),
+    });
+
+    if (!plan.ok) {
+      out.reason = plan.reason;
+      if (plan.reason === 'needs-external-funding') {
+        console.error(`❌ ${id}: nothing at the i-address to sweep. Fund ${rAddress} externally, or use \`wallet send\`.`);
+      } else if (plan.reason === 'sweep-pending') {
+        console.error(`❌ ${id}: a wallet transaction is recorded as unconfirmed. Wait for it, or pass --force.`);
+      } else if (plan.reason === 'below-min-sweep') {
+        console.error(`❌ ${id}: ${walletSats(s.sweepableSats)} sweepable does not cover the ${walletSats(FEE_SATS)} fee usefully.`);
+      } else {
+        console.error(`❌ ${id}: refusing to sweep — ${plan.reason}`);
+      }
+      return out;
+    }
+
+    out.amountSats = plan.amountSats;
+    console.log(
+      `\n[wallet] Sweep ${id}: ${walletSats(plan.amountSats)} ${walletCoin()} from ${s.sweepableUtxos.length} i-address UTXO(s)`
+    );
+    console.log(`  Into:   ${rAddress}  (tank ${walletSats(s.feeSats)}, ${writesAffordable(s.feeSats)} writes)`);
+    console.log(`  After:  ~${walletSats(s.feeSats + plan.amountSats)} (${writesAffordable(s.feeSats + plan.amountSats)} writes) once confirmed`);
+
+    if (!opts.yes) {
+      if (typeof opts.confirmFn !== 'function') {
+        out.reason = 'no-confirmation';
+        console.error('❌ Refusing to broadcast without a confirmation.');
+        return out;
+      }
+      const okay = await opts.confirmFn({ kind: 'sweep', agentId: id, amountSats: plan.amountSats, question: 'Sweep?' });
+      if (!okay) {
+        out.reason = 'cancelled';
+        console.log('[wallet] Cancelled — nothing broadcast.');
+        return out;
+      }
+    }
+
+    const sink = {};
+    const res = await executeFeeSweep({
+      buildPayment: walletBuildPayment(state),
+      broadcast: opts.dryRun ? walletDryRunBroadcast(sink) : (hex) => agent.client.broadcast(hex),
+      wif: agentInfo.wif,
+      network: J41_NETWORK,
+      rAddress,
+      sweepableUtxos: s.sweepableUtxos,
+      amountSats: plan.amountSats,
+    });
+
+    if (opts.dryRun) {
+      // Branch BEFORE reading res.swept: the injected broadcaster returns a
+      // placeholder txid, and no stamp may ever be written for a tx that was
+      // never sent.
+      out.dryRun = true;
+      out.bytes = sink.hex ? sink.hex.length / 2 : 0;
+      if (!sink.hex) {
+        out.reason = res.reason || 'build-failed';
+        console.error(`❌ ${id}: dry run stopped before broadcast — ${out.reason}`);
+        return out;
+      }
+      console.log(`  DRY RUN — built ${out.bytes} bytes, nothing broadcast.`);
+      console.log(`  ${DRY_RUN_CAVEAT}`);
+      return out;
+    }
+
+    if (!res.swept) {
+      out.reason = res.reason;
+      console.error(`❌ ${id}: sweep failed — ${res.reason}${res.detail ? ` (${res.detail})` : ''}`);
+      return out;
+    }
+
+    out.swept = true;
+    out.txid = res.txid;
+    try {
+      saveWalletPending(id, { txid: res.txid, at: Date.now(), kind: 'sweep' });
+    } catch (e) {
+      console.error(`⚠️  BROADCAST ${res.txid} but the pending stamp could not be written (${e.message}).`);
+      console.error('   Do not run another wallet command for this agent for 30 minutes.');
+    }
+    console.log(`✅ ${id}: swept in ${String(res.txid).substring(0, 12)} — confirms in a block or two.`);
+    return out;
+  } catch (e) {
+    out.reason = e.message;
+    console.error(`❌ ${id}: ${e.message}`);
+    return out;
+  }
+}
+
+/** `wallet sweep <agent-id>` / `wallet sweep --all`. */
+async function walletSweep(state, agentId, opts = {}) {
+  const daemon = opts.daemon || await walletPendingWrites();
+  const targets = [];
+
+  if (opts.all) {
+    targets.push(...state.agents.filter(walletIsRegistered));
+    if (targets.length === 0) {
+      console.error('❌ No registered agents to sweep.');
+      return { results: [] };
+    }
+  } else {
+    const a = walletResolveAgent(state, agentId, 'sweep');
+    if (!a) return { results: [] };
+    if (!walletIsRegistered(a)) {
+      console.error(`❌ ${a.id} is not registered — it has no session to broadcast with, and nothing has ever been paid to it.`);
+      console.error(`   Fund ${a.address || 'its R-address'} externally instead.`);
+      return { results: [] };
+    }
+    targets.push(a);
+  }
+
+  const results = [];
+  for (const a of targets) {
+    results.push(await walletSweepOne(state, a, { ...opts, daemon }));
+  }
+
+  if (opts.json) console.log(JSON.stringify({ results }, null, 2));
+  return { results };
+}
+
+/**
+ * `wallet send <from-agent> <to-agent> <amount>` — R→R inside the fleet.
+ *
+ * Spends ONLY the source's R-address (tank) UTXOs; `executeSend` refuses any
+ * other input class, address-less ones included. The destination is another
+ * fleet agent's own R-address, never a typed address.
+ */
+
+/**
+ * Serialise spends for one agent across PROCESSES (audit S1).
+ *
+ * The pending stamp guards a *sequence* of commands; it cannot guard two running
+ * at once. Both read "no stamp", both sit at the confirmation prompt for as long
+ * as the operator takes, both broadcast. Usually the chain rejects one — the
+ * SDK's greedy selector makes the input sets overlap — but with equal-valued
+ * UTXOs the selections can be disjoint, both confirm, and the agent has spent
+ * twice against one intent (and blown the reserve, since both plans were
+ * computed from the same pre-send snapshot).
+ *
+ * Reuses the refund lock primitive: exclusive create, with staleness recovery so
+ * a killed process cannot wedge the agent permanently.
+ */
+function acquireWalletLock(agentId) {
+  try { return acquireSendLock(`wallet-${agentId}`); } catch { return false; }
+}
+function releaseWalletLock(agentId) {
+  try { releaseSendLock(`wallet-${agentId}`); } catch { /* best effort */ }
+}
+
+async function walletSend(state, fromId, toId, amountStr, opts = {}) {
+  const out = { sent: false, dryRun: false, txid: null, amountSats: 0, reason: null };
+
+  // Opt-in to stricter, never opt-in to bypass: a real mainnet install is
+  // mainnet no matter what the caller passes.
+  const mainnet = IS_MAINNET || opts.forceMainnetRules === true;
+
+  if (mainnet && opts.yes) {
+    console.error('❌ --yes is refused for `wallet send` on mainnet. Confirm interactively by retyping the amount.');
+    out.reason = 'mainnet-yes-refused';
+    return out;
+  }
+
+  const parsed = parseVrscAmount(amountStr);
+  if (!parsed.ok) {
+    console.error(`❌ ${parsed.error}`);
+    out.reason = 'invalid-amount';
+    return out;
+  }
+
+  const from = walletResolveAgent(state, fromId, 'send source');
+  if (!from) { out.reason = 'unknown-agent'; return out; }
+  const to = walletResolveAgent(state, toId, 'send destination');
+  if (!to) { out.reason = 'unknown-agent'; return out; }
+
+  if (from.id === to.id) {
+    console.error('❌ Source and destination are the same agent — that only burns a fee.');
+    out.reason = 'self-send';
+    return out;
+  }
+  if (!to.address) {
+    console.error(`❌ ${to.id} has no R-address in its keys — it cannot be a destination.`);
+    out.reason = 'no-destination-address';
+    return out;
+  }
+  if (!walletIsRegistered(from)) {
+    console.error(`❌ ${from.id} is not registered — no session to query balances or broadcast with.`);
+    out.reason = 'unregistered-source';
+    return out;
+  }
+
+  const daemon = opts.daemon || await walletPendingWrites();
+  if (walletDaemonBlocks(daemon, from.id, opts.force)) {
+    out.reason = 'daemon-write-pending';
+    return out;
+  }
+
+  let agent, u;
+  try {
+    agent = await getAgentSession(state, from);
+    u = await agent.client.getUtxos();
+  } catch (e) {
+    console.error(`❌ ${from.id}: could not read balances — ${e.message}`);
+    out.reason = 'query-failed';
+    return out;
+  }
+
+  // Serialise against a concurrent CLI invocation for this same agent (audit S1).
+  // Held across the confirmation prompt and the broadcast, because that whole
+  // span is the window in which two processes can each decide to spend.
+  if (!acquireWalletLock(from.id)) {
+    console.error(`❌ ${from.id}: another wallet command is already spending for this agent. Wait for it to finish.`);
+    return { sent: false, reason: 'locked' };
+  }
+  try {
+
+  // Source address from OUR key. The destination already comes from the target
+  // agent's keys.json (to.address); this closes the same hole on the spend side.
+  const { wifToAddress: _wifToAddress } = require('@junction41/sovagent-sdk/dist/index.js');
+  const fromOwn = resolveOwnRAddress({
+    derived: from.wif ? _wifToAddress(from.wif, J41_NETWORK) : from.address,
+    platformAddress: u.address,
+    agentId: from.id,
+  });
+  if (!fromOwn.ok) {
+    console.error(`❌ ${fromOwn.error}`);
+    return { sent: false, reason: 'address-mismatch' };
+  }
+  const rAddress = fromOwn.rAddress;
+  const s = summarizeUtxos(u.utxos, rAddress);
+
+  const stamp = await resolveWalletPending(agent.client, from.id, loadWalletPending(from.id));
+  if (stamp && opts.force) {
+    console.warn(`⚠️  ${from.id}: ignoring the pending stamp for ${String(stamp.txid || '?').substring(0, 12)} because --force was given.`);
+  }
+
+  const reserveWrites = walletFloorWrites();
+  const plan = planFleetSend({
+    feeSats: s.feeSats,
+    amountSats: parsed.sats,
+    reserveWrites,
+    allowDrain: !!opts.allowDrain,
+    fromAgentId: from.id,
+    toAgentId: to.id,
+    pending: opts.force ? null : stamp,
+    now: Date.now(),
+  });
+
+  if (!plan.ok) {
+    out.reason = plan.reason;
+    if (plan.reason === 'insufficient-funds') {
+      console.error(`❌ ${from.id}: tank holds ${walletSats(s.feeSats)}; ${walletSats(parsed.sats)} + ${walletSats(FEE_SATS)} fee does not fit.`);
+    } else if (plan.reason === 'below-reserve') {
+      console.error(`❌ ${from.id}: that send leaves it below the ${reserveWrites}-write reserve — the outage would just move to the source.`);
+      console.error('   Sweep its earnings first, or pass --allow-drain if you really mean it.');
+    } else if (plan.reason === 'send-pending') {
+      console.error(`❌ ${from.id}: a wallet transaction is recorded as unconfirmed. Wait for it, or pass --force.`);
+    } else {
+      console.error(`❌ Refusing to send — ${plan.reason}`);
+    }
+    return out;
+  }
+
+  // Best effort, read-only: never invent the destination's balance. If it is
+  // unregistered or the query fails it stays "never queried", not zero.
+  let toTank = null;
+  if (walletIsRegistered(to)) {
+    try {
+      const toAgent = await getAgentSession(state, to);
+      const tu = await toAgent.client.getUtxos();
+      toTank = summarizeUtxos(tu.utxos, tu.address || to.address).feeSats;
+    } catch { toTank = null; }
+  }
+
+  const coin = walletCoin();
+  console.log('\n[wallet] Send:');
+  console.log(`  From:    ${from.id}  (${rAddress})   tank ${walletSats(s.feeSats)} (${writesAffordable(s.feeSats)} writes)`);
+  console.log(`  To:      ${to.id}  (${to.address})   tank ${walletSats(toTank)}${toTank === null ? ' (never queried)' : ` (${writesAffordable(toTank)} writes)`}`);
+  console.log(`  Amount:  ${walletSats(plan.sendSats)} ${coin}`);
+  console.log(`  Fee:     ${walletSats(FEE_SATS)}`);
+  console.log(`  After:   ${from.id} → ${walletSats(plan.remainingSats)} (${plan.remainingWrites} writes)   ${to.id} → +${walletSats(plan.sendSats)} once confirmed`);
+  if (opts.allowDrain && plan.remainingWrites < reserveWrites) {
+    console.log(`  ⚠️  --allow-drain: this leaves the source under the ${reserveWrites}-write reserve.`);
+  }
+
+  if (!opts.yes) {
+    if (typeof opts.confirmFn !== 'function') {
+      console.error('❌ Refusing to broadcast without a confirmation.');
+      out.reason = 'no-confirmation';
+      return out;
+    }
+    const okay = await opts.confirmFn({
+      kind: 'send',
+      fromAgentId: from.id,
+      toAgentId: to.id,
+      amountSats: plan.sendSats,
+      amountText: String(amountStr).trim(),
+      // Mainnet is real money and irreversible: pressing one key is not consent.
+      requireTypedAmount: mainnet,
+      question: 'Send?',
+    });
+    if (!okay) {
+      console.log('[wallet] Cancelled — nothing broadcast.');
+      out.reason = 'cancelled';
+      return out;
+    }
+  }
+
+  const sink = {};
+  const res = await executeSend({
+    buildPayment: walletBuildPayment(state),
+    broadcast: opts.dryRun ? walletDryRunBroadcast(sink) : (hex) => agent.client.broadcast(hex),
+    wif: from.wif,
+    network: J41_NETWORK,
+    rAddress,
+    toAddress: to.address,
+    utxos: s.feeUtxos,
+    amountSats: plan.sendSats,
+  });
+
+  out.amountSats = plan.sendSats;
+
+  if (opts.dryRun) {
+    out.dryRun = true;
+    out.bytes = sink.hex ? sink.hex.length / 2 : 0;
+    if (!sink.hex) {
+      out.reason = res.reason || 'build-failed';
+      console.error(`❌ dry run stopped before broadcast — ${out.reason}`);
+    } else {
+      console.log(`  DRY RUN — built ${out.bytes} bytes, nothing broadcast.`);
+      console.log(`  ${DRY_RUN_CAVEAT}`);
+    }
+    if (opts.json) console.log(JSON.stringify(out, null, 2));
+    return out;
+  }
+
+  if (!res.sent) {
+    out.reason = res.reason;
+    console.error(`❌ send failed — ${res.reason}${res.detail ? ` (${res.detail})` : ''}`);
+    if (opts.json) console.log(JSON.stringify(out, null, 2));
+    return out;
+  }
+
+  out.sent = true;
+  out.txid = res.txid;
+  try {
+    saveWalletPending(from.id, { txid: res.txid, at: Date.now(), kind: 'send' });
+  } catch (e) {
+    console.error(`⚠️  BROADCAST ${res.txid} but the pending stamp could not be written (${e.message}).`);
+    console.error('   Do not run another wallet command for this agent for 30 minutes.');
+  }
+  console.log(`✅ Sent ${walletSats(plan.sendSats)} ${coin} ${from.id} → ${to.id} in ${String(res.txid).substring(0, 12)}`);
+  if (opts.json) console.log(JSON.stringify(out, null, 2));
+  return out;
+
+  } finally {
+    releaseWalletLock(from.id);
+  }
+}
+
+/** Interactive confirmation. Typed-amount on mainnet, plain y/N otherwise. */
+async function walletConfirm(ctx) {
+  const readline = require('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    if (ctx.requireTypedAmount) {
+      console.log('\n  ⚠️  MAINNET — this moves real funds and cannot be undone.');
+      const typed = await new Promise(resolve => rl.question(`  Retype the exact amount (${ctx.amountText}) to confirm: `, resolve));
+      if (typed.trim() !== String(ctx.amountText).trim()) {
+        console.log('  Amount did not match.');
+        return false;
+      }
+      return true;
+    }
+    const answer = await new Promise(resolve => rl.question(`\n  ${ctx.question || 'Proceed?'} (y/N) `, resolve));
+    const a = answer.trim().toLowerCase();
+    return a === 'y' || a === 'yes';
+  } finally {
+    rl.close();
+  }
+}
+
+// One registration, internal dispatch — Commander uses only the FIRST word as
+// the command name, so `wallet sweep` as its own `.command()` would collide on
+// "wallet". Same shape as `refunds [action] [job-id]` below.
+program
+  .command('wallet [action] [args...]')
+  .description('Fleet wallet — actions: list (default) | show <agent-id> | sweep <agent-id>|--all | send <from-agent> <to-agent> <amount>')
+  .option('--json', 'Raw JSON output (satoshis as integers, never floats)')
+  .option('--dry-run', 'Plan and build without broadcasting — a successful build proves nothing')
+  .option('--yes', 'Skip the interactive confirmation (send: refused on mainnet)')
+  .option('--all', 'sweep: sweep every registered agent that has a sweepable balance')
+  .option('--allow-drain', 'send: permit leaving the source tank below the write reserve')
+  .option('--force', 'Proceed despite a pending unconfirmed tx recorded for this agent')
+  .action(async (action, args = [], options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
+    ensureDirs();
+    const state = buildWalletState();
+    action = (action || 'list').toLowerCase();
+
+    if (action === 'list') {
+      await walletList(state, { json: options.json });
+      return;
+    }
+
+    if (action === 'show') {
+      const r = await walletShow(state, args[0], { json: options.json });
+      if (!r) process.exit(1);
+      return;
+    }
+
+    if (action === 'sweep') {
+      if (!options.all && !args[0]) {
+        console.error('❌ Provide an <agent-id> or --all');
+        process.exit(1);
+      }
+      const daemon = await walletPendingWrites();
+
+      // One prompt for the whole batch, then run non-interactively — the same
+      // shape as `refunds approve --all`.
+      let yes = options.yes || false;
+      if (options.all && !yes && !options.dryRun) {
+        const ids = state.agents.filter(walletIsRegistered).map(a => a.id);
+        console.log(`\n[wallet] Sweeping every registered agent with a sweepable balance: ${ids.join(', ') || '(none)'}`);
+        console.log('  Each sweep sends an agent\'s own earnings to its own fee address; funds cannot leave the agent.');
+        if (!(await walletConfirm({ question: 'Sweep all?' }))) {
+          console.log('[wallet] Cancelled — nothing broadcast.');
+          return;
+        }
+        yes = true;
+      }
+
+      const { results } = await walletSweep(state, args[0], {
+        all: options.all,
+        yes,
+        dryRun: options.dryRun,
+        force: options.force,
+        json: options.json,
+        daemon,
+        confirmFn: walletConfirm,
+      });
+      // Exit non-zero when nothing succeeded. Previously `--all` was exempt
+      // (exit 0 even if every sweep failed) and a dry run whose BUILD failed
+      // still set dryRun:true, so scripts saw success on failure.
+      const anyOk = results.some(r => r && (r.swept || (r.dryRun && r.bytes > 0)));
+      if (!results.length || !anyOk) process.exit(1);
+      return;
+    }
+
+    if (action === 'send') {
+      const [fromId, toId, amount] = args;
+      if (!fromId || !toId || !amount) {
+        console.error('❌ Usage: wallet send <from-agent> <to-agent> <amount>');
+        process.exit(1);
+      }
+      const res = await walletSend(state, fromId, toId, amount, {
+        yes: options.yes,
+        dryRun: options.dryRun,
+        force: options.force,
+        allowDrain: options.allowDrain,
+        json: options.json,
+        confirmFn: walletConfirm,
+      });
+      if (!res.sent && !res.dryRun) process.exit(1);
+      return;
+    }
+
+    console.error(`❌ Unknown wallet action '${action}'. Use: list | show | sweep | send`);
+    process.exit(1);
+  });
+
 // ── Refunds management commands ───────────────────────────────────────────────
 
 /**
@@ -8810,7 +9853,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reportSpawnAttachFailed };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
