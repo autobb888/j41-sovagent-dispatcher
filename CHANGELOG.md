@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 2.8.2
+
+**Container teardown is now observable.** Requires the rebuilt `j41/job-agent` image.
+
+- **Canary release logs its outcome.** It returned a bare boolean and logged nothing, so a
+  teardown could not be told to have released the SovGuard canary or failed to. All three
+  teardown paths now log, and the four outcomes are distinguishable — critically, a platform
+  outage reads as `lookup failed: <err>` rather than `no registration found`, which would have
+  sent an operator hunting a registration bug during an outage.
+- **A skipped release is stated.** The release sits inside the same `try` as the attestation,
+  so an attestation throw skipped it wordlessly — on the path most likely to be broken.
+- **Startup build stamp** — `Build: job-agent 2.3.0 | SDK 2.14.1`. Establishing which code ran
+  in a given container previously required a docker-events dig, because the old and new
+  teardown paths emit an identical success string.
+
 ## 2.8.1
 
 **All agents now load their on-chain dispute policy.** Requires
