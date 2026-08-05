@@ -119,7 +119,9 @@ test('canary: release deletes the matching registration', async () => {
     getCanaries: async () => ([{ id: 'mine', token: 'tok' }]),
     deleteCanary: async (id) => { deleted.push(id); },
   };
-  assert.strictEqual(await releaseCanary({ client, token: 'tok' }), true);
+  const r = await releaseCanary({ client, token: 'tok' });
+  assert.strictEqual(r.released, true);
+  assert.match(r.reason, /released mine/);
   assert.deepStrictEqual(deleted, ['mine']);
 });
 
@@ -128,9 +130,37 @@ test('canary: release is best-effort — a failure never throws', async () => {
     getCanaries: async () => { throw new Error('boom'); },
     deleteCanary: async () => { throw new Error('boom'); },
   };
-  assert.strictEqual(await releaseCanary({ client, token: 'tok' }), false);
-  assert.strictEqual(await releaseCanary({ client: null, token: 'tok' }), false);
-  assert.strictEqual(await releaseCanary({ client: {}, token: 'tok' }), false);
+  // Every outcome must carry a REASON — a cleanup step that fails silently is
+  // exactly what this whole change set exists to remove.
+  // A platform outage must NOT read as "no registration found" — collapsing
+  // those two was the whole misleading-diagnostic problem. resolveCanaryId
+  // therefore propagates instead of swallowing. Asserting only that SOME reason
+  // exists is what let that dead branch hide.
+  const failed = await releaseCanary({ client, token: 'tok' });
+  assert.strictEqual(failed.released, false);
+  assert.match(failed.reason, /lookup failed: boom/,
+    'an API failure must be reported as a lookup failure, not as a missing registration');
+
+  const noClient = await releaseCanary({ client: null, token: 'tok' });
+  assert.strictEqual(noClient.released, false);
+  assert.match(noClient.reason, /no client/);
+
+  const noMethod = await releaseCanary({ client: {}, token: 'tok' });
+  assert.strictEqual(noMethod.released, false);
+  assert.match(noMethod.reason, /no client/);
+
+  // Registration never succeeded => nothing to release, and it must SAY so.
+  const none = await releaseCanary({ client: { getCanaries: async () => [], deleteCanary: async () => {} }, token: 'tok' });
+  assert.strictEqual(none.released, false);
+  assert.match(none.reason, /no registration found/);
+
+  // Delete itself failing must be distinguishable from not finding one.
+  const delFail = await releaseCanary({
+    client: { getCanaries: async () => ([{ id: 'x', token: 'tok' }]), deleteCanary: async () => { throw new Error('nope'); } },
+    token: 'tok',
+  });
+  assert.strictEqual(delFail.released, false);
+  assert.match(delFail.reason, /delete failed: nope/);
 });
 
 test('canary: purge deletes only ABANDONED slots, never a concurrent live job\'s', async () => {

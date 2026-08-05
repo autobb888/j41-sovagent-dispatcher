@@ -100,14 +100,14 @@ async function signAndSubmitDeletionAttestation({
  */
 async function resolveCanaryId(client, token) {
   if (!client || !token || typeof client.getCanaries !== 'function') return null;
-  try {
-    const list = await client.getCanaries();
-    const arr = Array.isArray(list) ? list : (list && list.canaries) || [];
-    const hit = arr.find((c) => c && c.token === token);
-    return (hit && (hit.id || hit.canaryId)) || null;
-  } catch {
-    return null;
-  }
+  // Deliberately does NOT swallow errors. Doing so collapsed "the platform is
+  // down" into "no registration found", so an outage read as a registration bug
+  // — the exact misleading-diagnostic problem this module exists to remove.
+  // Callers decide how to report a lookup failure.
+  const list = await client.getCanaries();
+  const arr = Array.isArray(list) ? list : (list && list.canaries) || [];
+  const hit = arr.find((c) => c && c.token === token);
+  return (hit && (hit.id || hit.canaryId)) || null;
 }
 
 /**
@@ -122,17 +122,30 @@ async function resolveCanaryId(client, token) {
  * — the privacy proof is worth more than canary hygiene, and container kill
  * windows are as short as 5s.
  *
- * @returns {Promise<boolean>} true if a registration was deleted.
+ * Returns a REASON, not just a boolean, so the caller can log every outcome. An
+ * earlier version returned a bare boolean and logged nothing, which made the
+ * release invisible in both directions — a cleanup step that can fail silently
+ * is the exact pattern the rest of this work exists to remove. Verified live on
+ * 2026-08-05: the release was unobservable in the job log.
+ *
+ * @returns {Promise<{released: boolean, reason: string}>}
  */
 async function releaseCanary({ client, token, canaryId = null }) {
-  if (!client || typeof client.deleteCanary !== 'function') return false;
+  if (!client || typeof client.deleteCanary !== 'function') {
+    return { released: false, reason: 'no client' };
+  }
+  let id = canaryId;
   try {
-    const id = canaryId || await resolveCanaryId(client, token);
-    if (!id) return false;
+    if (!id) id = await resolveCanaryId(client, token);
+  } catch (e) {
+    return { released: false, reason: `lookup failed: ${e && e.message}` };
+  }
+  if (!id) return { released: false, reason: 'no registration found for this token' };
+  try {
     await client.deleteCanary(id);
-    return true;
-  } catch {
-    return false;
+    return { released: true, reason: `released ${id}` };
+  } catch (e) {
+    return { released: false, reason: `delete failed: ${e && e.message}` };
   }
 }
 

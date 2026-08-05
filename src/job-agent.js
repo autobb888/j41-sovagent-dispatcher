@@ -346,7 +346,23 @@ async function main() {
   console.log(`Identity: ${IDENTITY}`);
   console.log(`Container: ${CONTAINER_ID.substring(0, 12)}`);
   console.log(`Timeout: ${TIMEOUT_MS / 60000} min`);
-  console.log(`Executor: ${EXECUTOR_TYPE}\n`);
+  console.log(`Executor: ${EXECUTOR_TYPE}`);
+  // Build identity. Without this, "which code actually ran in that container?"
+  // is unanswerable from the log — on 2026-08-05 it took a docker-events
+  // archaeology dig to establish which image produced a teardown line, because
+  // an old and a new code path emitted the SAME string.
+  // Read both off disk, not via require(): a package's `exports` field can
+  // block `require('<pkg>/package.json')` (ERR_PACKAGE_PATH_NOT_EXPORTED), which
+  // would silently degrade this to "unknown" — losing the SDK version, the part
+  // that actually matters.
+  const readVer = (p) => {
+    try { return JSON.parse(fs.readFileSync(p, 'utf8')).version || '?'; } catch { return '?'; }
+  };
+  const here = __dirname;
+  console.log(
+    `Build: job-agent ${readVer(path.join(here, 'package.json'))} | ` +
+    `SDK ${readVer(path.join(here, 'node_modules/@junction41/sovagent-sdk/package.json'))}\n`,
+  );
 
   // Load keys. In broker mode the WIF stays on the host — the container
   // shouldn't have `/app/keys.json` mounted at all. We fall back to env-var
@@ -450,9 +466,19 @@ async function main() {
           throw regErr;
         }
       }
+      // Registration SUCCEEDED at this point. The id lookup below is
+      // best-effort and must not be able to turn a successful registration into
+      // a "leak detection DISABLED" warning — resolveCanaryId now propagates
+      // errors so callers can tell an outage from a missing registration.
+      //
       // Do NOT trust the register response shape for the id — it is typed
       // `{ status }`. Match on the token via the typed list endpoint instead.
-      _canaryId = await resolveCanaryId(agent.client, CANARY_TOKEN);
+      try {
+        _canaryId = await resolveCanaryId(agent.client, CANARY_TOKEN);
+      } catch (lookupErr) {
+        // Release can still find it by token at teardown; only the fast path is lost.
+        console.warn(`[CANARY] Registered, but id lookup failed (will re-resolve at teardown): ${lookupErr.message}`);
+      }
       console.log('[CANARY] Registered with SovGuard');
     } catch (e) {
       // "non-fatal" is true for job EXECUTION and misleading for security posture:
@@ -1508,10 +1534,14 @@ process.on('SIGTERM', async () => {
         console.log(`✅ SIGTERM attestation ${r.submitted ? 'submitted' : 'signed (submit failed: ' + r.error + ')'}`);
         // Canary release LAST: the privacy proof matters more, and the SIGTERM
         // grace period can be as short as 5s.
-        await releaseCanary({ client: _agent.client || _agent._client, token: CANARY_TOKEN, canaryId: _canaryId });
+        const cr = await releaseCanary({ client: _agent.client || _agent._client, token: CANARY_TOKEN, canaryId: _canaryId });
+        console.log(`[CANARY] ${cr.released ? '✅ ' : '⚠️  not released — '}${cr.reason}`);
       }
     } catch (e) {
       console.error('⚠️  SIGTERM attestation failed:', e.message);
+      // The release lives inside the same try, so an attestation throw would
+      // otherwise skip it wordlessly — the silence class this work removes.
+      console.warn('[CANARY] ⚠️  not released — attestation path threw before release');
     }
 
     if (_agent) _agent.stop();
@@ -1583,11 +1613,13 @@ if (require.main === module) {
           extra: { terminatedBy: 'timeout' },
         });
         console.log(`✅ Timeout attestation ${r.submitted ? 'submitted' : 'signed (submit failed: ' + r.error + ')'}`);
-        await releaseCanary({ client: agent.client || agent._client, token: CANARY_TOKEN, canaryId: _canaryId });
+        const cr = await releaseCanary({ client: agent.client || agent._client, token: CANARY_TOKEN, canaryId: _canaryId });
+        console.log(`[CANARY] ${cr.released ? '✅ ' : '⚠️  not released — '}${cr.reason}`);
         agent.stop();
       } catch (apiErr) {
         // Fallback: sign locally and save to disk only
         console.error('⚠️  Could not submit attestation to API:', apiErr.message);
+        console.warn('[CANARY] ⚠️  not released — attestation path threw before release');
         const deletionAttestation = {
           jobId: JOB_ID,
           containerId: CONTAINER_ID,
@@ -1892,9 +1924,11 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult, signer) 
     });
     log.info('Deletion attestation signed', { jobId: JOB_ID, submitted: r.submitted });
     if (!r.submitted) console.log('⚠️  Submit failed (local artifact written):', r.error);
-    await releaseCanary({ client: agent.client || agent._client, token: CANARY_TOKEN, canaryId: _canaryId });
+    const cr = await releaseCanary({ client: agent.client || agent._client, token: CANARY_TOKEN, canaryId: _canaryId });
+    console.log(`[CANARY] ${cr.released ? '✅ ' : '⚠️  not released — '}${cr.reason}`);
   } catch (e) {
     console.log('⚠️  Could not build/sign attestation:', e.message);
+    console.warn('[CANARY] ⚠️  not released — attestation path threw before release');
   }
 
   // On-chain identity update: job.record + review.record

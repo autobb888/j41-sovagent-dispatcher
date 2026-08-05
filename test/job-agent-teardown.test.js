@@ -85,6 +85,16 @@ test('the startup job fetch validates INSIDE the retry', () => {
   );
 });
 
+test('every canary release outcome is logged, success or failure', () => {
+  // The release used to return a bare boolean and log nothing, so it was
+  // invisible in both directions — verified live 2026-08-05. A cleanup step that
+  // can fail silently is the pattern this work exists to remove.
+  const logs = CODE.match(/\[CANARY\] \$\{cr\.released/g) || [];
+  assert.strictEqual(logs.length, 3,
+    `all 3 teardown paths must log the release outcome, found ${logs.length}`);
+  assert.ok(/not released/.test(CODE), 'the failure branch must be visible too');
+});
+
 test('canary registration failure is reported as a security-posture warning', () => {
   // "non-fatal" is true for execution and misleading for security: it means this
   // job runs unwatched by SovGuard.
