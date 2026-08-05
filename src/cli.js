@@ -5152,23 +5152,58 @@ function acquireSendLock(jobId) {
       // short staleness bound on the gate itself is enough to survive a crash
       // inside it.
       const gatePath = `${lockPath}.steal`;
+      const gateTag = `${process.pid}.${crypto.randomBytes(6).toString('hex')}`;
       let gate;
       try {
         gate = fs.openSync(gatePath, 'wx');
+        fs.writeSync(gate, gateTag);
       } catch (ge) {
         if (ge.code !== 'EEXIST') return false;
-        // A gate left by a dead process must not wedge the agent forever.
-        // Fail CLOSED on an unreadable gate. stat() only fails here because the
-        // gate vanished between our EEXIST and this call — i.e. a peer is
-        // actively finishing its steal right now. Treating that as "infinitely
-        // old" and seizing the gate is how a live holder gets overrun; it left
-        // ~1 round in 20 still producing multiple winners. Standing down costs
-        // one retry.
-        let gateAge = 0;
-        try { gateAge = Date.now() - fs.statSync(gatePath).mtimeMs; } catch { return false; }
-        if (!Number.isFinite(gateAge) || gateAge < STEAL_GATE_STALE_MS) return false; // a peer is mid-steal
-        try { fs.unlinkSync(gatePath); } catch { /* already gone */ }
-        try { gate = fs.openSync(gatePath, 'wx'); } catch { return false; }
+        // Reclaiming an orphaned gate is itself a steal, so it needs the same
+        // discipline as the lock it guards — and the first version did not have
+        // it: an age check followed by unlink-then-create, exactly the
+        // non-atomic pattern this release condemned one layer down.
+        //
+        // Age is the wrong test anyway. "Old" flips over time and can be
+        // misjudged by a peer that is merely slow; "the holder is dead" is
+        // stable — a dead pid stays dead. So read the gate's owner and reuse the
+        // liveness check. A gate held by a LIVE process is never taken, however
+        // long it has been held; the gate is held for microseconds, so a live
+        // holder means a peer is genuinely mid-steal.
+        let owner = null;
+        try { owner = parseInt(String(fs.readFileSync(gatePath, 'utf8')).split('.')[0], 10); }
+        catch { return false; } // unreadable or vanished — a peer is active; stand down
+        if (Number.isInteger(owner) && owner > 0) {
+          let alive = true;
+          try { process.kill(owner, 0); } catch (err) { alive = (err.code === 'EPERM'); }
+          if (alive) return false; // a peer is mid-steal
+        } else {
+          // No usable owner. Fall back to age, which is all we have.
+          let gateAge = 0;
+          try { gateAge = Date.now() - fs.statSync(gatePath).mtimeMs; } catch { return false; }
+          if (!Number.isFinite(gateAge) || gateAge < STEAL_GATE_STALE_MS) return false;
+        }
+        // The gate's owner is provably gone. Reclaim in two atomic steps.
+        //
+        // Read-back verification is NOT enough here and measurably fails (2 bad
+        // rounds in 25): two contenders each unlink, create, and read their own
+        // tag back before the other overwrites, so both believe they won. The
+        // atomic claim has to be the rename — exactly one process can rename a
+        // given source, the rest get ENOENT — and the acquire has to be O_EXCL
+        // create, which lets a third contender that legitimately grabbed the
+        // freed path win instead, with us standing down.
+        try {
+          fs.renameSync(gatePath, `${gatePath}.dead.${gateTag}`);
+        } catch {
+          return false; // another contender claimed the reclaim
+        }
+        try { fs.unlinkSync(`${gatePath}.dead.${gateTag}`); } catch { /* already gone */ }
+        try {
+          gate = fs.openSync(gatePath, 'wx');
+          fs.writeSync(gate, gateTag);
+        } catch {
+          return false; // someone took the freed slot first — stand down
+        }
       }
       try {
         // Re-read under the gate: a peer may have completed its steal already.
@@ -5180,12 +5215,22 @@ function acquireSendLock(jobId) {
             let alive = true;
             try { process.kill(curPid, 0); } catch (err) { alive = (err.code === 'EPERM'); }
             stillStale = !alive;
+          } else if (cur === '') {
+            // EMPTY, not absent. openSync(wx) creates the file and writeSync
+            // fills it a moment later, so a zero-length lock means a peer is
+            // mid-write — it is the youngest possible lock, not a stale one.
+            // Reading it as stale is what let a contender steal a lock that was
+            // being created: measured as a second "winner" whose own lock file
+            // named a different pid.
+            stillStale = false;
           } else {
             const curTs = parseInt(cur.split(':')[1], 10);
             stillStale = !curTs || (Date.now() - curTs) > REFUND_LOCK_STALE_MS;
           }
-        } catch {
-          stillStale = true; // vanished or unreadable — free to take
+        } catch (e) {
+          // ENOENT means genuinely gone and free to take. Anything else (EACCES,
+          // EIO) is doubt, and doubt does not license taking a money lock.
+          stillStale = (e && e.code === 'ENOENT');
         }
         if (!stillStale) return false; // a peer stole it first; it is alive now
 
@@ -5193,6 +5238,13 @@ function acquireSendLock(jobId) {
         const fd = fs.openSync(lockPath, 'wx');
         fs.writeSync(fd, `${process.pid}:${Date.now()}`);
         fs.closeSync(fd);
+        // Final proof of ownership. Cheap, and it catches any interleaving the
+        // reasoning above missed — a caller that broadcasts while another
+        // process owns the lock is the whole failure mode.
+        try {
+          const back = fs.readFileSync(lockPath, 'utf8');
+          if (parseInt(back.split(':')[0], 10) !== process.pid) return false;
+        } catch { return false; }
         return true;
       } catch {
         return false;

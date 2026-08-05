@@ -26,11 +26,15 @@ const { execFileSync } = require('child_process');
 
 const RACER = path.join(__dirname, 'fixtures', 'lock-racer.js');
 
-function raceRound({ racers, lockContent }) {
+function raceRound({ racers, lockContent, gateContent }) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-lockrace-'));
   const locks = path.join(home, '.j41', 'dispatcher', 'refund-locks');
   fs.mkdirSync(locks, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(locks, 'job-race.lock'), lockContent);
+  // Optionally seed an ORPHANED steal gate — the reclaim path, which the
+  // original stress never touched because a gate is only ever held for
+  // microseconds and never survives a clean run.
+  if (gateContent) fs.writeFileSync(path.join(locks, 'job-race.lock.steal'), gateContent);
 
   const startAt = Date.now() + 700; // all children spin to this instant
   const kids = Array.from({ length: racers }, () =>
@@ -63,4 +67,32 @@ test('NO process wins a race for a lock held by a LIVE process', async () => {
   const liveButSlow = `${process.pid}:${Date.now() - 60 * 60 * 1000}`;
   const winners = await raceRound({ racers: 10, lockContent: liveButSlow });
   assert.equal(winners, 0, `${winners} processes robbed a live holder`);
+});
+
+test('exactly one process wins when the STEAL GATE itself was orphaned', async () => {
+  // Reclaiming an orphaned gate is a steal too, and the first implementation
+  // reclaimed it with unlink-then-create — the very pattern this file exists to
+  // prove wrong one layer down. It measured 2 bad rounds in 25.
+  //
+  // The decisive defect found while fixing it: openSync(wx) CREATES the lock
+  // file and writeSync fills it a moment later, so a contender reading in that
+  // gap sees '' — and an empty lock was being classified as stale. A process
+  // could therefore steal a lock that was in the act of being created. Caught by
+  // printing which pid each winner's own lock file named: one winner's lock
+  // named somebody else.
+  const deadHolder = `999999:${Date.now()}`;
+  const deadGate = '999998.deadbeefcafe';
+  for (let round = 0; round < 6; round++) {
+    const winners = await raceRound({ racers: 12, lockContent: deadHolder, gateContent: deadGate });
+    assert.equal(winners, 1, `round ${round + 1}: ${winners} processes believed they held the lock`);
+  }
+});
+
+test('an orphaned gate does not permanently wedge the agent', async () => {
+  // Failing closed forever would be safe for money and useless in practice: the
+  // refund would never be paid. Exactly one contender must get through.
+  const winners = await raceRound({
+    racers: 4, lockContent: `999999:${Date.now()}`, gateContent: '999998.abc',
+  });
+  assert.equal(winners, 1, 'a dead gate must be reclaimable, not a permanent block');
 });

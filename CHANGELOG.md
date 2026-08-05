@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+## 2.11.8
+
+**Stealing a lock that was in the act of being created.** Closing the last audit
+finding — reclaiming an orphaned *steal gate* still used unlink-then-create, the
+exact non-atomic pattern 2.11.3 condemned one layer down. Fixing that surfaced a
+worse defect underneath it.
+
+`openSync(lockPath, 'wx')` creates the file; `writeSync` fills it a moment later.
+A contender reading in that gap sees `''` — and an empty lock was classified as
+**stale**, because `parseInt('')` is `NaN`, which fell through to the timestamp
+branch where `!NaN` is `true`. So a process could steal a lock that another
+process was in the middle of creating. An empty lock is the *youngest possible*
+lock, not an old one.
+
+Found by instrumenting the race harness to print which pid each winner's own lock
+file named: one winner's lock named somebody else. Analysis alone had not found
+it — two rounds of reasoning about the interleaving were wrong before the data
+settled it.
+
+Also in this pass:
+- The gate is reclaimed only when its owner is provably **dead** (`kill(pid, 0)`),
+  never merely old — "dead" is stable, "old" flips and can be misjudged.
+- Reclaim is now `rename`-claim plus `O_EXCL` acquire, so exactly one contender
+  proceeds and a third that legitimately grabs the freed path wins instead.
+- A lock read failing with anything other than `ENOENT` no longer counts as free.
+  Doubt does not license taking a money lock.
+- A final ownership check before returning: a caller that broadcasts while
+  another process owns the lock is the entire failure mode.
+
+Measured after the fix: **0 bad rounds in 45** on the orphaned-gate path (12
+racers), 0 in 30 on the original stale-lock path (16 racers), 0 live holders
+robbed in 10.
+
+**One honest note on the tests.** The race harness pins the behaviour but does
+*not* guard this fix — the defect fired roughly twice in 45 rounds, and
+mutation-testing confirmed the race test still passes with the fix removed. The
+guard is a deterministic unit test that seeds an empty lock file directly; that
+one does fail when the fix is reverted.
+
+854 tests (850 before).
+
 ## 2.11.7
 
 Post-audit fixes. The audit of the day's work found that **one of yesterday's

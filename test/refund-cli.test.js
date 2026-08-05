@@ -536,3 +536,44 @@ test('an UNREADABLE marker still blocks — it must not read as "no marker"', ()
   clearRefundInflight('job-unreadable');
   assert.equal(readRefundInflight('job-unreadable'), null, 'and an absent one is still absent');
 });
+
+test('an EMPTY lock file is the youngest possible lock, not a stale one', () => {
+  // openSync(wx) creates the file and writeSync fills it a moment later. A
+  // contender reading in that gap sees '' — and '' was being classified as
+  // stale, so a process could steal a lock that was in the act of being
+  // created. Measured as a second "winner" whose own lock file named a
+  // different pid.
+  //
+  // Deterministic on purpose: the race that revealed this fired ~2 times in 45
+  // rounds, far too rare for a race harness to guard the fix.
+  const locksDir = path.dirname(refundInflightPath('probe'));
+  fs.mkdirSync(locksDir, { recursive: true, mode: 0o700 });
+  const lockPath = path.join(locksDir, 'job-empty.lock');
+
+  fs.writeFileSync(lockPath, '');   // mid-creation, as openSync(wx) leaves it
+  assert.equal(acquireSendLock('job-empty'), false,
+    'an empty lock means a peer is mid-write — stealing it double-spends');
+
+  fs.unlinkSync(lockPath);
+  assert.equal(acquireSendLock('job-empty'), true, 'and an absent lock is still takeable');
+  releaseSendLock('job-empty');
+});
+
+test('an unreadable-but-present lock is not treated as free', () => {
+  // ENOENT means genuinely gone. Any other read error is doubt, and doubt does
+  // not license taking a money lock.
+  const locksDir = path.dirname(refundInflightPath('probe'));
+  const lockPath = path.join(locksDir, 'job-noperm.lock');
+  fs.writeFileSync(lockPath, '999999:1');   // dead holder → normally stealable
+  fs.chmodSync(lockPath, 0o000);
+  try {
+    const got = acquireSendLock('job-noperm');
+    // Root can read anything, so only assert the property when the mode bites.
+    let readable = true;
+    try { fs.readFileSync(lockPath, 'utf8'); } catch { readable = false; }
+    if (!readable) assert.equal(got, false, 'an unreadable lock must not be taken');
+    if (got) releaseSendLock('job-noperm');
+  } finally {
+    try { fs.chmodSync(lockPath, 0o600); fs.unlinkSync(lockPath); } catch { /* gone */ }
+  }
+});
