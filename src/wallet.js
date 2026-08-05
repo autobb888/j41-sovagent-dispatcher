@@ -221,8 +221,8 @@ function summarizeFleet(rows) {
 
   for (const r of list) {
     if (!r) continue;
-    if (typeof r.feeSats === 'number' && Number.isFinite(r.feeSats)) totalFeeSats += r.feeSats;
-    if (typeof r.sweepableSats === 'number' && Number.isFinite(r.sweepableSats)) totalSweepableSats += r.sweepableSats;
+    if (Number.isSafeInteger(r.feeSats) && r.feeSats >= 0) totalFeeSats += r.feeSats;
+    if (Number.isSafeInteger(r.sweepableSats) && r.sweepableSats >= 0) totalSweepableSats += r.sweepableSats;
 
     if (r.status === 'ok') counts.ok += 1;
     else if (r.status === 'low') counts.low += 1;
@@ -280,7 +280,11 @@ function planManualSweep({
   now = 0,
   backstopMs = SWEEP_PENDING_BACKSTOP_MS,
 } = {}) {
-  if (!Number.isFinite(feeSats) || !Number.isFinite(sweepableSats) || !Number.isFinite(txFeeSats)) {
+  // isSafeInteger, not isFinite: 1e21 and 0.5 are finite but are not valid
+  // satoshi counts, and both flow straight into an approved amount.
+  if (!Number.isSafeInteger(feeSats) || feeSats < 0
+      || !Number.isSafeInteger(sweepableSats) || sweepableSats < 0
+      || !Number.isSafeInteger(txFeeSats) || txFeeSats <= 0) {
     return { ok: false, reason: 'invalid-balances', amountSats: 0 };
   }
 
@@ -334,13 +338,17 @@ function planFleetSend({
 } = {}) {
   const no = (reason) => ({ ok: false, reason, sendSats: 0, remainingSats: 0, remainingWrites: 0 });
 
-  if (!Number.isFinite(feeSats) || !Number.isFinite(txFeeSats) || !Number.isFinite(reserveWrites)) {
+  // isSafeInteger — see planManualSweep. A fractional tank produced a
+  // fractional `remainingSats` that was rendered to the operator.
+  if (!Number.isSafeInteger(feeSats) || feeSats < 0
+      || !Number.isSafeInteger(txFeeSats) || txFeeSats <= 0
+      || !Number.isFinite(reserveWrites)) {
     return no('invalid-balances');
   }
   // Must be a whole number of satoshis: `parseVrscAmount` is the only supported
   // producer and it returns integers, so a fraction here means someone did the
   // float multiplication this module refuses to do.
-  if (!Number.isFinite(amountSats) || !Number.isInteger(amountSats) || amountSats <= 0) {
+  if (!Number.isSafeInteger(amountSats) || amountSats <= 0) {
     return no('invalid-amount');
   }
 

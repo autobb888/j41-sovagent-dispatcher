@@ -4189,9 +4189,18 @@ program
       console.error('❌ Keys are already encrypted (master-key.json exists). Use change-passphrase.');
       process.exit(1);
     }
+    // Setting a NEW passphrase is deliberate, so it is not read from the
+    // environment — but a non-TTY must fail loudly rather than silently leave
+    // the keys in plaintext while reporting success.
+    if (!process.stdin.isTTY) {
+      console.error('❌ encrypt-keys needs a terminal to set a new passphrase — stdin is not a TTY.');
+      console.error('   Nothing was encrypted; your keys are still plaintext at rest.');
+      console.error('   Run it in an interactive shell. (J41_KEYS_PASSPHRASE is for UNLOCKING later, not for setting one here.)');
+      process.exit(1);
+    }
     const p1 = await keystore.promptHidden('New passphrase: ');
     const p2 = await keystore.promptHidden('Confirm passphrase: ');
-    if (!p1 || p1 !== p2) { console.error('❌ Passphrases empty or do not match.'); process.exit(1); }
+    if (!p1 || p1 !== p2) { console.error('❌ Passphrases empty or do not match. Nothing was encrypted.'); process.exit(1); }
     keystore.initMasterKey(p1, MASTER_KEY_PATH); // creates file + unlocks
     const n = encryptAllKeys(AGENTS_DIR);
     keystore.lock();
@@ -4219,10 +4228,14 @@ program
   .description('Change the at-rest encryption passphrase')
   .action(async () => {
     if (!fs.existsSync(MASTER_KEY_PATH)) { console.error('❌ Keys are not encrypted.'); process.exit(1); }
+    if (!process.stdin.isTTY) {
+      console.error('❌ change-passphrase needs a terminal — stdin is not a TTY. The passphrase was NOT changed.');
+      process.exit(1);
+    }
     const oldPass = await keystore.promptHidden('Current passphrase: ');
     const n1 = await keystore.promptHidden('New passphrase: ');
     const n2 = await keystore.promptHidden('Confirm new passphrase: ');
-    if (!n1 || n1 !== n2) { console.error('❌ New passphrases empty or do not match.'); process.exit(1); }
+    if (!n1 || n1 !== n2) { console.error('❌ New passphrases empty or do not match. The passphrase was NOT changed.'); process.exit(1); }
     try { keystore.changePassphrase(oldPass, n1, MASTER_KEY_PATH); }
     catch (e) { console.error(`❌ ${e.message}`); process.exit(1); }
     console.log('\n🔐 Passphrase changed.');

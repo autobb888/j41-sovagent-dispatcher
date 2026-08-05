@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+## 2.11.1
+
+**Clean-room install testing + property tests for the money layer.** Everything
+we had tested ran on a machine with nine configured agents, a populated
+`~/.j41`, a built image and funded wallets. A new user has none of that, so we
+installed 2.11.0 from npm into an empty HOME and drove it as a first-time
+operator, then fuzzed every pure money function with ~120k adversarial inputs.
+
+**Silent security failure in `encrypt-keys` (the clean-room find).** In a
+non-TTY — a script, CI, `ssh host 'j41-dispatcher encrypt-keys'` — the command
+printed its prompt, read nothing, **exited 0**, wrote no master key, and left
+every WIF in plaintext. No error. An operator automating it would believe their
+keys were encrypted at rest.
+
+Root cause: `promptHidden` never settled on EOF, so the action abandoned
+mid-`await` and the process exited before its own validation could run. The
+check was correct; it simply never executed. `promptHidden` now resolves `null`
+on a non-TTY or closed stdin, and `encrypt-keys`/`change-passphrase` refuse
+up front with an explicit *"nothing was encrypted; your keys are still
+plaintext"*. The interactive path is unchanged (verified through a pty).
+
+**`Number.isFinite` was too weak a guard for money (the fuzzing finds).** `0.5`
+and `1e21` are finite but are not valid satoshi counts, and every planner
+accepted and propagated them — a fractional `remainingSats` rendered to an
+operator, and sweep amounts past the range where integer arithmetic holds. Now
+`Number.isSafeInteger` + non-negative in `summarizeUtxos`, `planFeeSweep`,
+`planManualSweep`, `planFleetSend` and `summarizeFleet`. `writesAffordable`
+returns 0 for non-finite input instead of `Infinity`.
+
+**`classifyInboxFailure` and `isFundingFailure` could disagree.** An error whose
+message said "insufficient funds" but which also carried `code: TX_REJECTED`
+with an unrecognised detail classified `hard` while `isFundingFailure` returned
+true — so the daemon logged `FEE TANK EMPTY` and struck the item toward a dead
+letter in the same breath. Funding is now checked first, so the two cannot
+diverge by construction.
+
+`test/money-properties.test.js` (12 properties, ~120k cases, seeded PRNG so any
+failure is reproducible) asserts the invariants rather than examples: parsing
+never throws and never accepts an amount the SDK round-trip would alter; the
+R/i buckets are always disjoint, finite and integral; an approved plan is always
+arithmetically fundable; and **neither executor will sign or broadcast a
+wrong-address-class input under any input at all**.
+
+798 tests (786 before).
+
 ## 2.11.0
 
 **Mainnet security gate: six missing bypass flags.** An audit asked why the gate's

@@ -155,17 +155,38 @@ async function resolvePassphrase({ env = process.env, promptFn } = {}) {
   throw e;
 }
 
+/**
+ * Ask for a secret without echoing it.
+ *
+ * Resolves `null` — never hangs — when there is nothing to read from: a closed
+ * stdin, a pipe, a non-TTY (`ssh host 'j41-dispatcher encrypt-keys'`, CI, cron).
+ *
+ * That `'close'` handler is load-bearing. Without it the promise simply never
+ * settled, so the caller's `await` abandoned mid-action and the process exited 0
+ * with its own validation never reached. For `encrypt-keys` that printed a
+ * prompt, wrote no master key, left every WIF in plaintext, and reported
+ * success — an operator scripting it would believe their keys were encrypted at
+ * rest when they were not. Silence is the one outcome a passphrase prompt must
+ * never produce.
+ */
 function promptHidden(question) {
   return new Promise((resolve) => {
+    if (!process.stdin.isTTY) {
+      // Nothing can be typed. Say so rather than block or pretend.
+      return resolve(null);
+    }
     const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+    let settled = false;
+    const done = (v) => { if (settled) return; settled = true; try { rl.close(); } catch { /* already closed */ } resolve(v); };
     // Suppress echo of typed characters.
     rl._writeToOutput = () => {};
     process.stdout.write(question);
     rl.question('', (answer) => {
-      rl.close();
       process.stdout.write('\n');
-      resolve(answer);
+      done(answer);
     });
+    // EOF (^D, closed pipe) fires 'close' without ever calling the callback.
+    rl.on('close', () => { if (!settled) { process.stdout.write('\n'); done(null); } });
   });
 }
 

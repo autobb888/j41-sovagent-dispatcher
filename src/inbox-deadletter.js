@@ -182,6 +182,15 @@ const TRANSIENT_PATTERNS = [
  * forever and silently — the pathology this module exists to stop.
  */
 function classifyInboxFailure(err) {
+  // Funding is checked FIRST, ahead of the TX_REJECTED branch, so that this
+  // function and isFundingFailure() can never disagree. They did: an error whose
+  // MESSAGE said "insufficient funds" but which also carried code TX_REJECTED
+  // with an unrecognised detail returned 'hard' here while isFundingFailure()
+  // returned true — so cli.js logged "FEE TANK EMPTY" and struck the item toward
+  // a dead letter in the same breath. Whatever else is attached to it, an error
+  // that says the wallet is empty is not the item's fault.
+  if (isFundingFailure(err)) return 'transient';
+
   const code = err && typeof err === 'object' ? err.code : undefined;
   if (code === 'TX_REJECTED') {
     // Prefer the daemon's own reason when the platform gives it to us.

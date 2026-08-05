@@ -73,7 +73,11 @@ function summarizeUtxos(utxos, rAddress) {
     // become "0500000500000" and the plan proposes sweeping thousands of coins
     // from a hundredth of one. Nothing is spent (selectUtxos throws) but the
     // agent logs an absurd failed sweep every cycle forever.
-    if (!u || typeof u.satoshis !== 'number' || !Number.isFinite(u.satoshis) || u.satoshis <= 0) continue;
+    // isSafeInteger, not isFinite: a satoshi is indivisible and must stay exact.
+    // 0.5 and 1e21 are both finite, and both propagate nonsense downstream — a
+    // fractional tank balance shown to an operator, or an amount past the range
+    // where integer arithmetic holds. Found by property testing, not by review.
+    if (!u || !Number.isSafeInteger(u.satoshis) || u.satoshis <= 0) continue;
     if (!u.address || u.address === rAddress) fee.push(u);
     else sweepable.push(u);
   }
@@ -88,7 +92,11 @@ function summarizeUtxos(utxos, rAddress) {
 
 /** Fees-affordable write count for a balance. */
 function writesAffordable(sats, feeSats = FEE_SATS) {
-  return Math.floor((sats || 0) / feeSats);
+  // Infinity/NaN in must not become Infinity/NaN out — this number is rendered
+  // to operators and compared against the sweep floor.
+  if (!Number.isFinite(sats) || sats <= 0) return 0;
+  if (!Number.isFinite(feeSats) || feeSats <= 0) return 0;
+  return Math.floor(sats / feeSats);
 }
 
 /**
@@ -112,7 +120,10 @@ function planFeeSweep({
   // Fail closed on unusable numbers. Without this, feeSats=NaN makes every
   // comparison below false, so the function falls through ALL its guards and
   // answers "yes, sweep" for a tank whose level it does not know.
-  if (!Number.isFinite(feeSats) || !Number.isFinite(sweepableSats)) {
+  // isSafeInteger, not isFinite — see summarizeUtxos. 1e21 is finite and would
+  // otherwise be approved as a sweep amount.
+  if (!Number.isSafeInteger(feeSats) || feeSats < 0
+      || !Number.isSafeInteger(sweepableSats) || sweepableSats < 0) {
     return { sweep: false, reason: 'invalid-balances', amountSats: 0 };
   }
 
