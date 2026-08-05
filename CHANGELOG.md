@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 2.8.1
+
+**All agents now load their on-chain dispute policy.** Requires
+`@junction41/sovagent-sdk@2.14.1`.
+
+5 of 9 agents logged `no dispute policy on-chain — disputes will log only` even
+though the flat `agent.disputePolicy` key was present and well-formed on every
+one of them. The SDK misdetected any pre-2026-03-28 identity as legacy-format —
+the legacy parent key never disappears from the aggregated `getMyIdentity` view —
+and the legacy decoder does not know the flat keys. Their `displayName` was
+dropped the same way.
+
+This gated dispute handling on the OLDEST, most-used agents, and it is a
+prerequisite for `DISPUTE_RESOLVER_ENABLED`: an agent without a loaded policy
+degrades to log-only.
+
 ## 2.8.0
 
 **Round-4 prep: three job-container defects fixed.** Requires
