@@ -4,10 +4,10 @@
 **Shipped:** dispatcher **2.11.0** (SDK 2.14.1 unchanged — nothing here needs an SDK release)
 **Fleet:** 9/9 available, inbox clean, no dead letters
 
-Two things happened since the round-4 report. Most of it is a defect class we own and
-have fixed. **Two items need work from you** — §1 is a platform inconsistency to
-reconcile, §2 is a hard dependency we've just created for mainnet. Everything else is
-context.
+Since the round-4 report we hit an outage, found its cause, and shipped three releases.
+Most of that is ours and is done. **Two items need work from you** — §1 is a platform
+inconsistency to reconcile, §2 is a hard dependency we have just created for mainnet.
+Everything from §3 on is context, not a request.
 
 ---
 
