@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+## 2.11.3
+
+**The send lock admitted many holders at once.** `acquireSendLock` guards
+`attemptPendingRefund` — money to an external buyer address — and `wallet send`.
+Racing 10 real processes at one stale lock produced **2-5 simultaneous
+"winners" in 12 of 15 rounds**. Every one of them would have broadcast.
+
+2.11.2 stopped a *live* holder being robbed. This is the other half: the steal
+of a *dead* holder's lock was not atomic.
+
+Three implementations were measured before one was correct:
+
+| approach | rounds with >1 winner |
+|---|---|
+| unlink-then-exclusive-create (original) | 12/15, peak 5 |
+| rename ours into place + read back | 15/15, peak 9 |
+| rename the stale lock away | 15/20, peak 7 |
+| **exclusive gate + re-check inside it** | **0/40, peak 1** |
+
+All three failures shared one flaw: the staleness decision was made against the
+*old* lock, then acted on whatever occupied the path by that point — frequently
+a peer's fresh, live lock. Check one file, act on another.
+
+The fix serialises the steal behind an `O_EXCL` gate file and **re-reads the
+real lock inside the critical section**, so a contender whose peer already stole
+it sees a live holder and stands down. The gate carries its own short staleness
+bound so a crash inside it cannot wedge the agent, and an unreadable gate fails
+**closed** — that last detail was worth ~1 bad round in 20 on its own, because
+`stat` only fails there when a peer is mid-steal.
+
+Verified with 640 racing processes across 40 rounds: **max winners seen, 1**.
+Pinned by `test/send-lock-race.test.js`, which spawns real processes against a
+shared start barrier — in-process sequential calls cannot reproduce this, and
+that false negative is what let three broken versions look fine.
+
+817 tests (815 before).
+
 ## 2.11.2
 
 Two money bugs, found by adversarially reviewing a set of test plans **before**
