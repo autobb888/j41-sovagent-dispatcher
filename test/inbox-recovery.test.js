@@ -12,6 +12,7 @@ const {
   listInboxFailures,
   recordInboxFailure,
   isDeadLettered,
+  isFundingFailure,
   MAX_BATCH_FAILURES,
 } = require('../src/inbox-deadletter.js');
 
@@ -307,4 +308,77 @@ test('REVIEW FIX: a hard config error is not misread as transient', () => {
   // uncounted and retried forever.
   assert.strictEqual(classifyInboxFailure(new Error("invalid/absent network 'bogus' — refusing to accept")), 'hard');
   assert.strictEqual(classifyInboxFailure(new Error('network error while connecting')), 'transient');
+});
+
+// ---------------------------------------------------------------------------
+// A dry fee wallet is ENVIRONMENTAL, not the item's fault.
+//
+// Regression cover for 2026-08-05: agent-6's R-address ran out of spendable
+// UTXOs while 13.5 VRSCTEST of job earnings sat at its i-address (i-address
+// outputs can't pay a P2PKH fee). The SDK throws a bare Error — no `code`, no
+// `statusCode`, and no TRANSIENT_PATTERNS match — so it hit the 'hard' default
+// and dead-lettered an attestation, a review and a job_record that were all
+// perfectly valid. recordBatchFailure's own comment already named "an unfunded
+// wallet" as the thing that must NOT strike items; the classifier just never
+// agreed with it.
+// ---------------------------------------------------------------------------
+
+const dryWallet = () => new Error(
+  'No spendable R-address UTXOs for fee. Fund RWoeXSRs4WHQYauzUg6bPowNyBRsz5bW51 with at least 0.0001 VRSC.'
+);
+
+test('a dry fee wallet classifies as transient, not hard', () => {
+  assert.strictEqual(classifyInboxFailure(dryWallet()), 'transient');
+  assert.strictEqual(classifyInboxFailure(new Error('Insufficient funds for transaction')), 'transient');
+  assert.strictEqual(classifyInboxFailure(new Error('insufficient balance')), 'transient');
+});
+
+test('a dry fee wallet never escalates, however many cycles it fails', () => {
+  const m = new Map();
+  const ids = ['a', 'b', 'c'];
+  const cls = classifyInboxFailure(dryWallet());
+  for (let i = 0; i < MAX_BATCH_FAILURES * 3; i++) {
+    const r = recordBatchFailure(m, 'agent-6', ids, cls);
+    assert.strictEqual(r.escalate, false, `escalated on cycle ${i + 1}`);
+  }
+  // ...and the items were never struck, so none can be quarantined.
+  const failures = new Map();
+  assert.strictEqual(isDeadLettered(failures, 'a'), false);
+});
+
+test('a dry fee wallet is identifiable so the operator gets the address, not a generic line', () => {
+  assert.strictEqual(isFundingFailure(dryWallet()), true);
+  assert.strictEqual(isFundingFailure(new Error('Transaction rejected by the network')), false);
+  assert.strictEqual(isFundingFailure(null), false);
+});
+
+test('funding patterns do not swallow a genuinely malformed transaction', () => {
+  // The failure that MUST still dead-letter: nothing about it is operator-fixable.
+  assert.strictEqual(classifyInboxFailure(rejected('-25 - bad-txns-failed-precheck')), 'hard');
+});
+
+test('covers every wording the SDK currently uses for an unfunded fee wallet', () => {
+  // Three distinct call sites produce this same condition. Matching only the
+  // R-address phrasing would miss agent.ts today, not merely after a reword.
+  const wordings = [
+    'No spendable R-address UTXOs for fee. Fund RWoe... with at least 0.0001 VRSC.', // identity/update.ts
+    'Insufficient funds: need 510000 sat, have 500000 sat',                          // tx/payment.ts selectUtxos
+    'No spendable UTXOs on RWoeXSRs4WHQYauzUg6bPowNyBRsz5bW51',                      // agent.ts:2483
+  ];
+  for (const w of wordings) {
+    assert.strictEqual(classifyInboxFailure(new Error(w)), 'transient', w);
+    assert.strictEqual(isFundingFailure(new Error(w)), true, w);
+  }
+});
+
+test('the broadened funding match does not swallow item-fault errors', () => {
+  // These must still dead-letter — nothing an operator can fund fixes them.
+  for (const w of [
+    'inbox vdxfData contained no review.* keys',
+    'signature verification failed',
+    'invalid/absent network — refusing to accept',
+  ]) {
+    assert.strictEqual(isFundingFailure(new Error(w)), false, w);
+    assert.strictEqual(classifyInboxFailure(new Error(w)), 'hard', w);
+  }
 });

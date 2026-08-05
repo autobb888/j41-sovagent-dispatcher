@@ -37,6 +37,7 @@ j41-dispatcher post-bounty agent-1 --title "Fix API" --amount 5 --description ".
 | `src/executors/mcp.js` | MCP server + LLM agent loop. Uses `resolveLLMConfig()` from local-llm.js. |
 | `src/sovguard-context.js` | **Prompt-injection guard.** `scanUntrusted(text, source)` wraps the vendored `scanContext` from `@junction41/sovagent-sdk` (≥2.6.0). local-llm.js + mcp.js scan job descriptions + tool results through it (source-trust; strips/quarantines injections, never muzzles `user`). See `docs/sovguard-context-integration.md`. |
 | `src/token-budget.js` | **Token budget math (WP-D4).** The ONE VRSC↔USD↔tokens conversion point: model-id normalization to the SDK pricing table, rate staleness checks, initial-budget derivation, extension pricing from observed input:output ratio. All paths fail closed (fallback budget, null price) — never unlimited, never invented numbers. job-agent.js enforces via `setBudget`/`isBudgetExhausted`; executors gate every LLM call. |
+| `src/fee-tank.js` | **Fee-tank sweep.** Job payments land at the agent's **i-address**; identity-update fees are payable only from its **R-address**, so the R-address only ever drains and the agent silently stops being able to write on-chain. `planFeeSweep()` (pure) decides when to sweep; `executeFeeSweep()` broadcasts i→R. **Self-funding by construction** — it pays its own fee out of the swept inputs, so it works at a zero R-balance, which is exactly when it's needed. Refuses R-address inputs. Wired as `checkFeeTanks()` in cli.js on its own 30-min timer. |
 | `src/config.js` | Runtime detection, config persistence. |
 | `src/control.js` | IPC control socket for `j41-dispatcher ctl status/jobs/agents`, plus the open `/health` + `/metrics` HTTP server on `:9842`. Exports the shared **read-model builders** (`buildStatus`/`buildJobs`/`buildJob`/`buildAgents`/`buildEarnings`/`buildHealthDocument`) consumed by both the socket and the control API. |
 | `src/control-api.js` | **Headless control API (WP-D1/D2).** Token-gated HTTP surface on `:9843` (`GET /v1/status\|agents\|jobs\|jobs/:id\|earnings\|events`). Bearer token at `~/.j41/dispatcher/control.token` (0600, auto-created). File-backed event ring buffer (`events.jsonl`, monotonic `seq`, survives restart). `state.emitEvent(type, data)` is wired in cli.js at job/container/extension/agent lifecycle points. |
@@ -44,6 +45,34 @@ j41-dispatcher post-bounty agent-1 --title "Fix API" --amount 5 --description ".
 | `src/keygen.js` | Verus keypair generation. |
 | `src/sign-attestation.js` | Privacy deletion attestation signing. |
 | `src/logger.js` | Structured logging. |
+
+### Fee Tank (agents paying their own gas)
+
+Two addresses that never meet unless something moves funds between them:
+
+- **Payments credit the i-address** — paying the VerusID `name.agentplatform@` resolves there.
+- **Fees debit the R-address only** — `buildIdentityUpdateTx` filters inputs to `u.address === agentAddress`, correctly: an identity output's script can't be signed by that path.
+
+So the R-address is a strictly-draining tank at 0.0001/write. When it empties the agent goes silent on-chain — no reviews, attestations or job records — while holding unswept earnings. The failure surfaces as `No spendable R-address UTXOs for fee`, which `inbox-deadletter.js` classifies as **`transient`** (never counted, never dead-lettered — it is not the item's fault).
+
+The sweep is **on by default**. Disable or tune it:
+
+```bash
+j41-dispatcher start --no-fee-sweep              # off
+j41-dispatcher start --fee-sweep-floor 250       # sweep below 250 writes (default 100)
+j41-dispatcher start --fee-sweep-interval 10     # check every 10 min (default 30)
+```
+
+Or in `config.toml` / env (`J41_FEE_SWEEP`, `J41_FEE_SWEEP_FLOOR`, `J41_FEE_SWEEP_INTERVAL`):
+
+```toml
+[fee_sweep]
+enabled = true
+floor_writes = 100
+interval_ms = 1800000
+```
+
+Precedence is CLI flag > config/env > default. An agent that has **never earned** cannot self-fund — it logs `FEE TANK EMPTY and nothing to sweep — fund <R-addr> externally` and needs an operator transfer.
 
 ### Configuration
 

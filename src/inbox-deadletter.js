@@ -132,6 +132,33 @@ const PERMANENT_REJECT_PATTERNS = [
   'version',
 ];
 
+// The agent's R-address has no spendable UTXO to pay the fee. Environmental and
+// operator-fixable, exactly like the unfunded wallet recordBatchFailure's comment
+// already calls out: it is not the item's fault, EVERY item for that agent fails
+// identically, and every one of them succeeds once the address is funded. Striking
+// items for it quarantines healthy review/attestation data that nothing is wrong
+// with — which is what happened to agent-6 on 2026-08-05 (3 items dead-lettered
+// while 13.5 VRSCTEST of earnings sat at the i-address, unusable for fees).
+//
+// Anchored on the SDK's exact wording rather than a bare 'fund'/'utxo' substring,
+// for the same reason as TRANSIENT_PATTERNS below.
+// Anchored on the SDK's exact wordings rather than a bare 'fund'/'utxo'
+// substring, for the same reason as TRANSIENT_PATTERNS below. Covers all three
+// the SDK can currently produce for this condition:
+//   identity/update.ts  'No spendable R-address UTXOs for fee...'
+//   tx/payment.ts       'Insufficient funds: ...'   (has some, not enough)
+//   agent.ts:2483       'No spendable UTXOs on <address>'
+// The last one is why 'no spendable' is listed as its own prefix — matching only
+// the R-address phrasing would miss it today, not merely after some future
+// reword. This is a string-matching single point of failure on a module we also
+// own; a coded error (err.code = 'FEE_UNFUNDED') would be sturdier and is worth
+// doing SDK-side, with these kept as the fallback.
+const FUNDING_PATTERNS = [
+  'no spendable',
+  'insufficient funds',
+  'insufficient balance',
+];
+
 // Anchored deliberately. A bare 'network' substring would swallow the hard config
 // error "invalid/absent network '...' — refusing to accept" (inbox-job-record.js),
 // classifying a permanent misconfiguration as transient — uncounted and retried
@@ -176,6 +203,11 @@ function classifyInboxFailure(err) {
   const msg = String((err && err.message) || err || '').toLowerCase();
   if (CONTENTION_PATTERNS.some(p => msg.includes(p))) return 'contention';
 
+  // Checked before statusCode/TRANSIENT: the SDK throws this as a bare Error with
+  // no code and no statusCode, so without an explicit match it reaches the 'hard'
+  // default and quarantines every item on a dry fee tank.
+  if (FUNDING_PATTERNS.some(p => msg.includes(p))) return 'transient';
+
   const sc = err && typeof err === 'object' ? err.statusCode : undefined;
   if (typeof sc === 'number') {
     if (sc === 429 || sc >= 500) return 'transient';
@@ -183,6 +215,19 @@ function classifyInboxFailure(err) {
   }
   if (TRANSIENT_PATTERNS.some(p => msg.includes(p))) return 'transient';
   return 'hard';
+}
+
+/**
+ * True if this failure is "the fee wallet is dry" specifically.
+ *
+ * Classification alone is not enough here. 'transient' correctly stops the item
+ * being struck, but it also makes the failure quiet — and quiet is wrong for the
+ * one failure class an operator can actually fix. Callers use this to log the
+ * address and the remedy instead of a generic batch-failure line.
+ */
+function isFundingFailure(err) {
+  const msg = String((err && err.message) || err || '').toLowerCase();
+  return FUNDING_PATTERNS.some(p => msg.includes(p));
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +372,7 @@ module.exports = {
   clearInboxFailure,
   pruneInboxFailures,
   classifyInboxFailure,
+  isFundingFailure,
   shouldDeferForPendingWrite,
   batchCompositionKey,
   recordBatchFailure,

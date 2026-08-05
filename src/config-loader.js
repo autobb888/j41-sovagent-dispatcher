@@ -121,6 +121,15 @@ const ENV_OVERRIDES = [
   ['J41_PROXY_CIRCUIT_THRESHOLD',      'proxy.circuit_threshold',      'int'],
   ['J41_PROXY_CIRCUIT_OPEN_MS',        'proxy.circuit_open_ms',        'int'],
   ['J41_DEPOSIT_POLL_INTERVAL', 'deposit.poll_interval_ms', 'int'],
+  // `bool` (not bool1) deliberately: this is default-ON, so J41_FEE_SWEEP=true
+  // must not silently mean "disabled". See applyEnvOverrides.
+  ['J41_FEE_SWEEP',            'fee_sweep.enabled',        'bool'],
+  ['J41_FEE_SWEEP_FLOOR',      'fee_sweep.floor_writes',   'int'],
+  // _MS suffix is load-bearing: the CLI flag --fee-sweep-interval takes MINUTES.
+  // An unsuffixed env var named the same as the flag invites `=30` meaning
+  // 30 minutes, which would land as 30ms and clamp to a 1-minute cadence —
+  // 30x the intended getUtxos/auth traffic across the whole fleet.
+  ['J41_FEE_SWEEP_INTERVAL_MS','fee_sweep.interval_ms',    'int'],
   ['J41_HEALTH_POLL_INTERVAL',  'health.poll_interval_ms',  'int'],
   ['J41_WEBHOOK_MAX_BODY',      'webhook.max_body_bytes',   'int'],
   ['J41_RATE_LIMIT_BACKOFF_MULTIPLIER','retry.rate_limit_backoff_multiplier','int'],
@@ -181,6 +190,20 @@ function applyEnvOverrides(cfg) {
     if (kind === 'int') { v = parseInt(raw); if (Number.isNaN(v)) continue; }
     else if (kind === 'float') { v = parseFloat(raw); if (!Number.isFinite(v)) continue; }
     else if (kind === 'bool1') v = raw === '1';
+    else if (kind === 'bool') {
+      // Word-tolerant boolean, for DEFAULT-ON safety features. `bool1` treats
+      // anything but '1' as false, so `J41_FEE_SWEEP=true` would SILENTLY DISABLE
+      // the fee sweep — the intuitive "enable" value turning a money-safety
+      // feature off. bool1 is fine for default-off opt-ins (failing to false is
+      // safe there); it is not fine here.
+      const s = String(raw).trim().toLowerCase();
+      if (['1', 'true', 'yes', 'on', 'enabled'].includes(s)) v = true;
+      else if (['0', 'false', 'no', 'off', 'disabled'].includes(s)) v = false;
+      else {
+        console.warn(`[Config] ${env}="${raw}" is not a recognised boolean — ignoring (expected true/false)`);
+        continue;
+      }
+    }
     else v = raw;
     setPath(cfg, dotted, v);
   }

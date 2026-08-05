@@ -27,10 +27,29 @@ const {
   pruneInboxFailures,
   MAX_INBOX_ATTEMPTS,
   classifyInboxFailure,
+  isFundingFailure,
   shouldDeferForPendingWrite,
   recordBatchFailure,
   clearBatchFailure,
 } = require('./inbox-deadletter.js');
+const {
+  summarizeUtxos,
+  writesAffordable,
+  planFeeSweep,
+  executeFeeSweep,
+  DEFAULT_FLOOR_WRITES,
+} = require('./fee-tank.js');
+
+/**
+ * Single prefix for every "this agent cannot pay fees" alert, shared by the
+ * inbox batch handler and the fee-tank sweep.
+ *
+ * Load-bearing: the sweep retracts a stale alert by matching this prefix, and
+ * nothing else clears _agentErrors except a successful activation. Two different
+ * strings for the same condition means one of them never retracts, leaving a
+ * critical alert on a money surface lit after the problem is fixed.
+ */
+const FEE_TANK_ERROR_PREFIX = 'FEE TANK EMPTY';
 const log = require('./logger');
 const { loadDispatcherConfig, fileConfiguredNetwork } = require('./config-loader.js');
 const { SignChannelHost } = require('./sign-channel-host.js');
@@ -3047,6 +3066,9 @@ program
   .option('--webhook-url <url>', 'Public URL for receiving webhook events (enables webhook mode)')
   .option('--webhook-port <port>', 'Port for webhook HTTP server (default: 9841)', '9841')
   .option('--dev-unsafe', 'Allow local mode (ZERO isolation — development only)')
+  .option('--no-fee-sweep', 'Disable the automatic i-address → R-address fee-tank sweep')
+  .option('--fee-sweep-floor <writes>', `Sweep when an agent can afford fewer than this many on-chain writes (default: ${DEFAULT_FLOOR_WRITES})`)
+  .option('--fee-sweep-interval <minutes>', 'Minutes between fee-tank checks (default: 30)')
   .action(async (options) => {
     ensureDirs();
 
@@ -3225,6 +3247,26 @@ program
       _proxyStarted: false, // true once the api-endpoint proxy is wired at boot; drives the heal-time "restart to activate proxy" notice
       _devUnsafe, // security: allows local mode when true
       llmHealth: new Map(), // agentId -> { ok, at } — preflight probe cache (ok-only, 30s TTL)
+      _feeSweepPending: new Map(), // agentId -> { txid, at } — guards re-sweeping an unconfirmed sweep
+      // Fee-tank sweep config. Precedence: CLI flag > config.toml/env > default.
+      // Commander sets feeSweep=TRUE when --no-fee-sweep is absent (not
+      // undefined), so the check must be `=== false` to mean "explicitly
+      // disabled on the command line". Note this means the CLI can only ever
+      // disable: there is no positive --fee-sweep flag, so config `enabled=false`
+      // cannot be overridden back on from the command line.
+      feeSweep: {
+        enabled: options.feeSweep === false
+          ? false
+          : (cfg.fee_sweep?.enabled !== false),
+        floorWrites: Math.max(1,
+          parseInt(options.feeSweepFloor, 10)
+          || cfg.fee_sweep?.floor_writes
+          || DEFAULT_FLOOR_WRITES),
+        intervalMs: Math.max(60000,
+          (parseInt(options.feeSweepInterval, 10) * 60000)
+          || cfg.fee_sweep?.interval_ms
+          || 30 * 60000),
+      },
     };
 
     // ── Startup sweep: remove stale _live/*.log for jobs not in active state ──
@@ -3761,6 +3803,22 @@ program
 
       // Check for pending reviews
       safeInterval(() => checkPendingInbox(state), reviewInterval, 'Inbox');
+    }
+
+    // ── Fee-tank sweep ──────────────────────────────────────────────────────
+    // Without this an agent's R-address only drains and it eventually goes
+    // silent on-chain while holding unswept earnings (round 4, agent-6).
+    // Enabled by default: the failure it prevents is silent, and the sweep moves
+    // an agent's own funds between its own two addresses — never to a third party.
+    if (state.feeSweep.enabled) {
+      console.log(`  Fee-tank sweep: every ${state.feeSweep.intervalMs / 60000}min, floor ${state.feeSweep.floorWrites} writes`);
+      safeInterval(() => checkFeeTanks(state), state.feeSweep.intervalMs, 'FeeTank');
+      // Run once at startup rather than waiting out the first interval — a
+      // dispatcher restarted BECAUSE an agent ran dry should not stay dry for
+      // another 30 minutes.
+      setTimeout(() => { checkFeeTanks(state).catch(e => console.error(`[FeeTank] ${e.message}`)); }, 15000);
+    } else {
+      console.log(`  Fee-tank sweep: DISABLED (${options.feeSweep === false ? '--no-fee-sweep' : 'config/env fee_sweep.enabled=false'}) — agents will not refill their own fee wallets`);
     }
 
     // ── Profile sync — detect on-chain changes and re-register with platform ──
@@ -6570,8 +6628,15 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
         clearInboxFailure(state._inboxFailures, ref.id);
       } catch (e) {
         // Even on the old path, contention must not burn the budget.
-        if (classifyInboxFailure(e) === 'contention') {
-          console.warn(`[Inbox] ${ref.type} ${String(ref.id).substring(0, 8)}: chain contention (uncounted) — ${e.message}`);
+        // Only 'hard' — the item's own fault — may burn the dead-letter budget.
+        // Exempting contention alone was the 2026-08-05 incident: a dry fee tank
+        // classifies 'transient', and striking items for it quarantined three
+        // perfectly valid ones. This path is the older non-batched fallback, so
+        // it must honour the same rule the batched path does or the bug simply
+        // lives on wherever acceptInboxBatch is unavailable.
+        const cls = classifyInboxFailure(e);
+        if (cls !== 'hard') {
+          console.warn(`[Inbox] ${ref.type} ${String(ref.id).substring(0, 8)}: ${cls} (uncounted) — ${e.message}`);
         } else {
           noteFailure(ref.id, ref.type, e.message);
         }
@@ -6587,8 +6652,20 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
   } catch (e) {
     const cls = classifyInboxFailure(e);
     const bf = recordBatchFailure(state._inboxBatchFailures, agentInfo.id, batch.map(b => b.id), cls);
-    state._agentErrors.set(agentInfo.id, `inbox batch ${cls} (${bf.consecutive}x): ${String(e.message).slice(0, 100)}`);
-    if (cls === 'contention') {
+    const funding = isFundingFailure(e);
+    state._agentErrors.set(
+      agentInfo.id,
+      funding
+        ? `${FEE_TANK_ERROR_PREFIX} (${bf.consecutive}x) — fund this agent's R-address; earnings at the i-address cannot pay fees`
+        : `inbox batch ${cls} (${bf.consecutive}x): ${String(e.message).slice(0, 100)}`
+    );
+    if (funding) {
+      // The one failure class an operator can actually fix, so name the remedy
+      // rather than let it read as a generic batch failure. Uncounted (transient)
+      // by design — no item is at fault and all of them succeed once funded.
+      console.error(`[Inbox] 💸 ${agentInfo.id}: ${FEE_TANK_ERROR_PREFIX} (${bf.consecutive}x) — ${batch.length} item(s) stalled, none struck. ${e.message}`);
+      if (state.emitEvent) state.emitEvent('fee_tank_empty', { agentId: agentInfo.id, stalled: batch.length, consecutive: bf.consecutive });
+    } else if (cls === 'contention') {
       console.warn(`[Inbox] ${agentInfo.id}: chain contention — waiting for confirmation (uncounted, attempt ${bf.consecutive})`);
     } else {
       console.error(`[Inbox] ${agentInfo.id}: batch failed (${cls}, ${bf.consecutive}x): ${e.message}`);
@@ -6607,6 +6684,14 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
   }
 
   clearBatchFailure(state._inboxBatchFailures, agentInfo.id);
+  // A successful batch proves the tank is payable again, so retract our own
+  // fee-tank alert. Without this it stays lit on /health until the process
+  // restarts — a stale critical warning on a money surface is how operators
+  // learn to ignore the surface. Prefix-scoped so we never erase another
+  // subsystem's error.
+  if (String(state._agentErrors.get(agentInfo.id) || '').startsWith(FEE_TANK_ERROR_PREFIX)) {
+    state._agentErrors.delete(agentInfo.id);
+  }
 
   if (res.txid) {
     state._inboxLastWrite.set(agentInfo.id, {
@@ -6641,6 +6726,98 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
     console.log(`[Inbox] ✅ ${agentInfo.id}: ${res.acked.length} item(s) accepted${res.txid ? ` in tx ${String(res.txid).slice(0, 8)}` : ' (already on-chain)'}`);
   }
   return res;
+}
+
+/**
+ * Keep every agent able to pay its own transaction fees.
+ *
+ * Job payments land at the i-address; identity-update fees are payable only from
+ * the R-address. Without this the R-address only drains, and an agent eventually
+ * goes silent on-chain while holding earnings it never touches — which is exactly
+ * what happened to agent-6 in round 4 (see src/fee-tank.js).
+ *
+ * Deliberately its own low-frequency timer rather than a step in the inbox sweep:
+ * this costs one getUtxos per agent, and the inbox cycle runs every 60s.
+ */
+async function checkFeeTanks(state) {
+  if (state._feeSweepRunning) return;           // same reentrancy hazard as the inbox sweep
+  if (!state._feeSweepPending) state._feeSweepPending = new Map();
+  state._feeSweepRunning = true;
+  try {
+    const { buildPayment } = require('@junction41/sovagent-sdk/dist/index.js');
+    const cfg = state.feeSweep || {};
+    const now = Date.now();
+
+    for (const agentInfo of state.agents) {
+      if (!agentInfo.identity || !agentInfo.wif || !agentInfo.iAddress) continue;
+      try {
+        const agent = await getAgentSession(state, agentInfo);
+        const u = await agent.client.getUtxos();
+        const rAddress = u.address;
+        const s = summarizeUtxos(u.utxos, rAddress);
+
+        const plan = planFeeSweep({
+          feeSats: s.feeSats,
+          sweepableSats: s.sweepableSats,
+          floorWrites: cfg.floorWrites,
+          pending: state._feeSweepPending.get(agentInfo.id) || null,
+          now,
+        });
+
+        if (plan.reason === 'needs-external-funding') {
+          // Cannot self-heal: it has never earned. Only an operator transfer fixes
+          // this, so say so by name rather than let it surface as a batch failure.
+          const msg = `${FEE_TANK_ERROR_PREFIX} and nothing to sweep — fund ${rAddress} externally`;
+          state._agentErrors.set(agentInfo.id, msg);
+          console.error(`[FeeTank] 💸 ${agentInfo.id}: ${msg}`);
+          if (state.emitEvent) state.emitEvent('fee_tank_empty', { agentId: agentInfo.id, rAddress, selfFundable: false });
+          continue;
+        }
+        // A deferred sweep is otherwise a silent `continue`, so a wedged agent
+        // (e.g. a clock jump stamping `pending.at` in the future) is invisible.
+        if (plan.reason === 'sweep-pending') {
+          console.log(`[FeeTank] ${agentInfo.id}: sweep already broadcast and unconfirmed — skipping this cycle`);
+          continue;
+        }
+
+        // Retract our own stale alert once the tank recovers. Nothing else clears
+        // _agentErrors except a successful activation, so without this an agent
+        // funded after a FEE TANK EMPTY warning would keep reporting broken for
+        // the life of the process. Scoped to OUR message so we never erase a job
+        // or activation failure set by another subsystem.
+        if (plan.reason === 'above-floor' && String(state._agentErrors.get(agentInfo.id) || '').startsWith(FEE_TANK_ERROR_PREFIX)) {
+          state._agentErrors.delete(agentInfo.id);
+          console.log(`[FeeTank] ${agentInfo.id}: tank recovered (${writesAffordable(s.feeSats)} writes) — clearing alert`);
+        }
+
+        if (!plan.sweep) continue;
+
+        console.log(`[FeeTank] ${agentInfo.id}: ${writesAffordable(s.feeSats)} writes left — sweeping ${(plan.amountSats / 1e8).toFixed(8)} VRSC from ${s.sweepableUtxos.length} i-address UTXO(s)`);
+        const res = await executeFeeSweep({
+          buildPayment,
+          broadcast: (hex) => agent.client.broadcast(hex),
+          wif: agentInfo.wif,
+          network: J41_NETWORK,
+          rAddress,
+          sweepableUtxos: s.sweepableUtxos,
+          amountSats: plan.amountSats,
+        });
+
+        if (res.swept) {
+          state._feeSweepPending.set(agentInfo.id, { txid: res.txid, at: now });
+          const after = writesAffordable(s.feeSats + plan.amountSats);
+          console.log(`[FeeTank] ✅ ${agentInfo.id}: swept in ${res.txid.substring(0, 12)} — ~${after} writes once confirmed`);
+          if (state.emitEvent) state.emitEvent('fee_sweep', { agentId: agentInfo.id, txid: res.txid, amountSats: plan.amountSats });
+        } else {
+          console.error(`[FeeTank] ${agentInfo.id}: sweep failed — ${res.reason}${res.detail ? ` (${res.detail})` : ''}`);
+        }
+      } catch (e) {
+        console.error(`[FeeTank] ${agentInfo.id}: ${e.message}`);
+      }
+    }
+  } finally {
+    state._feeSweepRunning = false;
+  }
 }
 
 // Check for pending inbox items (reviews + job records) and process them
