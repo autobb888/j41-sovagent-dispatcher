@@ -3294,6 +3294,12 @@ program
           let skipThisAgent = false;
           try {
             const profile = await tmpAgent._client.getAgent(keys.iAddress || keys.identity);
+            // Already active and listed in the marker: nothing to restore, but it IS
+            // dealt with. Leaving it in the marker would make a LATER deliberate
+            // `deactivate` get silently undone by the next start.
+            if (profile.status === 'active' && _shutdownDeactivated.includes(agentId)) {
+              _reactivatedOnStart.push(agentId);
+            }
             if (profile.status === 'inactive' || profile.status === 'disabled') {
               // Did WE turn this one off at our last shutdown? If so, starting up is
               // an explicit instruction to bring it back — restore it rather than

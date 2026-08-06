@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 2.14.5
+
+An agent listed in the shutdown marker that was **already active** at the next start
+needed no restoring — but it was never removed from the marker either, so the entry
+persisted indefinitely. A later deliberate `j41-dispatcher deactivate` on that agent
+would then be silently undone by the following start, which is exactly the operator
+intent the marker exists to respect. Already-active agents now count as handled.
+
+923 tests.
+
 ## 2.14.4
 
 **The reconciler treated every historical dispute as actionable.** `getMyJobs` list
