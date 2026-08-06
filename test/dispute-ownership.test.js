@@ -141,6 +141,7 @@ function reconOpts(state, calls, { throwFor = null } = {}) {
         },
       },
     }),
+    refundLedger: {},
     queueDisputedJobForRespawn: async (_s, jobId, o) => { calls.push({ jobId, agentId: o.agentId }); return { respawned: true }; },
   };
 }
@@ -212,6 +213,38 @@ test('nothing to do is silent and cheap', async () => {
 
 const FUTURE = new Date(Date.now() + 86400000).toISOString();
 const PAST = new Date(Date.now() - 86400000).toISOString();
+
+test('a job already queued for operator refund approval is never respawned', () => {
+  // The load-bearing check. getMyJobs list items carry no nested `dispute`, so the
+  // deadline/answered rules see {} and default every historical dispute to "open".
+  // Live, that classified 24 months-old outage jobs as actionable and respawned 3
+  // per poll cycle, forever. A job awaiting a human approval step cannot be
+  // advanced by anything we spawn.
+  const v = shouldReconcileJob(
+    { id: 'j', status: 'disputed' },
+    Date.now(),
+    { refundLedger: { j: { status: 'pending_approval' } } },
+  );
+  assert.equal(v.respawn, false);
+});
+
+test('the ledger check beats even an actionable rework — the operator owns it', () => {
+  const v = shouldReconcileJob(
+    { id: 'j', status: 'rework' },
+    Date.now(),
+    { refundLedger: { j: { status: 'approved' } } },
+  );
+  assert.equal(v.respawn, false);
+});
+
+test('a job absent from the ledger is unaffected by it', () => {
+  const v = shouldReconcileJob(
+    { id: 'j', status: 'rework' },
+    Date.now(),
+    { refundLedger: { other: { status: 'pending_approval' } } },
+  );
+  assert.equal(v.respawn, true);
+});
 
 test('a lapsed dispute is not worth a container — nothing we spawn can change it', () => {
   const v = shouldReconcileJob({ id: 'j', status: 'disputed', dispute: { action: 'pending', deadline_at: PAST } });

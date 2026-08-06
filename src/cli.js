@@ -5135,8 +5135,21 @@ const MAX_RECONCILE_RESPAWNS_PER_SWEEP = 3;
  * on the account, including months-old ones already sitting in the operator's
  * refund-approval queue.
  */
-function shouldReconcileJob(job, nowMs = Date.now()) {
+function shouldReconcileJob(job, nowMs = Date.now(), opts = {}) {
   if (!job || !job.id) return { respawn: false, why: 'malformed' };
+
+  // Already the operator's problem. A job with a refund ledger entry is awaiting a
+  // human approval step, and no worker we spawn can advance it. This check is the
+  // load-bearing one in practice: `getMyJobs` list items do NOT carry a nested
+  // `dispute` object, so the deadline/answered rules below see `{}` and default
+  // every historical dispute to "open and unanswered". Live, that meant 24 months-
+  // old outage jobs all classified as actionable, respawning 3 per poll cycle
+  // forever.
+  const ledger = opts.refundLedger;
+  if (ledger && Object.prototype.hasOwnProperty.call(ledger, job.id)) {
+    return { respawn: false, why: 'queued for operator refund approval' };
+  }
+
   if (job.status === 'rework') return { respawn: true, why: 'rework pending' };
   if (job.status !== 'disputed') return { respawn: false, why: `status ${job.status}` };
 
@@ -5179,6 +5192,11 @@ function shouldReconcileJob(job, nowMs = Date.now()) {
 async function reconcileOrphanedDisputes(state, opts = {}) {
   const queueFn = opts.queueDisputedJobForRespawn || queueDisputedJobForRespawn;
   const getSession = opts.getAgentSession || getAgentSession;
+  // Read once per sweep, not per job — the ledger is small but this runs every poll.
+  let refundLedger = opts.refundLedger;
+  if (refundLedger === undefined) {
+    try { refundLedger = loadPendingRefunds(); } catch { refundLedger = {}; }
+  }
   const summary = { checked: 0, orphaned: 0, respawned: 0, skipped: 0, deferred: 0, failed: 0 };
 
   for (const agentInfo of state.agents || []) {
@@ -5202,7 +5220,7 @@ async function reconcileOrphanedDisputes(state, opts = {}) {
       if (state.queue.some(j => j.id === job.id)) continue;
       if (rq.has(state.reactivationQueue, job.id)) continue; // already waiting for capacity
 
-      const verdict = shouldReconcileJob(job);
+      const verdict = shouldReconcileJob(job, Date.now(), { refundLedger });
       if (!verdict.respawn) {
         summary.skipped++;
         continue;

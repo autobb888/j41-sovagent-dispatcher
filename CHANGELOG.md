@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 2.14.4
+
+**The reconciler treated every historical dispute as actionable.** `getMyJobs` list
+items do not carry a nested `dispute` object, so the "unanswered and inside its
+deadline" rule from 2.14.1 saw `{}` for all of them and defaulted to open. Live,
+that classified 24 months-old outage jobs as actionable — already sitting in the
+operator's refund-approval queue, where no worker can advance them — and respawned
+3 per poll cycle indefinitely. 2.14.1's cap turned a thundering herd into a slow
+drip; it did not stop it.
+
+A job with a refund-ledger entry is now never respawned: it is awaiting a human
+approval step and is the operator's, not a worker's. The ledger is read once per
+sweep, not per job.
+
+923 tests.
+
 ## 2.14.3
 
 **The test suite deleted live dispatcher state.** `test/dispute-ownership.test.js`
