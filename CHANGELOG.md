@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+## 2.13.0
+
+**Dispute → rework produced nothing, for three stacked reasons.** The round-6
+tester pulled the two fields we could not see — `delivery.message` (the stored
+deliverable, hard-capped at 200 chars) and `messages[]` — and proved the concrete
+reworked content existed in **neither**. It was never generated.
+
+**The rework token budget was granted as an absolute ceiling.** `setBudget()`
+installs a ceiling that `isBudgetExhausted()` compares against
+`_tokenUsage.totalTokens`, which is cumulative for the executor's life and is
+**never reset**. `resumeJob` passed the rework share straight in, so "30% of the
+job for rework" actually meant *"the whole job may now use 30% of its budget"* —
+and the original job has already spent most of it. On any job that used more than
+its rework share the gate tripped **before the first rework token**: no LLM call,
+no answer, and the executor returned its budget-exhausted line. Now offset by
+current usage, granting a genuine fresh allowance.
+
+This was **latent until 2.12.3 armed it.** `dispute_policy` never reached any
+Docker container, so `tokenBudget` was null and `setBudget` was never called
+during rework. Shipping 2.12.3's IPC fix alone would have converted an unmetered
+rework into a permanently gated one — the fallback path would have engaged every
+time. Two of these fixes had to ship together or neither was safe.
+
+**`resumeJob` computed the reworked answer and threw it away.** It returned
+`executor.finalize()` — the entire conversation rendered `user:` / `assistant:`
+and hashed. Since the platform stores only the first 200 characters, what the
+buyer saw as their "reworked" deliverable was the **start of the original
+conversation**. Now delivers the answer, falling back to the transcript only when
+the reply is unusable (empty, the llmBusy ack, or budget-gated) — a clumsy
+deliverable beats an empty one.
+
+**The rework was never posted to chat.** The content went only into the
+deliverable, so a buyer asking "did you redo it?" got silence and the job
+auto-completed. Now posted via `sendChatChunked`; a chat failure is logged and
+does not discard the deliverable.
+
+New `test/rework-delivery.test.js` drives `resumeJob` against the real `Executor`
+base class, so the budget arithmetic under test is the arithmetic that ships. All
+three fixes mutation-checked. 887 tests (881 before).
+
+Also: the send-lock race test was flaky 2 runs in 6, and the cause was the test —
+`await new Promise(() => {})` does not keep Node alive, so the winning racer
+exited, its lock went stale (dead pid), and the next racer *legitimately* stole
+it. Now holds with a live handle. 6/6 clean, and reverting the empty-lock guard
+still fails 2 tests, so determinism did not cost it teeth.
+
 ## 2.12.3
 
 Three defects found by auditing the round-6 fix plan **before executing it** —
