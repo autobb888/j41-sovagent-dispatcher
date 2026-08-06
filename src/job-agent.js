@@ -741,6 +741,14 @@ async function main() {
           _shuttingDown = true;
           _agent?.sendChatMessage(msg.jobId, 'Service is shutting down. Delivering current work now.');
           if (sessionEndResolve) sessionEndResolve('dispatcher-shutdown');
+          // Also wake a POST-DELIVERY waiter. This case consumes the message, so it
+          // never reached waitForPostDelivery's own 'shutdown' case in Docker mode —
+          // making that handler dead code and leaving a worker parked on an open
+          // dispute completely deaf to shutdown. It would then hold the dispatcher's
+          // drain until the drain timed out and the job was refunded. Now that a
+          // dispute can hold a worker for hours, that stopped being theoretical.
+          // safeResolve makes this idempotent if the session already ended.
+          if (_postDeliveryHandler) await _postDeliveryHandler(msg);
           break;
         case 'dispute_policy':
           _disputePolicy = msg.disputePolicy || null;

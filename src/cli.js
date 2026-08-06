@@ -4226,6 +4226,20 @@ program
       };
 
       log.warn('Graceful shutdown starting (drain mode)', { signal, activeJobs: state.active.size });
+      // Tell every worker to wrap up. Without this the drain simply WAITED for
+      // containers that had no reason to exit: a mid-job worker runs to its own
+      // timeout, and a worker parked on an open dispute waits for a deadline days
+      // away. Both handlers already existed in the container and neither was ever
+      // triggered — `type: 'shutdown'` was sent from nowhere in this file.
+      // It is graceful, not a kill: mid-job workers deliver current work first.
+      for (const [jobId, activeInfo] of state.active.entries()) {
+        try {
+          sendToJobAgent(activeInfo, { type: 'shutdown', jobId });
+        } catch (e) {
+          console.log(`   ⚠️  ${jobId.substring(0, 8)}: could not signal shutdown (${e.message}) — the drain timeout still bounds it`);
+        }
+      }
+
       console.log(`\n🔄 Draining: ${state.active.size} active job(s). Waiting for containers to finish...`);
       console.log('   Press Ctrl+C again for emergency exit.\n');
 

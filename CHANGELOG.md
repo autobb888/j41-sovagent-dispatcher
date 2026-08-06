@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+## 2.14.2
+
+**Shutdown never told its workers to leave.** `type: 'shutdown'` was sent from
+nowhere in `cli.js`, so both of the container's shutdown handlers — one that
+delivers current work mid-job, one that ends a post-delivery wait — had never once
+run. The drain simply *waited* for containers that had no reason to exit, until it
+timed out and the jobs were refunded.
+
+That was survivable while a post-delivery worker died at ~90 minutes. It stopped
+being survivable in 2.14.0, which holds a worker open toward a dispute deadline
+(up to 6 h) — a single disputed job would then block shutdown until the 120-minute
+drain timeout and get refunded. Observed live: a drain sat at 140s on one parked
+dispute worker with nothing to wait for.
+
+Shutdown now signals every active worker at drain start. It is graceful, not a
+kill: a mid-job worker delivers its current work first.
+
+**And the post-delivery handler was unreachable in Docker.** `handleIpcMessage`
+consumes `shutdown` before the `default:` branch that forwards to the
+post-delivery waiter, so a worker parked on a dispute was deaf to shutdown even
+once it was sent. It now forwards explicitly; `safeResolve` keeps it idempotent.
+
+919 tests.
+
 ## 2.14.1
 
 Fixes two defects **introduced by 2.14.0**, both caught on its own first live start.
