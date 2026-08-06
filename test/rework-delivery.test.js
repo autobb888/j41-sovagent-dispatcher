@@ -56,14 +56,16 @@ function makeAgent({ connected = true, reauth = true } = {}) {
   const agent = {
     sent,
     calls,
-    chatClient: { isConnected: connected },
+    // Mirrors the real SDK: a live socket that was auto-joined to this room while
+    // the job was in_progress. `joinedRooms` is a Set on ChatClient.
+    chatClient: { isConnected: connected, joinedRooms: new Set(connected ? [JOB.id] : []) },
     authenticate: async () => {
       calls.push('authenticate');
       if (!reauth) throw new Error('Authentication required');
       return true;
     },
     connectChat: async () => { calls.push('connectChat'); agent.chatClient.isConnected = true; },
-    joinJobChat: (id) => { calls.push(`joinJobChat:${id}`); },
+    joinJobChat: (id) => { calls.push(`joinJobChat:${id}`); agent.chatClient.joinedRooms.add(id); },
     sendChatMessage: async (_id, text) => {
       if (!agent.chatClient.isConnected) throw new Error('Chat not connected');
       sent.push(text);

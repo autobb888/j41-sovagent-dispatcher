@@ -3164,17 +3164,61 @@ program
       if (fs.existsSync(PID_FILE)) {
         const oldPid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim());
         if (oldPid && oldPid !== process.pid) {
-          try {
-            process.kill(oldPid, 0); // check if alive (throws if dead)
+          let alive = true;
+          try { process.kill(oldPid, 0); } catch (e) { alive = (e.code === 'EPERM'); }
+          if (alive) {
+            // WAIT for it to actually die. A flat 1s sleep meant the old dispatcher
+            // was still running its full shutdown — per-agent platform + on-chain
+            // deactivation, then a drain that can legitimately last hours — while
+            // this process started up. Three things went wrong concurrently:
+            //   1. its deactivate loop flipped agents inactive while our startup
+            //      check read them, so we skipped whatever it had already reached
+            //      ("No agents registered" — the fleet-loss bug, second cause);
+            //   2. our crash recovery read active-jobs.json, which still listed ITS
+            //      draining jobs, and killed those containers + queued refunds for
+            //      work that was about to deliver; and
+            //   3. both processes broadcast identity transactions against the same
+            //      confirmed prevOutput.
+            // Its own stall detector guarantees it exits, so waiting is bounded.
             process.kill(oldPid, 'SIGTERM');
-            console.log(`  Stopped previous dispatcher (PID ${oldPid})`);
-            await new Promise(r => setTimeout(r, 1000));
-          } catch {}
+            console.log(`  Stopping previous dispatcher (PID ${oldPid})...`);
+            const waitMs = Number(process.env.J41_STOP_WAIT_MS) > 0
+              ? Number(process.env.J41_STOP_WAIT_MS)
+              : 10 * 60 * 1000;
+            const startedWait = Date.now();
+            let gone = false;
+            while (Date.now() - startedWait < waitMs) {
+              await new Promise(r => setTimeout(r, 500));
+              try { process.kill(oldPid, 0); } catch (e) {
+                if (e.code !== 'EPERM') { gone = true; break; }
+              }
+            }
+            if (!gone) {
+              // Never proceed into a concurrent-dispatcher state — that is the
+              // double-spend class this release exists to prevent. Refuse instead.
+              console.error(`\n❌ Previous dispatcher (PID ${oldPid}) did not exit within ${Math.round(waitMs / 60000)} min.`);
+              console.error('   It is probably draining active jobs. Wait for it to finish, or stop it with:');
+              console.error(`     kill -9 ${oldPid}   # WARNING: orphans running containers; their jobs are refunded on next start`);
+              console.error('   Refusing to start a second dispatcher against the same agents.');
+              process.exit(1);
+            }
+            console.log(`  Previous dispatcher exited after ${Math.round((Date.now() - startedWait) / 1000)}s`);
+          }
         }
       }
     } catch {}
     fs.writeFileSync(PID_FILE, String(process.pid));
-    process.on('exit', () => { try { fs.unlinkSync(PID_FILE); } catch {} });
+    // Only remove the pid file if it is still OURS. An unconditional unlink meant a
+    // departing dispatcher deleted its successor's pid file, after which `ctl` and
+    // the dashboard both reported "not running" and the next `start` found no pid
+    // to stop — leaving two live dispatchers on the same agents.
+    process.on('exit', () => {
+      try {
+        if (parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10) === process.pid) {
+          fs.unlinkSync(PID_FILE);
+        }
+      } catch {}
+    });
 
     console.log('╔══════════════════════════════════════════╗');
     console.log('║     J41 Dispatcher                       ║');
@@ -3226,6 +3270,9 @@ program
     const enforceFinalize = cfg.runtime.require_finalize;
     const skipStatusCheck = cfg.runtime.skip_status_check;
     const readyAgents = [];
+    // Agents our own last shutdown turned off, and which this start restores.
+    const _shutdownDeactivated = readShutdownDeactivated();
+    const _reactivatedOnStart = [];
     for (const agentId of agents) {
       const keys = loadAgentKeys(agentId);
       if (!keys?.identity) {
@@ -3244,12 +3291,31 @@ program
           const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
           const tmpAgent = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif, identityName: keys.identity, iAddress: keys.iAddress });
           await tmpAgent.authenticate();
-          const profile = await tmpAgent._client.getAgent(keys.iAddress || keys.identity);
-          tmpAgent.stop();
-          if (profile.status === 'inactive' || profile.status === 'disabled') {
-            console.log(`⏸  ${agentId} (${keys.identity}): ${profile.status} on platform — skipping`);
-            continue;
+          let skipThisAgent = false;
+          try {
+            const profile = await tmpAgent._client.getAgent(keys.iAddress || keys.identity);
+            if (profile.status === 'inactive' || profile.status === 'disabled') {
+              // Did WE turn this one off at our last shutdown? If so, starting up is
+              // an explicit instruction to bring it back — restore it rather than
+              // skipping it and then dying with "No agents registered", a message
+              // that sends the operator to re-register and pay for on-chain writes.
+              // `disabled` is never auto-restored: that is a platform-side decision.
+              if (profile.status === 'inactive' && _shutdownDeactivated.includes(agentId)) {
+                console.log(`↻  ${agentId} (${keys.identity}): reactivating (deactivated by our last shutdown)`);
+                await tmpAgent.activate({ onChain: true });
+                _reactivatedOnStart.push(agentId);
+              } else {
+                console.log(`⏸  ${agentId} (${keys.identity}): ${profile.status} on platform — skipping` +
+                  (profile.status === 'inactive' ? ` (bring it back with: j41-dispatcher activate ${agentId})` : ''));
+                skipThisAgent = true;
+              }
+            }
+          } finally {
+            // One exit point for the session, so no path leaks it and no path uses
+            // it after stop() — the reactivate call above needs it still live.
+            tmpAgent.stop();
           }
+          if (skipThisAgent) continue;
         } catch (e) {
           // If we can't check, include the agent anyway (fail-open for polling)
           console.log(`⚠️  ${agentId}: could not check platform status (${e.message}) — including`);
@@ -3259,11 +3325,30 @@ program
       readyAgents.push({ id: agentId, ...keys });
     }
     
+    // Clear the marker only once every agent in it has been dealt with, so a start
+    // that dies partway through still restores the rest on the next attempt.
+    if (_shutdownDeactivated.length) {
+      if (_reactivatedOnStart.length) {
+        console.log(`↻  Reactivated ${_reactivatedOnStart.length}/${_shutdownDeactivated.length} agent(s) deactivated by the last shutdown`);
+      }
+      const _unrestored = _shutdownDeactivated.filter(id => !_reactivatedOnStart.includes(id));
+      if (_unrestored.length === 0) clearShutdownDeactivated();
+      else writeShutdownDeactivated(_unrestored);
+    }
+
     if (readyAgents.length === 0) {
-      console.error('\n❌ No agents registered. Run: j41-dispatcher register <agent> <name>');
+      // Never send the operator to `register` for a fleet that is merely offline —
+      // re-registering costs on-chain writes and does not fix an inactive agent.
+      if (agents.length === 0) {
+        console.error('\n❌ No agents registered. Run: j41-dispatcher register <agent> <name>');
+      } else {
+        console.error(`\n❌ No agents available to poll (${agents.length} registered, none active on the platform).`);
+        console.error('   Bring them back online with: j41-dispatcher activate-all');
+        console.error('   Do NOT re-register — that costs on-chain writes and will not fix an inactive agent.');
+      }
       process.exit(1);
     }
-    
+
     console.log(`Ready agents: ${readyAgents.length}\n`);
     
     // Start job polling loop
@@ -4100,12 +4185,33 @@ program
       // gives you two dispatchers polling the same agents and writing identity
       // transactions against the same prevOutput — the double-spend class this
       // release exists to prevent. Never let shutdown be best-effort.
+      // It is a STALL detector, not a deadline. The original 30s wall-clock version
+      // could not tell a hung cleanup from healthy work, and it force-exited both:
+      //   - a drain is designed to run up to drainTimeoutMs (2 x jobTimeoutMin =
+      //     120 min by default), so every drain longer than 30s was killed, its
+      //     containers orphaned, and the jobs refunded on next start even though
+      //     they would have delivered; and
+      //   - the deactivate loop below does ~3 network calls plus an on-chain
+      //     transaction PER AGENT, serially, so a large fleet blew the budget
+      //     mid-loop and left some agents active and some inactive. That is the
+      //     mechanism behind "the restart lost my fleet, but only sometimes".
+      // `unref()` never helped: it stops the timer holding the loop open, not from
+      // firing.
+      //
+      // Now each step of shutdown kicks it. No progress for HARD_EXIT_MS means
+      // genuinely stuck, which is what the 2026-08-04 fix was actually for.
       const HARD_EXIT_MS = 30000;
-      const hardExit = setTimeout(() => {
-        console.error(`\n⚠️  Graceful shutdown did not complete within ${HARD_EXIT_MS / 1000}s — forcing exit.`);
-        process.exit(1);
-      }, HARD_EXIT_MS);
-      hardExit.unref?.(); // must not itself keep the loop alive if we exit cleanly
+      let hardExit = null;
+      const kickWatchdog = (label) => {
+        if (hardExit) clearTimeout(hardExit);
+        hardExit = setTimeout(() => {
+          console.error(`\n⚠️  Graceful shutdown made no progress for ${HARD_EXIT_MS / 1000}s` +
+            `${label ? ` (last step: ${label})` : ''} — forcing exit.`);
+          process.exit(1);
+        }, HARD_EXIT_MS);
+        hardExit.unref?.(); // must not itself keep the loop alive if we exit cleanly
+      };
+      kickWatchdog('start');
 
       /** Run a cleanup step so one failure can never strand the process. */
       const safely = (label, fn) => {
@@ -4120,11 +4226,16 @@ program
       // 1. Set agents offline (stop accepting new jobs)
       // J41_NO_STATUS_TOGGLE=1: don't flip platform state on shutdown.
       const _skipStatusToggle = process.env.J41_NO_STATUS_TOGGLE === '1';
+      const _deactivatedByShutdown = [];
       for (const agentInfo of state.agents) {
         if (_skipStatusToggle) {
           console.log(`   ⏭️  ${agentInfo.id}: skipping deactivate (J41_NO_STATUS_TOGGLE=1)`);
           continue;
         }
+        // Each agent is ~3 network calls plus an on-chain tx; on a large fleet the
+        // loop legitimately outlives any fixed budget. Report progress per agent so
+        // the stall detector only fires if an agent genuinely wedges.
+        kickWatchdog(`deactivate ${agentInfo.id}`);
         try {
           const agent = await getAgentSession(state, agentInfo);
           const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
@@ -4136,6 +4247,7 @@ program
           const signature = signMessage(agentInfo.wif, message, J41_NETWORK);
           await agent.client.setAgentStatus(verusId, 'inactive', signature, timestamp, nonce);
           console.log(`   ✅ ${agentInfo.id}: status → inactive`);
+          _deactivatedByShutdown.push(agentInfo.id);
           try { await agent.setOnChainStatus('inactive'); } catch {}
           // Trigger backend re-index so marketplace shows offline immediately
           try {
@@ -4144,6 +4256,13 @@ program
         } catch (e) {
           console.log(`   ⚠️  ${agentInfo.id}: failed to mark offline`);
         }
+      }
+
+      // Persist BEFORE the drain. If the drain times out or the operator kill -9s
+      // during it, the marker still exists and the next start restores the fleet.
+      writeShutdownDeactivated(_deactivatedByShutdown);
+      if (_deactivatedByShutdown.length) {
+        console.log(`   📝 Recorded ${_deactivatedByShutdown.length} agent(s) to reactivate on next start`);
       }
 
       // 2. Calculate drain timeout
@@ -4166,6 +4285,9 @@ program
       const drainStart = Date.now();
       const drainInterval = setInterval(() => {
         const elapsed = Math.round((Date.now() - drainStart) / 1000);
+        // A ticking drain IS progress. The drain has its own drainTimeoutMs bound
+        // below; the stall detector must not pre-empt it.
+        kickWatchdog(`draining ${state.active.size} job(s)`);
         console.log(`   Draining: ${state.active.size} job(s) remaining (${elapsed}s elapsed)`);
 
         if (state.active.size === 0) {
@@ -4923,6 +5045,121 @@ async function queueDisputedJobForRespawn(state, jobId, opts = {}) {
   console.log(`[Dispute] job ${jobId.substring(0, 8)} torn-down → queued + respawning for ${match.id}`);
   await respawn(state);
   return { respawned: true };
+}
+
+// ── Shutdown/start fleet-state handoff ───────────────────────────────────────
+//
+// `gracefulShutdown` sets every agent inactive on the platform and on-chain so a
+// stopped dispatcher stops taking work. `start` then SKIPPED inactive agents and
+// exited with "No agents registered. Run: j41-dispatcher register <agent> <name>"
+// — pointing the operator at re-registration, which is both wrong and pays for
+// on-chain writes. A routine stop/start lost the whole fleet.
+//
+// We record exactly which agents WE turned off, so start restores those and only
+// those. An agent the operator deactivated deliberately stays deactivated — that
+// distinction is the whole reason this is a marker file and not "activate anything
+// that looks inactive".
+const SHUTDOWN_DEACTIVATED_FILE = path.join(DISPATCHER_DIR, 'shutdown-deactivated.json');
+
+function readShutdownDeactivated() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SHUTDOWN_DEACTIVATED_FILE, 'utf8'));
+    return Array.isArray(parsed?.agents) ? parsed.agents.filter(a => typeof a === 'string') : [];
+  } catch {
+    return []; // absent is the normal case (clean prior start); corrupt = restore nothing
+  }
+}
+
+function writeShutdownDeactivated(agentIds) {
+  try {
+    if (!agentIds.length) return;
+    const tmp = `${SHUTDOWN_DEACTIVATED_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ at: new Date().toISOString(), agents: agentIds }, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, SHUTDOWN_DEACTIVATED_FILE); // atomic: a torn file must not strand the fleet
+  } catch (e) {
+    console.error(`   ⚠️  Could not record deactivated agents (${e.message}) — next start may need: j41-dispatcher activate-all`);
+  }
+}
+
+function clearShutdownDeactivated() {
+  try { fs.unlinkSync(SHUTDOWN_DEACTIVATED_FILE); } catch {}
+}
+
+/**
+ * Statuses that mean "this job still needs us, and may have no worker alive".
+ * A disputed job's deadline is days away; a worker's post-delivery hold is hours
+ * at most. The gap between those two numbers is where jobs used to vanish.
+ */
+const ORPHANABLE_STATUSES = ['disputed', 'rework'];
+
+/**
+ * Own the jobs nobody else does.
+ *
+ * Before this, a job in `disputed` or `rework` whose container had exited was
+ * invisible to the entire dispatcher: `pollForJobs` keeps only
+ * requested/accepted/in_progress, and the post-delivery transition check iterates
+ * `state.active`, which by definition no longer holds it. No surface, no respawn,
+ * no operator alert — the dispute deadline simply lapsed on the platform's default
+ * terms. Every test we ran passed only because the buyer happened to act inside the
+ * worker's ~90-minute window.
+ *
+ * This reconciler closes that hole from the durable side. It is deliberately
+ * idempotent and cheap: it respawns only for jobs with no live worker, and
+ * `queueDisputedJobForRespawn` forwards rather than respawns when one exists.
+ *
+ * Scale notes: one `getMyJobs` call per agent per status, and the respawn path is
+ * already gated on memory headroom (`hasMemoryHeadroom`) and the reactivation
+ * queue, so a fleet with many simultaneous disputes degrades by queueing rather
+ * than by exhausting the host. Failures are per-agent and never abort the sweep.
+ */
+async function reconcileOrphanedDisputes(state, opts = {}) {
+  const queueFn = opts.queueDisputedJobForRespawn || queueDisputedJobForRespawn;
+  const getSession = opts.getAgentSession || getAgentSession;
+  const summary = { checked: 0, orphaned: 0, respawned: 0, failed: 0 };
+
+  for (const agentInfo of state.agents || []) {
+    let jobs = [];
+    try {
+      const session = await getSession(state, agentInfo);
+      for (const status of ORPHANABLE_STATUSES) {
+        const res = await session.client.getMyJobs({ status, role: 'seller' });
+        for (const j of (res?.data || [])) if (j?.id) jobs.push(j);
+      }
+    } catch (e) {
+      // One unreachable agent must not stop the fleet-wide sweep.
+      summary.failed++;
+      console.error(`[DisputeReconcile] ${agentInfo.id}: could not list disputed/rework jobs: ${e.message}`);
+      continue;
+    }
+
+    for (const job of jobs) {
+      summary.checked++;
+      if (state.active.has(job.id)) continue;      // a live worker already owns it
+      if (state.queue.some(j => j.id === job.id)) continue;
+      if (rq.has(state.reactivationQueue, job.id)) continue; // already waiting for capacity
+
+      summary.orphaned++;
+      console.log(`[DisputeReconcile] job ${job.id.substring(0, 8)} is ${job.status} with no worker — respawning for ${agentInfo.id}`);
+      try {
+        // Same entry point the webhook uses, so there is exactly one respawn path.
+        // Once the worker is up, the post-delivery transition check sees the job in
+        // `state.active` and sends the `rework`/`disputed` message — and because a
+        // fresh container clears `_lastSentStatus`, that message is not suppressed
+        // as "already sent" to the process that died.
+        const r = await queueFn(state, job.id, { agentId: agentInfo.id, reason: job.dispute?.reason });
+        if (r?.respawned || r?.forwarded) summary.respawned++;
+      } catch (e) {
+        summary.failed++;
+        console.error(`[DisputeReconcile] respawn failed for ${job.id.substring(0, 8)}: ${e.message}`);
+      }
+    }
+  }
+
+  if (summary.orphaned > 0 || summary.failed > 0) {
+    console.log(`[DisputeReconcile] checked=${summary.checked} orphaned=${summary.orphaned} respawned=${summary.respawned} failed=${summary.failed}`);
+  }
+  state._disputeReconcile = summary;
+  return summary;
 }
 
 const REACTIVATION_MEM_MARGIN_BYTES = 512 * 1024 * 1024; // 0.5 GB host margin
@@ -6411,6 +6648,16 @@ async function pollForJobs(state) {
     }
   }
 
+  // Own disputed/rework jobs whose worker is already gone. The loop above can only
+  // ever see jobs in `state.active`; this is the half that covers the rest, and
+  // without it a dispute filed after the worker's post-delivery hold expired was
+  // invisible to the whole dispatcher until its deadline lapsed.
+  try {
+    await reconcileOrphanedDisputes(state);
+  } catch (e) {
+    console.error(`[DisputeReconcile] sweep failed: ${e.message}`);
+  }
+
   // Poll-mode fallback: resume queued (container-freed) jobs whose platform status
   // returned to in_progress — the webhook (job.resumed) path may be absent in poll
   // mode. Batched round-robin so 100 queued jobs don't hammer the platform.
@@ -6465,12 +6712,14 @@ async function pollForJobs(state) {
   if (state._pendingWorkspace?.size) {
     for (const [pendingJobId, wsData] of state._pendingWorkspace) {
       const activeInfo = state.active.get(pendingJobId);
-      if (activeInfo?.process?.send) {
+      // Fork-gated: a Docker worker never drained this queue, so a workspace that
+      // arrived before spawn stayed queued for the life of the job.
+      if (activeInfo) {
         if (!checkWorkspaceCapability(state, activeInfo.agentId)) {
           state._pendingWorkspace.delete(pendingJobId);
           continue;
         }
-        activeInfo.process.send({
+        sendToJobAgent(activeInfo, {
           type: 'workspace_ready',
           jobId: pendingJobId,
           sessionId: wsData.sessionId,
@@ -6487,7 +6736,7 @@ async function pollForJobs(state) {
   // Check workspace status for active jobs that haven't been notified
   for (const [activeJobId, activeInfo] of state.active) {
     if (activeInfo.workspaceNotified) continue;
-    if (!activeInfo.process?.send) continue;
+    if (!activeInfo.process?.send && !activeInfo.container) continue;
     if (!checkWorkspaceCapability(state, activeInfo.agentId)) {
       activeInfo.workspaceNotified = true; // Don't check again
       continue;
@@ -6496,7 +6745,7 @@ async function pollForJobs(state) {
       const agentSession = await getAgentSession(state, activeInfo.agentInfo);
       const wsStatus = await agentSession.client.getWorkspaceStatus(activeJobId);
       if (wsStatus?.status === 'active' || wsStatus?.status === 'pending') {
-        activeInfo.process.send({
+        sendToJobAgent(activeInfo, {
           type: 'workspace_ready',
           jobId: activeJobId,
           sessionId: wsStatus.id || wsStatus.sessionId || '',
@@ -6694,26 +6943,27 @@ async function handleWebhookEvent(state, agentId, payload) {
     case 'job.dispute.resolved': {
       console.log(`[Webhook] ✅ Dispute resolved for job ${jobId?.substring(0, 8)}: ${data?.action || '?'}`);
       const resolvedJob = state.active.get(jobId);
-      if (resolvedJob?.process?.send) {
-        resolvedJob.process.send({ type: 'dispute.resolved', data });
-      }
+      // sendToJobAgent, not process.send: `.process` exists only for local forks, so
+      // gating on it silently dropped this for every Docker container — the same
+      // defect class as dispute_policy, which was migrated while these were missed.
+      if (resolvedJob) sendToJobAgent(resolvedJob, { type: 'dispute.resolved', data });
       break;
     }
 
     case 'job.dispute.rework_accepted': {
       console.log(`[Webhook] 🔄 Rework accepted for job ${jobId?.substring(0, 8)}`);
       const reworkJob = state.active.get(jobId);
-      if (reworkJob?.process?.send) {
-        reworkJob.process.send({ type: 'dispute.rework_accepted', data });
-      }
+      // See dispute.resolved above — this one silently never reached a Docker
+      // worker, so webhook-mode rework never ran at all.
+      if (reworkJob) sendToJobAgent(reworkJob, { type: 'dispute.rework_accepted', data });
       break;
     }
 
     case 'job.completed': {
       console.log(`[Webhook] ✅ Job ${jobId?.substring(0, 8)} completed`);
       const completedJob = state.active.get(jobId);
-      if (completedJob?.process?.send) {
-        completedJob.process.send({ type: 'job.completed', data });
+      if (completedJob) {
+        sendToJobAgent(completedJob, { type: 'job.completed', data });
       } else {
         // Job not active — just mark as seen
         if (jobId) {
@@ -6726,12 +6976,14 @@ async function handleWebhookEvent(state, agentId, payload) {
 
     case 'workspace.ready': {
       const activeInfo = state.active.get(jobId);
-      if (activeInfo?.process?.send) {
+      // Docker workers have `.container`, never `.process` — gating on the fork
+      // channel queued every containerised workspace as "not spawned yet".
+      if (activeInfo) {
         if (!checkWorkspaceCapability(state, activeInfo.agentId)) {
           console.log(`[Webhook] Workspace ready — BLOCKED by VDXF policy for ${activeInfo.agentId}`);
           break;
         }
-        activeInfo.process.send({
+        sendToJobAgent(activeInfo, {
           type: 'workspace_ready',
           jobId: jobId,
           sessionId: data.sessionId,
@@ -6755,8 +7007,8 @@ async function handleWebhookEvent(state, agentId, payload) {
     case 'workspace.disconnected':
     case 'workspace.completed': {
       const activeInfo2 = state.active.get(jobId);
-      if (activeInfo2?.process?.send) {
-        activeInfo2.process.send({
+      if (activeInfo2) {
+        sendToJobAgent(activeInfo2, {
           type: 'workspace_closed',
           jobId: jobId,
           reason: event,
@@ -6769,8 +7021,8 @@ async function handleWebhookEvent(state, agentId, payload) {
     case 'job.end_session_request': {
       console.log(`[Webhook] End-session requested for job ${jobId?.substring(0, 8)}`);
       const endSessionJob = state.active.get(jobId);
-      if (endSessionJob?.process?.send) {
-        endSessionJob.process.send({ type: 'end_session_request', jobId });
+      if (endSessionJob) {
+        sendToJobAgent(endSessionJob, { type: 'end_session_request', jobId });
       }
       break;
     }
@@ -7929,6 +8181,13 @@ async function startJobContainer(state, job, agentInfo) {
     
     await container.start();
 
+    // A brand-new container has received NOTHING. `_lastSentStatus` survives the
+    // death of the container it describes, and the transition check skips any
+    // status equal to it — so a respawned worker (dispute respawn, crash retry)
+    // would never be told the job is in `rework`, and would sit waiting for an
+    // IPC that was "already sent" to a process that no longer exists.
+    state._lastSentStatus.delete(job.id);
+
     state.active.set(job.id, {
       agentId: agentInfo.id,
       job,
@@ -8348,6 +8607,10 @@ async function startJobLocal(state, job, agentInfo) {
         agentMarkup: state.agentMarkup?.get(agentInfo.id) || 15,
       });
     }
+
+    // See the Docker path: a fresh worker has received nothing, so a stale
+    // last-sent status must not suppress the next transition message.
+    state._lastSentStatus.delete(job.id);
 
     state.active.set(job.id, {
       agentId: agentInfo.id,
@@ -10380,7 +10643,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');

@@ -2,6 +2,105 @@
 
 ## Unreleased
 
+## 2.14.0
+
+Two full-path reviews — the dispute/rework path and the daemon lifecycle — read as
+whole systems rather than as diffs. Every defect below lived in a **seam** between
+components, which is why three rounds of diff-level review passed while the path
+kept breaking.
+
+### Nobody owned a disputed job once its worker exited
+
+A dispute deadline is **days**. A worker's post-delivery hold was ~90 minutes.
+`pollForJobs` keeps only `requested|accepted|in_progress`, and the post-delivery
+transition check iterates `state.active` — which by definition no longer holds a
+job whose container died. So a dispute filed after that gap was invisible to the
+entire dispatcher: no surface, no respawn, no operator alert, and the deadline
+lapsed on the platform's default terms. Every test to date passed only because the
+buyer happened to act inside the 90 minutes.
+
+- New `reconcileOrphanedDisputes` sweep owns `disputed`/`rework` jobs that have no
+  live worker, respawning through the same entry point the webhook uses. Skips jobs
+  that already have a worker or are queued for capacity; one unreachable agent
+  never aborts the fleet-wide sweep.
+- The worker now holds itself open toward the **real dispute deadline** instead of
+  dying at the review timeout — bounded by `J41_DISPUTE_HOLD_MAX_MS` (default 6 h),
+  because one container per disputed job for days does not scale. After the cap it
+  exits and the dispatcher owns it.
+- `isPostDeliveryReconnect` now includes **`rework`** (plus `resolved`,
+  `resolved_rejected`). Its absence meant a container spawned for a job already in
+  rework fell through to `acceptJob`, hit the retry wall, and made the dispatcher
+  queue a **refund for a job that had both a delivery and a seller-agreed rework**.
+- A fresh container clears `_lastSentStatus` for its job. That guard outlived the
+  process it described, so a respawned worker was never told the job was in
+  `rework` — the message had "already been sent" to a process that no longer existed.
+
+### The chat fix shipped in 2.13.1 was incomplete
+
+`ensureChatConnected` gated on `isConnected`, but a post-delivery **respawn** calls
+`connectChat()` whose auto-join covers only `accepted` + `in_progress` jobs — a
+disputed job is neither. The socket was connected, the guard short-circuited, and
+the rework was emitted into a room the agent had never joined. `sendMessage` is an
+ack-less socket emit, so nothing threw and every log line read healthy. Now checks
+**room membership**, not connectivity, and falls back to per-process join tracking
+on SDK versions that do not expose `joinedRooms` — never to "assume joined" (silent
+loss) or "always join" (duplicate messages). `surfaceDispute` had the identical
+hole and is fixed with it.
+
+### The rework chat post bypassed the canary check
+
+Every other outbound reply goes through `checkCanaryLeak`; this one did not, and the
+SDK's own guard is inert because `enableCanaryProtection()` is never called. The
+rework instruction is **buyer-authored** (`dispute.reason`), so this was the
+prompt-injection path, unguarded, while the deliverable copy was dutifully stripped.
+
+### Shutdown deactivated the fleet and start never restored it
+
+`gracefulShutdown` sets every agent inactive on the platform *and* on-chain; `start`
+skipped inactive agents and exited with `No agents registered. Run: register …` —
+sending the operator to re-registration, which is wrong and pays for on-chain
+writes. A routine stop/start lost the whole fleet.
+
+Shutdown now records exactly which agents **it** deactivated (atomic write, before
+the drain, so a `kill -9` mid-drain still leaves the marker), and start restores
+those and only those — an agent the operator deactivated deliberately stays off.
+The dead-end error message now names the real remedy and explicitly warns against
+re-registering.
+
+### The 30-second shutdown watchdog force-exited healthy work
+
+`HARD_EXIT_MS` was a wall-clock deadline while `drainTimeoutMs` is **120 minutes**,
+so every drain longer than 30s was killed, its containers orphaned and their jobs
+refunded on next start. It also fired mid-deactivate-loop — ~3 network calls plus an
+on-chain tx per agent — leaving some agents active and some inactive, which is the
+mechanism behind "the restart lost my fleet, but only sometimes". It is now a
+**stall detector**: each step kicks it, so no-progress-for-30s still force-exits,
+which is what it was actually for.
+
+### `start` raced the dispatcher it had just killed
+
+It SIGTERMed the old pid and waited a flat **1 second** while the old process ran its
+full shutdown. Concurrently: its deactivate loop flipped agents inactive while our
+startup read them (a second, independent cause of the fleet loss); our crash recovery
+read `active-jobs.json`, still listing its **draining** jobs, and killed those
+containers and queued refunds for work about to deliver; and both processes broadcast
+identity transactions against the same confirmed `prevOutput`. `start` now waits for
+the old daemon to actually exit and **refuses to start a second dispatcher** rather
+than proceeding into that state. The exit handler also no longer deletes a pid file
+that belongs to its successor.
+
+### Six webhook handlers could not reach a Docker container
+
+`dispute.resolved`, `dispute.rework_accepted`, `job.completed`, `end_session_request`,
+`workspace.ready` and `workspace.disconnected/completed` all gated on
+`activeInfo.process?.send` — the **local-fork-only** channel. A Docker worker has
+`.container`, never `.process`, so every one was silently dropped while the handler's
+own log line reported success. Same defect class as `dispute_policy`, which was
+migrated to `sendToJobAgent()` while these were missed. In webhook mode, rework never
+ran at all.
+
+910 tests (892 before). Every fix above is mutation-checked.
+
 ## 2.13.1
 
 **The rework answer still could not be read in full.** 2.13.0's re-test confirmed

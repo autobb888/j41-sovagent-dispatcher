@@ -158,12 +158,53 @@ async function sendChatChunked(agent, jobId, text, maxLen = CHAT_MAX_LEN, gapMs 
  * nowhere. We join ONLY on a fresh connect — room membership survives a live
  * socket, and re-joining a room we are already in duplicates every message.
  */
+// Rooms this process has explicitly joined. Only consulted when the SDK does not
+// expose `chatClient.joinedRooms`; see ensureChatConnected.
+const _joinedRoomsFallback = new Set();
+
 async function ensureChatConnected(agent, jobId) {
-  if (agent.chatClient?.isConnected) return true;
+  // Membership, not just connectivity. Gating on `isConnected` alone was wrong:
+  // a post-delivery RESPAWN calls connectChat() during startup, and that auto-join
+  // covers only `accepted` + `in_progress` seller jobs — a job in dispute or rework
+  // is neither. So the socket is connected, this returned early, and the rework was
+  // emitted into a room the agent had never joined. `sendMessage` is an ack-less
+  // socket emit, so nothing throws and every log line reads healthy.
+  //
+  // `joinedRooms` is the SDK's own Set (ChatClient), and it is replayed on socket
+  // reconnect, so joining is durable and re-joining a room we are already in is
+  // what we still avoid — that duplicates every message.
+  // If the agent cannot manage its own socket (an alternative transport, a test
+  // double), do not pretend to — let the send attempt itself report the truth.
+  if (typeof agent.connectChat !== 'function' || typeof agent.joinJobChat !== 'function') {
+    return true;
+  }
+
+  // Prefer the SDK's own membership set. When a version does not expose it we fall
+  // back to what THIS process has joined — never to "assume joined", which loses
+  // messages silently, and never to "always join", which duplicates every message.
+  const inRoom = () => {
+    const rooms = agent.chatClient?.joinedRooms;
+    if (rooms && typeof rooms.has === 'function') return rooms.has(jobId);
+    return _joinedRoomsFallback.has(jobId);
+  };
+  const join = (why) => {
+    agent.joinJobChat(jobId);
+    _joinedRoomsFallback.add(jobId);
+    console.log(`  [CHAT] Joined room for ${jobId} (${why})`);
+  };
+
+  if (agent.chatClient?.isConnected) {
+    if (inRoom()) return true;
+    join('connected but not a member — post-delivery respawn');
+    return true;
+  }
+
+  // A brand-new socket is in no rooms, so our fallback record of past joins is
+  // stale the moment we reconnect.
+  _joinedRoomsFallback.delete(jobId);
   await agent.authenticate();
   await agent.connectChat();
-  agent.joinJobChat(jobId);
-  console.log(`  [CHAT] Reconnected and joined room for ${jobId} before posting`);
+  if (!inRoom()) join('reconnected');
   return true;
 }
 
@@ -171,8 +212,23 @@ async function ensureChatConnected(agent, jobId) {
 // work or re-deliver — it reconnects straight into the post-delivery wait so it
 // can surface/handle a dispute. (Fixes the job-agent.js:600 "not deliverable →
 // exit" drop that made torn-down disputes unreachable.)
+// Every status that means "work has already been delivered — do NOT re-accept".
+//
+// `rework` was missing, and the omission was expensive: a container spawned for a
+// job already in rework (a queued dispute-respawn that waited for capacity, a
+// crash-retry, or a dispatcher restart) fell through to signAccept + acceptJob on
+// a job that cannot be accepted. Either the platform refused — fatal, exit 1,
+// respawn, refuse again, until MAX_RETRIES ran out and the dispatcher queued a
+// refund for a job that had BOTH a delivery and a seller-agreed rework — or the
+// accept no-op'd and the container ran a fresh interactive session that never did
+// the rework at all. `resolved` and `resolved_rejected` are here for the same
+// reason: re-accepting a finished job is never right.
+const POST_DELIVERY_STATUSES = new Set([
+  'delivered', 'disputed', 'rework', 'resolved', 'resolved_rejected',
+]);
+
 function isPostDeliveryReconnect(status) {
-  return status === 'delivered' || status === 'disputed';
+  return POST_DELIVERY_STATUSES.has(status);
 }
 
 // Item C — worker self-reports attach to the platform. Gated on non-reconnect
@@ -1756,9 +1812,23 @@ async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndRes
   // Chat is also the only UNCAPPED channel: the platform stores just the first
   // 200 characters of a deliverable, so for any answer longer than that this post
   // is the only way the buyer can read the work in full.
+  //
+  // Canary-checked like every other outbound reply. The rework instruction is
+  // BUYER-authored (it is `dispute.reason`), so this is a prompt-injection path,
+  // and it was the only outbound chat write in the process that skipped the check.
+  // The SDK's own guard in sendChatMessage cannot cover it — job-agent.js never
+  // calls enableCanaryProtection(), so `canaryConfig` is unset and that guard is
+  // inert. The deliverable copy is stripped separately by the caller.
   try {
-    await ensureChatConnected(agent, job.id);
-    await sendChatChunked(agent, job.id, response);
+    if (checkCanaryLeak(response)) {
+      console.log('  ⛔ Rework blocked from chat — canary leak detected in the reworked answer');
+      await ensureChatConnected(agent, job.id).catch(() => {});
+      await agent.sendChatMessage(job.id,
+        'I\'m sorry, I can\'t share that information. Please contact the operator about this job.');
+    } else {
+      await ensureChatConnected(agent, job.id);
+      await sendChatChunked(agent, job.id, response);
+    }
   } catch (e) {
     console.warn(`  ⚠️  Could not post the rework to chat: ${e.message} (the deliverable still carries the first ${CHAT_MAX_LEN >= 200 ? 200 : CHAT_MAX_LEN} chars)`);
   }
@@ -1792,6 +1862,10 @@ async function surfaceDispute(job, agent) {
   }
 
   try {
+    // Same room hazard as the rework post: a post-delivery respawn is connected but
+    // was never auto-joined to a disputed job's room, so this alert emitted into
+    // nowhere while `[DISPUTE] surfaced …` still logged success.
+    await ensureChatConnected(agent, job.id);
     await agent.sendChatMessage(job.id,
       `⚠️ A dispute was filed on this job: "${reason}". A response is needed ${when}${whose ? ` — ${whose}` : ''}.`);
   } catch (e) { console.error(`[DISPUTE] surface chat failed: ${e.message}`); }
@@ -1811,17 +1885,60 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
 
     // Safety timeout: resolutionWindow + 30 min (default: 90 min if unknown)
     const safetyMs = ((fullJob.resolutionWindow || 60) + 30) * 60 * 1000;
-    let safetyTimer = setTimeout(() => {
-      console.log('⚠️  Post-delivery safety timeout reached — exiting');
+
+    // How long this worker may be held open by an OPEN DISPUTE, whose deadline is
+    // typically days away — far beyond `safetyMs`. Before this, the timer was
+    // neither cleared nor extended when a dispute arrived, so the container always
+    // died mid-dispute; combined with the dispatcher not tracking disputed jobs
+    // that had no container, nothing in the system owned the job and the deadline
+    // lapsed on the platform's default terms.
+    //
+    // We do NOT simply hold the container for the whole window: one container per
+    // disputed job for days does not scale, and the memory is held for nothing
+    // while both sides think. We hold it while the dispute is plausibly ACTIVE,
+    // then exit and let the dispatcher own it (it now polls `disputed`/`rework`
+    // jobs and respawns a worker when one is needed). Tunable for operators whose
+    // buyers are slower, or who would rather trade RAM for a warm executor.
+    const DISPUTE_GRACE_MS = 30 * 60 * 1000;
+    const _holdEnv = Number(process.env.J41_DISPUTE_HOLD_MAX_MS);
+    const MAX_DISPUTE_HOLD_MS = Number.isFinite(_holdEnv) && _holdEnv > 0
+      ? _holdEnv
+      : 6 * 60 * 60 * 1000;
+
+    let currentSafetyMs = safetyMs;
+
+    const onSafetyTimeout = () => {
+      console.log(`⚠️  Post-delivery safety timeout reached (${Math.round(currentSafetyMs / 60000)} min) — exiting; ` +
+        'the dispatcher owns this job from here and will respawn a worker if it is needed');
       safeResolve({ reason: 'timeout' });
-    }, safetyMs);
+    };
+
+    let safetyTimer = setTimeout(onSafetyTimeout, currentSafetyMs);
 
     function resetSafetyTimer() {
       clearTimeout(safetyTimer);
-      safetyTimer = setTimeout(() => {
-        console.log('⚠️  Post-delivery safety timeout reached — exiting');
-        safeResolve({ reason: 'timeout' });
-      }, safetyMs);
+      safetyTimer = setTimeout(onSafetyTimeout, currentSafetyMs);
+    }
+
+    /**
+     * Hold the worker open toward a dispute deadline, bounded by MAX_DISPUTE_HOLD_MS.
+     * Never SHORTENS an existing window — a second dispute event must not cut the
+     * first one short.
+     */
+    function extendSafetyForDispute(deadlineIso) {
+      let wanted = MAX_DISPUTE_HOLD_MS;
+      const t = deadlineIso ? Date.parse(deadlineIso) : NaN;
+      if (Number.isFinite(t)) {
+        // Deadline in the past (clock skew, or already lapsed) → nothing to wait for.
+        wanted = Math.min(Math.max(t - Date.now(), 0) + DISPUTE_GRACE_MS, MAX_DISPUTE_HOLD_MS);
+      }
+      if (wanted <= currentSafetyMs) return;
+      currentSafetyMs = wanted;
+      resetSafetyTimer();
+      const mins = Math.round(currentSafetyMs / 60000);
+      console.log(`  ⏳ Holding this worker open for ${mins} min for the open dispute` +
+        (Number.isFinite(t) ? ` (deadline ${deadlineIso})` : ' (no deadline reported — using the cap)') +
+        (wanted >= MAX_DISPUTE_HOLD_MS ? ' — capped; the dispatcher owns it after that' : ''));
     }
 
     async function handleMessage(msg) {
@@ -1838,7 +1955,10 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
 
         case 'dispute.filed': {
           console.log(`⚠️  Dispute filed: ${msg.data?.reason || 'no reason'}`);
-          await surfaceDispute(job, agent);
+          const _d = await surfaceDispute(job, agent);
+          // Hold the worker open toward the real deadline instead of dying at the
+          // ~90-min review timeout while the dispute is still open.
+          extendSafetyForDispute(_d?.deadline_at || msg.data?.deadline_at || null);
           // Surface-only: the operator (human) has the final say. A future
           // agent-autonomous policy engine would decide a response here.
           // Stay alive — wait for resolution.
