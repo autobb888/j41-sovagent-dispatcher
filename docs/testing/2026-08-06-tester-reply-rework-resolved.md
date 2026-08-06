@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-06
 **Re:** your "rework deliverable provenance" report
-**Status:** root cause found and fixed. Do **not** re-test yet — see the redeploy note at the end.
+**Status:** root cause found, fixed, and **live — 2.13.0 is deployed. Please re-test.**
 
 ---
 
@@ -73,20 +73,43 @@ called fixed. Two of the three fixes had to ship together or neither was safe.
 Also answered from our event log: the rework ran in the **original container**, not a
 respawn — one `container.started` for `f5c7c467`, where its siblings that day had two.
 
-## What we need from you
+## Go — 2.13.0 is live
 
-**Nothing right now.** Please hold the re-test until we say the redeploy is live —
-we're still on 2.12.1 in production and the fixes are on `main` unreleased.
+Deployed and verified: dispatcher **2.13.0** (`475b8a2`), job-agent image
+**`da3f9370`** (rebuilt — the rework fix runs *inside* the container, so the image
+mattered as much as the release), 9/9 agents available, inbox clean, all skip
+counters 0.
 
-When we do call it, the re-test is unchanged from last time:
+### The re-test
 
-1. Hire Shreck → dispute for rework → accept. The reworked answer must appear in
-   **both** chat and `delivery.message`. If chat stays silent, the fix missed.
-2. Please capture `delivery.hash` before and after the dispute again — that comparison
-   is what proved re-delivery was happening, and it's now our fastest check.
+1. **Hire Shreck → dispute for rework → accept.** The reworked answer must now appear
+   in **both** chat and `delivery.message`. If chat stays silent, the fix missed.
+2. **Capture `delivery.hash` before and after the dispute again.** That comparison is
+   what proved re-delivery was happening at all, and it's now our fastest check.
+3. **Watch for the fallback.** If rework genuinely can't produce an answer we now
+   deliver the transcript *deliberately* rather than silently — you'd see the old
+   `user: Hi Shreck…` head again. Tell us if you do; that's a different failure now,
+   and it's logged on our side, so we can tell the two apart for the first time.
 
-Still open and unchanged: bounty `0d7a81de` on hold, and the 0.5 VRSCTEST on
-`b09440f5` surfaces in the owner approval queue on redeploy.
+One thing that would help: if the reworked answer is longer than 200 characters,
+`delivery.message` will still truncate it — that cap is backend's. **Chat is the
+uncapped channel**, so please treat the chat copy as the real artifact and tell us
+whether it's complete.
+
+### Your 0.5 VRSCTEST is queued
+
+Confirmed live on redeploy — `b09440f5` entered the owner approval queue through the
+"seller already agreed" path, without re-responding to your resolved dispute:
+
+```
+[DisputeSweep] agent-7: b09440f5 — seller already agreed to refund; queueing for owner approval without re-responding
+[DisputeSweep] ⏸️  Queued for owner approval: b09440f5 → iC6bdkugcFbRuPXFsFcK3utr7custBw52i (0.5 VRSCTEST)
+```
+
+All five safety checks pass (`isIAddress`, `notSelf`, `notPlatformFee`, `disputeSigner`,
+`nameRoundTrip`). It awaits a human approval step by design — nothing pays automatically.
+
+Bounty `0d7a81de` is still on hold; we haven't pointed an agent at it yet.
 
 ## Note on the deliverable format
 
