@@ -1666,7 +1666,20 @@ async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndRes
   // Pricing goes through requestBudgetExtension — actual model, observed
   // input:output ratio, real exchange rate (audit fix #4).
   if (tokenBudget && tokenBudget > 0) {
-    executor.setBudget(tokenBudget, BUDGET_WARNING_PERCENT, (usage, budget) => {
+    // ADDITIVE, not absolute. `setBudget` installs a ceiling that
+    // `isBudgetExhausted()` compares against `_tokenUsage.totalTokens`, which is
+    // cumulative for the life of the executor and is never reset. Passing the
+    // rework share directly meant "the whole job may now use 30% of its budget"
+    // — and the original job has already spent most of it, so the gate trips
+    // before the first rework token. The rework LLM call never happens, the
+    // executor returns its budget-exhausted line, and no reworked answer is ever
+    // generated. That is a plausible root cause for the round-6 report: the
+    // reworked content appeared in neither the deliverable nor chat.
+    //
+    // Offsetting by current usage grants `tokenBudget` of FRESH allowance, which
+    // is what "30% of the job for rework" was always meant to mean.
+    const alreadyUsed = executor.getTokenUsage().totalTokens || 0;
+    executor.setBudget(alreadyUsed + tokenBudget, BUDGET_WARNING_PERCENT, (usage, budget) => {
       console.log(`⚠️  Token budget at ${Math.round((usage.totalTokens / budget) * 100)}% — requesting extension`);
       requestBudgetExtension(job, agent, executor, usage, budget)
         .catch(e => console.warn(`[BUDGET] Extension request failed: ${e.message}`));
@@ -2128,5 +2141,5 @@ if (require.main === module) {
 // Export testable helpers when running under NODE_ENV=test.
 // Avoids shipping a test seam in production while keeping coverage honest.
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach, isTerminalAttachError, ATTACH_CONFIRM_BACKOFF_MS };
+  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach, isTerminalAttachError, ATTACH_CONFIRM_BACKOFF_MS, resumeJob };
 }
