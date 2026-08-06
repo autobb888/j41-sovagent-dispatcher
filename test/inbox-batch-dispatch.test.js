@@ -151,13 +151,42 @@ test('contention never counts against any item and never escalates', async () =>
 });
 
 test('repeated non-contention batch failures escalate to per-item counting', async () => {
+  // The example must be an error that is genuinely the ITEM's fault. This test
+  // used to use 'no UTXOs available for TX fee' — which is literally what the
+  // SDK throws for an empty wallet (agent.ts:1380), i.e. an environmental
+  // failure that must NEVER escalate. It only passed because FUNDING_PATTERNS
+  // did not yet recognise that wording, so a dry wallet was silently striking
+  // healthy items. See the companion test below.
   const state = makeState();
-  const err = Object.assign(new Error('no UTXOs available for TX fee'), {});
+  const err = new Error('inbox vdxfData contained no review.* keys');
   const { agent } = makeAgent(err);
   for (let i = 0; i < MAX_BATCH_FAILURES + 5; i++) {
     await processInboxForAgent(agent, AGENT, [item('r1')], state, DEPS);
   }
   assert.ok(state._inboxFailures.has('r1'), 'after escalation the item starts counting so it cannot spin forever');
+});
+
+test('a DRY WALLET never escalates, however many cycles it fails', async () => {
+  // The property the previous test was accidentally contradicting. Every wording
+  // the SDK can produce for "cannot pay the fee" is environmental: not the
+  // item's fault, identical for every item on that agent, and resolved by
+  // funding the address. Striking items for it is the 2026-08-05 incident.
+  for (const msg of [
+    'No spendable R-address UTXOs for fee. Fund RWoe... with at least 0.0001 VRSC.',
+    'No UTXOs available for TX fee',
+    'No UTXOs available — wallet is empty',
+    'No spendable UTXOs on RWoeXSRs4WHQYauzUg6bPowNyBRsz5bW51',
+    'Insufficient funds: need 310000000 satoshis, have 0',
+  ]) {
+    const state = makeState();
+    const { agent } = makeAgent(new Error(msg));
+    for (let i = 0; i < MAX_BATCH_FAILURES + 5; i++) {
+      await processInboxForAgent(agent, AGENT, [item('r1')], state, DEPS);
+    }
+    assert.strictEqual(state._inboxFailures.has('r1'), false,
+      `a dry wallet must not strike the item: ${msg}`);
+    assert.strictEqual(isDeadLettered(state._inboxFailures, 'r1'), false, msg);
+  }
 });
 
 test('a batch-level failure sets the agent error surface', async () => {

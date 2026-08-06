@@ -577,3 +577,23 @@ test('an unreadable-but-present lock is not treated as free', () => {
     try { fs.chmodSync(lockPath, 0o600); fs.unlinkSync(lockPath); } catch { /* gone */ }
   }
 });
+
+test('a zero-length lock is protected while fresh but ages out, never wedging forever', () => {
+  // Both halves matter and they pull opposite ways. A lock file is created empty
+  // and filled a moment later, so stealing a fresh empty lock steals one that is
+  // being created. But "mid-write" lasts microseconds — an empty lock seconds old
+  // is crash debris (or a writeSync that hit ENOSPC), and treating THAT as
+  // forever-young wedges the agent permanently: no pid to prove dead, no
+  // timestamp to age out, never acquirable again.
+  const locksDir = path.dirname(refundInflightPath('probe'));
+  fs.mkdirSync(locksDir, { recursive: true, mode: 0o700 });
+  const lockPath = path.join(locksDir, 'job-empty-age.lock');
+
+  fs.writeFileSync(lockPath, '');
+  assert.equal(acquireSendLock('job-empty-age'), false, 'a fresh empty lock is mid-write — do not steal it');
+
+  const old = (Date.now() - 60_000) / 1000;
+  fs.utimesSync(lockPath, old, old);
+  assert.equal(acquireSendLock('job-empty-age'), true, 'a minute-old empty lock is debris — must be reclaimable');
+  releaseSendLock('job-empty-age');
+});

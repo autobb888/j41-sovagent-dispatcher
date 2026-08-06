@@ -4602,7 +4602,7 @@ async function getAgentSession(state, agentInfo) {
 
   // Back off when the platform is down. A failed session is never cached, so
   // without this every caller re-authenticates every cycle: the 2026-07-31
-  // outage produced ~908 failures at ~43 auth calls/min and ended with the
+  // outage produced ~908 failures and ended with the
   // platform returning 429, which outlasted the 503 that started it. See
   // src/auth-backoff.js.
   if (!state._authBackoff) state._authBackoff = new Map();
@@ -5098,8 +5098,11 @@ function readRefundInflight(jobId) {
   try {
     return JSON.parse(fs.readFileSync(p, 'utf8'));
   } catch (e) {
-    // The file EXISTS but cannot be read. Returning null here would mean "no
-    // marker" and the drain would pay — resolving an unreadable record of a
+    // ENOENT here means it vanished between existsSync and readFileSync — a
+    // genuine absence, and blocking on it would be a spurious over-block.
+    if (e && e.code === 'ENOENT') return null;
+    // Otherwise the file EXISTS but cannot be read. Returning null would mean
+    // "no marker" and the drain would pay — resolving an unreadable record of a
     // possible payment by making another one. Fail closed, same standard as the
     // steal gate: an unusable marker still blocks.
     return { unreadable: true, error: String(e && e.message).slice(0, 200) };
@@ -5251,12 +5254,24 @@ function acquireSendLock(jobId) {
             stillStale = !alive;
           } else if (cur === '') {
             // EMPTY, not absent. openSync(wx) creates the file and writeSync
-            // fills it a moment later, so a zero-length lock means a peer is
-            // mid-write — it is the youngest possible lock, not a stale one.
-            // Reading it as stale is what let a contender steal a lock that was
-            // being created: measured as a second "winner" whose own lock file
-            // named a different pid.
-            stillStale = false;
+            // fills it a moment later, so a zero-length lock usually means a
+            // peer is mid-write — the youngest possible lock, not a stale one.
+            // Reading it as stale let a contender steal a lock that was being
+            // created (a second "winner" whose lock named a different pid).
+            //
+            // But "mid-write" lasts microseconds. An empty lock that is SECONDS
+            // old is not mid-write — it is the debris of a crash between the
+            // create and the write, or of a writeSync that failed with ENOSPC.
+            // Treating that as forever-young wedges the agent permanently: no
+            // pid to prove dead, no timestamp to age out, nothing acquirable
+            // ever again. Bound it by mtime, the same fallback the steal gate
+            // already had and this path did not.
+            let emptyAge = 0;
+            try { emptyAge = Date.now() - fs.statSync(lockPath).mtimeMs; } catch { emptyAge = 0; }
+            stillStale = Number.isFinite(emptyAge) && emptyAge > STEAL_GATE_STALE_MS;
+            if (stillStale) {
+              console.warn(`  [refund] reclaiming a zero-length lock for ${jobId.substring(0, 8)} (${Math.round(emptyAge / 1000)}s old — crashed mid-write)`);
+            }
           } else {
             const curTs = parseInt(cur.split(':')[1], 10);
             stillStale = !curTs || (Date.now() - curTs) > REFUND_LOCK_STALE_MS;
@@ -5400,11 +5415,18 @@ async function attemptPendingRefund(state, jobId, entry, ledgerPath = PENDING_RE
       clearRefundInflight(jobId);
       console.error(`  [refund] ❌ ${jobId.substring(0, 8)}: send failed BEFORE broadcast (${e.message}).`);
       console.error('  [refund]    Nothing was sent. Fund the agent and it will retry on the next drain.');
-    } else {
+    } else if (readRefundInflight(jobId)) {
       noteRefundInflightFailure(jobId, e.message);
       console.error(`  [refund] ⛔ ${jobId.substring(0, 8)}: send failed and we CANNOT tell whether it broadcast: ${e.message}`);
       console.error('  [refund]    BLOCKED to avoid paying twice. Verify the buyer address on-chain, then:');
       console.error(`  [refund]      j41-dispatcher refunds unblock ${jobId}   (after confirming it did NOT arrive)`);
+    } else {
+      // We threw BEFORE the marker was written — no session, auth backoff, agent
+      // missing, allowlist. Nothing was sent and nothing is blocked, so telling
+      // the operator to verify on-chain and run `unblock` would be false twice
+      // over (and `unblock` would answer "not blocked"). During an outage this
+      // branch fires for every approved refund in the drain.
+      console.error(`  [refund] ${jobId.substring(0, 8)}: could not start the send (${e.message}) — nothing was sent; will retry.`);
     }
     return false;
   } finally {
@@ -5437,8 +5459,10 @@ async function drainPendingRefunds(state, opts = {}) {
   const inflightIds = jobIds.filter(id => !!readRefundInflight(id));
   for (const id of inflightIds) {
     const m = readRefundInflight(id) || {};
-    const why = m.lastError ? `failed mid-send (${m.lastError})` : 'was interrupted mid-send';
-    console.error(`  [refund] ⛔ ${id.substring(0, 8)}: a refund of ${m.amount} ${m.currency || ''} to ${m.buyerAddress} ${why}.`);
+    const why = m.unreadable ? `has an UNREADABLE marker (${m.error || 'parse failed'})`
+      : m.lastError ? `failed mid-send (${m.lastError})` : 'was interrupted mid-send';
+    const what = m.unreadable ? 'a refund' : `a refund of ${m.amount} ${m.currency || ''} to ${m.buyerAddress}`;
+    console.error(`  [refund] ⛔ ${id.substring(0, 8)}: ${what} ${why}.`);
     console.error('           NOT re-sending — it may already be on-chain. Verify that address, then:');
     console.error(`             j41-dispatcher refunds unblock ${id}   (only after confirming it did NOT arrive)`);
   }
@@ -5594,6 +5618,27 @@ function refundsList(state, opts = {}, ledgerPath) {
   // was stuck. A blocked refund needs a human more urgently than a pending one.
   const blocked = entries.filter(e => !!readRefundInflight(e.jobId));
   const blockedIds = new Set(blocked.map(e => e.jobId));
+
+  // Markers whose ledger entry has gone. Blocked entries are derived from the
+  // ledger, so if the ledger is lost or hand-edited the marker becomes invisible
+  // — and it is the ONLY record that a payment may have happened. There is no
+  // double-pay risk (nothing left to drain), but the operator loses the pointer
+  // precisely when the ledger is broken, which is when they need it most.
+  let orphans = [];
+  try {
+    orphans = fs.readdirSync(REFUND_LOCKS_DIR)
+      .filter(f => f.endsWith('.inflight.json'))
+      .map(f => f.slice(0, -'.inflight.json'.length))
+      .filter(id => !blockedIds.has(id));
+  } catch { /* no locks dir yet */ }
+  if (orphans.length) {
+    console.log(`\n⚠️  ${orphans.length} in-flight marker(s) with NO ledger entry — a possible payment with no record:`);
+    for (const id of orphans) {
+      const m = readRefundInflight(id) || {};
+      console.log(`   ${id}  ${m.amount ?? '?'} ${m.currency || ''} → ${m.buyerAddress || '(unknown)'}`);
+      console.log(`      verify on-chain, then: j41-dispatcher refunds unblock ${id}`);
+    }
+  }
   const visible = opts.all
     ? entries
     : entries.filter(e => blockedIds.has(e.jobId) || e.status === 'pending_approval' || e.status === 'needs_review');
@@ -10187,14 +10232,32 @@ program
       if (m.lastError) console.log(`  Error:   ${m.lastError}`);
       console.log('\n  Unblocking allows this refund to be SENT AGAIN on the next drain.');
       console.log(`  Confirm on-chain that ${m.buyerAddress} did NOT receive ${m.amount} before continuing.\n`);
-      if (!options.yes) {
-        const ok = await new Promise((resolve) => {
-          const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout });
-          rl.question('  Verified it did NOT arrive? Type "yes" to unblock: ', (a) => { rl.close(); resolve(a.trim() === 'yes'); });
-        });
-        if (!ok) { console.log('  Left blocked.'); return; }
+      // Deliberately NOT skippable with --yes. Every other confirmation in this
+      // CLI guards a decision the operator can reason about from the screen;
+      // this one asserts a fact they must have checked ON-CHAIN. A flag cannot
+      // stand in for having looked, and the cost of being wrong is paying twice.
+      if (options.yes) {
+        console.error('❌ --yes is not accepted for `refunds unblock`. It asserts you verified on-chain that the money did NOT arrive; confirm interactively.');
+        process.exit(1);
       }
-      clearRefundInflight(jobId);
+      const ok = await new Promise((resolve) => {
+        const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout });
+        rl.question('  Verified it did NOT arrive? Type "yes" to unblock: ', (a) => { rl.close(); resolve(a.trim() === 'yes'); });
+      });
+      if (!ok) { console.log('  Left blocked.'); return; }
+      // Take the send lock: the drain runs every 5 minutes, and clearing a
+      // marker while a send is in flight loses the blocked state — if that send
+      // then fails ambiguously, noteRefundInflightFailure finds no marker to
+      // annotate and the next drain pays again.
+      if (!acquireSendLock(jobId)) {
+        console.error(`❌ ${jobId.substring(0, 8)}: a send is in progress for this job. Try again in a moment.`);
+        process.exit(1);
+      }
+      try {
+        clearRefundInflight(jobId);
+      } finally {
+        releaseSendLock(jobId);
+      }
       console.log(`✅ ${jobId.substring(0, 8)} unblocked — it will be retried on the next drain.`);
       return;
     }

@@ -428,11 +428,6 @@ function buildHealthDocument(state, startedAt) {
       containers_total: containers.length,
       containers_unhealthy: containersUnhealthy,
       fee_tanks_empty: feeTanksEmpty,
-      // Cycles a loop skipped because the previous one had not finished. Non-zero
-      // means the dispatcher cannot keep up with its own interval at this agent
-      // count — the fleet stops looking for work, and tanks stop being watched,
-      // while everything else still reports healthy. Surfaced here because a log
-      // line nobody greps is not observability.
       // Agents whose auth is deliberately paused because the platform is down.
       // Without this an outage looks identical to a hang: agents present, no
       // work moving, nothing obviously wrong.
@@ -442,6 +437,11 @@ function buildHealthDocument(state, startedAt) {
           return summarizeAuthBackoff(state._authBackoff, Date.now()).waiting;
         } catch { return 0; }
       })(),
+      // Cycles a loop skipped because the previous one had not finished. Non-zero
+      // means the dispatcher cannot keep up with its own interval at this agent
+      // count — the fleet stops looking for work, and tanks stop being watched,
+      // while everything else still reports healthy. A log line nobody greps is
+      // not observability.
       poll_cycles_skipped: Number.isFinite(state._pollSkips) ? state._pollSkips : 0,
       fee_tank_cycles_skipped: Number.isFinite(state._feeSweepSkips) ? state._feeSweepSkips : 0,
       jobs_active: state.active.size,

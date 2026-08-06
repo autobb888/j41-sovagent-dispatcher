@@ -233,3 +233,88 @@ test('second drainPendingRefunds does NOT re-send an already-refunded job', asyn
   const remaining = JSON.parse(fs.readFileSync(PENDING_REFUNDS_PATH, 'utf8'));
   assert.equal(Object.keys(remaining).length, 0, 'de-duped entry is cleared from ledger');
 });
+
+// ---------------------------------------------------------------------------
+// The refund failure split — the branch that decides whether money can be paid
+// twice. It shipped in 2.11.7 with NO coverage: an audit mutated
+// `if (isFundingFailure(e))` to both `true` and `false` and all 866 tests
+// passed. `true` destroys the double-pay protection; `false` reintroduces the
+// permanent wedge 2.11.7 was written to fix. Neither was caught.
+//
+// The earlier attempt asserted on classifyInboxFailure and then called the
+// marker helpers by hand — it tested fs.unlinkSync, not the branch. These drive
+// the real attemptPendingRefund through the _testAgentSession seam and make
+// sendCurrency throw, which is the only way to reach the catch.
+// ---------------------------------------------------------------------------
+
+// attemptPendingRefund is imported at the top of this file.
+const { clearRefundInflight, readRefundInflight } = require('../src/cli.js');
+
+function refundEntry(over = {}) {
+  return {
+    status: 'approved',
+    agentInfoId: 'agent-1',
+    buyerAddress: 'iBuyerTest',
+    orphan: { currency: 'VRSC' },
+    refundAmount: 3,
+    refundPercent: 100,
+    ...over,
+  };
+}
+
+/** Run one refund attempt whose send throws `err`; return the marker afterwards. */
+async function attemptWithSendError(jobId, err) {
+  clearRefundInflight(jobId);
+  const session = {
+    sendCurrency: async () => { throw err; },
+    client: { submitRefundTxid: async () => {}, sendChatMessage: async () => {} },
+  };
+  const state = makeState({ _testAgentSession: session });
+  const ok = await attemptPendingRefund(state, jobId, refundEntry(), PENDING_REFUNDS_PATH);
+  return { ok, marker: readRefundInflight(jobId) };
+}
+
+test('PRE-BROADCAST failure clears the marker, so the refund is retried', async () => {
+  // Nothing left the host — a dry tank fails while building the transaction.
+  // Keeping the marker here is the 2.11.2 bug: an owed refund never paid.
+  for (const msg of [
+    'No spendable UTXOs on RWoeXSRs4WHQYauzUg6bPowNyBRsz5bW51',
+    'Insufficient funds: need 310000000 sat, have 0 sat',
+    'No UTXOs available — wallet is empty',
+  ]) {
+    const { ok, marker } = await attemptWithSendError('job-pre-' + msg.length, new Error(msg));
+    assert.equal(ok, false, 'the attempt failed');
+    assert.equal(marker, null, `marker must be CLEARED for a pre-broadcast failure: ${msg}`);
+  }
+});
+
+test('AMBIGUOUS failure keeps the marker, so the refund is never paid twice', async () => {
+  // The broadcast may have landed. Paying again to resolve the doubt is the one
+  // outcome that cannot be undone.
+  for (const err of [
+    new Error('socket hang up'),
+    new Error('request timed out after 30000ms'),
+    Object.assign(new Error('gateway timeout'), { statusCode: 504 }),
+  ]) {
+    const jobId = 'job-amb-' + err.message.length;
+    const { ok, marker } = await attemptWithSendError(jobId, err);
+    assert.equal(ok, false);
+    assert.ok(marker, `marker must be KEPT for an ambiguous failure: ${err.message}`);
+    assert.equal(marker.lastError, err.message, 'and annotated with why');
+    assert.equal(marker.buyerAddress, 'iBuyerTest', 'original payee preserved');
+    assert.equal(marker.amount, 3, 'original amount preserved');
+    clearRefundInflight(jobId);
+  }
+});
+
+test('a successful send leaves no marker behind', async () => {
+  clearRefundInflight('job-ok');
+  const session = {
+    sendCurrency: async () => 'TXID-OK',
+    client: { submitRefundTxid: async () => {}, sendChatMessage: async () => {} },
+  };
+  const state = makeState({ _testAgentSession: session });
+  const ok = await attemptPendingRefund(state, 'job-ok', refundEntry(), PENDING_REFUNDS_PATH);
+  assert.equal(ok, true);
+  assert.equal(readRefundInflight('job-ok'), null, 'the marker must not outlive a successful send');
+});

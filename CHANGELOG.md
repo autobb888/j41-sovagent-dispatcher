@@ -2,16 +2,70 @@
 
 ## Unreleased
 
+## 2.12.1
+
+Post-audit again. **The refund failure split — 2.11.7's fix for the previous
+audit's blocking finding — shipped with no test coverage at all.** Mutating
+`if (isFundingFailure(e))` to `true` (always clear the marker, destroying the
+double-pay protection) and to `false` (never clear, reintroducing the wedge)
+each left **all 866 tests passing**.
+
+That is the second time in two days the same money fix has shipped guarded by a
+test that could not fail. The earlier test asserted on `classifyInboxFailure` and
+then called the marker helpers by hand — it tested `fs.unlinkSync`, not the
+branch. Replaced with integration tests that drive the real
+`attemptPendingRefund` through the `_testAgentSession` seam and make
+`sendCurrency` throw, which is the only way to reach that catch. Both mutations
+now fail.
+
+**Writing that test immediately caught a live bug.** `isFundingFailure` did not
+match `'No UTXOs available — wallet is empty'` (SDK `agent.ts:2476`, and two
+sibling wordings), so the **commonest total-drain case** — an agent with nothing
+at all — took the ambiguous branch: refund blocked, operator told to verify
+on-chain and unblock, for a send that never built a transaction. Fails safe, but
+recreates by hand the wedge this release exists to remove.
+
+**An existing test was pinning the buggy behaviour.** `inbox-batch-dispatch`
+used `'no UTXOs available for TX fee'` as its example of an *escalating* failure
+— which is literally what the SDK throws for an empty wallet. It only passed
+because that wording was unmatched, meaning a dry wallet was silently striking
+healthy inbox items. Corrected, and a companion test now pins that **no** wording
+of "cannot pay the fee" ever escalates.
+
+Also fixed:
+- **A zero-length lock file wedged an agent permanently.** 2.11.8 correctly
+  stopped treating an empty lock as stale (it is mid-creation) — but "mid-write"
+  lasts microseconds, and an empty lock left by a crash or an `ENOSPC` has no pid
+  to prove dead and no timestamp to age out. Now bounded by mtime.
+- **Auth backoff missed hang-mode outages.** The SDK's own auth timeout is
+  `J41Error('Login timed out…', 'TIMEOUT', 408)`; none of 408, `TIMEOUT`,
+  `timed out`, `ECONNRESET` or `ENOTFOUND` matched, so a platform that accepts
+  connections and never answers got **zero** backoff plus the actively wrong log
+  *"authentication rejected … will not resolve on its own"*.
+- The ambiguous branch no longer claims a refund is blocked when the failure
+  happened **before** the marker was written (auth backoff, missing agent,
+  allowlist) — during an outage that fired for every approved refund.
+- `refunds unblock` now takes the send lock, and **refuses `--yes`**: that flag
+  would assert the operator checked the chain, which a flag cannot do.
+- Orphan markers — an in-flight marker whose ledger entry is gone — are now
+  listed. They were invisible, and they are the only record that a payment may
+  have happened.
+- The 2026-07-31 outage figures did not reconcile (~908 failures vs "43/min for
+  46 min" ⇒ ~1978). Only the observed figures are now claimed.
+
+873 tests (866 before).
+
 ## 2.12.0
 
 **Back off when the platform is down.** The last open round-3 finding, and the
 only one that was never fixed.
 
 On 2026-07-31 a fleet-wide `503 CHAIN_SYNCING` outage produced **~908 auth
-failures**. `getAgentSession` calls `authenticate()` with no backoff and never
-caches a failed session, so every caller re-authenticated every cycle — measured
-at ~43 calls/min sustained for 46 minutes, until the platform answered `429 Too
-many requests`. We turned their degradation into our rate-limit ban, and the 429
+failures**, until the platform answered `429 Too many requests`.
+`getAgentSession` calls `authenticate()` with no backoff and never caches a
+failed session, so every caller re-authenticated every cycle. (An earlier note
+of "~43 calls/min for 46 min" does not reconcile with the 908 figure and is not
+repeated here — the failures and the 429 are what was observed.) We turned their degradation into our rate-limit ban, and the 429
 outlasted the 503 that caused it. This recurs daily around 04:00 UTC.
 
 `src/auth-backoff.js` — pure, no I/O, no clock — with exponential backoff from
@@ -126,7 +180,8 @@ stuck — the only signal was a log line every five minutes. Blocked entries now
 head the list with amount, payee, last error and the exact command to resolve
 them, and are marked `BLOCKED-inflight` in the status column. New
 `refunds unblock <job-id>`: deliberately manual, deliberately loud, and it makes
-you type `yes` after confirming on-chain that the money never arrived.
+you type `yes` after confirming on-chain that the money never arrived. `--yes`
+is refused outright — a flag cannot stand in for having looked at the chain.
 
 **The test for all of this asserted nothing.** It wired `state._testAttemptRefund`
 — a hook that does not exist in `src/cli.js` — so the array it inspected could

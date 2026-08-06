@@ -146,16 +146,22 @@ const PERMANENT_REJECT_PATTERNS = [
 // substring, for the same reason as TRANSIENT_PATTERNS below. Covers all three
 // the SDK can currently produce for this condition:
 //   identity/update.ts  'No spendable R-address UTXOs for fee...'
-//   tx/payment.ts       'Insufficient funds: ...'   (has some, not enough)
-//   agent.ts:2483       'No spendable UTXOs on <address>'
+//   tx/payment.ts       'Insufficient funds: ...'      (has some, not enough)
+//   agent.ts            'No spendable UTXOs on <addr>'
+//   agent.ts            'No UTXOs available — wallet is empty'
+// The last one was missing until 2.12.1, so the COMMONEST total-drain case — an
+// agent with nothing at all — took the ambiguous branch: its refund was blocked
+// and the operator told to verify on-chain, for a send that never built a
+// transaction. Fails safe (no double-pay) but recreates the manual wedge.
 // The last one is why 'no spendable' is listed as its own prefix — matching only
 // the R-address phrasing would miss it today, not merely after some future
 // reword. This is a string-matching single point of failure on a module we also
 // own; a coded error (err.code = 'FEE_UNFUNDED') would be sturdier and is worth
 // doing SDK-side, with these kept as the fallback.
 const FUNDING_PATTERNS = [
-  'no spendable',
-  'insufficient funds',
+  'no spendable',        // identity/update.ts, agent.ts — some UTXOs, none usable
+  'no utxos available',  // agent.ts — the wallet is completely empty
+  'insufficient funds',  // tx/payment.ts selectUtxos — some, but not enough
   'insufficient balance',
 ];
 

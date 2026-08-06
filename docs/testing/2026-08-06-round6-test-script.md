@@ -19,9 +19,9 @@ pass/fail. Work top to bottom. **Step 1 is time-critical.**
 
 **Why it matters.** The platform goes `503 CHAIN_SYNCING` most days around
 **04:00 UTC** for 50–90 minutes. Until 2.12.0 we had no backoff: every caller
-re-authenticated every cycle, ~43 calls/min for 46 minutes, and the platform
-eventually answered `429 Too many requests` — a ban that outlasted the outage
-that caused it.
+re-authenticated every cycle — ~908 failures in the 2026-07-31 outage — and the
+platform eventually answered `429 Too many requests`, a ban that outlasted the
+outage that caused it.
 
 **This is the only claim in the release proven solely by simulation.** A real
 outage is the proof, and one is due within the hour.
@@ -69,6 +69,7 @@ There is currently nothing blocked, so create the state:
 j41-dispatcher refunds list
 
 # 2b. Fabricate a blocked refund. Safe: no money moves, these are two local files.
+#     Keep the fake job id and fake address — see the status note below.
 #     BOTH are needed — the list derives blocked entries from the ledger and
 #     annotates them from the marker, so a marker alone shows nothing.
 #     (Verified: marker-only prints "No pending refunds".)
@@ -79,7 +80,11 @@ import json, os
 d = os.path.expanduser('~/.j41/dispatcher')
 led = os.path.join(d, 'pending-refunds.json')
 cur = json.load(open(led)) if os.path.exists(led) else {}
-cur['test-job-xyz'] = {"status": "approved", "refundAmount": 0.5,
+# status pending_approval, NOT approved: the daemon drains every 5 MINUTES, and
+# an approved entry is a live send candidate. It renders identically here —
+# BLOCKED-inflight comes from the marker — but pending_approval is never drained,
+# so this cannot turn into a real broadcast if you swap in a real address.
+cur['test-job-xyz'] = {"status": "pending_approval", "refundAmount": 0.5,
                        "buyerAddress": "RTestBuyerAddressForRound6Testing",
                        "orphan": {"currency": "VRSCTEST"}}
 json.dump(cur, open(led, 'w'), indent=2)
@@ -105,8 +110,10 @@ j41-dispatcher refunds unblock test-job-xyz
 - **PASS (2d):** it prints the amount, payee and error, warns that unblocking
   allows the refund to be **sent again**, and refuses to proceed until you type
   `yes`. Answering anything else leaves it blocked.
-- **FAIL:** the list hides it; or `unblock` clears the marker without an explicit
-  confirmation.
+- **PASS (2e):** `j41-dispatcher refunds unblock test-job-xyz --yes` is **refused**.
+  That flag would assert you checked the chain, which a flag cannot do.
+- **FAIL:** the list hides it; `unblock` clears the marker without an explicit
+  confirmation; or `--yes` is accepted.
 
 **Clean up both files** — the ledger entry outlives the marker:
 

@@ -2,12 +2,16 @@
 /**
  * Back off when the platform says it is unavailable.
  *
- * Measured 2026-07-31: a fleet-wide auth outage (`503 CHAIN_SYNCING`) ran from
- * ~04:03 to 16:37 and produced **~908 auth failures**. `getAgentSession` calls
- * `authenticate()` with no backoff and does not cache a failed session, so every
- * poll cycle re-authenticated every agent — roughly 43 calls a minute, sustained
- * for 46 minutes, which the platform eventually answered with `429 Too many
- * requests`. We turned their degradation into our rate-limit ban.
+ * Observed 2026-07-31: a fleet-wide auth outage (`503 CHAIN_SYNCING`) produced
+ * **~908 auth failures**, and the platform eventually answered `429 Too many
+ * requests` — we turned their degradation into our own rate-limit ban, and the
+ * 429 outlasted the 503 that caused it.
+ *
+ * `getAgentSession` calls `authenticate()` with no backoff and does not cache a
+ * failed session, so every caller re-authenticated every cycle. (The contemporary
+ * notes also record "~43 calls/min for 46 min", which does not reconcile with the
+ * 908 figure — 43x46 is ~1978. Treat the exact rate as unverified; the ~908
+ * failures and the resulting 429 are the parts actually observed.)
  *
  * The platform's own 503 says "try again shortly". Hammering it is both rude and
  * self-defeating: the 429 outlasts the 503.
@@ -49,11 +53,18 @@ function isRetryableAuthFailure(err) {
   if (!err) return false;
   const status = typeof err.statusCode === 'number' ? err.statusCode : null;
   if (status === 429) return true;               // explicitly rate-limited
+  if (status === 408) return true;               // request timeout — see below
   if (status !== null && status >= 500) return true; // 502/503/504 — their side
   const code = String((err && err.code) || '').toUpperCase();
-  if (code === 'CHAIN_SYNCING' || code === 'SERVICE_UNAVAILABLE') return true;
+  if (code === 'CHAIN_SYNCING' || code === 'SERVICE_UNAVAILABLE' || code === 'TIMEOUT') return true;
+  // HANG-MODE outages matter as much as 503s and were missed until 2.12.1: a
+  // platform that accepts connections and never answers produces the SDK's own
+  // `J41Error('… timed out after Nms', 'TIMEOUT', 408)`, plus bare ECONNRESET /
+  // ENOTFOUND. None matched, so the commonest silent outage got ZERO backoff and
+  // the actively wrong log "authentication rejected … will not resolve on its
+  // own" every cycle. Note 'timed out' (spaced) as well as 'etimedout'.
   const msg = String((err && err.message) || '').toLowerCase();
-  return /chain_syncing|temporarily unavailable|too many requests|service unavailable|econnrefused|etimedout|socket hang up|fetch failed/.test(msg);
+  return /chain_syncing|temporarily unavailable|too many requests|service unavailable|econnrefused|econnreset|enotfound|etimedout|timed out|timeout|socket hang up|fetch failed|network/.test(msg);
 }
 
 /**

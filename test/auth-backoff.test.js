@@ -150,3 +150,30 @@ test('never throws, whatever it is handed', () => {
     assert.doesNotThrow(() => summarizeAuthBackoff(junk, junk));
   }
 });
+
+test('HANG-MODE outages back off too — a platform that never answers', () => {
+  // Missed until 2.12.1. The SDK's own auth timeout is
+  // J41Error('Login timed out after Nms', 'TIMEOUT', 408) — client/index.ts:326.
+  // None of 408, code TIMEOUT, 'timed out', ECONNRESET or ENOTFOUND matched, so
+  // the commonest silent outage (connections accepted, nothing answered) got
+  // ZERO backoff and logged "authentication rejected … will not resolve on its
+  // own" every single cycle — actively wrong advice.
+  for (const e of [
+    Object.assign(new Error('Login timed out after 30000ms'), { code: 'TIMEOUT', statusCode: 408 }),
+    Object.assign(new Error('Request to POST /v1/auth timed out after 30000ms'), { code: 'TIMEOUT' }),
+    Object.assign(new Error('gateway timeout'), { statusCode: 408 }),
+    new Error('ECONNRESET'),
+    new Error('getaddrinfo ENOTFOUND api.junction41.io'),
+  ]) assert.equal(isRetryableAuthFailure(e), true, e.message);
+});
+
+test('the widened match still refuses to wait on a credential problem', () => {
+  // The widening must not swallow failures that waiting cannot fix.
+  for (const e of [
+    Object.assign(new Error('unauthorized'), { statusCode: 401 }),
+    Object.assign(new Error('forbidden'), { statusCode: 403 }),
+    Object.assign(new Error('bad request'), { statusCode: 400 }),
+    new Error('identity not registered on platform'),
+    new Error('signature verification failed'),
+  ]) assert.equal(isRetryableAuthFailure(e), false, e.message);
+});
