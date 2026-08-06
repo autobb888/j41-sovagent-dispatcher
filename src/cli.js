@@ -5081,28 +5081,28 @@ async function queueDisputedJobForRespawn(state, jobId, opts = {}) {
 // that looks inactive".
 const SHUTDOWN_DEACTIVATED_FILE = path.join(DISPATCHER_DIR, 'shutdown-deactivated.json');
 
-function readShutdownDeactivated() {
+function readShutdownDeactivated(file = SHUTDOWN_DEACTIVATED_FILE) {
   try {
-    const parsed = JSON.parse(fs.readFileSync(SHUTDOWN_DEACTIVATED_FILE, 'utf8'));
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
     return Array.isArray(parsed?.agents) ? parsed.agents.filter(a => typeof a === 'string') : [];
   } catch {
     return []; // absent is the normal case (clean prior start); corrupt = restore nothing
   }
 }
 
-function writeShutdownDeactivated(agentIds) {
+function writeShutdownDeactivated(agentIds, file = SHUTDOWN_DEACTIVATED_FILE) {
   try {
     if (!agentIds.length) return;
-    const tmp = `${SHUTDOWN_DEACTIVATED_FILE}.tmp`;
+    const tmp = `${file}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify({ at: new Date().toISOString(), agents: agentIds }, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, SHUTDOWN_DEACTIVATED_FILE); // atomic: a torn file must not strand the fleet
+    fs.renameSync(tmp, file); // atomic: a torn file must not strand the fleet
   } catch (e) {
     console.error(`   ⚠️  Could not record deactivated agents (${e.message}) — next start may need: j41-dispatcher activate-all`);
   }
 }
 
-function clearShutdownDeactivated() {
-  try { fs.unlinkSync(SHUTDOWN_DEACTIVATED_FILE); } catch {}
+function clearShutdownDeactivated(file = SHUTDOWN_DEACTIVATED_FILE) {
+  try { fs.unlinkSync(file); } catch {}
 }
 
 /**

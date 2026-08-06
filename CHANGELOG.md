@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 2.14.3
+
+**The test suite deleted live dispatcher state.** `test/dispute-ownership.test.js`
+called the shutdown-marker helpers without a path, and their default is the real
+`~/.j41/dispatcher/shutdown-deactivated.json`. Running the suite beside a live
+dispatcher destroyed the marker — caught here when a restart silently failed to
+restore three agents because a test run had removed the record of them between the
+shutdown that wrote it and the start that would have read it.
+
+The helpers now take an explicit path (defaulting to the live one) and every test
+passes a temp directory, with a pin asserting the default is the live path and the
+tests' is not. No behaviour change for the dispatcher itself.
+
+920 tests.
+
 ## 2.14.2
 
 **Shutdown never told its workers to leave.** `type: 'shutdown'` was sent from

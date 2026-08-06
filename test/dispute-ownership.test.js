@@ -285,37 +285,48 @@ test('non-actionable orphans are counted separately from deferred ones', async (
 
 // ── shutdown → start fleet handoff ───────────────────────────────────────────
 
+// These tests MUST NOT touch the operator's real ~/.j41/dispatcher state. An
+// earlier version of this file called the marker helpers with their default path
+// and deleted a live dispatcher's marker mid-restart, silently un-restoring three
+// agents on the next start. Every call below passes an explicit temp path.
+const MARKER = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'j41-marker-')), 'shutdown-deactivated.json');
+
+test('the marker helpers never touch the real dispatcher directory by accident', () => {
+  // Regression pin for the incident above: the default path is the live one, so a
+  // test that omits the argument is writing to production.
+  assert.ok(SHUTDOWN_DEACTIVATED_FILE.includes('.j41'), 'default path is the live one');
+  assert.ok(!MARKER.includes('.j41'), 'tests must use a temp path');
+});
+
 test('the shutdown marker round-trips, and absent means restore nothing', () => {
-  clearShutdownDeactivated();
-  assert.deepEqual(readShutdownDeactivated(), [], 'absent must not be an error');
+  clearShutdownDeactivated(MARKER);
+  assert.deepEqual(readShutdownDeactivated(MARKER), [], 'absent must not be an error');
 
-  writeShutdownDeactivated(['agent-1', 'agent-2']);
-  assert.deepEqual(readShutdownDeactivated(), ['agent-1', 'agent-2']);
+  writeShutdownDeactivated(['agent-1', 'agent-2'], MARKER);
+  assert.deepEqual(readShutdownDeactivated(MARKER), ['agent-1', 'agent-2']);
 
-  clearShutdownDeactivated();
-  assert.deepEqual(readShutdownDeactivated(), []);
+  clearShutdownDeactivated(MARKER);
+  assert.deepEqual(readShutdownDeactivated(MARKER), []);
 });
 
 test('a corrupt marker restores nothing rather than throwing on startup', () => {
-  clearShutdownDeactivated();
-  fs.writeFileSync(SHUTDOWN_DEACTIVATED_FILE, '{ this is not json');
-  assert.deepEqual(readShutdownDeactivated(), [],
+  clearShutdownDeactivated(MARKER);
+  fs.writeFileSync(MARKER, '{ this is not json');
+  assert.deepEqual(readShutdownDeactivated(MARKER), [],
     'a torn marker must never stop the dispatcher from starting');
-  clearShutdownDeactivated();
+  clearShutdownDeactivated(MARKER);
 });
 
 test('the marker is written atomically — a reader never sees a partial file', () => {
-  clearShutdownDeactivated();
-  writeShutdownDeactivated(['agent-1']);
-  // No .tmp left behind: the write is tmp+rename, so a crash mid-write cannot
-  // leave a half-written marker that strands the fleet.
-  assert.equal(fs.existsSync(`${SHUTDOWN_DEACTIVATED_FILE}.tmp`), false);
-  clearShutdownDeactivated();
+  clearShutdownDeactivated(MARKER);
+  writeShutdownDeactivated(['agent-1'], MARKER);
+  assert.equal(fs.existsSync(`${MARKER}.tmp`), false);
+  clearShutdownDeactivated(MARKER);
 });
 
 test('writing an empty list does not create a marker', () => {
-  clearShutdownDeactivated();
-  writeShutdownDeactivated([]);
-  assert.equal(fs.existsSync(SHUTDOWN_DEACTIVATED_FILE), false,
+  clearShutdownDeactivated(MARKER);
+  writeShutdownDeactivated([], MARKER);
+  assert.equal(fs.existsSync(MARKER), false,
     'a shutdown that deactivated nothing must not make the next start reactivate anything');
 });
