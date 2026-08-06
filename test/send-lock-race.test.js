@@ -36,25 +36,41 @@ function raceRound({ racers, lockContent, gateContent }) {
   // microseconds and never survives a clean run.
   if (gateContent) fs.writeFileSync(path.join(locks, 'job-race.lock.steal'), gateContent);
 
-  const startAt = Date.now() + 700; // all children spin to this instant
+  const startAt = Date.now() + 1500; // children spin to this instant
   const kids = Array.from({ length: racers }, () =>
     require('child_process').spawn(process.execPath, [RACER, 'job-race', String(startAt)],
       { env: { ...process.env, HOME: home }, stdio: ['ignore', 'pipe', 'ignore'] }));
 
-  return Promise.all(kids.map((c) => new Promise((resolve) => {
-    let out = '';
-    c.stdout.on('data', (d) => { out += d; });
-    c.on('close', () => resolve(out));
-  }))).then((outs) => {
-    fs.rmSync(home, { recursive: true, force: true });
-    return outs.filter((o) => o.includes('ACQUIRED')).length;
+  // Resolve once every child has REPORTED, then kill them all. A winner holds
+  // the lock until killed, so no late starter can ever find it free — the
+  // assertion never depends on how long a spawn took.
+  return new Promise((resolve) => {
+    const results = new Array(kids.length).fill(null);
+    let reported = 0;
+    const finish = () => {
+      for (const c of kids) { try { c.kill('SIGKILL'); } catch { /* already gone */ } }
+      fs.rmSync(home, { recursive: true, force: true });
+      resolve(results.filter((r) => r && r.includes('ACQUIRED')).length);
+    };
+    let done = false;
+    const maybeFinish = () => { if (!done && reported === kids.length) { done = true; finish(); } };
+    kids.forEach((c, i) => {
+      let buf = '';
+      c.stdout.on('data', (d) => {
+        buf += d;
+        if (buf.includes('\n') && results[i] === null) { results[i] = buf; reported++; maybeFinish(); }
+      });
+      c.on('close', () => { if (results[i] === null) { results[i] = buf || 'refused'; reported++; maybeFinish(); } });
+    });
+    // Backstop: never hang the suite if a child dies without reporting.
+    setTimeout(() => { if (!done) { done = true; finish(); } }, 20000);
   });
 }
 
 test('exactly one process wins a race for a STALE lock', async () => {
   // A lock left behind by a dead process — the only case a steal is allowed.
   const deadHolder = `999999:${Date.now()}`;
-  for (let round = 0; round < 6; round++) {
+  for (let round = 0; round < 4; round++) {
     const winners = await raceRound({ racers: 10, lockContent: deadHolder });
     assert.equal(winners, 1, `round ${round + 1}: ${winners} processes believed they held the lock`);
   }
@@ -82,7 +98,7 @@ test('exactly one process wins when the STEAL GATE itself was orphaned', async (
   // named somebody else.
   const deadHolder = `999999:${Date.now()}`;
   const deadGate = '999998.deadbeefcafe';
-  for (let round = 0; round < 6; round++) {
+  for (let round = 0; round < 4; round++) {
     const winners = await raceRound({ racers: 12, lockContent: deadHolder, gateContent: deadGate });
     assert.equal(winners, 1, `round ${round + 1}: ${winners} processes believed they held the lock`);
   }

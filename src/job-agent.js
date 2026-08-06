@@ -1681,10 +1681,45 @@ async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndRes
   // The executor keeps its conversation history from the original job.
   const response = await executor.handleMessage(reworkContext, { jobId: job.id, senderVerusId: 'system' });
 
-  // Finalize to get the deliverable
-  const result = await executor.finalize();
+  // Deliver the REWORKED ANSWER, not the whole transcript.
+  //
+  // This used to return executor.finalize(), which is the entire conversation
+  // log rendered as `user: …` / `assistant: …` and hashed. The buyer asked for a
+  // corrected deliverable and received a transcript — and since the platform
+  // stores only the first 200 characters of it, what they actually saw was the
+  // START of the original conversation, not the rework at all. `response` is the
+  // work the buyer paid the rework for; it is right here and was being thrown
+  // away.
+  //
+  // Fall back to the transcript only if `response` is unusable — better a
+  // clumsy deliverable than an empty one.
+  const canned = new Set([
+    'I received your message — one moment while I finish my current thought.',
+  ]);
+  const usable = typeof response === 'string'
+    && response.trim().length > 0
+    && !canned.has(response.trim())
+    && !executor._budgetGateHit
+    && !/^I've reached the token budget for this job/.test(response.trim());
 
-  return result;
+  if (!usable) {
+    console.log(`  ⚠️  Rework produced no usable answer (${response ? 'canned/budget-gated reply' : 'empty'}) — falling back to the full transcript`);
+    return executor.finalize();
+  }
+
+  // Tell the buyer. Without this the rework is invisible to them: the content
+  // goes only into the deliverable, so a buyer who asks "did you redo it?" gets
+  // silence and the job auto-completes.
+  try {
+    await sendChatChunked(agent, job.id, response);
+  } catch (e) {
+    console.warn(`  ⚠️  Could not post the rework to chat: ${e.message} (the deliverable still carries it)`);
+  }
+
+  return {
+    content: response,
+    hash: require('crypto').createHash('sha256').update(response).digest('hex'),
+  };
 }
 
 // Surface a dispute to the operator (human has final say — no auto-response).
