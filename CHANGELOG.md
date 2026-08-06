@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+## 2.14.1
+
+Fixes two defects **introduced by 2.14.0**, both caught on its own first live start.
+
+**The reconciler was a thundering herd.** Its first sweep respawned a container for
+*every* historical dispute on the account — twelve at once here, including
+months-old jobs already sitting in the operator's refund-approval queue, which no
+worker can do anything about. The sweep now respawns only where a worker could
+actually act: `rework` always; `disputed` only while the dispute is **unanswered
+and inside its deadline**. A missing deadline still counts as open — refusing to act
+on absent data would silently recreate the hole the sweep exists to close. Respawns
+are capped per sweep (3), and anything deferred is **reported and retried next
+cycle**, never silently dropped.
+
+**Reactivating a restored agent double-wrote it on-chain.** `start` already
+activates every ready agent; the platform-status gate was the only thing keeping
+shutdown-deactivated agents out of that list. 2.14.0 also activated them *in the
+gate*, so each restored agent broadcast two identity transactions against the same
+confirmed `prevOutput` and the second was rejected (`-25`) — the exact double-spend
+class this release exists to prevent. The gate now only lets the agent through.
+
+Also: the orphaned-steal-gate lock test asserted `winners === 1` per round, which
+conflated a **lock breach** (>1 — two processes would each broadcast a refund) with
+**starvation** (0 — a round where nobody got through, which happens legitimately
+when the full suite runs 12 processes under CPU contention). Safety is now asserted
+absolutely per round; liveness across rounds. Verified still to catch a real breach
+by making the steal gate non-exclusive.
+
+919 tests.
+
 ## 2.14.0
 
 Two full-path reviews — the dispute/rework path and the daemon lifecycle — read as

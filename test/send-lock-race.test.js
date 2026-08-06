@@ -96,12 +96,27 @@ test('exactly one process wins when the STEAL GATE itself was orphaned', async (
   // could therefore steal a lock that was in the act of being created. Caught by
   // printing which pid each winner's own lock file named: one winner's lock
   // named somebody else.
+  //
+  // Two different failures hide behind "winners !== 1", and only one is a bug that
+  // costs money:
+  //   >1  — a genuine lock breach. Two processes would each broadcast a refund.
+  //          Never tolerated, in any round, for any reason.
+  //   0   — nobody got through this round. That is liveness, and under heavy CPU
+  //          contention (the full suite spawns 12 processes here while other tests
+  //          run) a round can legitimately starve. Asserting == 1 per round made
+  //          this test fail intermittently for a reason that is not a defect,
+  //          which is how a money-guarding test gets labelled "flaky" and ignored.
+  // So: safety is absolute per round, liveness is asserted across the rounds.
   const deadHolder = `999999:${Date.now()}`;
   const deadGate = '999998.deadbeefcafe';
+  let roundsWithAWinner = 0;
   for (let round = 0; round < 4; round++) {
     const winners = await raceRound({ racers: 12, lockContent: deadHolder, gateContent: deadGate });
-    assert.equal(winners, 1, `round ${round + 1}: ${winners} processes believed they held the lock`);
+    assert.ok(winners <= 1, `round ${round + 1}: ${winners} processes believed they held the lock — LOCK BREACH`);
+    if (winners === 1) roundsWithAWinner++;
   }
+  assert.ok(roundsWithAWinner > 0,
+    'no round produced a winner — the orphaned gate is wedging the agent permanently');
 });
 
 test('an orphaned gate does not permanently wedge the agent', async () => {

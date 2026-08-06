@@ -3301,8 +3301,14 @@ program
               // that sends the operator to re-register and pay for on-chain writes.
               // `disabled` is never auto-restored: that is a platform-side decision.
               if (profile.status === 'inactive' && _shutdownDeactivated.includes(agentId)) {
-                console.log(`↻  ${agentId} (${keys.identity}): reactivating (deactivated by our last shutdown)`);
-                await tmpAgent.activate({ onChain: true });
+                // Let it through the gate — do NOT activate here. Startup already
+                // activates every ready agent (see "Setting agents active" below),
+                // and the skip was the only thing keeping these out of that list.
+                // Activating here too would broadcast a second identity tx for the
+                // same agent against the same confirmed prevOutput, and the second
+                // is rejected (`-25`) — which is precisely the double-spend class
+                // this release exists to prevent.
+                console.log(`↻  ${agentId} (${keys.identity}): deactivated by our last shutdown — restoring`);
                 _reactivatedOnStart.push(agentId);
               } else {
                 console.log(`⏸  ${agentId} (${keys.identity}): ${profile.status} on platform — skipping` +
@@ -5092,6 +5098,50 @@ function clearShutdownDeactivated() {
  */
 const ORPHANABLE_STATUSES = ['disputed', 'rework'];
 
+// Never respawn more than this many workers in a single sweep. On first run after
+// an upgrade the platform can return every historical dispute at once; spawning a
+// container for each would be a thundering herd against the host and the platform.
+// Anything deferred is REPORTED, never silently dropped, and the next sweep picks
+// it up.
+const MAX_RECONCILE_RESPAWNS_PER_SWEEP = 3;
+
+/**
+ * Should a worker be respawned for this orphaned job?
+ *
+ * Pure so it can be tested without a fleet. The rule is "only when a worker could
+ * actually DO something":
+ *
+ *  - `rework`  — there is work to redo. Always actionable.
+ *  - `disputed` — only while the dispute is unanswered AND its deadline is still in
+ *    the future. A dispute the seller already answered needs no worker (the refund
+ *    or rework path owns it), and a lapsed one cannot be influenced by anything we
+ *    spawn — the platform has already decided it on default terms.
+ *
+ * Without this, the first sweep after an upgrade respawns every historical dispute
+ * on the account, including months-old ones already sitting in the operator's
+ * refund-approval queue.
+ */
+function shouldReconcileJob(job, nowMs = Date.now()) {
+  if (!job || !job.id) return { respawn: false, why: 'malformed' };
+  if (job.status === 'rework') return { respawn: true, why: 'rework pending' };
+  if (job.status !== 'disputed') return { respawn: false, why: `status ${job.status}` };
+
+  const d = job.dispute || {};
+  const action = d.action || d.status || 'pending';
+  if (action !== 'pending') return { respawn: false, why: `dispute already answered (${action})` };
+
+  // No deadline reported → treat as open. Refusing to act on missing data would
+  // silently recreate the very hole this sweep exists to close.
+  const deadline = d.deadline_at || d.deadlineAt || null;
+  if (deadline) {
+    const t = Date.parse(deadline);
+    if (Number.isFinite(t) && t <= nowMs) {
+      return { respawn: false, why: `dispute deadline passed (${deadline})` };
+    }
+  }
+  return { respawn: true, why: 'dispute open and unanswered' };
+}
+
 /**
  * Own the jobs nobody else does.
  *
@@ -5115,7 +5165,7 @@ const ORPHANABLE_STATUSES = ['disputed', 'rework'];
 async function reconcileOrphanedDisputes(state, opts = {}) {
   const queueFn = opts.queueDisputedJobForRespawn || queueDisputedJobForRespawn;
   const getSession = opts.getAgentSession || getAgentSession;
-  const summary = { checked: 0, orphaned: 0, respawned: 0, failed: 0 };
+  const summary = { checked: 0, orphaned: 0, respawned: 0, skipped: 0, deferred: 0, failed: 0 };
 
   for (const agentInfo of state.agents || []) {
     let jobs = [];
@@ -5138,8 +5188,18 @@ async function reconcileOrphanedDisputes(state, opts = {}) {
       if (state.queue.some(j => j.id === job.id)) continue;
       if (rq.has(state.reactivationQueue, job.id)) continue; // already waiting for capacity
 
+      const verdict = shouldReconcileJob(job);
+      if (!verdict.respawn) {
+        summary.skipped++;
+        continue;
+      }
+
       summary.orphaned++;
-      console.log(`[DisputeReconcile] job ${job.id.substring(0, 8)} is ${job.status} with no worker — respawning for ${agentInfo.id}`);
+      if (summary.respawned >= MAX_RECONCILE_RESPAWNS_PER_SWEEP) {
+        summary.deferred++;
+        continue; // reported below — never a silent truncation
+      }
+      console.log(`[DisputeReconcile] job ${job.id.substring(0, 8)} is ${job.status} with no worker (${verdict.why}) — respawning for ${agentInfo.id}`);
       try {
         // Same entry point the webhook uses, so there is exactly one respawn path.
         // Once the worker is up, the post-delivery transition check sees the job in
@@ -5156,7 +5216,12 @@ async function reconcileOrphanedDisputes(state, opts = {}) {
   }
 
   if (summary.orphaned > 0 || summary.failed > 0) {
-    console.log(`[DisputeReconcile] checked=${summary.checked} orphaned=${summary.orphaned} respawned=${summary.respawned} failed=${summary.failed}`);
+    console.log(`[DisputeReconcile] checked=${summary.checked} actionable=${summary.orphaned} ` +
+      `respawned=${summary.respawned} deferred=${summary.deferred} not-actionable=${summary.skipped} failed=${summary.failed}`);
+  }
+  if (summary.deferred > 0) {
+    console.log(`[DisputeReconcile] ${summary.deferred} actionable job(s) deferred past this sweep's cap of ` +
+      `${MAX_RECONCILE_RESPAWNS_PER_SWEEP} — they will be picked up on the next poll cycle`);
   }
   state._disputeReconcile = summary;
   return summary;
@@ -10643,7 +10708,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');

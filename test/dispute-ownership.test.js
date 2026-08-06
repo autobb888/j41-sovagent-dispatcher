@@ -18,6 +18,8 @@ const os = require('os');
 const path = require('path');
 
 const {
+  shouldReconcileJob,
+  MAX_RECONCILE_RESPAWNS_PER_SWEEP,
   reconcileOrphanedDisputes,
   readShutdownDeactivated,
   writeShutdownDeactivated,
@@ -200,6 +202,85 @@ test('nothing to do is silent and cheap', async () => {
   assert.deepEqual(calls, []);
   assert.equal(r.orphaned, 0);
   assert.equal(r.failed, 0);
+});
+
+// ── which orphans are worth a container ──────────────────────────────────────
+//
+// Caught live: the first sweep after upgrading respawned EVERY historical dispute
+// on the account — including months-old ones already sitting in the operator's
+// refund-approval queue — and spawned a container for each.
+
+const FUTURE = new Date(Date.now() + 86400000).toISOString();
+const PAST = new Date(Date.now() - 86400000).toISOString();
+
+test('a lapsed dispute is not worth a container — nothing we spawn can change it', () => {
+  const v = shouldReconcileJob({ id: 'j', status: 'disputed', dispute: { action: 'pending', deadline_at: PAST } });
+  assert.equal(v.respawn, false);
+});
+
+test('an already-answered dispute is owned by the refund/rework path, not a worker', () => {
+  for (const action of ['refund', 'rework', 'rejected']) {
+    const v = shouldReconcileJob({ id: 'j', status: 'disputed', dispute: { action, deadline_at: FUTURE } });
+    assert.equal(v.respawn, false, `action=${action} must not respawn`);
+  }
+});
+
+test('an open unanswered dispute inside its deadline IS worth a container', () => {
+  const v = shouldReconcileJob({ id: 'j', status: 'disputed', dispute: { action: 'pending', deadline_at: FUTURE } });
+  assert.equal(v.respawn, true);
+});
+
+test('rework is always actionable — there is work to redo', () => {
+  assert.equal(shouldReconcileJob({ id: 'j', status: 'rework' }).respawn, true);
+  // even with no dispute object attached
+  assert.equal(shouldReconcileJob({ id: 'j', status: 'rework', dispute: { action: 'rework' } }).respawn, true);
+});
+
+test('a missing deadline is treated as open — refusing on absent data recreates the hole', () => {
+  const v = shouldReconcileJob({ id: 'j', status: 'disputed', dispute: { action: 'pending' } });
+  assert.equal(v.respawn, true);
+});
+
+test('camelCase deadline is honoured too (platform field-shape drift)', () => {
+  const v = shouldReconcileJob({ id: 'j', status: 'disputed', dispute: { action: 'pending', deadlineAt: PAST } });
+  assert.equal(v.respawn, false);
+});
+
+test('malformed input never respawns', () => {
+  for (const j of [null, undefined, {}, { status: 'disputed' }]) {
+    assert.equal(shouldReconcileJob(j).respawn, false);
+  }
+});
+
+test('a sweep is capped, and what it defers is reported rather than dropped', async () => {
+  const many = Array.from({ length: 12 }, (_, i) => ({
+    id: `job-${i}`, status: 'rework',
+  }));
+  const state = reconState({ jobsByAgent: { 'agent-6': many } });
+  const calls = [];
+  const r = await reconcileOrphanedDisputes(state, reconOpts(state, calls));
+
+  assert.equal(calls.length, MAX_RECONCILE_RESPAWNS_PER_SWEEP,
+    'must not spawn a container for every historical dispute at once');
+  assert.equal(r.orphaned, 12);
+  assert.equal(r.deferred, 12 - MAX_RECONCILE_RESPAWNS_PER_SWEEP,
+    'deferred work must be counted, not silently truncated');
+});
+
+test('non-actionable orphans are counted separately from deferred ones', async () => {
+  const state = reconState({
+    jobsByAgent: {
+      'agent-6': [
+        { id: 'old', status: 'disputed', dispute: { action: 'refund', deadline_at: PAST } },
+        { id: 'live', status: 'rework' },
+      ],
+    },
+  });
+  const calls = [];
+  const r = await reconcileOrphanedDisputes(state, reconOpts(state, calls));
+  assert.deepEqual(calls.map(c => c.jobId), ['live']);
+  assert.equal(r.skipped, 1);
+  assert.equal(r.deferred, 0);
 });
 
 // ── shutdown → start fleet handoff ───────────────────────────────────────────
