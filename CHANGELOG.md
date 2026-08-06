@@ -2,6 +2,63 @@
 
 ## Unreleased
 
+## 2.12.0
+
+**Back off when the platform is down.** The last open round-3 finding, and the
+only one that was never fixed.
+
+On 2026-07-31 a fleet-wide `503 CHAIN_SYNCING` outage produced **~908 auth
+failures**. `getAgentSession` calls `authenticate()` with no backoff and never
+caches a failed session, so every caller re-authenticated every cycle — measured
+at ~43 calls/min sustained for 46 minutes, until the platform answered `429 Too
+many requests`. We turned their degradation into our rate-limit ban, and the 429
+outlasted the 503 that caused it. This recurs daily around 04:00 UTC.
+
+`src/auth-backoff.js` — pure, no I/O, no clock — with exponential backoff from
+5s, jittered ±25%, capped at 5 minutes.
+
+The property that matters is not the percentage, it is that **the call count
+stops depending on how many callers there are**. Modelled over a 46-minute
+outage with 9 agents:
+
+| caller attempts/min | without backoff | with backoff |
+|---|---|---|
+| 1 | 414 | 118 |
+| 5 | 2,070 | 126 |
+| 20 | 8,280 | 133 |
+| 60 | 24,840 | 133 |
+
+The baseline grows 60x; the actual calls stay flat, because the schedule bounds
+them. At the observed rate that is ~94% suppressed, and it can no longer
+escalate into a 429.
+
+Two deliberate limits:
+- **The 5-minute cap is a recovery guarantee, not politeness.** The daily window
+  is ~50 minutes; an uncapped exponential would still be asleep an hour after the
+  platform came back. Capped, it probes ~10 times across an outage and never
+  leaves the fleet idle more than 5 minutes after recovery.
+- **It only waits for failures that end by themselves** — 5xx, 429,
+  `CHAIN_SYNCING`, connection errors. A 401 or a malformed identity fails loudly
+  every cycle, because backing off there would hide a misconfiguration behind a
+  slow retry loop, which is the silent-failure pattern this codebase keeps
+  getting bitten by.
+
+Jitter is load-bearing rather than decorative: the outage hits every agent at
+once, so without it the fleet retries in lockstep and reproduces the burst that
+earned the 429, just less often.
+
+A server-supplied `Retry-After` is obeyed and clamped. The gate **fails open** on
+a malformed record — one wasted request is recoverable, a dispatcher that
+silently stops is not. `/health` gains `auth_backoff_agents`, because an outage
+the operator cannot see is indistinguishable from a hang.
+
+**The other three round-3 defects were already fixed and proven live in round 4**
+— deletion attestation via the JCS path (`job-agent-teardown.js`), the `getJob`
+startup retry, broker-mode review deferral, and canary release. Verified in the
+source rather than assumed before writing this.
+
+866 tests (854 before).
+
 ## 2.11.8
 
 **Stealing a lock that was in the act of being created.** Closing the last audit

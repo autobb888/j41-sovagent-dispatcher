@@ -32,6 +32,7 @@ const {
   recordBatchFailure,
   clearBatchFailure,
 } = require('./inbox-deadletter.js');
+const { shouldAttemptAuth, recordAuthFailure, clearAuthFailure } = require('./auth-backoff.js');
 const {
   summarizeUtxos,
   writesAffordable,
@@ -4599,13 +4600,46 @@ async function getAgentSession(state, agentInfo) {
     return cached.agent;
   }
 
+  // Back off when the platform is down. A failed session is never cached, so
+  // without this every caller re-authenticates every cycle: the 2026-07-31
+  // outage produced ~908 failures at ~43 auth calls/min and ended with the
+  // platform returning 429, which outlasted the 503 that started it. See
+  // src/auth-backoff.js.
+  if (!state._authBackoff) state._authBackoff = new Map();
+  const now = Date.now();
+  const gate = shouldAttemptAuth(state._authBackoff.get(agentInfo.id), now);
+  if (!gate.attempt) {
+    const e = new Error(
+      `auth backoff: platform unavailable for ${agentInfo.id} (${gate.failures} failure(s)), retrying in ${Math.ceil(gate.waitMs / 1000)}s`
+    );
+    e.code = 'AUTH_BACKOFF';
+    throw e;
+  }
+
   const agent = new J41Agent({
     apiUrl: baseUrl,
     wif: agentInfo.wif,
     identityName: agentInfo.identity,
     iAddress: agentInfo.iAddress,
   });
-  await agent.authenticate();
+  try {
+    await agent.authenticate();
+  } catch (e) {
+    const rec = recordAuthFailure(state._authBackoff.get(agentInfo.id), e, { now });
+    state._authBackoff.set(agentInfo.id, rec);
+    if (rec.retryable) {
+      // Log the transition only, not every cycle — an outage should not also
+      // produce a log flood.
+      if (rec.failures === 1 || rec.failures % 10 === 0) {
+        console.warn(`[Auth] ${agentInfo.id}: platform unavailable (${e.message}). Backing off ${Math.round((rec.delayMs || 0) / 1000)}s (failure ${rec.failures}).`);
+      }
+    } else {
+      // Not something waiting fixes — say so every time.
+      console.error(`[Auth] ${agentInfo.id}: authentication rejected (${e.message}). This will not resolve on its own.`);
+    }
+    throw e;
+  }
+  clearAuthFailure(state._authBackoff, agentInfo.id);
   state.agentSessions.set(agentInfo.id, { agent, authedAt: Date.now() });
   return agent;
 }
