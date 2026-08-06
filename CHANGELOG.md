@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+## 2.12.2
+
+**Agreeing to a refund was the thing that guaranteed nobody paid it.** Found live
+during a tester run, on job `b09440f5`.
+
+A buyer cancelled mid-flight and asked for a refund. The seller responded
+`refund`, 100% — which the platform recorded, and which the buyer can see. Then
+nothing happened, and nothing ever would have:
+
+```
+sweep picks it up BEFORE the response (action=pending): true
+sweep picks it up AFTER  the response (action=refund) : false
+```
+
+`selectRefundableDisputes` required `action === 'pending'`. Responding `refund`
+moves the dispute out of `pending`, so the act of agreeing to pay is precisely
+what removed the job from the queue the operator approves from. There was no
+manual route either — `refunds approve` only works on queued entries, and
+`wallet send` is fleet-internal by design and refuses a buyer address. The
+obligation existed on the platform, was visible to the buyer, and was invisible
+to every automated and manual path on our side.
+
+That also explains the July batch: the nine outage refunds needed a bespoke
+out-of-band script because seller-agreed refunds never enter the queue at all.
+
+The sweep now recognises **two** distinct obligations:
+
+- **Unanswered** — platform auto-opened, seller silent, buyer demonstrably got
+  nothing (no delivery, no tokens). Deliberately narrow, unchanged.
+- **Seller-agreed** — the seller answered `refund` and no `refund_txid` exists.
+  Delivery and token usage are irrelevant here: the seller has explicitly said
+  they owe it, and explicit consent outranks the heuristics.
+
+**A partial refund would have paid double.** `buildDisputeRefundEntry` hardcoded
+`refundPercent: 100` and `refundAmount: job.amount`. A seller agreeing to 50%
+would have had the full amount queued. It now honours the agreed percentage, and
+refuses to queue at all on a malformed one rather than guessing.
+
+Also guarded: a dispute carrying a `refund_txid` is **never** re-queued — the
+txid is the proof of payment, and re-queueing is how you pay twice.
+
+Not fixed, recorded: there is **no refunds screen in the TUI** — approval is
+CLI-only (`refunds list` / `refunds approve`). `dashboard.js` contains no refund
+handling of any kind.
+
+881 tests (873 before).
+
 ## 2.12.1
 
 Post-audit again. **The refund failure split — 2.11.7's fix for the previous

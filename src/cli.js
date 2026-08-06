@@ -3953,7 +3953,7 @@ program
     });
 
     // Drain any pending refunds left over from a previous crash mid-loop
-    await drainPendingRefunds(state);
+    await drainPendingRefunds(state, { startup: true });
     sweepDisputesForRefund(state).catch(e =>
       console.error(`[DisputeSweep] Boot sweep failed (non-fatal): ${e.message}`)
     );
@@ -5448,6 +5448,11 @@ async function attemptPendingRefund(state, jobId, entry, ledgerPath = PENDING_RE
  * @param {string} [opts.ledgerPath] — override ledger file path (tests / custom installs).
  */
 async function drainPendingRefunds(state, opts = {}) {
+  // Called at startup AND every 5 minutes (safeInterval, 'RefundDrain'). The
+  // log line below used to say "Startup drain" unconditionally, so an operator
+  // watching a healthy daemon saw "Startup drain" every five minutes and could
+  // only conclude it was restart-looping.
+  const isStartup = opts.startup === true;
   const ledgerPath = (opts && opts.ledgerPath) || PENDING_REFUNDS_PATH;
   const pending = loadPendingRefunds(ledgerPath);
   const jobIds = Object.keys(pending);
@@ -5470,7 +5475,7 @@ async function drainPendingRefunds(state, opts = {}) {
   const approvedIds = jobIds.filter(id => pending[id].status === 'approved' && !readRefundInflight(id));
   const skippedCount = jobIds.length - approvedIds.length;
 
-  console.log(`\n⚠️  Startup drain: ${approvedIds.length} approved refund(s) to send` +
+  console.log(`\n⚠️  ${isStartup ? 'Startup' : 'Periodic'} refund drain: ${approvedIds.length} approved refund(s) to send` +
     (skippedCount > 0 ? ` (${skippedCount} awaiting owner approval — skipped)` : ''));
 
   for (const jobId of approvedIds) {
