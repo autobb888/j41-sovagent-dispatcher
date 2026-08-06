@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+## 2.13.1
+
+**The rework answer still could not be read in full.** 2.13.0's re-test confirmed
+generation and delivery were fixed — the deliverable carried a real hazards table
+instead of a transcript — but chat stayed silent, and since the platform caps a
+stored deliverable at **200 characters**, chat is the only uncapped channel. The
+buyer could read the intro and one table header row; the packing list and
+entry/exit times were unreachable.
+
+**The chat socket does not survive the dispute window.** A dispute deadline is
+days long. The container logged `[CHAT] Disconnected: transport close` then
+`[CHAT] Connection error: Authentication required` — the session token expired
+mid-window — so `sendChatMessage` threw `Chat not connected` and 2.13.0's guard
+correctly degraded to the deliverable. The guard worked; the socket was the
+problem. Chat is now re-authenticated and reconnected before the rework is posted.
+
+**A reconnected socket would still have reached nobody.** `connectChat()`
+auto-joins only the seller's `accepted` and `in_progress` job rooms. A job under
+dispute or rework is neither, so a fresh socket is connected but not in the room.
+The room is now joined explicitly — and *only* on a fresh connect, because
+re-joining a room on a live socket duplicates every message.
+
+**Rework no longer requests a budget extension it cannot get.** The 30% rework
+grant hit 93% on the re-test and fired an extension request that the platform
+refused with `Job must be in_progress or paused` — a job under rework is neither,
+so the request had never once been grantable. It now logs the ceiling honestly
+(`rework cannot be extended, the answer may be cut short`) instead of a misleading
+failure. **The underlying limit stands: a rework that needs more than its share
+will be cut short**, and that needs a platform-side answer, not a client one.
+
+892 tests (887 before). The reconnect, the explicit join, and the
+don't-re-join-a-live-socket guard are each mutation-checked.
+
 ## 2.13.0
 
 **Dispute → rework produced nothing, for three stacked reasons.** The round-6

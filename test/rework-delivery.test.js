@@ -46,9 +46,30 @@ function makeExecutor({ alreadyUsed, answer = ANSWER }) {
   return ex;
 }
 
-function makeAgent() {
+/**
+ * @param connected  whether the chat socket survived the dispute window
+ * @param reauth     whether re-authentication succeeds when it did not
+ */
+function makeAgent({ connected = true, reauth = true } = {}) {
   const sent = [];
-  return { sent, sendChatMessage: async (_id, text) => { sent.push(text); } };
+  const calls = [];
+  const agent = {
+    sent,
+    calls,
+    chatClient: { isConnected: connected },
+    authenticate: async () => {
+      calls.push('authenticate');
+      if (!reauth) throw new Error('Authentication required');
+      return true;
+    },
+    connectChat: async () => { calls.push('connectChat'); agent.chatClient.isConnected = true; },
+    joinJobChat: (id) => { calls.push(`joinJobChat:${id}`); },
+    sendChatMessage: async (_id, text) => {
+      if (!agent.chatClient.isConnected) throw new Error('Chat not connected');
+      sent.push(text);
+    },
+  };
+  return agent;
 }
 
 test('rework budget is additive — a job that spent its original budget can still be reworked', async () => {
@@ -114,9 +135,79 @@ test('an empty rework reply falls back rather than delivering an empty artifact'
 
 test('a chat failure does not lose the rework — the deliverable still carries it', async () => {
   const ex = makeExecutor({ alreadyUsed: 0 });
-  const agent = { sent: [], sendChatMessage: async () => { throw new Error('platform 503'); } };
+  const agent = makeAgent();
+  agent.sendChatMessage = async () => { throw new Error('platform 503'); };
 
   const result = await resumeJob(JOB, agent, 'soul', ex, () => {}, REWORK, 1080);
 
   assert.equal(result.content, ANSWER, 'a chat outage must not discard the reworked answer');
+});
+
+// ── D3: the chat socket does not survive the dispute window ──────────────────
+//
+// Round-6 re-test on 2.13.0: the answer reached the deliverable but chat stayed
+// silent. The container logged `[CHAT] Disconnected: transport close` then
+// `Connection error: Authentication required` — the session expired during the
+// (multi-day) dispute deadline, so `sendChatMessage` threw `Chat not connected`.
+// Because the deliverable is capped at 200 chars, chat is the ONLY channel that
+// can carry a full answer, so a dead socket makes the rework unreadable.
+
+test('a chat socket that died during the dispute window is re-authenticated and re-joined', async () => {
+  const ex = makeExecutor({ alreadyUsed: 0 });
+  const agent = makeAgent({ connected: false });
+
+  const result = await resumeJob(JOB, agent, 'soul', ex, () => {}, REWORK, 1080);
+
+  assert.equal(agent.sent.length, 1, 'the buyer must still receive the rework in chat');
+  assert.ok(agent.sent[0].includes('Concrete hazards'));
+  assert.deepEqual(agent.calls, ['authenticate', 'connectChat', `joinJobChat:${JOB.id}`],
+    'must re-auth, reconnect, THEN join — a fresh socket is not in the room');
+  assert.equal(result.content, ANSWER);
+});
+
+test('a live chat socket is not re-joined — re-joining a room duplicates every message', async () => {
+  const ex = makeExecutor({ alreadyUsed: 0 });
+  const agent = makeAgent({ connected: true });
+
+  await resumeJob(JOB, agent, 'soul', ex, () => {}, REWORK, 1080);
+
+  assert.deepEqual(agent.calls, [], 'no reconnect and no re-join when the socket is already live');
+  assert.equal(agent.sent.length, 1, 'exactly one copy of the rework');
+});
+
+test('a rework job must be joined explicitly — connectChat only auto-joins accepted/in_progress', async () => {
+  // Regression pin: dropping joinJobChat leaves a connected socket that is not in
+  // the room, so the send silently reaches nobody.
+  const ex = makeExecutor({ alreadyUsed: 0 });
+  const agent = makeAgent({ connected: false });
+
+  await resumeJob(JOB, agent, 'soul', ex, () => {}, REWORK, 1080);
+
+  assert.ok(agent.calls.includes(`joinJobChat:${JOB.id}`));
+});
+
+test('a failed re-auth degrades to the deliverable rather than losing the rework', async () => {
+  const ex = makeExecutor({ alreadyUsed: 0 });
+  const agent = makeAgent({ connected: false, reauth: false });
+
+  const result = await resumeJob(JOB, agent, 'soul', ex, () => {}, REWORK, 1080);
+
+  assert.equal(result.content, ANSWER, 'the reworked answer must survive a dead chat');
+  assert.equal(agent.sent.length, 0);
+});
+
+test('rework never requests a budget extension — the platform refuses them outside in_progress/paused', async () => {
+  const ex = makeExecutor({ alreadyUsed: 0 });
+  const agent = makeAgent();
+  let requested = false;
+  ex.handleMessage = async () => {
+    // Push usage past the warning threshold so the callback fires.
+    ex._trackUsage({ prompt_tokens: 1000, completion_tokens: 60, total_tokens: 1060 });
+    return ANSWER;
+  };
+  agent.requestExtension = () => { requested = true; };
+
+  await resumeJob(JOB, agent, 'soul', ex, () => {}, REWORK, 1080);
+
+  assert.equal(requested, false);
 });

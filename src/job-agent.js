@@ -143,6 +143,30 @@ async function sendChatChunked(agent, jobId, text, maxLen = CHAT_MAX_LEN, gapMs 
   return chunks.length;
 }
 
+/**
+ * Make the chat socket usable for `jobId`, reconnecting if it died.
+ *
+ * The post-delivery window is long (a dispute deadline is days), and the chat
+ * session does not survive it: the round-6 rework re-test logged
+ * `[CHAT] Disconnected: transport close` then `Connection error: Authentication
+ * required` — the session token expired mid-window — so the rework answer had
+ * nowhere to go and only the 200-char-capped deliverable carried it.
+ *
+ * The explicit join is not redundant. `connectChat()` auto-joins only the seller's
+ * `accepted` and `in_progress` jobs; a job in dispute or rework is neither, so a
+ * fresh socket would be connected but not in the room and the message would go
+ * nowhere. We join ONLY on a fresh connect — room membership survives a live
+ * socket, and re-joining a room we are already in duplicates every message.
+ */
+async function ensureChatConnected(agent, jobId) {
+  if (agent.chatClient?.isConnected) return true;
+  await agent.authenticate();
+  await agent.connectChat();
+  agent.joinJobChat(jobId);
+  console.log(`  [CHAT] Reconnected and joined room for ${jobId} before posting`);
+  return true;
+}
+
 // A worker spawned for an already-delivered or disputed job must NOT redo the
 // work or re-deliver — it reconnects straight into the post-delivery wait so it
 // can surface/handle a dispute. (Fixes the job-agent.js:600 "not deliverable →
@@ -1680,9 +1704,14 @@ async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndRes
     // is what "30% of the job for rework" was always meant to mean.
     const alreadyUsed = executor.getTokenUsage().totalTokens || 0;
     executor.setBudget(alreadyUsed + tokenBudget, BUDGET_WARNING_PERCENT, (usage, budget) => {
-      console.log(`⚠️  Token budget at ${Math.round((usage.totalTokens / budget) * 100)}% — requesting extension`);
-      requestBudgetExtension(job, agent, executor, usage, budget)
-        .catch(e => console.warn(`[BUDGET] Extension request failed: ${e.message}`));
+      // Deliberately does NOT request an extension. A job under rework is not
+      // `in_progress` or `paused`, and the platform refuses extensions in any
+      // other state ("Job must be in_progress or paused"), so the request is
+      // guaranteed to fail — it fired and failed on every rework before this.
+      // Logging the ceiling honestly beats a misleading `Extension request
+      // failed` line for something that was never possible.
+      console.log(`⚠️  Rework token budget at ${Math.round((usage.totalTokens / budget) * 100)}% ` +
+        `(${usage.totalTokens}/${budget}) — rework cannot be extended, the answer may be cut short`);
     });
     console.log(`  Token budget for rework: ${tokenBudget} tokens`);
   }
@@ -1723,10 +1752,15 @@ async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndRes
   // Tell the buyer. Without this the rework is invisible to them: the content
   // goes only into the deliverable, so a buyer who asks "did you redo it?" gets
   // silence and the job auto-completes.
+  //
+  // Chat is also the only UNCAPPED channel: the platform stores just the first
+  // 200 characters of a deliverable, so for any answer longer than that this post
+  // is the only way the buyer can read the work in full.
   try {
+    await ensureChatConnected(agent, job.id);
     await sendChatChunked(agent, job.id, response);
   } catch (e) {
-    console.warn(`  ⚠️  Could not post the rework to chat: ${e.message} (the deliverable still carries it)`);
+    console.warn(`  ⚠️  Could not post the rework to chat: ${e.message} (the deliverable still carries the first ${CHAT_MAX_LEN >= 200 ? 200 : CHAT_MAX_LEN} chars)`);
   }
 
   return {
@@ -2141,5 +2175,5 @@ if (require.main === module) {
 // Export testable helpers when running under NODE_ENV=test.
 // Avoids shipping a test seam in production while keeping coverage honest.
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach, isTerminalAttachError, ATTACH_CONFIRM_BACKOFF_MS, resumeJob };
+  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach, isTerminalAttachError, ATTACH_CONFIRM_BACKOFF_MS, resumeJob, ensureChatConnected };
 }
