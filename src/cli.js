@@ -5570,15 +5570,32 @@ async function sweepDisputesForRefund(state) {
 
         const target = resolveRefundTarget(job, dispute, ctx);
 
-        try {
-          await agent.respondToDispute(jobId, {
-            action: 'refund',
-            refundPercent: 100,
-            message: OUTAGE_APOLOGY,
-          });
-        } catch (e) {
-          console.error(`[DisputeSweep] ${agentInfo.id}: respondToDispute failed for ${jobId.substring(0, 8)}: ${e.message} — will retry next sweep`);
-          continue;
+        // Only respond if the seller has NOT already answered.
+        //
+        // A dispute already at action:'refund' carries a human-authored response
+        // and a resolved_at. Responding again is wrong both ways:
+        //   - it fails, we `continue`, and the ledger entry is never written —
+        //     so the buyer is silently never paid while the sweep retries and
+        //     re-fails every 5 minutes. That is the exact silent-failure class
+        //     this queue exists to prevent.
+        //   - or it succeeds and overwrites the operator's own words with a
+        //     canned outage apology, and forces refundPercent 100 over whatever
+        //     partial the seller actually agreed to.
+        // The seller has already decided; the sweep's only remaining job is to
+        // put the obligation in front of the owner for approval.
+        if (dispute.action !== 'refund') {
+          try {
+            await agent.respondToDispute(jobId, {
+              action: 'refund',
+              refundPercent: 100,
+              message: OUTAGE_APOLOGY,
+            });
+          } catch (e) {
+            console.error(`[DisputeSweep] ${agentInfo.id}: respondToDispute failed for ${jobId.substring(0, 8)}: ${e.message} — will retry next sweep`);
+            continue;
+          }
+        } else {
+          console.log(`[DisputeSweep] ${agentInfo.id}: ${jobId.substring(0, 8)} — seller already agreed to refund; queueing for owner approval without re-responding`);
         }
 
         const entry = buildDisputeRefundEntry(job, dispute, agentInfo.id, target, new Date().toISOString());
@@ -7911,7 +7928,7 @@ async function startJobContainer(state, job, agentInfo) {
     });
     
     await container.start();
-    
+
     state.active.set(job.id, {
       agentId: agentInfo.id,
       job,
@@ -7934,6 +7951,29 @@ async function startJobContainer(state, job, agentInfo) {
       _signerTeardown: signerTeardown,
       _egressToken: egressToken,
     });
+
+    // Deliver the dispute policy + markup to the container.
+    //
+    // The local-fork path sends this over Node IPC (`child.send`), which a Docker
+    // container does not have — so until now `_disputePolicy` was null in EVERY
+    // production container. Two things silently did not work as a result:
+    //   - the rework token budget (30% share) was never applied, so rework ran
+    //     unmetered; and
+    //   - the `maxReworkCycles` guard was inert, so rework cycles were unbounded.
+    // The container's file-IPC handler already accepts `dispute_policy`
+    // (job-agent.js), so this only ever needed sending down the right channel.
+    // Best-effort by design: a failure here must not fail the job, but it is
+    // logged rather than swallowed so an inert policy is visible.
+    try {
+      const sent = sendToJobAgent(state.active.get(job.id), {
+        type: 'dispute_policy',
+        disputePolicy: state.disputePolicy?.get(agentInfo.id) || null,
+        agentMarkup: state.agentMarkup?.get(agentInfo.id) || 15,
+      });
+      if (!sent) console.warn(`[Start] ${agentInfo.id}: could not deliver dispute policy to the container — rework will be unmetered for job ${job.id.substring(0, 8)}`);
+    } catch (e) {
+      console.warn(`[Start] ${agentInfo.id}: dispute policy delivery failed (${e.message}) — rework will be unmetered`);
+    }
 
     state.emitEvent?.('container.started', {
       jobId: job.id, agentId: agentInfo.id, container: container?.name || null, runtime: 'docker',

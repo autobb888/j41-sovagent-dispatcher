@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+## 2.12.3
+
+Three defects found by auditing the round-6 fix plan **before executing it** —
+including one in 2.12.2's own fix.
+
+**2.12.2 would have left the buyer silently unpaid anyway.** `sweepDisputesForRefund`
+called `respondToDispute` unconditionally for every selected job, including the
+seller-agreed ones 2.12.2 had just taught it to select. For a dispute already at
+`action: 'refund'` that means responding again to a resolved dispute — which
+either fails, hits `continue`, and **never writes the ledger entry** (buyer never
+paid, retried and re-failed every 5 minutes, no signal), or succeeds and
+overwrites the operator's own human-authored response with a canned outage
+apology while forcing 100% over any agreed partial. The sweep now responds only
+when the seller has **not** already answered; an agreed dispute goes straight to
+the approval queue. 2.12.2's claim that seller-agreed refunds reach the owner was
+therefore premature — this is what makes it true.
+
+**`dispute_policy` never reached any Docker container.** It is sent with
+`child.send()` — Node fork IPC, which a Docker container does not have — so
+`_disputePolicy` was null in every production container. Two things silently did
+not work: the rework token budget (30% share) never applied, and the
+`maxReworkCycles` guard was inert, making rework cycles **unbounded and
+unmetered**. Now delivered over the file-IPC channel the container already
+listens on, and a failure to deliver is logged rather than swallowed. (The
+earlier diagnosis blamed `fullJob` scope — wrong suspect; `fullJob` is in scope
+fine.)
+
+**A stripped canary left the signed delivery hash wrong.** `finalize()` hashes
+the content, then the canary is stripped *afterwards* — so whenever a canary
+appeared in a deliverable, the hash signed by `signDeliver` and submitted to the
+platform committed to text the buyer never receives. The hash is now recomputed
+after stripping, on both the delivery and rework paths.
+
+Ruled **safe** by the same audit, and worth recording so it is not re-litigated:
+changing the deliverable format is **not** a breaking cryptographic change.
+`deliveryHash` is computed fresh per delivery, signed, submitted, and never
+recomputed or compared afterwards; `verifyInboxJobRecord` binds `jobHash`, not
+`deliveryHash`, and the witnessed `job_record` schema does not contain it.
+Historical delivery hashes are inert.
+
+881 tests.
+
 ## 2.12.2
 
 **Agreeing to a refund was the thing that guaranteed nobody paid it.** Found live

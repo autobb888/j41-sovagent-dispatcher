@@ -743,9 +743,21 @@ async function main() {
     return;
   }
   log.info('Delivering result', { jobId: JOB_ID });
-  // Strip canary token from deliverable content before sending to platform
+  // Strip canary token from deliverable content before sending to platform.
+  //
+  // The hash MUST be recomputed after this. finalize() hashed the content that
+  // still contained the canary, so stripping it afterwards left the signed hash
+  // committing to text the buyer never receives — i.e. whenever a canary
+  // appeared in the deliverable, the delivery hash was wrong. It is signed
+  // (signDeliver) and submitted to the platform, so a wrong hash is a broken
+  // integrity claim, not a cosmetic mismatch.
   if (CANARY_TOKEN && result.content) {
-    result.content = result.content.split(CANARY_TOKEN).join('[redacted]');
+    const stripped = result.content.split(CANARY_TOKEN).join('[redacted]');
+    if (stripped !== result.content) {
+      result.content = stripped;
+      result.hash = require('crypto').createHash('sha256').update(stripped).digest('hex');
+      log.info('Canary stripped from deliverable — hash recomputed', { jobId: JOB_ID });
+    }
   }
   // 'failed' is not a 64-char hex SHA-256 — the broker policy would reject
   // it. Compute a real hash of the failure sentinel so both paths agree.
@@ -1843,7 +1855,13 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
             // Strip canary token from rework deliverable content (same as
             // main delivery path at STEP 3) before sending to platform.
             if (CANARY_TOKEN && reworkResult.content) {
-              reworkResult.content = reworkResult.content.split(CANARY_TOKEN).join('[redacted]');
+              const strippedRw = reworkResult.content.split(CANARY_TOKEN).join('[redacted]');
+              if (strippedRw !== reworkResult.content) {
+                reworkResult.content = strippedRw;
+                // Recompute — see the delivery path above. A stripped canary
+                // must not leave the signed hash committing to the original.
+                reworkResult.hash = require('crypto').createHash('sha256').update(strippedRw).digest('hex');
+              }
             }
 
             // 'rework' is not a hex SHA-256; hash the sentinel so the
