@@ -20,6 +20,7 @@ const path = require('path');
 const {
   shouldReconcileJob,
   MAX_RECONCILE_RESPAWNS_PER_SWEEP,
+  MAX_RECONCILE_ATTEMPTS_PER_JOB,
   reconcileOrphanedDisputes,
   readShutdownDeactivated,
   writeShutdownDeactivated,
@@ -314,6 +315,49 @@ test('non-actionable orphans are counted separately from deferred ones', async (
   assert.deepEqual(calls.map(c => c.jobId), ['live']);
   assert.equal(r.skipped, 1);
   assert.equal(r.deferred, 0);
+});
+
+// ── a job that can never make progress ───────────────────────────────────────
+//
+// Round 7, live: the platform's second-dispute insert failed on a unique constraint
+// (Postgres 23505) but moved the job to `disputed` anyway, so it reported disputed
+// with no dispute record behind it. Nothing could ever resolve it, and the sweep
+// respawned a worker 14 times. Retrying forever is a resource leak, not resilience.
+
+test('a job that never progresses is abandoned after a bounded number of respawns', async () => {
+  const state = reconState({ jobsByAgent: { 'agent-6': [{ id: 'stuck', status: 'disputed' }] } });
+  const calls = [];
+  const opts = reconOpts(state, calls);
+
+  // Sweep repeatedly, as the poll loop would.
+  for (let i = 0; i < 10; i++) await reconcileOrphanedDisputes(state, opts);
+
+  assert.equal(calls.length, MAX_RECONCILE_ATTEMPTS_PER_JOB,
+    'must stop respawning a job it cannot advance');
+});
+
+test('giving up is counted and reported, not silent', async () => {
+  const state = reconState({ jobsByAgent: { 'agent-6': [{ id: 'stuck', status: 'disputed' }] } });
+  const opts = reconOpts(state, []);
+  for (let i = 0; i < 5; i++) await reconcileOrphanedDisputes(state, opts);
+  const last = await reconcileOrphanedDisputes(state, opts);
+  assert.equal(last.stuck, 1, 'a stuck job must remain visible in the summary');
+  assert.equal(last.respawned, 0);
+});
+
+test('the give-up is per job — a healthy job is unaffected by a stuck neighbour', async () => {
+  const state = reconState({
+    jobsByAgent: { 'agent-6': [{ id: 'stuck', status: 'disputed' }] },
+  });
+  const calls = [];
+  const opts = reconOpts(state, calls);
+  for (let i = 0; i < 6; i++) await reconcileOrphanedDisputes(state, opts);
+  assert.equal(calls.length, MAX_RECONCILE_ATTEMPTS_PER_JOB);
+
+  // A new job appears later and must still be served.
+  state._jobsByAgent['agent-6'].push({ id: 'fresh', status: 'rework' });
+  await reconcileOrphanedDisputes(state, opts);
+  assert.ok(calls.some(c => c.jobId === 'fresh'), 'a stuck job must not starve new work');
 });
 
 // ── shutdown → start fleet handoff ───────────────────────────────────────────

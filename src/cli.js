@@ -5125,6 +5125,17 @@ const ORPHANABLE_STATUSES = ['disputed', 'rework'];
 // it up.
 const MAX_RECONCILE_RESPAWNS_PER_SWEEP = 3;
 
+// How many times we will respawn a worker for the SAME job before giving up and
+// asking for a human.
+//
+// A job can be stuck in `disputed` with nothing that can ever resolve it — round 7
+// produced exactly that: the platform's second-dispute insert failed on a unique
+// constraint (Postgres 23505) but the status was moved to `disputed` anyway, so the
+// job reports disputed while no dispute record exists. Our sweep respawned a worker
+// for it 14 times. Retrying forever is not resilience; it is a silent resource leak
+// that gets worse with fleet size. Give up loudly instead.
+const MAX_RECONCILE_ATTEMPTS_PER_JOB = 3;
+
 /**
  * Should a worker be respawned for this orphaned job?
  *
@@ -5199,11 +5210,13 @@ async function reconcileOrphanedDisputes(state, opts = {}) {
   const queueFn = opts.queueDisputedJobForRespawn || queueDisputedJobForRespawn;
   const getSession = opts.getAgentSession || getAgentSession;
   // Read once per sweep, not per job — the ledger is small but this runs every poll.
+  if (!state._reconcileAttempts) state._reconcileAttempts = new Map();
+  const attempts = state._reconcileAttempts;
   let refundLedger = opts.refundLedger;
   if (refundLedger === undefined) {
     try { refundLedger = loadPendingRefunds(); } catch { refundLedger = {}; }
   }
-  const summary = { checked: 0, orphaned: 0, respawned: 0, skipped: 0, deferred: 0, failed: 0 };
+  const summary = { checked: 0, orphaned: 0, respawned: 0, skipped: 0, deferred: 0, stuck: 0, failed: 0 };
 
   for (const agentInfo of state.agents || []) {
     let jobs = [];
@@ -5232,6 +5245,22 @@ async function reconcileOrphanedDisputes(state, opts = {}) {
         continue;
       }
 
+      // Give up loudly on a job we cannot make progress on, rather than respawning
+      // a container for it every poll cycle forever.
+      const priorAttempts = attempts.get(job.id) || 0;
+      if (priorAttempts >= MAX_RECONCILE_ATTEMPTS_PER_JOB) {
+        summary.stuck++;
+        if (priorAttempts === MAX_RECONCILE_ATTEMPTS_PER_JOB) {
+          attempts.set(job.id, priorAttempts + 1); // log once, then stay quiet
+          console.error(`[DisputeReconcile] ⛔ GIVING UP on ${job.id.substring(0, 8)} (${agentInfo.id}) after ` +
+            `${MAX_RECONCILE_ATTEMPTS_PER_JOB} respawns — it reports "${job.status}" but never progresses. ` +
+            'This usually means the platform has a job whose dispute record is missing or unresolvable. ' +
+            `Inspect with: j41-dispatcher ctl jobs   —   it will not be retried until the dispatcher restarts.`);
+          state.emitEvent?.('dispute.reconcile_gave_up', { jobId: job.id, agentId: agentInfo.id, status: job.status, attempts: priorAttempts });
+        }
+        continue;
+      }
+
       summary.orphaned++;
       if (summary.respawned >= MAX_RECONCILE_RESPAWNS_PER_SWEEP) {
         summary.deferred++;
@@ -5244,6 +5273,7 @@ async function reconcileOrphanedDisputes(state, opts = {}) {
         // `state.active` and sends the `rework`/`disputed` message — and because a
         // fresh container clears `_lastSentStatus`, that message is not suppressed
         // as "already sent" to the process that died.
+        attempts.set(job.id, priorAttempts + 1);
         const r = await queueFn(state, job.id, { agentId: agentInfo.id, reason: job.dispute?.reason });
         if (r?.respawned || r?.forwarded) summary.respawned++;
       } catch (e) {
@@ -5253,9 +5283,10 @@ async function reconcileOrphanedDisputes(state, opts = {}) {
     }
   }
 
-  if (summary.orphaned > 0 || summary.failed > 0) {
+  if (summary.orphaned > 0 || summary.failed > 0 || summary.stuck > 0) {
     console.log(`[DisputeReconcile] checked=${summary.checked} actionable=${summary.orphaned} ` +
-      `respawned=${summary.respawned} deferred=${summary.deferred} not-actionable=${summary.skipped} failed=${summary.failed}`);
+      `respawned=${summary.respawned} deferred=${summary.deferred} not-actionable=${summary.skipped} ` +
+      `stuck=${summary.stuck} failed=${summary.failed}`);
   }
   if (summary.deferred > 0) {
     console.log(`[DisputeReconcile] ${summary.deferred} actionable job(s) deferred past this sweep's cap of ` +
@@ -7803,6 +7834,13 @@ function buildContainerEnv(job, agentInfo, agentCfg, canaryToken, jobDir, keysPa
     J41_SOUL_FILE: path.join(path.dirname(keysPath), 'SOUL.md'),
     J41_CANARY_TOKEN: canaryToken,
     JOB_TIMEOUT_MS: String(JOB_TIMEOUT_MS),
+    // How long a worker may hold itself open for an OPEN DISPUTE. Read by
+    // job-agent.js, which runs INSIDE the container — so setting it on the
+    // dispatcher alone did nothing, and the knob silently had no effect. Only
+    // forwarded when set, so the container keeps its own default otherwise.
+    ...(process.env.J41_DISPUTE_HOLD_MAX_MS
+      ? { J41_DISPUTE_HOLD_MAX_MS: String(process.env.J41_DISPUTE_HOLD_MAX_MS) }
+      : {}),
     J41_EXECUTOR: (agentCfg && agentCfg.executor) || cfg.executor.type,
     J41_LLM_PROVIDER: provider,
     J41_LLM_BASE_URL: baseUrl,
@@ -10746,7 +10784,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');

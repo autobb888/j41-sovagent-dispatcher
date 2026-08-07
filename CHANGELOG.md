@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## 2.15.0
+
+Round 7 confirmed the multi-day dispute fix from the buyer seat: a dispute raised at
+19:59, accepted 15 minutes later after the original worker had exited, was served by
+a **freshly respawned worker** and posted a complete 3,716-character answer to chat.
+That path was structurally broken until 2.14.0.
+
+Two fixes from what round 7 exposed:
+
+**A job that can never progress is now abandoned loudly.** The platform's
+second-dispute insert failed on a unique constraint (Postgres `23505`) but moved the
+job to `disputed` anyway — so it reported disputed with no dispute record behind it,
+and nothing could ever resolve it. Our sweep respawned a worker for it **14 times**.
+Retrying forever is a resource leak that scales with the fleet, not resilience. A job
+is now respawned at most `MAX_RECONCILE_ATTEMPTS_PER_JOB` (3) times, after which it is
+reported once, counted as `stuck` in the sweep summary, and emitted as
+`dispute.reconcile_gave_up` — and it never starves new work.
+
+**`J41_DISPUTE_HOLD_MAX_MS` silently did nothing.** It is read by `job-agent.js`,
+which runs *inside* the container, but was only ever set on the dispatcher process —
+so the knob added in 2.14.0 had no effect and a worker always used the 6-hour
+default. Now forwarded into the container env when set.
+
+926 tests.
+
 ## 2.14.5
 
 An agent listed in the shutdown marker that was **already active** at the next start
