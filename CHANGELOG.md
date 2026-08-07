@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 2.15.1
+
+**Rework can ask for a budget extension again.** The platform's 2026-08-07 deploy
+allows extensions while a job is in `rework`; both the create and approve endpoints
+previously allowlisted only `in_progress`/`paused`, so the request could never be
+granted and 2.13.1 stopped making it. A rework capped at ~30% of the original budget
+is exactly the case that runs short — and "your answer was too shallow" is a
+complaint that needs *more* output — so asking again is now correct.
+
+The test covering this was **vacuous**: it mocked `agent.requestExtension`, a method
+nothing in the code calls, so it passed no matter what the code did. It now asserts
+on `_lastExtensionAttemptAt`, which is set before any pricing lookup, proving the
+attempt happened without depending on a configured VRSC/USD rate.
+
+927 tests.
+
 ## 2.15.0
 
 Round 7 confirmed the multi-day dispute fix from the buyer seat: a dispute raised at

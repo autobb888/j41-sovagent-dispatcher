@@ -1768,14 +1768,17 @@ async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndRes
     // is what "30% of the job for rework" was always meant to mean.
     const alreadyUsed = executor.getTokenUsage().totalTokens || 0;
     executor.setBudget(alreadyUsed + tokenBudget, BUDGET_WARNING_PERCENT, (usage, budget) => {
-      // Deliberately does NOT request an extension. A job under rework is not
-      // `in_progress` or `paused`, and the platform refuses extensions in any
-      // other state ("Job must be in_progress or paused"), so the request is
-      // guaranteed to fail — it fired and failed on every rework before this.
-      // Logging the ceiling honestly beats a misleading `Extension request
-      // failed` line for something that was never possible.
+      // Extensions ARE grantable during rework as of the platform's 2026-08-07
+      // deploy. Before it, both the create and approve endpoints allowlisted only
+      // `in_progress`/`paused`, so every rework extension request failed with
+      // "Job must be in_progress or paused" — never once grantable — and we
+      // stopped asking. Asking again is now the right behaviour: a rework capped
+      // at ~30% of the original budget is exactly the case that runs short, and
+      // "your answer was too shallow" is a complaint that needs MORE output.
       console.log(`⚠️  Rework token budget at ${Math.round((usage.totalTokens / budget) * 100)}% ` +
-        `(${usage.totalTokens}/${budget}) — rework cannot be extended, the answer may be cut short`);
+        `(${usage.totalTokens}/${budget}) — requesting extension`);
+      requestBudgetExtension(job, agent, executor, usage, budget)
+        .catch(e => console.warn(`[BUDGET] Rework extension request failed: ${e.message} — the answer may be cut short`));
     });
     console.log(`  Token budget for rework: ${tokenBudget} tokens`);
   }

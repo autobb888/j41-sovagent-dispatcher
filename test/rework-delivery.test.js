@@ -198,18 +198,34 @@ test('a failed re-auth degrades to the deliverable rather than losing the rework
   assert.equal(agent.sent.length, 0);
 });
 
-test('rework never requests a budget extension — the platform refuses them outside in_progress/paused', async () => {
+test('rework DOES request a budget extension — the platform allows them during rework since 2026-08-07', async () => {
+  // Was the opposite assertion until backend fixed it: both the create and approve
+  // endpoints allowlisted only in_progress/paused, so a rework extension could never
+  // be granted. The previous version of this test mocked `agent.requestExtension`,
+  // which nothing in the code calls — it could not fail. This asserts on
+  // `_lastExtensionAttemptAt`, which requestBudgetExtension sets before any pricing
+  // lookup, so it proves the attempt happened without depending on a configured rate.
   const ex = makeExecutor({ alreadyUsed: 0 });
   const agent = makeAgent();
-  let requested = false;
   ex.handleMessage = async () => {
-    // Push usage past the warning threshold so the callback fires.
-    ex._trackUsage({ prompt_tokens: 1000, completion_tokens: 60, total_tokens: 1060 });
+    ex._trackUsage({ prompt_tokens: 1000, completion_tokens: 60, total_tokens: 1060 }); // >80% of 1080
     return ANSWER;
   };
-  agent.requestExtension = () => { requested = true; };
 
   await resumeJob(JOB, agent, 'soul', ex, () => {}, REWORK, 1080);
 
-  assert.equal(requested, false);
+  assert.ok(ex._lastExtensionAttemptAt, 'crossing the rework warning threshold must attempt an extension');
+});
+
+test('staying under the warning threshold asks for nothing', async () => {
+  const ex = makeExecutor({ alreadyUsed: 0 });
+  const agent = makeAgent();
+  ex.handleMessage = async () => {
+    ex._trackUsage({ prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 });
+    return ANSWER;
+  };
+
+  await resumeJob(JOB, agent, 'soul', ex, () => {}, REWORK, 1080);
+
+  assert.equal(ex._lastExtensionAttemptAt, undefined, 'no extension ask below the threshold');
 });
