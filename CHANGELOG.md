@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 2.17.0
+
+**Bounty awards now sign the canonical message that binds the recipients.** The
+platform verifies `/select` signatures as of its 2026-08-07 deploy (shadow mode now,
+enforce once clients adopt it). Our signature would have failed: the SDK's
+`buildSelectClaimantsMessage` produced `J41-BOUNTY-SELECT|…|Selected:<application row
+ids>|…` — different prefix, different field, and substantively the wrong content.
+Application row ids are opaque server primary keys a signer cannot independently
+verify, so signing them commits to nothing.
+
+`src/bounty-award.js` builds the canonical form binding the **sorted applicant
+VerusIDs** — the actual recipients of the money. Sorted so collection order cannot
+change the bytes, non-mutating because the caller reuses the array for the request
+body, and it **throws on a UUID** rather than signing it: passing `app.id` where
+`app.applicant_verus_id` was needed is the exact mistake the old message institutionalised,
+and it would otherwise surface only on the day enforcement lands. The dashboard now
+carries both ids through the selection UI and refuses to sign an award whose
+recipients it cannot name.
+
+942 tests; the sort, the row-id guard and the non-mutation are each mutation-checked.
+
 ## 2.16.0
 
 Round 8 passed all three retests — bounty `/select` and its award→job handoff, the

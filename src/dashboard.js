@@ -2580,12 +2580,16 @@ async function bountyDetailScreen(inquirer, bountyId, agentKeys) {
 
   if (action === 'select') {
     // Checkbox to select winners
+    // Carry BOTH ids: the row id goes in the request body, the applicant's VerusID
+    // is what the award signature must bind (see src/bounty-award.js).
     const appChoices = applications.map(app => ({
       name: `  ${app.applicant_verus_id || app.applicantVerusId} — ${(app.message || '').substring(0, 50)}`,
-      value: app.id,
+      value: { id: app.id, verusId: app.applicant_verus_id || app.applicantVerusId },
     }));
 
-    const { selectedIds } = await promptWithEsc(inquirer, [{ type: 'checkbox', pageSize: 20, name: 'selectedIds', message: 'Select winners (space to toggle, enter to confirm):', choices: appChoices }]);
+    const { selectedIds: selectedApps } = await promptWithEsc(inquirer, [{ type: 'checkbox', pageSize: 20, name: 'selectedIds', message: 'Select winners (space to toggle, enter to confirm):', choices: appChoices }]);
+    const selectedIds = (selectedApps || []).map(a => a.id);
+    const selectedVerusIds = (selectedApps || []).map(a => a.verusId).filter(Boolean);
 
     if (!selectedIds || selectedIds.length === 0) {
       console.log('\n  No winners selected.\n');
@@ -2597,9 +2601,18 @@ async function bountyDetailScreen(inquirer, bountyId, agentKeys) {
     if (!confirm) return;
 
     try {
-      const { buildSelectClaimantsMessage, signMessage } = require('@junction41/sovagent-sdk');
+      const { signMessage } = require('@junction41/sovagent-sdk');
+      // Canonical award message — binds the RECIPIENTS, sorted. The SDK's
+      // buildSelectClaimantsMessage bound application row IDs, which the platform
+      // stopped accepting: opaque server keys commit to nothing a signer can verify.
+      const { buildBountyAwardMessage } = require('./bounty-award.js');
       const timestamp = Math.floor(Date.now() / 1000);
-      const msg = buildSelectClaimantsMessage(bountyId, selectedIds, timestamp);
+      if (selectedVerusIds.length !== selectedIds.length) {
+        console.log('\n  ❌ Could not resolve a VerusID for every selected applicant — refusing to sign an award that does not name its recipients.\n');
+        await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to go back' }]);
+        return;
+      }
+      const msg = buildBountyAwardMessage(bountyId, selectedVerusIds, timestamp);
       const signature = signMessage(agentKeys.wif, msg, agentKeys.network || 'verustest');
 
       const agent = await createAgent(agentKeys);
