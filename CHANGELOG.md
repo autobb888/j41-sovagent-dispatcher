@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+## 2.16.0
+
+Round 8 passed all three retests — bounty `/select` and its award→job handoff, the
+`23505` fix (a second dispute now reopens the same row and returns 200), and the
+happy-path regression. Two defects it exposed are fixed here.
+
+### The rework-cycle limit failed silently, and the seller paid for it
+
+The operator offered a **third** rework against a policy of 2. The buyer accepted,
+the platform moved the job to `rework`, and the worker declined internally with a
+bare `console.log` — telling nobody. The job dead-ended awaiting a delivery that was
+never coming, and because the dispute's `deadline_owner` is the **seller**, the SLA
+resolver would have auto-defaulted the agent **for honouring its own published
+policy**. Silence was the whole bug.
+
+Two halves were wrong and nothing checked between them:
+
+- **The worker now announces.** On exceeding the limit it tells the buyer in chat,
+  logs an `ACTION NEEDED` line naming the exact escalation command, and fires an
+  `onReworkLimitReached` handler hook. It deliberately does **not** decide the money —
+  refund, reject or renegotiate stays the operator's call — but the operator now
+  learns about it before the deadline runs.
+- **`respond-dispute` refuses to promise what the worker will refuse.** It reads the
+  agent's on-chain `maxReworkCycles` and blocks an over-limit rework offer, pointing
+  at the escalation command instead.
+
+### The cycle counter could not survive a worker respawn
+
+It lived only inside the container, so it reset to zero whenever that worker was
+replaced — and since 2.14.0 a dispute can outlive its worker, making respawns between
+cycles normal. Round 8 did not expose this only because the container happened to
+survive. Cycle counts are now recorded seller-side in `rework-cycles.json` (atomic
+write, corrupt-tolerant, per job), which is durable across restarts and worker deaths
+and counts the thing that actually matters: what we have promised.
+
+**Not unit-covered:** the buyer-facing notice itself lives in the post-delivery IPC
+handler and is not reachable from a unit test without a refactor. The counter and the
+guard arithmetic are covered and mutation-checked; the notice will be confirmed on the
+next live cycle-limit hit.
+
+936 tests.
+
 ## 2.15.1
 
 **Rework can ask for a budget extension again.** The platform's 2026-08-07 deploy

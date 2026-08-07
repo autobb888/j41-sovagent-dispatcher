@@ -5073,6 +5073,57 @@ async function queueDisputedJobForRespawn(state, jobId, opts = {}) {
   return { respawned: true };
 }
 
+
+// ── Rework cycle accounting (durable, seller-side) ───────────────────────────
+//
+// `maxReworkCycles` was enforced only by a counter inside the worker container,
+// which resets to zero whenever that worker is replaced — and a dispute can now
+// outlive its worker, so respawns between cycles are normal. Round 8 did not hit
+// that (the worker survived), but the limit was unenforceable by construction.
+//
+// The seller counting its OWN rework offers is durable across restarts and worker
+// deaths, and it is the number that actually matters: what we have promised.
+const REWORK_CYCLES_PATH = path.join(DISPATCHER_DIR, 'rework-cycles.json');
+
+function readReworkCycles(file = REWORK_CYCLES_PATH) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return (parsed && typeof parsed === 'object') ? parsed : {};
+  } catch {
+    return {}; // absent is normal; corrupt must not block a dispute response
+  }
+}
+
+function reworkCyclesFor(jobId, store = readReworkCycles()) {
+  const n = store[jobId];
+  return Number.isInteger(n) && n >= 0 ? n : 0;
+}
+
+function bumpReworkCycle(jobId, file = REWORK_CYCLES_PATH) {
+  try {
+    const store = readReworkCycles(file);
+    store[jobId] = reworkCyclesFor(jobId, store) + 1;
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(store, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, file); // atomic — a torn count must not reset the limit
+    return store[jobId];
+  } catch (e) {
+    // Never fail a dispute response because bookkeeping failed; log loudly instead,
+    // because an uncounted cycle is how the limit silently stops being enforced.
+    console.error(`  ⚠️  Could not record rework cycle for ${jobId.substring(0, 8)}: ${e.message}`);
+    return null;
+  }
+}
+
+/** Read the agent's on-chain dispute policy via its live session. Null if absent. */
+async function readDisputePolicyFor(agent) {
+  const identity = await agent.client.getMyIdentity();
+  if (!identity?.contentmultimap) return null;
+  const { decodeContentMultimap } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+  const decoded = decodeContentMultimap(identity.contentmultimap);
+  return decoded?.disputePolicy || null;
+}
+
 // ── Shutdown/start fleet-state handoff ───────────────────────────────────────
 //
 // `gracefulShutdown` sets every agent inactive on the platform and on-chain so a
@@ -9025,6 +9076,33 @@ program
       const agent = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif, identityName: keys.identity, iAddress: keys.iAddress });
       await agent.authenticate();
 
+      // Do not promise a rework the worker is going to refuse. Round 8: the operator
+      // offered a 3rd rework against a policy of 2, the buyer accepted, the platform
+      // moved the job to `rework`, and the container declined it internally — leaving
+      // the job dead-ended with a SELLER-owned deadline ticking toward auto-default.
+      // The two halves disagreed and nothing checked between them.
+      if (action === 'rework') {
+        try {
+          const pol = await readDisputePolicyFor(agent);
+          const max = pol && Number.isInteger(pol.maxReworkCycles) ? pol.maxReworkCycles : null;
+          if (max !== null) {
+            const priorReworks = reworkCyclesFor(jobId);
+            if (priorReworks >= max) {
+              console.error(`\n❌ Refusing: this agent's dispute policy allows ${max} rework cycle(s) and ${priorReworks} ` +
+                'have already been delivered.');
+              console.error('   The worker WILL decline this rework, and the job would dead-end with a');
+              console.error('   seller-owned deadline — auto-defaulting the agent for honouring its own policy.');
+              console.error(`   Escalate instead:  j41-dispatcher respond-dispute ${jobId} --agent ${agentId} --action refund --refund-percent <n> --message "..."`);
+              console.error('   Or raise the limit in the agent\'s on-chain dispute policy first.');
+              process.exit(1);
+            }
+          }
+        } catch (e) {
+          // Never block a legitimate response because the policy could not be read.
+          console.log(`  ⚠️  Could not check the rework-cycle limit (${e.message}) — proceeding`);
+        }
+      }
+
       const result = await agent.respondToDispute(jobId, {
         action,
         refundPercent: options.refundPercent ? parseInt(options.refundPercent, 10) : undefined,
@@ -9032,6 +9110,10 @@ program
         message,
       });
 
+      if (action === 'rework') {
+        const n = bumpReworkCycle(jobId);
+        if (n !== null) console.log(`  ↻ rework cycle ${n} recorded for this job`);
+      }
       console.log('✅ Dispute response submitted:');
       console.log(JSON.stringify(result, null, 2));
       agent.stop();
@@ -10784,7 +10866,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');

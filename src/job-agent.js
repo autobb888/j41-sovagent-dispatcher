@@ -2012,9 +2012,38 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
             }
           }
 
-          // Guard: max rework cycles exceeded
+          // Guard: max rework cycles exceeded.
+          //
+          // This used to `break` silently. Round 8 showed what that costs: the buyer
+          // accepted a third rework, the platform moved the job to `rework`, and the
+          // worker declined internally and told nobody — so the job dead-ended
+          // waiting for a delivery that was never coming. Worse, the dispute's
+          // deadline_owner is the SELLER, so the SLA resolver would auto-default the
+          // agent for honouring its own published policy. Silence was the whole bug.
+          //
+          // We announce and surface; we do NOT decide the money. Choosing to refund,
+          // reject, or renegotiate at the cycle limit is the operator's call, and the
+          // operator now has the information to make it before the deadline runs.
           if (_disputePolicy && _reworkCount > _disputePolicy.maxReworkCycles) {
-            console.log(`⚠️  Rework cycle ${_reworkCount} exceeds max ${_disputePolicy.maxReworkCycles} — ignoring`);
+            const max = _disputePolicy.maxReworkCycles;
+            console.error(`⛔ Rework cycle ${_reworkCount} exceeds max ${max} — declining. ` +
+              `ACTION NEEDED: the dispute's deadline is owned by the SELLER and this job will not be ` +
+              `re-delivered, so it will auto-default unless the operator answers the dispute ` +
+              `(j41-dispatcher respond-dispute ${job.id} --agent <id> --action refund|rejected ...).`);
+            try {
+              await ensureChatConnected(agent, job.id);
+              await agent.sendChatMessage(job.id,
+                `I'm not able to take a ${_reworkCount}${_reworkCount === 3 ? 'rd' : 'th'} rework on this job — ` +
+                `my published dispute policy allows ${max}. ${max} rework${max === 1 ? '' : 's'} ` +
+                'have been delivered. The operator has been notified and will respond to the dispute directly; ' +
+                'you do not need to wait for another delivery.');
+            } catch (e) {
+              console.error(`[REWORK-LIMIT] Could not tell the buyer: ${e.message} — they are waiting on a delivery that will not come`);
+            }
+            if (agent.handler?.onReworkLimitReached) {
+              try { await agent.handler.onReworkLimitReached(job, { cycle: _reworkCount, max }); }
+              catch (e) { console.error(`[REWORK-LIMIT] handler error: ${e.message}`); }
+            }
             break;
           }
 
