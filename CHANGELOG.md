@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+## 2.17.2
+
+**The over-limit buyer notice could never fire.** Round 9 found it missing on both
+test jobs, and the cause was a design error in 2.16.0 rather than a bug in the code
+that was written.
+
+The worker's announcement runs on `dispute.rework_accepted`. But the
+`respond-dispute` guard prevents the over-limit offer, so the buyer can never accept,
+so that IPC never arrives — the two halves were **mutually exclusive**, and the notice
+could only fire in exactly the scenario the guard makes impossible. Confirmed in the
+logs: the `exceeds max` branch executed **zero** times across both jobs.
+
+The dispatcher is the only side that knows a refusal happened, so the dispatcher now
+posts the message when it refuses. A chat failure is logged and never blocks the
+refusal. Verified live against a parked at-limit job.
+
+The worker-side branch stays: it is still correct when an offer *was* made (a policy
+raised mid-flight, or an operator override), it is just rarely reached now.
+
+942 tests. This path remains outside unit coverage by nature — it needs a live
+at-limit dispute — which is precisely why round 9 caught what unit tests could not.
+
 ## 2.17.1
 
 **The dispute hold was defeated by the job clock.** 2.14.0 taught a worker to hold

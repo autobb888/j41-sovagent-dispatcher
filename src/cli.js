@@ -9088,6 +9088,26 @@ program
           if (max !== null) {
             const priorReworks = reworkCyclesFor(jobId);
             if (priorReworks >= max) {
+              // TELL THE BUYER. The worker has an over-limit announcement too, but it
+              // only runs on `dispute.rework_accepted` — and this guard prevents the
+              // offer, so the buyer can never accept and that IPC never arrives. The
+              // two halves of the 2.16.0 fix were mutually exclusive: the notice could
+              // only fire in the scenario the guard makes impossible. Round 9 found it
+              // exactly there ("worker over-limit chat message: MISSING, both jobs").
+              // The dispatcher is the only side that knows a refusal happened, so the
+              // dispatcher is what has to say so.
+              try {
+                await agent.connectChat();
+                agent.joinJobChat(jobId);
+                await agent.sendChatMessage(jobId,
+                  `I'm not able to take another rework on this job — my published dispute policy allows ${max}, ` +
+                  `and ${priorReworks} ${priorReworks === 1 ? 'has' : 'have'} been delivered. ` +
+                  'The operator has been notified and will respond to this dispute directly; ' +
+                  'you do not need to wait for another delivery.');
+                console.log('  💬 Told the buyer in chat that no further rework is coming.');
+              } catch (e) {
+                console.error(`  ⚠️  Could not tell the buyer in chat (${e.message}) — they will see only the dispute notice.`);
+              }
               console.error(`\n❌ Refusing: this agent's dispute policy allows ${max} rework cycle(s) and ${priorReworks} ` +
                 'have already been delivered.');
               console.error('   The worker WILL decline this rework, and the job would dead-end with a');
