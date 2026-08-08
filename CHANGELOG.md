@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 2.17.1
+
+**The dispute hold was defeated by the job clock.** 2.14.0 taught a worker to hold
+itself open toward an open dispute's deadline — but it extended the post-delivery
+*safety* timer only. `JOB_TIMEOUT_MS` is a separate, bare module-scope `setTimeout`
+that is never cleared, so a worker that announced "Holding this worker open for 360
+min" was killed at 60 anyway.
+
+Observed live on `d22c9df5`: the worker announced the hold, hit
+`⏰ Job timeout! Signing deletion attestation and exiting`, the reconciler respawned
+it, each replacement died the same way, and after three attempts it gave up
+**permanently** — leaving an open dispute with no worker and no respawn. Extending
+one timer and not the other was the entire defect; the give-up then looked like a
+job that "never progresses" when in fact we were killing it ourselves.
+
+The hard timeout now defers while a dispute hold is active, re-arming for the
+remaining time instead of exiting. The hold is bounded (`J41_DISPUTE_HOLD_MAX_MS`,
+6 h default), so this cannot extend indefinitely.
+
+942 tests.
+
 ## 2.17.0
 
 **Bounty awards now sign the canonical message that binds the recipients.** The

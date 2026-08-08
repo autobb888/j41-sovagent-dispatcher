@@ -158,6 +158,17 @@ async function sendChatChunked(agent, jobId, text, maxLen = CHAT_MAX_LEN, gapMs 
  * nowhere. We join ONLY on a fresh connect — room membership survives a live
  * socket, and re-joining a room we are already in duplicates every message.
  */
+// Wall-clock deadline (ms epoch) until which this worker is legitimately holding an
+// OPEN DISPUTE. The hard job timeout below defers while this is in the future.
+//
+// Round 8 live: the dispute hold extended the post-delivery SAFETY timer but NOT
+// JOB_TIMEOUT_MS, which is a bare module-scope setTimeout that is never cleared. So a
+// worker parked on a dispute announced "holding for 360 min" and was then killed at 60
+// anyway. The reconciler respawned it, each replacement died the same way, and after
+// three attempts it gave up permanently — leaving a live dispute with no worker and no
+// respawn. Extending one timer and not the other was the whole defect.
+let _disputeHoldUntilMs = 0;
+
 // Rooms this process has explicitly joined. Only consulted when the SDK does not
 // expose `chatClient.joinedRooms`; see ensureChatConnected.
 const _joinedRoomsFallback = new Set();
@@ -1673,7 +1684,17 @@ if (require.main === module) {
 // Guarded under require.main so that requiring this module in tests doesn't
 // schedule a 10-minute timer that prevents the test process from exiting.
 if (require.main === module) {
-  setTimeout(async () => {
+  const _hardTimeout = async () => {
+    // An open dispute outranks the job clock. Re-arm rather than exit, so a worker
+    // that announced a multi-hour hold actually survives it. The hold itself is
+    // bounded (J41_DISPUTE_HOLD_MAX_MS, 6h default), so this cannot extend forever.
+    const remaining = _disputeHoldUntilMs - Date.now();
+    if (remaining > 0) {
+      console.log(`⏰ Job timeout reached, but an open dispute is being held for another ` +
+        `${Math.round(remaining / 60000)} min — deferring exit.`);
+      setTimeout(_hardTimeout, remaining + 1000);
+      return;
+    }
     console.error('⏰ Job timeout! Signing deletion attestation and exiting.');
 
     try {
@@ -1737,7 +1758,8 @@ if (require.main === module) {
     }
 
     process.exit(1);
-  }, TIMEOUT_MS);
+  };
+  setTimeout(_hardTimeout, TIMEOUT_MS);
 }
 
 /**
@@ -1945,6 +1967,8 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
       }
       if (wanted <= currentSafetyMs) return;
       currentSafetyMs = wanted;
+      // Tell the hard job timeout to stand down for as long as we are holding.
+      _disputeHoldUntilMs = Date.now() + currentSafetyMs;
       resetSafetyTimer();
       const mins = Math.round(currentSafetyMs / 60000);
       console.log(`  ⏳ Holding this worker open for ${mins} min for the open dispute` +
