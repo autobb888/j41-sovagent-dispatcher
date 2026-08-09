@@ -1,9 +1,9 @@
 # Dispatcher — release readiness
 
-**Date:** 2026-08-09
-**Assessed build:** 2.17.2 (`a8f7639`), 942 tests, 9-agent fleet on VRSCTEST
-**Verdict: not yet shippable to third-party operators. Five blockers, all in the
-operational surface, all small. The job path itself is in good shape.**
+**Date:** 2026-08-09 (updated after the B1–B5 batch)
+**Assessed build:** 2.18.1 (`e8f740c`), 948 tests, 9-agent fleet on VRSCTEST
+**Verdict: all five blockers fixed and live. Shippable to a pilot operator with
+known caveats; not yet to an unattended third party — see "What still stands".**
 
 ---
 
@@ -33,7 +33,7 @@ difference between "works for us" and "someone else can run this".
 
 942 tests, and every fix this cycle was mutation-checked — reverting it fails a test.
 
-## Blockers for third-party release
+## Blockers — ALL FIXED in 2.18.0 / 2.18.1 (kept for the record)
 
 Ordered by what breaks first for someone who is not us.
 
@@ -98,6 +98,33 @@ the inbox pending-write gate is an in-memory Map, so a fast restart can double-s
 3. **Honest first-run docs.** The README was corrected once already this cycle for
    overstating scale claims; the `encrypt-keys` → broken-Start interaction (B3) is
    exactly the kind of thing a new operator hits in the first hour.
+
+## What still stands
+
+Fixing the blockers did not make the remaining risks disappear, and two are worth
+stating plainly before anyone calls this done:
+
+1. **B2–B5 have no automated coverage.** They are process-lifecycle and interactive-TUI
+   paths. B1 is covered and mutation-checked; the other four were verified by hand on a
+   live restart. Every defect that reached production this cycle lived in exactly this
+   kind of un-unit-testable path, so treat them as "observed working once", not "proven".
+2. **The operator lifecycle has still never been run end to end by anyone.** Clean
+   install → register → encrypt keys → start from the dashboard → take a job → restart
+   mid-job → confirm the fleet returns. That sequence is the actual release gate and it
+   remains outstanding.
+3. The six known-open non-blockers below are unchanged. **N2** (`_budgetGateHit` never
+   reset outside `_agentLoop`) will bite the day the jailbox is re-enabled.
+4. One test remains intermittently flaky under full-suite CPU contention — the
+   12-process send-lock race. It has never produced a `LOCK BREACH` (the assertion that
+   would indicate a real double-holder); the failures are the starvation mode. Worth
+   fixing so it stops masking a genuine regression one day.
+
+## What the batch actually changed, live
+
+- `/health` now degrades on an inactive fleet, and reported `ok` correctly through a
+  full restart window — the false-alarm case caught on 2.18.0's own first restart and
+  fixed in 2.18.1.
+- A restart now performs **0 on-chain transactions**, down from 18 on a 9-agent fleet.
 
 ## Recommendation
 
