@@ -2094,7 +2094,7 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
               try {
                 const { initialTokenBudget } = require('./token-budget.js');
                 const { resolveLLMConfig } = require('./executors/local-llm.js');
-                const shareVrsc = ((_disputePolicy.reworkBudgetPercent || 30) / 100) * fullJob.amount;
+                const shareVrsc = ((_disputePolicy.reworkBudgetPercent || 50) / 100) * fullJob.amount;
                 const derived = initialTokenBudget({
                   model: resolveLLMConfig().model,
                   amountVrsc: shareVrsc,

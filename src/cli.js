@@ -776,7 +776,7 @@ async function interactiveProfileSetup(keys, soulContent) {
     defaultAction: 'rework',
     maxRefundPercent: 100,
     maxReworkCycles: 2,
-    reworkBudgetPercent: 30,
+    reworkBudgetPercent: 50,
     escalateAfter: 'max_rework',
     systemCrashRefund: 100,
   };
@@ -805,7 +805,7 @@ async function interactiveProfileSetup(keys, soulContent) {
       defaultAction,
       maxRefundPercent: Math.min(Math.max(maxRefundPercent, 0), 100),
       maxReworkCycles: Math.max(maxReworkCycles, 0),
-      reworkBudgetPercent: 30,
+      reworkBudgetPercent: 50,
       escalateAfter: 'max_rework',
       systemCrashRefund: 100,
     };
@@ -2310,7 +2310,7 @@ const DEFAULT_DISPUTE_POLICY = {
   defaultAction: 'rework',
   maxRefundPercent: 100,
   maxReworkCycles: 2,
-  reworkBudgetPercent: 30,
+  reworkBudgetPercent: 50,
   escalateAfter: 'max_rework',
   systemCrashRefund: 100,
 };
@@ -4167,8 +4167,17 @@ program
       // per restart; it only matters when the agent's standing genuinely changes, which
       // is what the explicit `activate` / `deactivate` commands are for (they still
       // write on-chain, unchanged). Opt back in with J41_STATUS_TOGGLE_ONCHAIN=1.
-      const _toggleOnChain = process.env.J41_STATUS_TOGGLE_ONCHAIN === '1';
-      console.log(`\n→ Setting agents active${_toggleOnChain ? '' : ' (platform only — set J41_STATUS_TOGGLE_ONCHAIN=1 to also write on-chain)'}...`);
+      // DEFAULT ON — reverted from 2.18.0's platform-only default after backend
+      // explained the crack (2026-08-09 §1). Their hire gate reads `agents.status` and
+      // nothing else, and their indexer OVERWRITES that column from on-chain
+      // `data.status` on every re-index. So a platform-set `inactive` is best-effort:
+      // while we are stopped with on-chain still `active`, any re-index — an identity
+      // tx, a /refresh, or indexer catch-up after their daily downtime — reverts us to
+      // active. A hire landing in that window sends the buyer's funds to a down agent,
+      // and there is NO ESCROW. Saving 18 transactions is not worth that trade.
+      // On-chain deactivate is the durable lever; opt out with J41_STATUS_TOGGLE_ONCHAIN=0.
+      const _toggleOnChain = process.env.J41_STATUS_TOGGLE_ONCHAIN !== '0';
+      console.log(`\n→ Setting agents active${_toggleOnChain ? '' : ' (PLATFORM ONLY — J41_STATUS_TOGGLE_ONCHAIN=0; a re-index can revert this and let a hire land on a stopped agent)'}...`);
       for (let i = 0; i < readyAgents.length; i++) {
         const agentInfo = readyAgents[i];
         // Stagger activation — 1s between agents to avoid rate limits at scale
@@ -4308,7 +4317,9 @@ program
           agentInfo.platformStatus = 'inactive';
           _deactivatedByShutdown.push(agentInfo.id);
           // On-chain only when explicitly requested — see B5 at the activation loop.
-          if (process.env.J41_STATUS_TOGGLE_ONCHAIN === '1') {
+          // On-chain deactivate is what actually keeps a hire off a stopped agent —
+          // see the activation loop. Default on; J41_STATUS_TOGGLE_ONCHAIN=0 opts out.
+          if (process.env.J41_STATUS_TOGGLE_ONCHAIN !== '0') {
             try { await agent.setOnChainStatus('inactive'); } catch {}
           }
           // Trigger backend re-index so marketplace shows offline immediately

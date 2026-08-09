@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+## 2.19.0
+
+Two changes from backend's 2026-08-09 response. The first reverses a decision from
+2.18.0 that was wrong for a reason we could not have known.
+
+**On-chain status writes are back ON by default (reverts B5's default).** 2.18.0 made
+the routine start/stop cycle platform-only to save 18 identity transactions per
+restart, on the reasoning that the marketplace gates on platform status. Backend
+explained the crack: their hire gate reads `agents.status` and **nothing else**, and
+their indexer **overwrites that column from on-chain `data.status` on every
+re-index**. A platform-set `inactive` is therefore best-effort — while we are stopped
+with on-chain still `active`, any re-index (an identity tx, a `/refresh`, or indexer
+catch-up after their daily downtime) reverts us to `active`. A hire landing in that
+window sends the buyer's funds to a stopped agent, and **there is no escrow**.
+
+Saving 18 transactions is not worth that trade. On-chain deactivate is the durable
+lever. `J41_STATUS_TOGGLE_ONCHAIN=0` still opts out for an operator who understands
+the window, and the log says plainly what they are accepting.
+
+**Rework share raised 30% → 50%.** Every rework we measured overran its ~30% grant:
+107 / 109 / 113 / 138 %. Backend confirmed this is the primary fix for the
+unreachable-top-up problem and explicitly advised *against* building a blocking
+real-time gate — it converts a bounded cost overrun into a stalled job holding memory
+on a buyer who may never answer. 138% of 30 is ~41% of the true need, so 50% covers
+the observed range with margin. Existing on-chain policies keep their stored value;
+this changes the default for new policies and the fallback when the field is absent.
+
+Backend also shipped their half: `delivered` is now an approvable state, so a
+post-delivery top-up is finally collectable — a route to bill, not a guarantee, and
+not a licence to overrun.
+
+948 tests.
+
 ## 2.18.1
 
 **B1 follow-up: the new degrade fired on every startup.** The health server binds
