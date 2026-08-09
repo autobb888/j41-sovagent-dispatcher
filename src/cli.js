@@ -4387,6 +4387,9 @@ program
     // activation pass), so it is NOT a reliable "safe to stop" marker. Anything
     // scripting a restart should wait for this line.
     readyForShutdown = true;
+    // Gates the /health platform-status degrade: agents are activated in a staggered
+    // loop above, and degrading before that finishes would alert on every restart.
+    state.startupComplete = true;
     console.log('✅ Startup complete — graceful shutdown enabled.');
     // Zeroize the in-memory master key on any exit (after all WIF use is done).
     process.on('exit', () => { try { keystore.lock(); } catch (_) {} });

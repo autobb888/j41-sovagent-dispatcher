@@ -437,9 +437,15 @@ function buildHealthDocument(state, startedAt) {
     // B1: a fleet the platform considers inactive cannot take work, so reporting `ok`
     // is actively misleading — that is exactly what happened through the 2026-08-06
     // outage. `unknown` does NOT degrade: it only means we have not checked yet.
+    // Platform status only degrades AFTER startup activation has finished. The health
+    // server binds before agents are activated (staggered ~1s each), so degrading
+    // during that window would fire an alert on every single restart — and an alert
+    // that cries wolf on every restart is precisely how the 2026-08-06 outage went
+    // unnoticed in the first place.
     status: (containersUnhealthy > 0
       || inbox.deadLettered.length > 0
-      || agents.some(a => a.platformStatus === 'inactive' || a.platformStatus === 'disabled'))
+      || (state.startupComplete === true
+          && agents.some(a => a.platformStatus === 'inactive' || a.platformStatus === 'disabled')))
       ? 'degraded' : 'ok',
     inbox,
     uptime,

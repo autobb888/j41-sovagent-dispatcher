@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 2.18.1
+
+**B1 follow-up: the new degrade fired on every startup.** The health server binds
+before the staggered activation loop runs (~1s per agent), so a restart briefly showed
+every agent `inactive` and reported `degraded` — caught immediately on 2.18.0's own
+first restart. An alarm that cries wolf on every restart is exactly how the
+2026-08-06 outage went unnoticed, so this would have defeated the fix it belongs to.
+The platform-status degrade is now gated on `state.startupComplete`.
+
+948 tests.
+
 ## 2.18.0
 
 All five release blockers from `docs/RELEASE-READINESS.md`. These are operator-surface

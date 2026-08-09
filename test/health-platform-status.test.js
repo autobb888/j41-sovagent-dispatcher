@@ -30,6 +30,7 @@ function stateWith(agents) {
     _containerCrashes: new Map(),
     _inboxFailures: new Map(),
     startedAt: Date.now() - 1000,
+    startupComplete: true, // the degrade only applies once activation has finished
   };
 }
 
@@ -76,4 +77,17 @@ test('unknown does not degrade — "not checked yet" is not "broken"', () => {
 
   assert.equal(doc.agents[0].platformStatus, 'unknown', 'absent reads as unknown, never as active');
   assert.equal(doc.status, 'ok');
+});
+
+test('the startup window does not degrade — agents are not activated yet', () => {
+  // The health server binds before the staggered activation loop runs, so every
+  // restart would otherwise fire an alert. An alarm that cries wolf on every restart
+  // is how the 2026-08-06 outage went unnoticed to begin with.
+  const st = stateWith([{ id: 'agent-1', identity: 'a1@', platformStatus: 'inactive' }]);
+  st.startupComplete = false;
+  assert.equal(buildHealthDocument(st, Date.now() - 1000).status, 'ok');
+
+  st.startupComplete = true;
+  assert.equal(buildHealthDocument(st, Date.now() - 1000).status, 'degraded',
+    'once startup is done, an inactive agent is a real fault');
 });
