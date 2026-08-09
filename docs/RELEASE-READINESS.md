@@ -15,7 +15,8 @@ by construction — nothing pays without owner approval, and every guard we rela
 relaxed deliberately. **The weak half is everything an *operator* touches**: starting,
 stopping, restarting, and knowing whether the thing is alive. That surface has had a
 fraction of the scrutiny and it is where a new user meets the product first. Five
-defects there are known, documented, and unfixed. None is hard; together they are the
+defects there were found and are now fixed (2.18.0/2.18.1) — but four of them have no
+automated coverage, so they are "observed working once", not proven. They were the
 difference between "works for us" and "someone else can run this".
 
 ## What is solid — verified live, not just unit-tested
@@ -31,11 +32,13 @@ difference between "works for us" and "someone else can run this".
 | Crash-safety of state files | Atomic writes, corrupt-vs-absent distinguished, quarantine |
 | Money conservatism | 20 refunds sat queued for weeks without a single unapproved send |
 
-942 tests, and every fix this cycle was mutation-checked — reverting it fails a test.
+948 tests. Every fix this cycle was mutation-checked where a unit test could reach it —
+which, as noted below, is not everywhere.
 
 ## Blockers — ALL FIXED in 2.18.0 / 2.18.1 (kept for the record)
 
-Ordered by what breaks first for someone who is not us.
+Stated below in the present tense as originally written, describing the defect each fix
+addressed. Ordered by what breaks first for someone who is not us.
 
 ### B1 — `/health` cannot see whether the fleet is actually online
 `src/control.js` derives agent status purely from local job assignment; platform
@@ -112,7 +115,7 @@ stating plainly before anyone calls this done:
    install → register → encrypt keys → start from the dashboard → take a job → restart
    mid-job → confirm the fleet returns. That sequence is the actual release gate and it
    remains outstanding.
-3. The six known-open non-blockers below are unchanged. **N2** (`_budgetGateHit` never
+3. The six known-open non-blockers above are unchanged. **N2** (`_budgetGateHit` never
    reset outside `_agentLoop`) will bite the day the jailbox is re-enabled.
 4. One test remains intermittently flaky under full-suite CPU contention — the
    12-process send-lock race. It has never produced a `LOCK BREACH` (the assertion that
