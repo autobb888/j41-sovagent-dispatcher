@@ -123,7 +123,24 @@ function startControlServer(state, handlers) {
   healthServer.listen(healthPort, '127.0.0.1', () => {
     console.log(`[Health] http://127.0.0.1:${healthPort}/health`);
   });
-  healthServer.on('error', () => {}); // non-fatal if port is busy
+  // B1: swallowing the error meant a dispatcher that lost the port race (e.g. a
+  // restart overlapping its predecessor) ran its ENTIRE life with no /health, and
+  // monitoring read that as "down" or, worse, kept reading the OLD process's numbers.
+  // Retry a bounded number of times so the successor picks the port up once the old
+  // process exits, and say so if it never does.
+  let _healthBindAttempts = 0;
+  healthServer.on('error', (err) => {
+    if (err && err.code === 'EADDRINUSE' && _healthBindAttempts < 10) {
+      _healthBindAttempts++;
+      setTimeout(() => { try { healthServer.listen(healthPort, '127.0.0.1'); } catch {} }, 3000).unref?.();
+      if (_healthBindAttempts === 1) console.warn(`[Health] port ${healthPort} busy — retrying`);
+      return;
+    }
+    if (err && err.code === 'EADDRINUSE') {
+      console.error(`[Health] port ${healthPort} still busy after ${_healthBindAttempts} retries — ` +
+        'running WITHOUT /health. Monitoring will see this dispatcher as down.');
+    }
+  });
 
   return server;
 }
@@ -377,6 +394,12 @@ function buildHealthDocument(state, startedAt) {
       id: a.id,
       identity: a.identity || null,
       status: busyEntry ? (busyEntry[1].paused ? 'paused' : 'busy') : 'available',
+      // B1: local job assignment says nothing about whether the PLATFORM still
+      // considers this agent online. During the 2026-08-06 fleet outage every agent
+      // reported "available" while the platform had all nine inactive, and /health
+      // stayed green throughout. An agent that is inactive upstream cannot receive
+      // work no matter how idle it looks here.
+      platformStatus: a.platformStatus || 'unknown',
       currentJob: busyEntry ? busyEntry[0] : null,
       lastError: state._agentErrors?.get(a.id) || null,
       feeTank: buildFeeTank(state, a.id, now),
@@ -411,7 +434,13 @@ function buildHealthDocument(state, startedAt) {
   return {
     // A dead-lettered inbox item means on-chain reputation data silently did not
     // land, which is a degraded dispatcher even when every container is healthy.
-    status: (containersUnhealthy > 0 || inbox.deadLettered.length > 0) ? 'degraded' : 'ok',
+    // B1: a fleet the platform considers inactive cannot take work, so reporting `ok`
+    // is actively misleading — that is exactly what happened through the 2026-08-06
+    // outage. `unknown` does NOT degrade: it only means we have not checked yet.
+    status: (containersUnhealthy > 0
+      || inbox.deadLettered.length > 0
+      || agents.some(a => a.platformStatus === 'inactive' || a.platformStatus === 'disabled'))
+      ? 'degraded' : 'ok',
     inbox,
     uptime,
     version: getVersionStamp(),

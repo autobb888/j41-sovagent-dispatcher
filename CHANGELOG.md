@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+## 2.18.0
+
+All five release blockers from `docs/RELEASE-READINESS.md`. These are operator-surface
+defects — the half of the product that had a fraction of the scrutiny the job path got.
+
+**B1 — `/health` could not see whether the fleet was online.** Agent status was derived
+purely from local job assignment; platform state was never queried (zero references in
+`control.js`). Through the 2026-08-06 outage every surface reported `ok` with all nine
+agents `available` while the platform had them all inactive. Now carries
+`platformStatus` per agent and **degrades** on `inactive`/`disabled`. `unknown` does not
+degrade — "not checked yet" is not "broken". The health server also no longer swallows
+`EADDRINUSE` forever: it retries 10× and says so if it gives up, instead of running the
+daemon's whole life with no `/health`.
+
+**B2 — the dispatcher accepted new jobs while shutting down.** `shuttingDown` was a
+closure variable no other function could read, so `pollForJobs` kept signing and
+accepting during a drain, after every agent had been marked offline — a buyer could pay
+into a job whose seller was mid-shutdown. Now on `state`, and the poll loop declines new
+work while in-flight work continues to drain.
+
+**B3 — the dashboard's Start button always reported success.** The child is spawned with
+`stdio: 'ignore'`, so with an encrypted key pool and no passphrase it exits within a
+second — the operator who followed our own `encrypt-keys` advice got a Start button that
+never worked and never said so. It now waits, reports the real outcome, and names the
+likely cause and the fix.
+
+**B4 — `runtime.webhook_url` parsed but was never consulted.** `start` read only the CLI
+flag while the dashboard printed `Mode: webhook` from the config value, confirming the
+operator's wrong belief; the api-endpoint proxy is webhook-mode-only and so never
+started either. Config is now honoured when the flag is absent.
+
+**B5 — every restart broadcast 2N unrequested on-chain transactions.** N deactivations
+at shutdown plus N activations at start, fee-paying, that the operator never asked for
+(18 per restart on a 9-agent fleet). The marketplace gates on *platform* status, so the
+on-chain write buys nothing per restart. The routine cycle is now platform-only;
+`J41_STATUS_TOGGLE_ONCHAIN=1` restores the old behaviour, and the explicit
+`activate`/`deactivate` commands still write on-chain unchanged.
+
+947 tests. B1 is covered and mutation-checked. B2–B5 are not unit-covered — they are
+process-lifecycle and interactive-TUI paths — and are flagged as such in the readiness
+doc rather than implied to be verified.
+
 ## 2.17.2
 
 **The over-limit buyer notice could never fire.** Round 9 found it missing on both

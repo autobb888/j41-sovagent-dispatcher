@@ -3273,6 +3273,7 @@ program
     // Agents our own last shutdown turned off, and which this start restores.
     const _shutdownDeactivated = readShutdownDeactivated();
     const _reactivatedOnStart = [];
+    let _lastSeenPlatformStatus = null;
     for (const agentId of agents) {
       const keys = loadAgentKeys(agentId);
       if (!keys?.identity) {
@@ -3294,6 +3295,7 @@ program
           let skipThisAgent = false;
           try {
             const profile = await tmpAgent._client.getAgent(keys.iAddress || keys.identity);
+            _lastSeenPlatformStatus = profile.status || 'unknown';
             // Already active and listed in the marker: nothing to restore, but it IS
             // dealt with. Leaving it in the marker would make a LATER deliberate
             // `deactivate` get silently undone by the next start.
@@ -3334,7 +3336,10 @@ program
         }
       }
 
-      readyAgents.push({ id: agentId, ...keys });
+      // platformStatus feeds /health (B1) and lets the activation loop skip a
+      // redundant on-chain write (B5).
+      readyAgents.push({ id: agentId, ...keys, platformStatus: _lastSeenPlatformStatus || 'unknown' });
+      _lastSeenPlatformStatus = null;
     }
     
     // Clear the marker only once every agent in it has been dealt with, so a start
@@ -3556,6 +3561,14 @@ program
     };
 
     // ── Mode selection: Webhook (push) vs Poll (pull) ──
+    // B4: config.toml is documented as the source of truth, but `start` read only the
+    // CLI flag — so `runtime.webhook_url` parsed and did nothing, while the dashboard
+    // printed "Mode: webhook" from the same value and confirmed the operator's wrong
+    // belief. The api-endpoint proxy is webhook-mode-only, so it silently never started.
+    if (!options.webhookUrl && cfg.runtime && cfg.runtime.webhook_url) {
+      options.webhookUrl = cfg.runtime.webhook_url;
+      console.log(`  Webhook mode from config.toml: ${options.webhookUrl}`);
+    }
     if (options.webhookUrl) {
       // ── WEBHOOK MODE ──
       const webhookPort = parseInt(options.webhookPort) || 9841;
@@ -4147,14 +4160,30 @@ program
     if (process.env.J41_NO_STATUS_TOGGLE === '1') {
       console.log('\n→ Skipping auto-activate (J41_NO_STATUS_TOGGLE=1) — using current platform state');
     } else {
-      console.log('\n→ Setting agents active...');
+      // B5: the routine start/stop cycle used to broadcast 2N on-chain identity
+      // transactions — N deactivations at shutdown, N activations at start — that the
+      // operator never asked for and pays fees for (18 per restart on a 9-agent fleet).
+      // The MARKETPLACE gates on platform status, so the on-chain write buys nothing
+      // per restart; it only matters when the agent's standing genuinely changes, which
+      // is what the explicit `activate` / `deactivate` commands are for (they still
+      // write on-chain, unchanged). Opt back in with J41_STATUS_TOGGLE_ONCHAIN=1.
+      const _toggleOnChain = process.env.J41_STATUS_TOGGLE_ONCHAIN === '1';
+      console.log(`\n→ Setting agents active${_toggleOnChain ? '' : ' (platform only — set J41_STATUS_TOGGLE_ONCHAIN=1 to also write on-chain)'}...`);
       for (let i = 0; i < readyAgents.length; i++) {
         const agentInfo = readyAgents[i];
         // Stagger activation — 1s between agents to avoid rate limits at scale
         if (i > 0) await new Promise(r => setTimeout(r, 1000));
         try {
           const agent = await getAgentSession(state, agentInfo);
-          const result = await agent.activate({ onChain: true });
+          if (agentInfo.platformStatus === 'active' && !_toggleOnChain) {
+            agentInfo.platformStatus = 'active';
+            console.log(`  ✅ ${agentInfo.id}: already active — no write needed`);
+            state._agentErrors.delete(agentInfo.id);
+            state.emitEvent?.('agent.online', { agentId: agentInfo.id, identity: agentInfo.identity });
+            continue;
+          }
+          const result = await agent.activate({ onChain: _toggleOnChain });
+          agentInfo.platformStatus = 'active';
           console.log(`  ✅ ${agentInfo.id}: active (on-chain txid: ${result.onChainTxid || 'skipped'})`);
           state._agentErrors.delete(agentInfo.id);
           state.emitEvent?.('agent.online', { agentId: agentInfo.id, identity: agentInfo.identity });
@@ -4232,6 +4261,9 @@ program
       };
 
       log.warn('Graceful shutdown starting (drain mode)', { signal, activeJobs: state.active.size });
+      // Visible to every loop, not just this closure — see pollForJobs (B2).
+      state.shuttingDown = true;
+
       // Tell every worker to wrap up. Without this the drain simply WAITED for
       // containers that had no reason to exit: a mid-job worker runs to its own
       // timeout, and a worker parked on an open dispute waits for a deadline days
@@ -4273,8 +4305,12 @@ program
           const signature = signMessage(agentInfo.wif, message, J41_NETWORK);
           await agent.client.setAgentStatus(verusId, 'inactive', signature, timestamp, nonce);
           console.log(`   ✅ ${agentInfo.id}: status → inactive`);
+          agentInfo.platformStatus = 'inactive';
           _deactivatedByShutdown.push(agentInfo.id);
-          try { await agent.setOnChainStatus('inactive'); } catch {}
+          // On-chain only when explicitly requested — see B5 at the activation loop.
+          if (process.env.J41_STATUS_TOGGLE_ONCHAIN === '1') {
+            try { await agent.setOnChainStatus('inactive'); } catch {}
+          }
           // Trigger backend re-index so marketplace shows offline immediately
           try {
             await agent.client.refreshAgent(agentInfo.iAddress || agentInfo.identity);
@@ -6612,6 +6648,19 @@ let _polling = false;
 /** Cycles the poll loop skipped because the previous one overran. Surfaced on /health. */
 let _pollSkips = 0;
 async function pollForJobs(state) {
+  // B2: once shutdown begins, stop taking on new work. `shuttingDown` used to be a
+  // closure variable no other function could see, so this loop kept signing and
+  // accepting jobs during a drain — after every agent had been marked offline. A
+  // buyer could pay into a job whose seller was mid-shutdown, stranding their money.
+  // Post-delivery transitions and the dispute reconciler below still run: work
+  // already in flight must keep being serviced while we drain.
+  if (state.shuttingDown) {
+    if (!state._loggedDrainPollSkip) {
+      state._loggedDrainPollSkip = true;
+      console.log('[Poll] Shutting down — not accepting new jobs (in-flight work continues to drain)');
+    }
+    return;
+  }
   if (_polling) {
     // A skipped cycle is the symptom of the poll loop taking longer than its own
     // interval — at N agents that is (N-1)*500ms of stagger plus N API round

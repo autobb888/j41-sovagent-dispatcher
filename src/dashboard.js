@@ -2972,7 +2972,29 @@ async function main() {
             stdio: ['ignore', fs.openSync('/tmp/dispatcher.log', 'a'), fs.openSync('/tmp/dispatcher.log', 'a')],
           });
           child.unref();
-          console.log(`\n  ✅ Dispatcher started (PID ${child.pid})\n  Logs: tail -f /tmp/dispatcher.log\n`);
+
+          // B3: this used to claim success unconditionally. The child is spawned with
+          // stdio 'ignore', so it has no TTY — and with an encrypted key pool and no
+          // passphrase in the environment it exits within a second. The operator who
+          // followed our own `encrypt-keys` hardening advice therefore got a Start
+          // button that ALWAYS reported success and never started anything.
+          // Wait briefly and report what actually happened.
+          const _alive = await new Promise(resolve => {
+            let settled = false;
+            child.on('exit', (code) => { if (!settled) { settled = true; resolve({ ok: false, code }); } });
+            setTimeout(() => { if (!settled) { settled = true; resolve({ ok: true }); } }, 2500);
+          });
+
+          if (_alive.ok) {
+            console.log(`\n  ✅ Dispatcher started (PID ${child.pid})\n  Logs: tail -f /tmp/dispatcher.log\n`);
+          } else {
+            console.log(`\n  ❌ Dispatcher exited immediately (code ${_alive.code}).`);
+            console.log('     Most common cause: the key pool is encrypted and no passphrase is available.');
+            console.log('     A dashboard-spawned dispatcher has no terminal to prompt on, so set');
+            console.log('     J41_KEYS_PASSPHRASE in the environment, or start it from a terminal:');
+            console.log('       j41-dispatcher start');
+            console.log('     Full reason: tail -20 /tmp/dispatcher.log\n');
+          }
         }
         await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
       }); break;
