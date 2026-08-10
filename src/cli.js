@@ -1219,7 +1219,18 @@ program
         console.error('❌ --max-concurrent must be a positive number');
         process.exit(1);
       }
-      config.maxConcurrent = n;
+      // L8 — this wrote `maxConcurrent` into the legacy config.json, but `start`
+      // resolves capacity from `config.toml`'s runtime.max_concurrent and the comment
+      // there says the legacy key is "deliberately NOT consulted". So the command
+      // printed success and changed nothing. Write where the value is actually read.
+      config.maxConcurrent = n; // legacy mirror, harmless
+      try {
+        const { saveDispatcherConfig } = require('./config-loader.js');
+        saveDispatcherConfig({ runtime: { max_concurrent: n } });
+      } catch (e) {
+        console.error(`❌ Could not write max_concurrent to config.toml: ${e.message}`);
+        process.exit(1);
+      }
       changed = true;
     }
 
@@ -3706,7 +3717,13 @@ program
             const rateLimits = (apiSvc.rateLimits && Object.keys(apiSvc.rateLimits).length)
               ? apiSvc.rateLimits
               : (localCfg.rateLimits || {});
-            const upstreamAuth = apiSvc.upstreamAuth || localCfg.apiEndpointAuth || '';
+            // T6 — the TUI's API-endpoint screen saves the credential into
+            // agent-config.json as `upstreamAuth`, but this only ever read
+            // `apiEndpointAuth`, so a key configured through the dashboard was NEVER
+            // sent upstream: the proxy forwarded unauthenticated and every request
+            // failed with no indication why. Accept both names; `apiEndpointAuth` is
+            // what `api-setup --upstream-auth` writes.
+            const upstreamAuth = apiSvc.upstreamAuth || localCfg.upstreamAuth || localCfg.apiEndpointAuth || '';
             agentConfigs.set(a.id, {
               endpointUrl: apiSvc.endpointUrl,
               modelPricing,

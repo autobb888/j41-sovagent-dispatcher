@@ -138,3 +138,40 @@ test('an unverified buyer address still routes to needs_review, not auto-approva
   assert.equal(e.status, 'needs_review');
   assert.match(e.reason, /ADDRESS UNVERIFIED/);
 });
+
+// ── M5: an unusable agreed percentage must be loud, not silent ──────────────
+//
+// A seller-agreed refund whose percent is absent or outside (0,100] was dropped with
+// no ledger entry, no event and no log line — the same silent-loss class this module
+// documents as fixed in 2.12.2, reached through a different door. respond-dispute does
+// not range-check the flag, so an operator typo is a live trigger and the buyer is
+// simply never paid.
+
+test('M5: an out-of-range agreed percentage is not queued, and says so', () => {
+  const logged = [];
+  const origErr = console.error;
+  console.error = (...a) => logged.push(a.join(' '));
+  try {
+    for (const bad of [150, 0, -10, 'abc', null, undefined]) {
+      const jobs = [{ id: 'job-m5-bad', status: 'disputed', amount: 1 }];
+      const disputes = { 'job-m5-bad': { action: 'refund', refund_percent: bad } };
+      const picked = selectRefundableDisputes(jobs, disputes);
+      assert.equal(picked.length, 0, `percent ${JSON.stringify(bad)} must not be auto-queued`);
+    }
+  } finally { console.error = origErr; }
+  assert.ok(logged.length >= 6, 'every dropped refund must produce an operator-visible line');
+  assert.ok(logged.some(l => /respond-dispute/.test(l)),
+    'the message must name the command that fixes it');
+});
+
+test('M5: a valid agreed percentage is still queued silently', () => {
+  const logged = [];
+  const origErr = console.error;
+  console.error = (...a) => logged.push(a.join(' '));
+  try {
+    const jobs = [{ id: 'job-m5-ok', status: 'disputed', amount: 1 }];
+    const disputes = { 'job-m5-ok': { action: 'refund', refund_percent: 50 } };
+    assert.equal(selectRefundableDisputes(jobs, disputes).length, 1);
+  } finally { console.error = origErr; }
+  assert.equal(logged.length, 0, 'the happy path must not warn');
+});

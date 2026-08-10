@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+## 2.25.0
+
+First triaged batch of the audit mediums. All three chosen for the same reason: they
+**fail silently while reporting success** — this codebase's recurring weakness, and the
+one an operator cannot debug.
+
+**M5 — a seller-agreed refund could vanish with no trace.** If the agreed percentage
+was absent or outside `(0,100]`, `selectRefundableDisputes` dropped the job: no ledger
+entry, no event, no log line. That is the exact silent-loss class `dispute-sweep.js`
+documents as fixed in 2.12.2, reached through a different door — and `respond-dispute`
+does not range-check the flag, so an operator typo (`--refund-percent 150`) is a live
+trigger and the buyer is simply never paid. It still does **not** auto-queue (inventing
+an amount the seller did not agree to would be worse), but it now prints the job, the
+unusable value, and the exact command that fixes it.
+
+**T6 — a credential configured in the TUI was never sent.** The API-endpoint screen
+saves it into `agent-config.json` as `upstreamAuth`; the proxy wiring only ever read
+`apiEndpointAuth`. So an operator who configured their upstream key through the
+dashboard got a proxy that forwarded unauthenticated, and every request failed with no
+indication why. Both names are now accepted.
+
+**L8 — `config --max-concurrent` printed success and changed nothing.** It wrote
+`maxConcurrent` into the legacy `config.json`, while `start` resolves capacity from
+`config.toml`'s `runtime.max_concurrent` — and the comment there says the legacy key is
+"deliberately NOT consulted". Now written where it is actually read.
+
+973 tests. M5 mutation-checked; T6 and L8 are wiring paths without unit coverage.
+
 ## 2.24.0
 
 The last two audit highs. Both were controls this codebase already had, unapplied at a

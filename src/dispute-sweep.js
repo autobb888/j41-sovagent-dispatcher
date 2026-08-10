@@ -58,7 +58,21 @@ function selectRefundableDisputes(jobs, disputeByJobId) {
 
     // (2) Seller agreed to refund. Explicit consent outranks the heuristics —
     // a delivered job can still be refunded if the seller said so.
-    if (d.action === 'refund') return agreedRefundPercent(d) !== null;
+    // M5 — a seller-agreed refund whose percentage is absent or outside (0,100] used
+    // to be dropped here with NO ledger entry, NO event and NO log line: the same
+    // silent-loss class this file documents as fixed in 2.12.2, reached through a
+    // different door. `respond-dispute` does not range-check the flag, so an operator
+    // typo (`--refund-percent 150`, or `1o0`) is a live trigger and the buyer is
+    // simply never paid. Keep it OUT of the auto-queue — we must not invent an amount
+    // the seller did not agree to — but make it impossible to miss.
+    if (d.action === 'refund') {
+      if (agreedRefundPercent(d) !== null) return true;
+      const raw = d.refund_percent ?? d.refundPercent;
+      console.error(`[DisputeSweep] ⚠️  ${String(j.id).substring(0, 8)}: seller agreed to a refund but the ` +
+        `percentage is unusable (${JSON.stringify(raw)}). NOT queueing — the amount owed is ambiguous. ` +
+        `Fix it with: j41-dispatcher respond-dispute ${j.id} --agent <id> --action refund --refund-percent <1-100> --message "..."`);
+      return false;
+    }
 
     // (1) Unanswered + buyer got nothing.
     if (d.action !== 'pending') return false;
