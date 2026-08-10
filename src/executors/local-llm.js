@@ -60,14 +60,27 @@ function resolveLLMConfig() {
   const apiKey = process.env.J41_LLM_API_KEY || process.env.KIMI_API_KEY || (preset?.envKey ? process.env[preset.envKey] : '') || '';
   const customHeaders = preset?.headers ? preset.headers(apiKey) : null;
 
-  return { baseUrl, model, apiKey, customHeaders, provider: provider || 'custom' };
+  // F2 — `ollama`, `lmstudio` and `vllm` are declared with `envKey: ''` because they
+  // need no credential. Every gate below tested `apiKey` truthiness, so those three
+  // fell through to generateTemplateResponse — and that filler was then DELIVERED AND
+  // HASHED as the buyer's paid work product. Preflight could not catch it: it probes
+  // the endpoint, which is up. The TUI even labels them "(no key needed)".
+  //
+  // `usable` is the question the call sites actually mean: can we reach a real model?
+  const keyless = !!preset && preset.envKey === '';
+  return {
+    baseUrl, model, apiKey, customHeaders,
+    provider: provider || 'custom',
+    keyless,
+    usable: Boolean(apiKey) || (keyless && Boolean(baseUrl)),
+  };
 }
 
 const LLM_CONFIG = resolveLLMConfig();
 const MAX_CONVERSATION_LOG = parseInt(process.env.MAX_CONVERSATION_LOG || '50');
 const MAX_TOOL_ROUNDS = parseInt(process.env.J41_MAX_TOOL_ROUNDS || '10');
 
-if (LLM_CONFIG.apiKey) {
+if (LLM_CONFIG.usable) {
   console.log(`[LLM] Provider: ${LLM_CONFIG.provider}, Model: ${LLM_CONFIG.model}, Base: ${LLM_CONFIG.baseUrl}`);
 } else {
   console.log(`[LLM] No API key — using template responses`);
@@ -118,7 +131,7 @@ class LocalLLMExecutor extends Executor {
 
     // Send greeting — use LLM if available, template fallback
     let greeting;
-    if (LLM_CONFIG.apiKey) {
+    if (LLM_CONFIG.usable) {
       try {
         const greetResult = await callLLM(this.systemPrompt, [
           { role: 'user', content: `[SYSTEM: The buyer just connected. Introduce yourself briefly and ask how you can help with this job. Keep it under 2 sentences.]` },
@@ -205,13 +218,13 @@ class LocalLLMExecutor extends Executor {
       this.conversationLog.splice(0, this.conversationLog.length - MAX_CONVERSATION_LOG + 1, first);
     }
 
-    if (LLM_CONFIG.apiKey && this.llmBusy) {
+    if (LLM_CONFIG.usable && this.llmBusy) {
       console.log(`[CHAT] LLM busy, queuing acknowledgment`);
       return 'I received your message — one moment while I finish my current thought.';
     }
 
     let response;
-    if (LLM_CONFIG.apiKey) {
+    if (LLM_CONFIG.usable) {
       // Budget gate (audit fix #1): no LLM call ever goes out over budget.
       // The extension ask is handled by the setBudget warning callback;
       // here we pause generation and tell the buyer honestly.
@@ -358,7 +371,9 @@ class LocalLLMExecutor extends Executor {
 function buildHeaders() {
   const h = { 'Content-Type': 'application/json', 'User-Agent': 'j41-agent/1.0' };
   if (LLM_CONFIG.customHeaders) Object.assign(h, LLM_CONFIG.customHeaders);
-  else h['Authorization'] = `Bearer ${LLM_CONFIG.apiKey}`;
+  // A keyless local endpoint gets no Authorization header — `Bearer ` with an empty
+  // key is a malformed credential some servers reject outright.
+  else if (LLM_CONFIG.apiKey) h['Authorization'] = `Bearer ${LLM_CONFIG.apiKey}`;
   return h;
 }
 

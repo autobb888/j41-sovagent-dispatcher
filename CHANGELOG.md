@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+## 2.21.0
+
+The four **first-run fail-opens** from the audit. They share one shape: the first-run
+path detects the problem correctly and then reports success — so a new operator's very
+first install produces a dispatcher that takes money and returns nothing usable.
+
+**F1 — `setup` reported success over an empty on-chain identity.** A fresh agent has no
+UTXOs, so `publishVdxf` warned and `return`ed. The SDK cannot distinguish that from a
+completed publish: it marked `vdxf_published` and walked the agent to `ready`, and
+`setup` printed "Setup Complete". Unconditional for every first agent. The documented
+recovery was a no-op too — `finalize` never clears state, so the `ready` marker makes a
+rerun return instantly. It now throws, which is what stops the state machine advancing
+over a step that did not happen.
+
+**F2 — keyless local providers delivered template filler as the paid work product.**
+`ollama`, `lmstudio` and `vllm` are declared `envKey: ''` because they need no
+credential, but every gate in the executor tested `apiKey` truthiness — so all three
+fell through to `generateTemplateResponse`, and that filler was delivered and hashed as
+the buyer's deliverable. Preflight could not catch it: it probes the endpoint, which is
+up. The TUI even labels them "(no key needed)". Config now exposes `usable`
+(a key, or a keyless preset with a baseUrl) and the gates ask that instead. A keyless
+endpoint also no longer receives a `Bearer ` header with an empty key.
+
+**F3 — `quickstart` discarded the key it collected.** It printed
+`export OPENAI_API_KEY=…`, which `buildContainerEnv` deliberately never reads — provider
+keys come from `config.toml`'s `[provider_keys]`, never from the dispatcher's own
+environment. Following the printed instructions exactly produced a fleet that declined
+every job. The key is now persisted to `config.toml`. It also offered a `claude`
+provider that does not exist (the real presets are `claude-opus` / `claude-sonnet` /
+`claude-haiku`); the prompt now validates against `LLM_PRESETS` and re-asks.
+
+**F7 — local mode accepted and charged for jobs before refusing them.** The isolation
+gate lived inside `startJobLocal`, so a dispatcher in `runtime=local` without
+`--dev-unsafe` started cleanly, advertised its agents, accepted jobs, took payment, and
+only then refused to run them. Both installers default to `local` when Docker is absent
+and the `curl | bash` path takes it silently, so this was the out-of-the-box state for
+anyone without Docker. It now refuses at startup, before anything can be accepted.
+
+961 tests. F1/F2 covered and mutation-checked; F3 and F7 are interactive/startup paths
+with no unit coverage, flagged as such.
+
 ## 2.20.0
 
 Eight parallel domain audits (money, keys, isolation, trust-boundary, liveness, scale,

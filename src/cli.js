@@ -1101,10 +1101,22 @@ function createFinalizeHooks(agentId, identityName, profile, services = [], disp
       console.log(`   ↳ Identity data retrieved, ${utxos.length} UTXO(s) available`);
 
       if (!utxos.length) {
+        // F1 — this used to `return`, and the SDK cannot distinguish that from a
+        // completed publish: it marked `vdxf_published` and walked the agent to
+        // `ready`, so `setup` printed "Setup Complete" over an EMPTY on-chain
+        // identity. Unconditional for every first agent, because a fresh identity has
+        // no UTXOs. Worse, the documented recovery is a no-op — `finalize` never
+        // clears state, so the `ready` marker makes a rerun return instantly.
+        // Throwing is what stops the state machine advancing on a step that did not
+        // happen.
         console.log('   ⚠️  No UTXOs available — identity needs funds for tx fee');
         console.log(`   ↳ Send at least 0.0001 VRSCTEST to ${keys.address}`);
         console.log(`   ↳ VDXF plan saved to: ${planPath}`);
-        return;
+        console.log('   ↳ Then re-run this step; nothing was published on-chain.');
+        throw new Error(
+          `VDXF publish skipped: ${keys.address} has no spendable UTXOs for the transaction fee. ` +
+          'Fund it with at least 0.0001 and run setup again — the on-chain identity is still empty.',
+        );
       }
 
       const _ci = await agent.client.getChainInfo();
@@ -1302,8 +1314,17 @@ program
     const template = await ask('Choose a template', 'general-assistant');
 
     // 3. LLM provider
-    console.log('\nPopular LLM providers: openai, claude, groq, deepseek, ollama');
-    const provider = await ask('LLM provider', 'openai');
+    // F3 — "claude" is not a preset. The real ones are claude-opus / claude-sonnet /
+    // claude-haiku (they route via OpenRouter, because Anthropic's native API uses
+    // /messages rather than /chat/completions). Offering a name that does not resolve
+    // sent the operator straight to a fleet that declines every job.
+    console.log('\nPopular LLM providers: openai, claude-sonnet, groq, deepseek, ollama');
+    const { LLM_PRESETS: _PRESETS } = require('./executors/local-llm.js');
+    let provider = await ask('LLM provider', 'openai');
+    while (provider && !_PRESETS[provider]) {
+      console.log(`  ✗ "${provider}" is not a known provider. Valid: ${Object.keys(_PRESETS).join(', ')}`);
+      provider = await ask('LLM provider', 'openai');
+    }
 
     // 4. API key
     let apiKey = '';
@@ -1329,20 +1350,26 @@ program
     config.runtime = runtime;
     saveConfig(config);
 
-    // Write env hints
-    const envHints = [`J41_LLM_PROVIDER=${provider}`];
-    if (apiKey) {
-      const { LLM_PRESETS } = require('./executors/local-llm.js');
-      const preset = LLM_PRESETS[provider];
-      if (preset?.envKey) envHints.push(`${preset.envKey}=${apiKey}`);
+    // F3 — the key used to be collected and then DISCARDED, with the operator told to
+    // `export OPENAI_API_KEY=…`. buildContainerEnv never reads that: provider keys come
+    // from config.toml's [provider_keys] (cli.js:7952), deliberately never from the
+    // dispatcher's own environment. Following the printed instructions exactly produced
+    // a fleet that declined every job. Persist it where the dispatcher actually looks.
+    try {
+      const { saveDispatcherConfig } = require('./config-loader.js');
+      const partial = { llm: { provider } };
+      if (apiKey) partial.provider_keys = { [provider]: apiKey };
+      saveDispatcherConfig(partial);
+      console.log(`\n  ✅ Saved provider${apiKey ? ' + API key' : ''} to ~/.j41/dispatcher/config.toml`);
+    } catch (e) {
+      console.log(`\n  ⚠️  Could not write config.toml (${e.message}).`);
+      console.log(`     Set it by hand: [provider_keys] ${provider} = "<your key>"`);
     }
 
-    console.log('Next steps:\n');
-    console.log(`  1. Export your LLM config:`);
-    for (const hint of envHints) console.log(`     export ${hint}`);
-    console.log(`\n  2. Set up your agent:`);
+    console.log('\nNext steps:\n');
+    console.log(`  1. Set up your agent:`);
     console.log(`     j41-dispatcher setup agent-1 ${name} --template ${template}`);
-    console.log(`\n  3. Start the dispatcher:`);
+    console.log(`\n  2. Start the dispatcher:`);
     console.log(`     j41-dispatcher start`);
     console.log('');
   });
@@ -3227,6 +3254,28 @@ program
     console.log('╚══════════════════════════════════════════╝\n');
     // Store --dev-unsafe flag in state for local mode gate
     const _devUnsafe = !!options.devUnsafe;
+
+    // F7 — refuse local mode HERE, before a single job is accepted.
+    //
+    // The gate existed only inside `startJobLocal` (see the "Security gate" below), so
+    // a dispatcher in local mode without --dev-unsafe started cleanly, advertised its
+    // agents, accepted jobs, took the buyer's payment, and only THEN refused to run
+    // them. Both installers default to `runtime=local` when Docker is absent — and the
+    // `curl | bash` path takes that default silently — so this is the out-of-the-box
+    // state for anyone without Docker. Taking money for work we have already decided
+    // not to do is the worst possible ordering.
+    if (RUNTIME === 'local' && !_devUnsafe) {
+      console.error('\n❌ Refusing to start: runtime is "local", which gives containers ZERO isolation.');
+      console.error('   Nothing was accepted and no buyer can pay into this fleet.');
+      console.error('');
+      console.error('   Fix one of these:');
+      console.error('     • Install Docker and switch back:  j41-dispatcher config --runtime docker');
+      console.error('     • Development only, accepting no isolation:  j41-dispatcher start --dev-unsafe');
+      console.error('');
+      console.error('   Local mode was most likely selected automatically by the installer because');
+      console.error('   Docker was not found on this machine.');
+      process.exit(1);
+    }
 
     // Local mode warning timer
     if (RUNTIME === 'local' && _devUnsafe) {
