@@ -1,11 +1,93 @@
 # Dispatcher — release readiness
 
-**Date:** 2026-08-09 (updated after the B1–B5 batch)
-**Assessed build:** 2.18.1 (`e8f740c`), 948 tests, 9-agent fleet on VRSCTEST
-**Verdict: all five blockers fixed and live. Shippable to a pilot operator with
-known caveats; not yet to an unattended third party — see "What still stands".**
+**Date:** 2026-08-10 (rewritten after eight domain audits)
+**Assessed build:** 2.20.0, 955 tests, 9-agent fleet on VRSCTEST
+**Verdict: NOT shippable. Eight parallel audits returned ~106 findings — 1 critical,
+17 high. Four are fixed. The previous verdict on this page ("shippable to a pilot
+operator") was wrong and is retracted.**
 
 ---
+
+## Why the previous verdict was wrong
+
+The 2026-08-09 assessment looked at five operator-surface blockers I had found by
+following live testing, fixed them, and called the product close. Eight targeted audits
+then found **twenty times** as many issues, including one that destroys private keys and
+one that makes the documented install impossible. My assessment was not wrong in what it
+said — it was wrong in how little it had looked at. Live testing finds what testers
+happen to do; it does not find what nobody has tried.
+
+Three of the audit findings landed on claims I had personally made:
+
+- **L3** — I fixed the container-side dispute clock in 2.17.1 and reported the hold
+  working. There was a **fourth** clock in the dispatcher that killed the worker anyway.
+  My own memory note said there were three.
+- **X1** — Fable flagged the `startJob` argument swap on 2026-08-06. I passed it on as
+  "not verified by me" and never came back to it. It was real, and every
+  bounty-awarded job was silently never started.
+- **D1** — I published sixteen releases without ever checking that the tarball could
+  produce a working install.
+
+## Fixed in 2.20.0
+
+| # | Sev | Finding |
+|---|---|---|
+| K1 | **crit** | `writeKeysFile` could drop a plaintext key-less file over encrypted key material — WIF gone, no backup. Guarded in the primitive. Only fires after `encrypt-keys`, i.e. the hardening we recommend created the exposure |
+| D1 | high | `scripts/`, `Dockerfile.job-agent`, `package.docker.json` were missing from the npm tarball while the README makes building the image mandatory |
+| L3 | high | Fourth clock: the dispatcher's own `JOB_TIMEOUT_MS+60s` killed workers holding an open dispute |
+| X1 | high | `bounty.awarded` called `startJob` with swapped arguments; awarded jobs never started |
+
+## Open — 13 high, triaged
+
+**Fail-open on the operator's own path (first-run).** F1 `setup` reports success with an
+empty on-chain identity and the documented recovery is a no-op. F2 `ollama`/`lmstudio`/
+`vllm` resolve an empty key, so template filler is delivered and hashed as the paid work
+product. F3 `quickstart` prints an env var the container never reads. F7 both installers
+default to `local` runtime without Docker and accept paid jobs before refusing them.
+**These make a first install produce a dispatcher that takes money and returns nothing.**
+
+**Money.** M1 the streaming proxy bills the full worst-case reservation when the upstream
+returns 503 — status code is never consulted before billing. M2 the non-streaming path
+never got the same hardening and under-bills instead.
+
+**Isolation.** I1 `Content-Disposition` filename is unsanitised and lands in the host
+broker's watch dir — a forged `executeOnChain` drains the fee tank. I2 resume rewrites
+`description.txt` following symlinks, giving an arbitrary host-path overwrite.
+
+**Liveness.** L1 the shutdown stall watchdog budgets 30 s against a ~93 s SDK worst case
+and writes the restore marker only after the whole loop. L2 `AutoRemove: true` races the
+inspect poller, so Docker container crashes are invisible — `containers_unhealthy`, the
+README's canonical alarm, is pinned at 0 in the production runtime.
+
+**Scale.** S1 the documented scale remedy takes the operator's own fleet down. S2 the
+poll cycle is ~3 round trips per agent, not one, so the published table is wrong from
+N=31. S3 `/j41/deposit/report` does outbound work before the signature check with no
+rate limit. S4/S5 two costs with no steady state.
+
+**Keys.** K2 `init` never calls the unlock guard, so new agents land plaintext on an
+encrypted pool.
+
+## The pattern worth acting on
+
+Four separate audits independently reported the same shape: **a control that already
+exists in this codebase, correctly implemented, simply not applied at a second site.**
+`O_NOFOLLOW` on the read path but not the write. Nonce-after-verify on one route but not
+its neighbour. A scan on arrival but not on re-entry. A rate limit on one webhook route
+but not the adjacent one. That is not a knowledge gap; it is a review gap, and it is
+cheap to close with a checklist of "where else does this pattern appear".
+
+## Recommendation
+
+**Do not ship.** Next batch, in order: the four first-run fail-opens (F1/F2/F3/F7),
+because they are what a new operator hits in the first ten minutes; then M1/M2 and
+I1/I2; then L1/L2 and K2. Scale and docs-truth after, since they mislead rather than
+break.
+
+The full reports are in `AUDIT/`, with per-domain claim checklists.
+
+---
+
+## Superseded assessment (2026-08-09) — kept for the record
 
 ## The one-paragraph version
 
