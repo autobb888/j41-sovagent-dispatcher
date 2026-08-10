@@ -8259,6 +8259,34 @@ function makeCappedLogWriter(logStream, maxBytes) {
 // follow symlinks — a malicious container could plant one to exfiltrate a host
 // secret. Returns the content, or null if the path is a symlink (ELOOP) or
 // the file no longer exists (ENOENT — handles concurrent removal safely).
+/**
+ * I2 — write a job file without following a symlink.
+ *
+ * Pause tears the container down but leaves `jobDir` in place; on resume
+ * `startJobContainer` re-wrote `description.txt` with a plain `writeFileSync`, which
+ * FOLLOWS symlinks. A container that plants one before it is paused gets an arbitrary
+ * host path overwritten with up to 1 MB of buyer-authored text, running as the operator
+ * user. The read path already had `readJobFileNoFollow`; the write path had no
+ * counterpart — the same "control exists, not applied at the second site" shape the
+ * audits reported four times.
+ *
+ * O_NOFOLLOW fails with ELOOP on a symlink; we unlink and retry once so a planted link
+ * cannot wedge a legitimate resume.
+ */
+function writeJobFileNoFollow(p, data) {
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW;
+  let fd;
+  try {
+    fd = fs.openSync(p, flags, 0o600);
+  } catch (e) {
+    if (e.code !== 'ELOOP') throw e;
+    console.warn(`  ⚠️  ${p} is a symlink — refusing to follow it. Removing and rewriting.`);
+    try { fs.unlinkSync(p); } catch {}
+    fd = fs.openSync(p, flags, 0o600);
+  }
+  try { fs.writeFileSync(fd, data); } finally { fs.closeSync(fd); }
+}
+
 function readJobFileNoFollow(p, enc = 'utf8') {
   let fd;
   try { fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
@@ -8306,7 +8334,7 @@ async function startJobContainer(state, job, agentInfo) {
   }
 
   // Write job data
-  fs.writeFileSync(path.join(jobDir, 'description.txt'), desc);
+  writeJobFileNoFollow(path.join(jobDir, 'description.txt'), desc);
   fs.writeFileSync(path.join(jobDir, 'buyer.txt'), job.buyerVerusId);
   fs.writeFileSync(path.join(jobDir, 'amount.txt'), String(job.amount));
   fs.writeFileSync(path.join(jobDir, 'currency.txt'), job.currency);
@@ -8810,7 +8838,7 @@ async function startJobLocal(state, job, agentInfo) {
   fs.mkdirSync(jobDir, { recursive: true });
 
   // Write job data (same as Docker mode)
-  fs.writeFileSync(path.join(jobDir, 'description.txt'), job.description);
+  writeJobFileNoFollow(path.join(jobDir, 'description.txt'), job.description);
   fs.writeFileSync(path.join(jobDir, 'buyer.txt'), job.buyerVerusId);
   fs.writeFileSync(path.join(jobDir, 'amount.txt'), String(job.amount));
   fs.writeFileSync(path.join(jobDir, 'currency.txt'), job.currency);

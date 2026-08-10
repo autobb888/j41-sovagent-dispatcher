@@ -504,8 +504,26 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         // CASE the buyer declared (max_tokens, bounded by the cap = the same value
         // we reserved) so a non-compliant upstream can't be exploited for free
         // output. Input falls back to the estimate (no per-stream input signal).
+        // M1 — the worst-case settle is an anti-abuse measure against a non-compliant
+        // upstream that returns real output without a usage frame. It must NOT apply to
+        // an upstream that returned an ERROR: a 503 has no usage frame either, and the
+        // buyer received an error page, not tokens. `proxyRes.statusCode` was passed
+        // through to the client but never consulted before billing, so a buyer sending
+        // `stream:true, max_tokens:200000` was charged the full 204,000-token
+        // reservation for a failed request. `proxyReq.on('error')` does not fire —
+        // the connection succeeded. The circuit breaker only opens after N consecutive
+        // failures, so the first N are billed in full.
+        const _upstreamOk = proxyRes.statusCode >= 200 && proxyRes.statusCode < 300;
         if (!sawUsage) {
-          outputTok = reserveOutput;
+          if (_upstreamOk) {
+            outputTok = reserveOutput;
+          } else {
+            // No completion was delivered. Charge nothing for output, and nothing for
+            // input either — the buyer got an error, not a service.
+            outputTok = 0;
+            inputTok = 0;
+            console.warn(`[proxy] upstream ${proxyRes.statusCode} on a streaming request — not billing (job ${key ? String(key).slice(0, 8) : '?'})`);
+          }
         }
 
         // Adjust reservation with actual token counts (or worst case if usage absent)
@@ -554,13 +572,33 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         let inputTok = estimatedInput;
         let outputTok = estimatedOutput;
 
+        let sawUsageNS = false;
         try {
           const parsed = JSON.parse(responseBody.toString());
           if (parsed.usage) {
+            sawUsageNS = true;
             inputTok = parsed.usage.prompt_tokens || estimatedInput;
             outputTok = parsed.usage.completion_tokens || estimatedOutput;
           }
         } catch {}
+
+        // M2 — this path never received the hardening the streaming path did, and it
+        // is wrong in BOTH directions:
+        //   • an upstream that omits usage was billed a flat `estimatedOutput`
+        //     (~2000 tokens) regardless of how much it actually returned — a buyer
+        //     just sets `stream:false` to get cheap unmetered output; and
+        //   • an ERROR response was billed the same estimate, so the buyer paid for a
+        //     503 exactly as the streaming path did.
+        const _okNS = proxyRes.statusCode >= 200 && proxyRes.statusCode < 300;
+        if (!_okNS) {
+          inputTok = 0;
+          outputTok = 0;
+          console.warn(`[proxy] upstream ${proxyRes.statusCode} — not billing (job ${key ? String(key).slice(0, 8) : '?'})`);
+        } else if (!sawUsageNS) {
+          // Mirror the streaming defence: settle against the declared worst case so a
+          // non-compliant upstream cannot serve a large completion for a flat estimate.
+          outputTok = reserveOutput;
+        }
 
         const result = adjustCredit(agentId, record.buyerVerusId, model, inputTok, outputTok, creditCheck.reserved, config.modelPricing || []);
         recordUsage(agentId, key, inputTok, outputTok);

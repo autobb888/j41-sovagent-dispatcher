@@ -1248,6 +1248,27 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
         knownFileIds.add(f.id);
         try {
           const localPath = await agent.downloadFileTo(job.id, f.id, filesDir);
+          // I1 — the SDK derives the on-disk name from the `Content-Disposition`
+          // header (`filename="([^"]+)"`, unsanitised), so a traversing filename can
+          // land the payload OUTSIDE filesDir — including `/app/sign/req/`, the host
+          // broker's watch dir, whose own filter `^[a-f0-9-]{8,80}\.json$` such a name
+          // satisfies. A forged `executeOnChain` there broadcasts an identity tx and
+          // drains the fee tank; a forged `budget_increased` lifts the token ceiling.
+          // No code execution or prompt injection required.
+          //
+          // We cannot sanitise before the SDK writes, so verify after and remove
+          // anything that escaped. NOTE: this closes the window, it does not eliminate
+          // it — the file exists briefly at the escaped path. The durable fix is
+          // broker-side (only act on request files the host itself created); tracked
+          // as I1-residual.
+          const _resolved = path.resolve(localPath);
+          const _root = path.resolve(filesDir) + path.sep;
+          if (!_resolved.startsWith(_root)) {
+            try { fs.unlinkSync(_resolved); } catch {}
+            console.error(`[FILES] ⛔ SECURITY: download for ${f.id} escaped the job files dir ` +
+              `(${_resolved}) — removed. Filename came from an untrusted Content-Disposition header.`);
+            continue;
+          }
           console.log(`[FILES] ✓ ${f.filename} (${(f.sizeBytes / 1024).toFixed(1)}KB)`);
         } catch (dlErr) {
           console.error(`[FILES] ⚠️  Failed to download ${f.filename}: ${dlErr.message}`);

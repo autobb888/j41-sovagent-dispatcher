@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+## 2.22.0
+
+Audit highs: two money defects in the paid proxy, two container-escape seams.
+
+**M1 — a streaming upstream error billed the full worst-case reservation.** The
+worst-case settle is the correct defence against an upstream that returns real output
+without a usage frame, but `proxyRes.statusCode` was passed through to the client and
+**never consulted before billing** — and a 503 has no usage frame either. A buyer
+sending `stream:true, max_tokens:200000` was charged ~204,000 tokens for an error page.
+`proxyReq.on('error')` does not fire because the connection succeeded, and the circuit
+breaker only opens after N consecutive failures, so the first N bill in full.
+
+**M2 — the non-streaming path had the same gap with the opposite sign.** It never
+received the streaming path's hardening: an upstream that omits usage was billed a flat
+~2,000-token estimate regardless of what it actually returned (a buyer just sets
+`stream:false`), and an error response was billed that estimate too.
+
+Both now settle on status: a non-2xx bills **nothing** — no output *and* no input,
+because the buyer received an error rather than a service — while a 2xx with no usage
+frame still settles worst-case, so the anti-abuse defence is intact. Tested against the
+real handler with 503 upstream mocks, and mutation-checked.
+
+**I1 (partial) — a downloaded file could escape the job directory.** The SDK derives
+the on-disk name from an unsanitised `Content-Disposition` header, so a traversing
+filename can land the payload in `/app/sign/req/` — the host broker's watch dir, whose
+own filter `^[a-f0-9-]{8,80}\.json$` such a name satisfies. A forged `executeOnChain`
+there broadcasts an identity transaction and drains the fee tank; a forged
+`budget_increased` lifts the token ceiling. No code execution or prompt injection
+required.
+
+We cannot sanitise before the SDK writes, so the download is now verified to have
+landed inside the job's files directory and removed if it did not. **This narrows the
+window, it does not close it** — the file exists briefly at the escaped path, and a
+broker poll could read it first. The durable fix is broker-side (act only on request
+files the host itself created) and is tracked as I1-residual, still open.
+
+**I2 — resume could overwrite an arbitrary host path.** Pause tears the container down
+but leaves `jobDir`; on resume, `description.txt` was rewritten with a plain
+`writeFileSync`, which follows symlinks. A container that plants one gets any host path
+overwritten with up to 1 MB of buyer-authored text, as the operator user. The read path
+already had `readJobFileNoFollow`; there was no write counterpart. Added
+`writeJobFileNoFollow` (O_NOFOLLOW, unlink-and-retry once so a planted link cannot
+wedge a legitimate resume) and both call sites now use it.
+
+963 tests.
+
 ## 2.21.0
 
 The four **first-run fail-opens** from the audit. They share one shape: the first-run

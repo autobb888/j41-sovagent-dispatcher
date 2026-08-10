@@ -66,6 +66,14 @@ function startUpstream() {
           res.write('data: {"usage":{"prompt_tokens":10,"completion_tokens":20}}\n\n');
           res.write('data: [DONE]\n\n');
           res.end();
+        } else if (upstreamMode === 'stream-503') {
+          // Upstream is down. No usage frame — same as a non-compliant upstream, but
+          // the buyer received nothing. M1.
+          res.writeHead(503, { 'Content-Type': 'text/event-stream' });
+          res.end('data: {"error":"upstream unavailable"}\n\n');
+        } else if (upstreamMode === 'json-503') {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end('{"error":"upstream unavailable"}');
         } else if (upstreamMode === 'stream-no-usage') {
           // Upstream ignores include_usage → never emits a usage frame.
           res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -253,4 +261,48 @@ test('H2: streaming WITH a usage frame still settles on actual usage', async () 
   const actual = calculateCost(PRICING, MODEL, 10, 20);
   assert.ok(Math.abs(getBalance(agentId, buyer) - (worst - actual)) < 1e-9,
     `should settle on the actual usage frame; got ${getBalance(agentId, buyer)}`);
+});
+
+// ── M1/M2: an upstream ERROR must not be billed ─────────────────────────────
+//
+// The worst-case settle is the right defence against an upstream that returns real
+// output without a usage frame. But `proxyRes.statusCode` was never consulted before
+// billing, and a 503 has no usage frame either — so a buyer sending
+// `stream:true, max_tokens:200000` was charged the full ~204,000-token reservation for
+// an error page. proxyReq.on('error') does not fire (the connection succeeded), and the
+// circuit breaker only opens after N consecutive failures, so the first N bill in full.
+
+test('M1: a streaming upstream 503 bills NOTHING — not the worst-case reservation', async () => {
+  inflight._reset();
+  upstreamMode = 'stream-503';
+  const agentId = 'agent-m1-503';
+  const buyer = 'iBuyerM1';
+  const key = mintApiKey(agentId, buyer).key;
+  const maxTokens = 50000;
+  const worst = calculateCost(PRICING, MODEL, 4000, maxTokens);
+  creditDeposit(agentId, buyer, worst, 'tx-m1-503');
+
+  await runProxy(agentId, key, { model: MODEL, stream: true, max_tokens: maxTokens, messages: [] });
+  await new Promise((res) => setTimeout(res, 50));
+
+  const remaining = getBalance(agentId, buyer);
+  assert.ok(Math.abs(remaining - worst) < 1e-9,
+    `a 503 must leave the balance untouched; deposited=${worst} remaining=${remaining}`);
+});
+
+test('M2: a non-streaming upstream 503 bills NOTHING', async () => {
+  inflight._reset();
+  upstreamMode = 'json-503';
+  const agentId = 'agent-m2-503';
+  const buyer = 'iBuyerM2';
+  const key = mintApiKey(agentId, buyer).key;
+  const deposit = calculateCost(PRICING, MODEL, 4000, 20000);
+  creditDeposit(agentId, buyer, deposit, 'tx-m2-503');
+
+  await runProxy(agentId, key, { model: MODEL, stream: false, max_tokens: 20000, messages: [] });
+  await new Promise((res) => setTimeout(res, 50));
+
+  const remaining = getBalance(agentId, buyer);
+  assert.ok(Math.abs(remaining - deposit) < 1e-9,
+    `a non-streaming 503 must leave the balance untouched; deposited=${deposit} remaining=${remaining}`);
 });
