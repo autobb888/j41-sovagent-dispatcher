@@ -1,89 +1,65 @@
 # Dispatcher — release readiness
 
-**Date:** 2026-08-10 (rewritten after eight domain audits)
-**Assessed build:** 2.20.0, 955 tests, 9-agent fleet on VRSCTEST
-**Verdict: NOT shippable. Eight parallel audits returned ~106 findings — 1 critical,
-17 high. Four are fixed. The previous verdict on this page ("shippable to a pilot
-operator") was wrong and is retracted.**
+**Date:** 2026-08-10 (updated — all audit highs closed)
+**Assessed build:** 2.24.0, 971 tests, 9-agent fleet on VRSCTEST
+**Verdict: still NOT shippable, but for a different reason than a week ago.** The
+1 critical and all 17 high findings from the eight domain audits are fixed. What blocks
+release now is coverage, not known defects: ~40 mediums are untriaged, one high is only
+partially fixed, and the full operator lifecycle has never been run end to end.
 
 ---
 
-## Why the previous verdict was wrong
+## What changed since the audits
 
-The 2026-08-09 assessment looked at five operator-surface blockers I had found by
-following live testing, fixed them, and called the product close. Eight targeted audits
-then found **twenty times** as many issues, including one that destroys private keys and
-one that makes the documented install impossible. My assessment was not wrong in what it
-said — it was wrong in how little it had looked at. Live testing finds what testers
-happen to do; it does not find what nobody has tried.
+| Rel | Findings closed |
+|---|---|
+| 2.20.0 | **K1 (crit)** key destruction · **D1** unrunnable npm install · **L3** 4th dispute clock · **X1** bounty arg swap |
+| 2.21.0 | **F1/F2/F3/F7** the four first-run fail-opens |
+| 2.22.0 | **M1/M2** proxy billed for upstream errors · **I1 (partial)** file traversal · **I2** symlink write |
+| 2.23.0 | **L2** invisible container crashes · **L1** shutdown fleet-strand · **K2** `init` key downgrade |
+| 2.24.0 | **S3** deposit nonce/rate-limit · **S1** the scale remedy that killed your fleet |
 
-Three of the audit findings landed on claims I had personally made:
+Two of these are worth remembering beyond the fix:
 
-- **L3** — I fixed the container-side dispute clock in 2.17.1 and reported the hold
-  working. There was a **fourth** clock in the dispatcher that killed the worker anyway.
-  My own memory note said there were three.
-- **X1** — Fable flagged the `startJob` argument swap on 2026-08-06. I passed it on as
-  "not verified by me" and never came back to it. It was real, and every
-  bounty-awarded job was silently never started.
-- **D1** — I published sixteen releases without ever checking that the tarball could
-  produce a working install.
+- **L2** means `summary.containers_unhealthy` — the README's canonical "tell me when
+  anything is wrong" watch — had **never been able to fire** in the Docker runtime. It
+  now reports, and the live fleet immediately went `degraded` on real crashes that were
+  previously discarded.
+- **K1** only fired *after* an operator ran `encrypt-keys`. The hardening we recommend
+  was what created the exposure.
 
-## Fixed in 2.20.0
+## Still open, ranked
 
-| # | Sev | Finding |
-|---|---|---|
-| K1 | **crit** | `writeKeysFile` could drop a plaintext key-less file over encrypted key material — WIF gone, no backup. Guarded in the primitive. Only fires after `encrypt-keys`, i.e. the hardening we recommend created the exposure |
-| D1 | high | `scripts/`, `Dockerfile.job-agent`, `package.docker.json` were missing from the npm tarball while the README makes building the image mandatory |
-| L3 | high | Fourth clock: the dispatcher's own `JOB_TIMEOUT_MS+60s` killed workers holding an open dispute |
-| X1 | high | `bounty.awarded` called `startJob` with swapped arguments; awarded jobs never started |
+**I1-residual (high, partial).** A downloaded file is verified to have landed inside
+the job directory and removed if it escaped — but it exists briefly at the escaped path
+first, and a broker poll could read it. The durable fix is broker-side: act only on
+request files the host itself created. **This is the one genuinely unfinished high.**
 
-## Open — 13 high, triaged
+**~40 mediums, untriaged.** Distribution: trust-boundary 7, liveness 8, scale 7,
+isolation 5, docs-truth 5, money 3, keys 2, first-run 3. Triage is the next task.
 
-**Fail-open on the operator's own path (first-run).** F1 `setup` reports success with an
-empty on-chain identity and the documented recovery is a no-op. F2 `ollama`/`lmstudio`/
-`vllm` resolve an empty key, so template filler is delivered and hashed as the paid work
-product. F3 `quickstart` prints an env var the container never reads. F7 both installers
-default to `local` runtime without Docker and accept paid jobs before refusing them.
-**These make a first install produce a dispatcher that takes money and returns nothing.**
+**~45 lows.** Mostly documentation drift.
 
-**Money.** M1 the streaming proxy bills the full worst-case reservation when the upstream
-returns 503 — status code is never consulted before billing. M2 the non-streaming path
-never got the same hardening and under-bills instead.
+## The gate that has not moved
 
-**Isolation.** I1 `Content-Disposition` filename is unsanitised and lands in the host
-broker's watch dir — a forged `executeOnChain` drains the fee tank. I2 resume rewrites
-`description.txt` following symlinks, giving an arbitrary host-path overwrite.
+The full operator lifecycle — clean install → register → encrypt keys → dashboard start
+→ take a job → restart mid-job → confirm the fleet returns — **has still never been run
+start to finish by anyone.** Two audits (first-run, docs-truth) found four highs in
+exactly that path, including an install that could not produce a runnable dispatcher.
+Until someone walks it on a clean machine, "shippable" is an assertion, not a finding.
 
-**Liveness.** L1 the shutdown stall watchdog budgets 30 s against a ~93 s SDK worst case
-and writes the restore marker only after the whole loop. L2 `AutoRemove: true` races the
-inspect poller, so Docker container crashes are invisible — `containers_unhealthy`, the
-README's canonical alarm, is pinned at 0 in the production runtime.
+## What the audits taught, worth keeping
 
-**Scale.** S1 the documented scale remedy takes the operator's own fleet down. S2 the
-poll cycle is ~3 round trips per agent, not one, so the published table is wrong from
-N=31. S3 `/j41/deposit/report` does outbound work before the signature check with no
-rate limit. S4/S5 two costs with no steady state.
+Four independent domains reported the same defect shape: **a control that exists in
+this codebase, correctly implemented, simply not applied at a second site.**
+`O_NOFOLLOW` on the read path but not the write. `checkNonceAfterVerify` on one route
+but not its neighbour — with the attack documented in the same file. A rate limit
+whose comment says it prevents amplification DoS, on one of two adjacent routes. A
+scan on arrival but not on re-entry.
 
-**Keys.** K2 `init` never calls the unlock guard, so new agents land plaintext on an
-encrypted pool.
-
-## The pattern worth acting on
-
-Four separate audits independently reported the same shape: **a control that already
-exists in this codebase, correctly implemented, simply not applied at a second site.**
-`O_NOFOLLOW` on the read path but not the write. Nonce-after-verify on one route but not
-its neighbour. A scan on arrival but not on re-entry. A rate limit on one webhook route
-but not the adjacent one. That is not a knowledge gap; it is a review gap, and it is
-cheap to close with a checklist of "where else does this pattern appear".
-
-## Recommendation
-
-**Do not ship.** Next batch, in order: the four first-run fail-opens (F1/F2/F3/F7),
-because they are what a new operator hits in the first ten minutes; then M1/M2 and
-I1/I2; then L1/L2 and K2. Scale and docs-truth after, since they mislead rather than
-break.
-
-The full reports are in `AUDIT/`, with per-domain claim checklists.
+Every one of those was cheap to fix once named. The cheap systemic defence is a
+"where else does this pattern appear?" pass whenever a control is added — which is now
+encoded as a derived test for the encryption guard, and should be for the others.
 
 ---
 
