@@ -2989,7 +2989,21 @@ async function main() {
             console.log(`\n  ✅ Dispatcher started (PID ${child.pid})\n  Logs: tail -f /tmp/dispatcher.log\n`);
           } else {
             console.log(`\n  ❌ Dispatcher exited immediately (code ${_alive.code}).`);
-            console.log('     Most common cause: the key pool is encrypted and no passphrase is available.');
+            // F7 follow-up — local runtime now refuses to START (2.21.0), and this
+            // screen has no way to pass --dev-unsafe, so the button is permanently
+            // dead in that configuration. Diagnosing it as "encrypted keys" sends the
+            // operator down the wrong path entirely. Name the actual runtime first.
+            try {
+              const _rt = (loadConfig().runtime || '').toLowerCase();
+              if (_rt === 'local') {
+                console.log('     Runtime is "local", which the dispatcher refuses to start (ZERO isolation).');
+                console.log('     This screen cannot pass --dev-unsafe. Either:');
+                console.log('       • install Docker and:  j41-dispatcher config --runtime docker');
+                console.log('       • or start from a terminal:  j41-dispatcher start --dev-unsafe');
+                console.log('');
+              }
+            } catch {}
+            console.log('     Other common cause: the key pool is encrypted and no passphrase is available.');
             console.log('     A dashboard-spawned dispatcher has no terminal to prompt on, so set');
             console.log('     J41_KEYS_PASSPHRASE in the environment, or start it from a terminal:');
             console.log('       j41-dispatcher start');

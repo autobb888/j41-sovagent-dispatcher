@@ -72,7 +72,12 @@ test('every command whose body writes key material calls the unlock guard', () =
     const base = cmds[i].name.split(' ')[0];
     if (EXCLUDED.has(base)) continue;
     if (!KEY_WRITING.test(block)) continue;
-    if (!/ensureKeystoreUnlockedIfEncrypted\(\)/.test(block)) offenders.push(cmds[i].name);
+    // ORDER matters, not mere presence. Requiring the guard "somewhere in the block"
+    // passes a block that guards one key-write and leaves a sibling unguarded — the
+    // exact class this test exists to catch. Require it BEFORE the first key write.
+    const guardAt = block.search(/ensureKeystoreUnlockedIfEncrypted\(\)/);
+    const writeAt = block.search(KEY_WRITING);
+    if (guardAt === -1 || guardAt > writeAt) offenders.push(cmds[i].name);
   }
 
   assert.deepStrictEqual(offenders, [],

@@ -13,6 +13,7 @@
  */
 
 const fs = require('fs');
+const path = require('path');
 const keystore = require('./keystore.js');
 
 function writeKeysFile(p, obj) {
@@ -31,12 +32,25 @@ function writeKeysFile(p, obj) {
     if (fs.existsSync(p) && obj && obj.wif === undefined && obj.encrypted === undefined) {
       const existing = JSON.parse(fs.readFileSync(p, 'utf8'));
       if (existing && (existing.wif !== undefined || existing.encrypted !== undefined)) {
-        throw new Error(
-          `refusing to write ${p}: the object carries no wif and no encrypted envelope, ` +
-          'but the file on disk holds key material. This would destroy the private key ' +
-          'irrecoverably. The caller almost certainly read with { allowLocked: true } — ' +
-          're-read unlocked, or merge onto the existing record.',
-        );
+        // CARRY THE KEY FORWARD rather than throwing.
+        //
+        // The first version of this guard threw. That was safe but wrong in practice:
+        // `readKeysFile(path, { allowLocked: true })` strips key material even when the
+        // pool is UNLOCKED, so the dashboard's Retry Registration screen — whose three
+        // write-backs all read that way — began throwing a plain Error on every
+        // encrypted pool. It propagated past the TUI's BACK handler and crashed the
+        // whole dashboard, leaving an operator who followed our own `encrypt-keys`
+        // advice with no registration recovery at all. Trading silent key destruction
+        // for a stack trace is not a fix.
+        //
+        // Merging is safe because nothing in this codebase legitimately clears a key:
+        // an object without one is always an incomplete read, never an intent to erase.
+        // We still say so loudly, so the caller bug is visible rather than absorbed.
+        console.warn(`[keys] ${path.basename(p)}: write carried no key material; preserving the ` +
+          'existing one. (Caller read with { allowLocked: true } and wrote the result back — ' +
+          'harmless here, but it means that call site cannot rotate or clear the key.)');
+        if (existing.wif !== undefined) obj = { ...obj, wif: existing.wif };
+        if (existing.encrypted !== undefined) obj = { ...obj, v: existing.v ?? 2, encrypted: existing.encrypted };
       }
     }
   } catch (e) {

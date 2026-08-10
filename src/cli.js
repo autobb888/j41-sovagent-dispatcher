@@ -1115,7 +1115,8 @@ function createFinalizeHooks(agentId, identityName, profile, services = [], disp
         console.log('   ↳ Then re-run this step; nothing was published on-chain.');
         throw new Error(
           `VDXF publish skipped: ${keys.address} has no spendable UTXOs for the transaction fee. ` +
-          'Fund it with at least 0.0001 and run setup again — the on-chain identity is still empty.',
+          'Fund it with at least 0.0001 and run setup again. ' +
+          'Nothing was published in THIS run — any previously published data is unchanged.',
         );
       }
 
@@ -1213,10 +1214,13 @@ program
       changed = true;
     }
 
-    if (options.maxConcurrent) {
+    if (options.maxConcurrent !== undefined) {
       const n = parseInt(options.maxConcurrent);
-      if (n < 1 || n > 1000) {
-        console.error('❌ --max-concurrent must be a positive number');
+      // 0 is the AUTO sentinel (resolveCapacity falls back to the hardware estimate).
+      // `if (options.maxConcurrent)` treated it as absent, so once an operator set a
+      // value there was no way back to auto — and the command said nothing.
+      if (!Number.isFinite(n) || n < 0 || n > 1000) {
+        console.error('❌ --max-concurrent must be 0 (auto) or 1-1000');
         process.exit(1);
       }
       // L8 — this wrote `maxConcurrent` into the legacy config.json, but `start`
@@ -2989,7 +2993,27 @@ program
       });
       console.log(`  ✓ Finalize: ${finalizeResult.stage}`);
     } catch (e) {
-      console.error(`  ⚠️  Finalize: ${e.message}`);
+      // F1 (follow-up) — 2.21.0 made publishVdxf throw so the SDK stops marking a
+      // step that did not happen. That fixed the state machine but NOT the headline
+      // claim: this catch swallowed the throw and the "Setup Complete" banner printed
+      // regardless, so the operator still walked away believing a fresh, unfunded
+      // agent was ready. `runtime.require_finalize` defaults to false, so `start`
+      // would then happily run it over an empty on-chain identity. One warning line
+      // scrolling past is not a failure report.
+      console.error(`\n  ❌ Finalize did not complete: ${e.message}`);
+      console.error('');
+      console.error('  ╔══════════════════════════════════════════╗');
+      console.error('  ║     Setup INCOMPLETE                     ║');
+      console.error('  ╚══════════════════════════════════════════╝');
+      console.error(`  Agent:    ${agentId}`);
+      console.error(`  Identity: ${keys.identity}`);
+      console.error(`  i-Address: ${keys.iAddress}`);
+      console.error('');
+      console.error('  The local agent exists, but its on-chain identity is NOT complete.');
+      console.error(`  Fix the cause above, then re-run:  j41-dispatcher setup ${agentId} ${keys.identity}`);
+      console.error('  Do NOT start the dispatcher until this succeeds — the agent cannot');
+      console.error('  publish reviews, attestations or job records on-chain.');
+      process.exit(1);
     }
 
     // ── Summary ──
@@ -4406,11 +4430,24 @@ program
           // Deactivating an agent is progress; the budget is for a WEDGED call, not
           // for the loop as a whole.
           kickWatchdog(`deactivated ${agentInfo.id}`);
-          // On-chain only when explicitly requested — see B5 at the activation loop.
           // On-chain deactivate is what actually keeps a hire off a stopped agent —
           // see the activation loop. Default on; J41_STATUS_TOGGLE_ONCHAIN=0 opts out.
+          // Announce the outcome. This is the write B5 calls "the durable lever" —
+          // the one that actually keeps a hire off a stopped agent — and it was
+          // swallowed by a bare `catch {}` while the line above had already printed
+          // "✅ status → inactive". A drained fee tank is the routine cause, and the
+          // operator would never know the on-chain half did not happen. The
+          // activation path reports its txid; this one reported nothing.
           if (process.env.J41_STATUS_TOGGLE_ONCHAIN !== '0') {
-            try { await agent.setOnChainStatus('inactive'); } catch {}
+            try {
+              await agent.setOnChainStatus('inactive');
+              console.log(`   ✅ ${agentInfo.id}: on-chain status → inactive`);
+            } catch (e) {
+              console.error(`   ⚠️  ${agentInfo.id}: on-chain deactivate FAILED (${e.message}). ` +
+                'The platform shows inactive, but a re-index can revert that from chain — ' +
+                'a hire could still land on this stopped agent. Run: j41-dispatcher deactivate ' +
+                `${agentInfo.id}`);
+            }
           }
           // Trigger backend re-index so marketplace shows offline immediately
           try {
@@ -8376,13 +8413,19 @@ async function startJobContainer(state, job, agentInfo) {
 
   // Write job data
   writeJobFileNoFollow(path.join(jobDir, 'description.txt'), desc);
-  fs.writeFileSync(path.join(jobDir, 'buyer.txt'), job.buyerVerusId);
-  fs.writeFileSync(path.join(jobDir, 'amount.txt'), String(job.amount));
-  fs.writeFileSync(path.join(jobDir, 'currency.txt'), job.currency);
+  // I2 — every one of these is the same symlink-following write on the same
+  // pause/resume rewrite path. Guarding description.txt alone left four more: a
+  // container that plants `buyer.txt -> ~/.ssh/authorized_keys` before pause gets
+  // that file truncated and overwritten with buyer-controlled text on resume. The
+  // payload is smaller than description's 1 MB; the primitive is identical.
+  writeJobFileNoFollow(path.join(jobDir, 'buyer.txt'), job.buyerVerusId);
+  writeJobFileNoFollow(path.join(jobDir, 'amount.txt'), String(job.amount));
+  writeJobFileNoFollow(path.join(jobDir, 'currency.txt'), job.currency);
 
   // Mandatory canary token (Plan B: every job gets one)
   const canaryToken = require('crypto').randomBytes(32).toString('hex');
-  fs.writeFileSync(path.join(jobDir, 'canary.token'), canaryToken, { mode: 0o600 });
+  writeJobFileNoFollow(path.join(jobDir, 'canary.token'), canaryToken);
+  try { fs.chmodSync(path.join(jobDir, 'canary.token'), 0o600); } catch {}
 
   const agentDir = path.join(AGENTS_DIR, agentInfo.id);
   const keysPath = path.join(agentDir, 'keys.json');
@@ -8880,13 +8923,19 @@ async function startJobLocal(state, job, agentInfo) {
 
   // Write job data (same as Docker mode)
   writeJobFileNoFollow(path.join(jobDir, 'description.txt'), job.description);
-  fs.writeFileSync(path.join(jobDir, 'buyer.txt'), job.buyerVerusId);
-  fs.writeFileSync(path.join(jobDir, 'amount.txt'), String(job.amount));
-  fs.writeFileSync(path.join(jobDir, 'currency.txt'), job.currency);
+  // I2 — every one of these is the same symlink-following write on the same
+  // pause/resume rewrite path. Guarding description.txt alone left four more: a
+  // container that plants `buyer.txt -> ~/.ssh/authorized_keys` before pause gets
+  // that file truncated and overwritten with buyer-controlled text on resume. The
+  // payload is smaller than description's 1 MB; the primitive is identical.
+  writeJobFileNoFollow(path.join(jobDir, 'buyer.txt'), job.buyerVerusId);
+  writeJobFileNoFollow(path.join(jobDir, 'amount.txt'), String(job.amount));
+  writeJobFileNoFollow(path.join(jobDir, 'currency.txt'), job.currency);
 
   // Mandatory canary token (Plan B: every job gets one)
   const canaryToken = require('crypto').randomBytes(32).toString('hex');
-  fs.writeFileSync(path.join(jobDir, 'canary.token'), canaryToken, { mode: 0o600 });
+  writeJobFileNoFollow(path.join(jobDir, 'canary.token'), canaryToken);
+  try { fs.chmodSync(path.join(jobDir, 'canary.token'), 0o600); } catch {}
 
   const agentDir = path.join(AGENTS_DIR, agentInfo.id);
   const keysPath = path.join(agentDir, 'keys.json');
@@ -9208,8 +9257,13 @@ async function cleanupCompletedJobs(state) {
                 const agent = await getAgentSession(state, agentInfo);
                 job = await agent.client.getJob(jobId);
               } catch (fetchErr) {
-                console.error(`❌ Could not re-fetch job ${jobId} for retry: ${fetchErr.message}`);
-                await stopJobContainer(state, jobId);
+                // Same shape as the 404 path: a network blip on the re-fetch used to
+                // consume the retry AND tear the job down — no delivery, no retry, no
+                // refund, and gone from active-jobs.json so crash recovery cannot see
+                // it either. Give the attempt back and re-evaluate next cycle.
+                state.retries.set(jobId, retries);
+                console.warn(`[cleanup] ${jobId.substring(0, 8)}: could not re-fetch after exit ` +
+                  `(${fetchErr.message}) — retry not consumed; will re-evaluate next cycle.`);
                 continue;
               }
               if (job && TERMINAL_STATUSES.includes(job.status)) {
@@ -9281,6 +9335,16 @@ async function cleanupCompletedJobs(state) {
             if (job && !TERMINAL_STATUSES.includes(job.status)) {
               await stopJobContainer(state, jobId, true);
               await startJobContainer(state, job, agentInfo);
+              continue;
+            }
+            // The re-fetch failed (network blip), so we cannot tell whether the job is
+            // still live. Give the retry back rather than consuming it: falling
+            // through here used to burn an attempt AND drop the job with neither a
+            // retry nor a refund — the silent-loss class this batch exists to remove.
+            if (!job) {
+              state.retries.set(jobId, retries);
+              console.warn(`[cleanup] ${jobId.substring(0, 8)}: could not re-fetch after crash — ` +
+                'retry not consumed; will re-evaluate next cycle.');
               continue;
             }
           } else {
@@ -9701,6 +9765,12 @@ async function mainMenu() {
   }
 
   async function registerAgentIdentity(agent) {
+    // Writes a WIF at the end of this function. It survived on an encrypted pool only
+    // because the plain readKeysFile below throws ELOCKED first — incidental, not a
+    // guard, and it would break the moment that read changed. Found by tightening the
+    // derived guard test to require the guard BEFORE the first key write rather than
+    // merely somewhere in the block.
+    await ensureKeystoreUnlockedIfEncrypted();
     const keysPath = path.join(AGENTS_DIR, agent.id, 'keys.json');
     const keys = readKeysFile(keysPath);
 

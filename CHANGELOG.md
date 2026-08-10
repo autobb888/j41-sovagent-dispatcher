@@ -2,6 +2,62 @@
 
 ## Unreleased
 
+## 2.26.0
+
+Two independent adversarial reviews of everything shipped since the audits
+(2.20.0–2.25.0). They found defects **in the fixes themselves**, including one
+regression this release reverses.
+
+**K1 regression — the guard crashed the dashboard.** 2.20.0 made `writeKeysFile`
+*refuse* to overwrite key material with a key-less object. Safe, but
+`readKeysFile({allowLocked:true})` strips key material **even when the pool is
+unlocked**, and the Retry Registration screen's three write-backs all read that way —
+so on any encrypted pool every one of them threw a plain `Error`, which propagated
+past the TUI's `BACK` handler and killed the whole dashboard. An operator who followed
+our own `encrypt-keys` advice lost registration recovery entirely and got a stack
+trace. Trading silent key destruction for a crash is not a fix. The guard now **carries
+the existing key forward and warns loudly** — safe because nothing here legitimately
+clears a key, and the warning keeps the call-site defect visible.
+
+**I1 — the containment check was purely lexical and bypassable.** `path.resolve`
+normalises `..` but does **not** follow symlinks. Since the job-agent can write into
+its own files directory, it could plant `files/link -> /app/sign/req` and a
+`Content-Disposition` of `link/abcd1234.json` then resolved *lexically inside* the job
+directory while the bytes landed in the host broker's watch dir — the forged
+`executeOnChain` attack, still reachable with the fix in place. Now uses
+`fs.realpathSync` on the resolved parent, and treats an unresolvable path as an escape.
+Demonstrated before and after: the lexical check reported "contained" while the file
+was provably in the broker directory.
+
+**F1 — the headline claim was false.** 2.21.0 made `publishVdxf` throw so the SDK stops
+marking a step that did not happen; that half was real. But `setup` wraps finalize in
+a `try/catch`, logged one ⚠️ line, and printed the **"Setup Complete"** banner anyway —
+and `require_finalize` defaults to false, so `start` would run the agent over an empty
+on-chain identity. Exactly the failure F1 claimed to fix. `setup` now prints **"Setup
+INCOMPLETE"**, says not to start the dispatcher, and exits 1. The throw's message also
+no longer claims the identity is empty, which was false on a re-run.
+
+**I2 — one of five sibling writes.** `writeJobFileNoFollow` guarded `description.txt`;
+`buyer.txt`, `amount.txt`, `currency.txt` and `canary.token` kept plain
+symlink-following writes on the same pause/resume path, in **both** runtimes. A
+container planting `buyer.txt -> ~/.ssh/authorized_keys` still got an arbitrary
+overwrite. All five now guarded — the very pattern the fix's own comment lectured about.
+
+**The derived encryption-guard test was too weak**, and tightening it found a real
+offender. It required the guard *somewhere* in a command block, so a block with one
+guarded and one unguarded write passed. It now requires the guard **before** the first
+key write — which immediately caught `registerAgentIdentity`, unguarded and protected
+only incidentally by an `ELOCKED` throw from an unrelated read.
+
+Also: **B5's on-chain deactivate no longer fails silently** (a bare `catch {}` swallowed
+the write B5 itself calls "the durable lever" while the log printed ✅ — a drained fee
+tank is the routine cause); **two L2 retry paths** no longer consume an attempt and drop
+a paid job when the re-fetch blips; **`--max-concurrent 0`** (the auto sentinel) is no
+longer silently ignored; the dashboard's Start failure no longer misdiagnoses a
+local-runtime refusal as encrypted keys; and a dead import is gone.
+
+974 tests.
+
 ## 2.25.0
 
 First triaged batch of the audit mediums. All three chosen for the same reason: they

@@ -28,21 +28,33 @@ function tmpKeys(content) {
   return p;
 }
 
-test('refuses to overwrite an ENCRYPTED record with a key-less object', () => {
+test('carries an ENCRYPTED envelope forward when the write omits it', () => {
+  // The guard MERGES rather than throwing: readKeysFile({allowLocked:true}) strips key
+  // material even when unlocked, so the dashboard's Retry Registration write-backs
+  // would otherwise crash the whole TUI on any encrypted pool. Nothing here
+  // legitimately clears a key, so preserving it is always the correct read of intent.
   const p = tmpKeys({ v: 2, identity: 'a@', encrypted: { ct: 'deadbeef', iv: 'x' } });
-  assert.throws(
-    () => writeKeysFile(p, { identity: 'a@', registrationStatus: 'retrying' }),
-    /destroy the private key/,
-  );
-  // and the ciphertext is still there, untouched
+  writeKeysFile(p, { identity: 'a@', registrationStatus: 'retrying' });
   const after = JSON.parse(fs.readFileSync(p, 'utf8'));
-  assert.ok(after.encrypted, 'the encrypted envelope must survive the refusal');
+  assert.deepEqual(after.encrypted, { ct: 'deadbeef', iv: 'x' }, 'key material must survive');
+  assert.equal(after.registrationStatus, 'retrying', 'and the caller\'s update must apply');
 });
 
-test('refuses to overwrite a PLAINTEXT wif with a key-less object', () => {
+test('carries a PLAINTEXT wif forward when the write omits it', () => {
   const p = tmpKeys({ identity: 'a@', wif: 'Uxxxxxxxxxxxxxxxxxxx' });
-  assert.throws(() => writeKeysFile(p, { identity: 'a@' }), /destroy the private key/);
-  assert.equal(JSON.parse(fs.readFileSync(p, 'utf8')).wif, 'Uxxxxxxxxxxxxxxxxxxx');
+  writeKeysFile(p, { identity: 'a@', registrationStatus: 'x' });
+  const after = JSON.parse(fs.readFileSync(p, 'utf8'));
+  assert.equal(after.wif, 'Uxxxxxxxxxxxxxxxxxxx');
+  assert.equal(after.registrationStatus, 'x');
+});
+
+test('the carry-forward is announced, so the caller bug stays visible', () => {
+  const p = tmpKeys({ identity: 'a@', wif: 'Ukeep' });
+  const seen = [];
+  const orig = console.warn; console.warn = (...a) => seen.push(a.join(' '));
+  try { writeKeysFile(p, { identity: 'a@' }); } finally { console.warn = orig; }
+  assert.ok(seen.some(l => /preserving the existing one/.test(l)),
+    'a silent merge would hide the call-site defect');
 });
 
 test('a legitimate write carrying the wif still succeeds', () => {

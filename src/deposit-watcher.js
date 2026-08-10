@@ -21,7 +21,7 @@ const crypto = require('crypto');
 const { creditDeposit } = require('./credit-meter');
 const { clampCredit } = require('./deposit-credit.js');
 const { loadDispatcherConfig } = require('./config-loader.js');
-const { checkAndRecordNonce, checkNonceAfterVerify } = require('./nonce-cache');
+const { checkNonceAfterVerify } = require('./nonce-cache');
 
 const AGENTS_DIR = path.join(os.homedir(), '.j41', 'dispatcher', 'agents');
 

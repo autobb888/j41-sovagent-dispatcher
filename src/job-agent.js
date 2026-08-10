@@ -1261,8 +1261,25 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
           // it — the file exists briefly at the escaped path. The durable fix is
           // broker-side (only act on request files the host itself created); tracked
           // as I1-residual.
-          const _resolved = path.resolve(localPath);
-          const _root = path.resolve(filesDir) + path.sep;
+          // realpath, not resolve. `path.resolve` normalises `..` LEXICALLY and does
+          // not follow symlinks, so it catches `../../../app/sign/req/x.json` but not
+          // the sibling vector: this process can write into filesDir, so it can plant
+          // `filesDir/link -> /app/sign/req` and then a Content-Disposition of
+          // `link/abcd1234.json` resolves lexically INSIDE filesDir while the bytes
+          // land in the broker's watch dir. Resolving the real parent closes that.
+          let _resolved;
+          let _root;
+          try {
+            _root = fs.realpathSync(filesDir) + path.sep;
+            // realpath the PARENT: the file itself may be a dangling link or already
+            // removed, and realpathSync on a missing path throws.
+            _resolved = path.join(fs.realpathSync(path.dirname(localPath)), path.basename(localPath));
+          } catch {
+            // If either side cannot be resolved, treat it as an escape — we cannot
+            // prove containment, and this path is security-critical.
+            _resolved = String(localPath);
+            _root = '\u0000never-matches';
+          }
           if (!_resolved.startsWith(_root)) {
             try { fs.unlinkSync(_resolved); } catch {}
             console.error(`[FILES] ⛔ SECURITY: download for ${f.id} escaped the job files dir ` +
