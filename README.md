@@ -364,10 +364,24 @@ so it is reported rather than hidden: a `[Poll]` / `[FeeTank]` warning naming th
 count, and `poll_cycles_skipped` / `fee_tank_cycles_skipped` in `/health`.
 
 **If you see skipped cycles**, you have more agents than the interval allows at
-your API latency. Raise the interval or run a second dispatcher against a
-different subset of agents; a second instance on the same host needs
-`J41_HEALTH_PORT`, `J41_CONTROL_API_PORT` and `J41_EGRESS_PROXY_PORT` set to free
-values.
+your API latency. Raise the interval:
+
+```bash
+J41_POLL_INTERVAL_MS=180000 j41-dispatcher start   # or [poll] interval_ms in config.toml
+```
+
+The default is automatic — `max(60s, agents x 1s)` — and setting the knob overrides it.
+Note the real cost is roughly **3 round trips per agent**, not one: the cycle also runs
+the dispute reconciler and three per-active-job passes. At 500 ms latency a 30-agent
+fleet is already near its budget, so prefer measuring `poll_cycles_skipped` over
+trusting the table above.
+
+Running a **second dispatcher** on the same host is possible but needs more than the
+three port variables: it also needs its own `HOME` (or `J41_DIR`), because
+`dispatcher.pid`, the control socket and the whole `~/.j41/dispatcher` state directory
+are shared otherwise — and `start` SIGTERMs whatever PID it finds in `dispatcher.pid`.
+**Starting a second instance without a separate HOME will stop the first one.** Set
+`J41_HEALTH_PORT`, `J41_CONTROL_API_PORT`, `J41_EGRESS_PROXY_PORT` *and* `HOME`.
 
 Skipped cycles do **not** mark the daemon unhealthy — they are a capacity signal
 to tune, not a fault.

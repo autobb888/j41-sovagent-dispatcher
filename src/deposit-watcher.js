@@ -21,7 +21,7 @@ const crypto = require('crypto');
 const { creditDeposit } = require('./credit-meter');
 const { clampCredit } = require('./deposit-credit.js');
 const { loadDispatcherConfig } = require('./config-loader.js');
-const { checkAndRecordNonce } = require('./nonce-cache');
+const { checkAndRecordNonce, checkNonceAfterVerify } = require('./nonce-cache');
 
 const AGENTS_DIR = path.join(os.homedir(), '.j41', 'dispatcher', 'agents');
 
@@ -60,13 +60,21 @@ async function verifyDepositReport(client, report, network) {
     return { ok: false, code: 'STALE', message: 'Report timestamp is outside the allowed freshness window' };
   }
 
-  // 2. Replay — single-use nonce, remembered past the freshness window.
-  const replay = checkAndRecordNonce(String(nonce), ts * 1000 + DEPOSIT_REPORT_MAX_AGE_MS * 2);
-  if (!replay.ok) {
-    return { ok: false, code: 'REPLAY', message: 'Deposit report nonce has already been used' };
-  }
+  // S3 — the nonce is recorded AFTER the signature verifies, not before.
+  //
+  // This route used to record the nonce and fire the outbound getIdentityKeys before
+  // any signature check, unauthenticated and unrated. nonce-cache.js:78-88 documents
+  // exactly this attack and ships `checkNonceAfterVerify` for it — the v2 access path
+  // uses it; this one did not. The cache is bounded at 100k and SHARED with that path,
+  // so junk nonces here evict legitimate entries and reopen the replay window on the
+  // paid proxy. (The outbound lookup cannot move after verification — it supplies the
+  // key we verify against — so amplification is handled by the rate limit added to the
+  // route in webhook-server.js, mirroring /j41/discovery/request-access.)
+  //
+  // Replay protection is unchanged: a genuine replay still finds the nonce recorded
+  // from the first time it verified.
 
-  // 3. Signature — must match the buyer's on-chain identity.
+  // 2. Signature — must match the buyer's on-chain identity.
   const { buildDepositReportMessage, verifyMessage } = require('@junction41/sovagent-sdk/dist/index.js');
   const message = buildDepositReportMessage({ buyerVerusId, sellerVerusId, txid, amount, nonce, timestamp: ts });
 
@@ -89,6 +97,12 @@ async function verifyDepositReport(client, report, network) {
   const signed = primaryAddresses.some((addr) => verifyMessage(message, addr, signature, network));
   if (!signed) {
     return { ok: false, code: 'BAD_SIGNATURE', message: 'Deposit report signature does not match the buyer identity' };
+  }
+
+  // 3. Replay — single-use nonce, recorded only now that the caller is proven.
+  const replay = checkNonceAfterVerify(true, String(nonce), ts * 1000 + DEPOSIT_REPORT_MAX_AGE_MS * 2);
+  if (!replay.ok) {
+    return { ok: false, code: 'REPLAY', message: 'Deposit report nonce has already been used' };
   }
 
   return { ok: true };

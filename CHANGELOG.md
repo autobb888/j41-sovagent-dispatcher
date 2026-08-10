@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+## 2.24.0
+
+The last two audit highs. Both were controls this codebase already had, unapplied at a
+second site — the pattern four separate audit domains reported independently.
+
+**S3 — an unauthenticated caller could burn the shared nonce cache.**
+`/j41/deposit/report` recorded the nonce and fired an outbound `getIdentityKeys`
+*before* checking the signature, with no rate limit. `nonce-cache.js:78-88` documents
+precisely this attack and ships `checkNonceAfterVerify` for it — the v2 access path
+uses it, this route did not. The cache is bounded at 100k entries and **shared** with
+that path, so junk nonces here evict legitimate entries and reopen the replay window on
+the paid proxy.
+
+The nonce is now recorded only after the signature verifies. The outbound lookup cannot
+move later (it supplies the key we verify against), so amplification is handled by rate
+limiting the route on the same limiter as `/j41/discovery/request-access` — which
+carries a comment saying it exists "to prevent amplification DoS" and was never applied
+to its neighbour. Replay protection is unchanged.
+
+**S1 — the documented scale remedy took the operator's own fleet down.** The README's
+only guidance was "raise the interval or run a second dispatcher". Neither worked: the
+poll interval was computed inline in `cli.js` with no config or env path, and `start`
+SIGTERMs whatever PID it finds in `dispatcher.pid`, so a second instance stops the
+first.
+
+Added `[poll] interval_ms` / `J41_POLL_INTERVAL_MS` (0 = the previous automatic
+`max(60s, agents x 1s)`). The README now documents the knob, states that a second
+instance needs its own **`HOME`** as well as the three port variables — and says
+plainly that omitting it stops the running dispatcher. It also corrects the cost model:
+roughly **3 round trips per agent**, not one, so the published table understates the
+load.
+
+971 tests.
+
 ## 2.23.0
 
 Three more audit highs. All three are the same shape the audits kept reporting: a

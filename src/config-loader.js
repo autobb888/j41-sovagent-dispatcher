@@ -60,6 +60,12 @@ const DEFAULTS = Object.freeze({
     circuit_threshold: 3,           // consecutive_failures before circuit opens
     circuit_open_ms: 30000,         // how long the circuit stays open after tripping
   },
+  // S1 — the job-poll interval. 0 = auto (max(60s, agents x 1s)). The README's only
+  // scale guidance was "raise the interval or run a second dispatcher", and NEITHER
+  // was possible: the interval was computed inline in cli.js with no config or env
+  // path, and `start` SIGTERMs the PID in dispatcher.pid — so an operator following
+  // the docs took their own fleet down.
+  poll: { interval_ms: 0 },
   deposit: { poll_interval_ms: 60000 },
   health: { poll_interval_ms: 60000 },
   webhook: { max_body_bytes: 1048576 },
@@ -120,6 +126,7 @@ const ENV_OVERRIDES = [
   ['J41_PROXY_RATE_LIMIT_MAX_BUCKETS', 'proxy.rate_limit_max_buckets', 'int'],
   ['J41_PROXY_CIRCUIT_THRESHOLD',      'proxy.circuit_threshold',      'int'],
   ['J41_PROXY_CIRCUIT_OPEN_MS',        'proxy.circuit_open_ms',        'int'],
+  ['J41_POLL_INTERVAL_MS',      'poll.interval_ms',         'int'],
   ['J41_DEPOSIT_POLL_INTERVAL', 'deposit.poll_interval_ms', 'int'],
   // `bool` (not bool1) deliberately: this is default-ON, so J41_FEE_SWEEP=true
   // must not silently mean "disabled". See applyEnvOverrides.

@@ -4009,9 +4009,16 @@ program
       // 50 agents: 60s cycle (25s stagger, fits within interval)
       // 100 agents: 90s cycle (50s stagger, needs wider interval)
       const agentCount = state.agents.length;
-      const pollInterval = Math.max(60000, agentCount * 1000);
+      // S1 — honour an explicit interval when the operator sets one. The auto value
+      // is a floor-based heuristic; a large fleet or a slow platform legitimately
+      // needs a longer cycle, and until now there was no way to ask for one.
+      const _cfgPoll = Number(loadDispatcherConfig().poll?.interval_ms) || 0;
+      const pollInterval = _cfgPoll > 0
+        ? Math.max(1000, _cfgPoll)
+        : Math.max(60000, agentCount * 1000);
       const reviewInterval = Math.max(60000, agentCount * 1000);
-      console.log(`  Poll interval: ${Math.round(pollInterval / 1000)}s (${agentCount} agent${agentCount !== 1 ? 's' : ''})`);
+      console.log(`  Poll interval: ${Math.round(pollInterval / 1000)}s ` +
+        `(${_cfgPoll > 0 ? 'configured' : `auto, ${agentCount} agent${agentCount !== 1 ? 's' : ''}`})`);
 
       // Poll for jobs
       safeInterval(() => pollForJobs(state), pollInterval, 'Poll');

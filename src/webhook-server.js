@@ -155,7 +155,18 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
     }
 
     // POST /j41/deposit/report — buyer reports a deposit txid (signed)
+    // S3 — rate-limited on the same limiter as /j41/discovery/request-access, and for
+    // the same stated reason: this route is unauthenticated and fires an outbound
+    // getIdentityKeys before the caller is proven (the lookup supplies the key we
+    // verify against, so it cannot move later). Without a limit, anyone can force
+    // unbounded RPC work. The neighbouring route was protected; this one was not.
     if (req.method === 'POST' && req.url === '/j41/deposit/report' && proxyContext) {
+      const depositIp = req.socket?.remoteAddress || 'unknown';
+      if (!_checkDiscoveryRate(depositIp)) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+        res.end(JSON.stringify({ error: 'Rate limit exceeded' }));
+        return;
+      }
       const body = await readBody(req, res);
       if (body === null) return;
       try {
