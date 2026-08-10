@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+## 2.23.0
+
+Three more audit highs. All three are the same shape the audits kept reporting: a
+control that exists and works, not applied at a second site.
+
+**L2 — Docker container crashes were invisible, and the canonical alarm could never
+fire.** `AutoRemove: true` deletes an exited container immediately, so the 10-second
+`inspect()` poller almost always 404s before it sees the exit. The catch logged
+"container gone" and tore down — skipping the **entire** non-zero-exit branch: no
+retry, no `refundAbandonedJob`, no `container.died` event, and `_containerCrashes`
+never incremented. That pins `summary.containers_unhealthy` — the README's canonical
+"tell me when anything is wrong" watch — at **0 in the production runtime**. A buyer
+OOMing the 2 GB container was recorded as a clean completion.
+
+The exit code was already available: `container.wait()` records it on the active entry
+at spawn time. The 404 path now consults it and runs the same retry / crash-signal /
+refund decisions instead of discarding the event.
+
+**L1 — the shutdown stall watchdog could strand the whole fleet.** `HARD_EXIT_MS` is
+30 s and the deactivate loop kicked it once per agent *before* that agent's four serial
+platform calls, whose SDK worst case is ~93 s (30 s timeout × 3 attempts + backoff).
+Worse, `shutdown-deactivated.json` — the marker that lets the next start restore those
+agents — was written only *after* the whole loop, so a watchdog exit mid-loop recorded
+nothing and the next start skipped every agent it had just deactivated. The trigger is
+a **slow platform**, which is the usual reason to restart in the first place. The marker
+is now written after every agent, and a completed deactivation kicks the watchdog:
+the budget is for a wedged call, not for the loop.
+
+**K2 — `init` wrote plaintext keys onto an encrypted pool.** It never called the unlock
+guard, so every agent created after `encrypt-keys` silently downgraded custody. A gap,
+not a decision — `setup` calls the guard immediately before the identical write.
+
+The guard's test enumerated commands by hand, which is *how* `init` slipped: it was
+neither guarded nor listed. Added alongside `setup`, and backed by a **derived** check
+that finds every command whose body writes key material and fails if it lacks the
+guard — so the next one cannot slip the same way. Mutation-checked: removing the guard
+from `init` now fails two tests instead of none.
+
+966 tests.
+
 ## 2.22.0
 
 Audit highs: two money defects in the paid proxy, two container-escape seams.

@@ -1381,6 +1381,13 @@ program
   .option('-n, --agents <number>', 'Number of agents to create', '9')
   .option('--soul <file>', 'SOUL.md template to use for all agents')
   .action(async (options) => {
+    // K2 — `init` writes a WIF per agent, so it must respect an encrypted key pool.
+    // Without this it wrote every new agent's key in PLAINTEXT onto a pool the
+    // operator had deliberately encrypted, silently downgrading custody. This is a
+    // gap rather than a decision: test/cli-encryption-guard.test.js names its
+    // deliberate exclusions (`start`, `privacy`), and the sibling `setup` calls the
+    // guard immediately before the identical write.
+    await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
     const count = parseInt(options.agents);
     
@@ -4365,6 +4372,16 @@ program
           console.log(`   ✅ ${agentInfo.id}: status → inactive`);
           agentInfo.platformStatus = 'inactive';
           _deactivatedByShutdown.push(agentInfo.id);
+          // L1 — persist after EVERY agent, not once after the loop. Each agent costs
+          // ~4 serial platform calls whose SDK worst case is ~93s (30s timeout x 3
+          // attempts + backoff), so a slow platform — the usual reason to restart —
+          // can blow the stall budget mid-loop. The marker written only at the end
+          // meant a watchdog exit recorded NOTHING, and the next start skipped every
+          // agent it had just deactivated with "No agents available to poll".
+          writeShutdownDeactivated(_deactivatedByShutdown);
+          // Deactivating an agent is progress; the budget is for a WEDGED call, not
+          // for the loop as a whole.
+          kickWatchdog(`deactivated ${agentInfo.id}`);
           // On-chain only when explicitly requested — see B5 at the activation loop.
           // On-chain deactivate is what actually keeps a hire off a stopped agent —
           // see the activation loop. Default on; J41_STATUS_TOGGLE_ONCHAIN=0 opts out.
@@ -4380,8 +4397,8 @@ program
         }
       }
 
-      // Persist BEFORE the drain. If the drain times out or the operator kill -9s
-      // during it, the marker still exists and the next start restores the fleet.
+      // Already persisted incrementally above (L1); this is the final confirmation
+      // for the case where the loop completed normally.
       writeShutdownDeactivated(_deactivatedByShutdown);
       if (_deactivatedByShutdown.length) {
         console.log(`   📝 Recorded ${_deactivatedByShutdown.length} agent(s) to reactivate on next start`);
@@ -9203,7 +9220,53 @@ async function cleanupCompletedJobs(state) {
           await stopJobContainer(state, jobId);
         }
       } catch (e) {
-        console.log(`🗑️  Container for job ${jobId} gone`);
+        // L2 — `AutoRemove: true` means Docker deletes an exited container
+        // immediately, so this 10s poller's inspect() usually 404s before it ever
+        // sees the exit. Treating that as "gone" skipped the ENTIRE non-zero-exit
+        // branch above: no retry, no refundAbandonedJob, no `container.died`, and
+        // `_containerCrashes` never incremented — which pins
+        // `summary.containers_unhealthy`, the README's canonical "tell me when
+        // anything is wrong" watch, at 0 in the production runtime. A buyer OOMing
+        // the 2 GB container was recorded as a clean completion.
+        //
+        // The exit code is already on the active entry: container.wait() records it
+        // at the spawn site. Consult it instead of discarding the event.
+        const _code = active?._exitCode;
+        const _crashed = typeof _code === 'number' && _code !== 0;
+        if (_crashed) {
+          const crashedAgentId = active.agentInfoId || active.agentInfo?.id || null;
+          console.log(`🗑️  Container for job ${jobId} gone — exited ${_code} (auto-removed before inspect)`);
+          if (crashedAgentId) {
+            const n = (state._containerCrashes.get(crashedAgentId) || 0) + 1;
+            state._containerCrashes.set(crashedAgentId, n);
+            state._agentErrors.set(crashedAgentId, `job ${jobId} container exited ${_code}`);
+            state.emitEvent?.('container.died', { jobId, agentId: crashedAgentId, code: _code, signal: null });
+          }
+          const retries = state.retries.get(jobId) || 0;
+          if (retries < MAX_RETRIES) {
+            state.retries.set(jobId, retries + 1);
+            console.log(`🔄 Retrying job ${jobId} (attempt ${retries + 2}/${MAX_RETRIES + 1})`);
+            const agentInfo = active.agentInfo;
+            let job = null;
+            try {
+              const agent = await getAgentSession(state, agentInfo);
+              job = await agent.client.getJob(jobId);
+            } catch (fetchErr) {
+              console.error(`❌ Could not re-fetch job ${jobId} for retry: ${fetchErr.message}`);
+            }
+            if (job && !TERMINAL_STATUSES.includes(job.status)) {
+              await stopJobContainer(state, jobId, true);
+              await startJobContainer(state, job, agentInfo);
+              continue;
+            }
+          } else {
+            console.log(`❌ Job ${jobId} failed after ${MAX_RETRIES + 1} attempts`);
+            try { await refundAbandonedJob(state, jobId, active); }
+            catch (refundErr) { console.error(`[refund] Could not process abandoned-job refund for ${jobId.substring(0, 8)}: ${refundErr.message}`); }
+          }
+        } else {
+          console.log(`🗑️  Container for job ${jobId} gone`);
+        }
         await stopJobContainer(state, jobId);
       }
     }

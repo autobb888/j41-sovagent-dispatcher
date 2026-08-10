@@ -12,6 +12,8 @@ const CLI = fs.readFileSync(path.join(__dirname, '..', 'src', 'cli.js'), 'utf8')
 // Deliberately excluded: `start` (has its own dedicated interactive unlock block)
 // and `privacy` (read-only status display, loads no keys).
 const COMMANDS = [
+  "init",
+  "setup <agent-id> <identity-name>",
   "register <agent-id> <identity-name>",
   "finalize <agent-id>",
   "set-authorities <agentId>",
@@ -40,3 +42,39 @@ for (const cmd of COMMANDS) {
     assert.match(block, /ensureKeystoreUnlockedIfEncrypted\(\)/, `missing guard in "${cmd}"`);
   });
 }
+
+// ── Derived check: the list above is hand-maintained, which is how `init` slipped ──
+//
+// K2: `init` writes a WIF per agent and was simply never added to COMMANDS, so it
+// wrote plaintext keys onto an encrypted pool AND no test noticed. Enumerating the
+// commands that actually touch key material closes that class: a new command that
+// writes keys fails here whether or not somebody remembers to list it.
+
+const KEY_WRITING = /writeKeysFile\s*\(|generateKeypair\s*\(/;
+const EXCLUDED = new Set([
+  'start',     // dedicated interactive unlock block
+  'privacy',   // read-only status display, loads no keys
+  'keys-migrate', // operates on the keystore itself
+  'encrypt-keys', // establishes the passphrase
+]);
+
+test('every command whose body writes key material calls the unlock guard', () => {
+  const re = /\n  \.command\('([^']+)'\)/g;
+  const cmds = [];
+  let m;
+  while ((m = re.exec(CLI)) !== null) cmds.push({ name: m[1], at: m.index });
+
+  const offenders = [];
+  for (let i = 0; i < cmds.length; i++) {
+    const start = cmds[i].at;
+    const end = i + 1 < cmds.length ? cmds[i + 1].at : CLI.length;
+    const block = CLI.slice(start, end);
+    const base = cmds[i].name.split(' ')[0];
+    if (EXCLUDED.has(base)) continue;
+    if (!KEY_WRITING.test(block)) continue;
+    if (!/ensureKeystoreUnlockedIfEncrypted\(\)/.test(block)) offenders.push(cmds[i].name);
+  }
+
+  assert.deepStrictEqual(offenders, [],
+    `these commands write key material without the unlock guard: ${offenders.join(', ')}`);
+});
