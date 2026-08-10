@@ -16,6 +16,34 @@ const fs = require('fs');
 const keystore = require('./keystore.js');
 
 function writeKeysFile(p, obj) {
+  // K1 (critical) — NEVER let a write destroy the private key.
+  //
+  // `readKeysFile(path, { allowLocked: true })` returns the public fields only: on a
+  // v2 file it strips BOTH `wif` and the `encrypted` envelope. Four call sites in the
+  // dashboard's "Retry Registration" screen read that way and write the object
+  // straight back. With no `wif` present the encryption branch below is skipped, and
+  // the atomic rename drops a plaintext, key-less file over the ciphertext — the WIF
+  // is gone, there is no backup, and the master key now decrypts nothing.
+  //
+  // Guarding the primitive rather than the call sites: any future caller that reads
+  // locked and writes back is covered, and the failure is loud instead of silent.
+  try {
+    if (fs.existsSync(p) && obj && obj.wif === undefined && obj.encrypted === undefined) {
+      const existing = JSON.parse(fs.readFileSync(p, 'utf8'));
+      if (existing && (existing.wif !== undefined || existing.encrypted !== undefined)) {
+        throw new Error(
+          `refusing to write ${p}: the object carries no wif and no encrypted envelope, ` +
+          'but the file on disk holds key material. This would destroy the private key ' +
+          'irrecoverably. The caller almost certainly read with { allowLocked: true } — ' +
+          're-read unlocked, or merge onto the existing record.',
+        );
+      }
+    }
+  } catch (e) {
+    if (/refusing to write/.test(e.message)) throw e;
+    // A corrupt/unreadable existing file must not block a legitimate write.
+  }
+
   let toWrite = obj;
   if (keystore.isUnlocked() && obj.wif !== undefined) {
     const { wif, ...pub } = obj;

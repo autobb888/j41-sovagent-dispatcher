@@ -7377,7 +7377,11 @@ async function handleWebhookEvent(state, agentId, payload) {
 
           // Start the job — same as poll-mode acceptance
           try {
-            await startJob(state, agentInfo, fullJob);
+            // X1 — signature is (state, job, agentInfo); this site had them swapped, so
+            // every bounty-awarded job was accepted, signed and allowlisted and then
+            // never started: agent-1..9 fail isValidJobId's 8-char floor and silently
+            // early-return, agent-10+ throw on undefined.
+            await startJob(state, fullJob, agentInfo);
           } catch (startErr) {
             console.error(`[Webhook] Bounty job start failed: ${startErr.message}`);
           }
@@ -8555,8 +8559,31 @@ async function startJobContainer(state, job, agentInfo) {
 
     // Set timeout — offset +60s from container's internal timeout
     // so the container can self-terminate and submit attestation first
-    const _timeoutTimer = setTimeout(async () => {
+    const _timeoutTimer = setTimeout(async function _onJobTimeout() {
       const active = state.active.get(job.id);
+      // L3 — do NOT kill a worker that is legitimately holding an open dispute.
+      //
+      // 2.17.1 taught the CONTAINER's own timer to defer for a dispute hold, and that
+      // was reported as the fix. It was half of it: this dispatcher-side timer fires
+      // at JOB_TIMEOUT_MS + 60s and kills the container regardless. The reconciler then
+      // respawns, each replacement dies at ~61 min, and after 3 attempts it gives up
+      // "until the dispatcher restarts" — roughly three hours against a deadline
+      // measured in days. A fourth clock nobody had counted.
+      //
+      // Uses the status the transition check already maintains, so this costs no API
+      // call. Bounded by the container's own dispute hold (J41_DISPUTE_HOLD_MAX_MS),
+      // which still ends the worker, so this cannot defer forever.
+      const _st = state._lastSentStatus?.get(job.id);
+      if (active && (_st === 'disputed' || _st === 'rework')) {
+        active._disputeDeferrals = (active._disputeDeferrals || 0) + 1;
+        if (active._disputeDeferrals <= 12) { // 12 x (timeout+60s) ~= 12h ceiling
+          console.log(`⏰ Job ${job.id.substring(0, 8)} hit the dispatcher timeout but is ${_st} — ` +
+            `deferring the kill (${active._disputeDeferrals}/12); the container's own hold still bounds it.`);
+          active._timeoutTimer = setTimeout(_onJobTimeout, JOB_TIMEOUT_MS + 60000);
+          return;
+        }
+        console.log(`⏰ Job ${job.id.substring(0, 8)} is ${_st} but has deferred 12 times — killing.`);
+      }
       if (active) {
         active._killed = true;
         console.log(`⏰ Job ${job.id} timeout, killing container`);

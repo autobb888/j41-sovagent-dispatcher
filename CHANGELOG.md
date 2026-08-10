@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+## 2.20.0
+
+Eight parallel domain audits (money, keys, isolation, trust-boundary, liveness, scale,
+docs-truth, first-run) returned **~106 findings: 1 critical, 17 high**. This release
+takes the four that either destroy data, prevent installation, or invalidate a fix we
+already claimed. The rest are triaged in `docs/RELEASE-READINESS.md`.
+
+**K1 (CRITICAL) — a write could destroy the private key irrecoverably.**
+`readKeysFile(path, { allowLocked: true })` returns public fields only: on a v2 file it
+strips **both** `wif` and the `encrypted` envelope. The dashboard's "Retry Registration"
+screen reads that way at four sites and writes the object straight back — with no `wif`
+present the encryption branch is skipped and the atomic rename drops a plaintext,
+key-less file over the ciphertext. No backup; the master key then decrypts nothing.
+Every path through that screen writes.
+
+Guarded in the **primitive**, not the four call sites: `writeKeysFile` now refuses to
+overwrite a record holding key material with an object that carries neither `wif` nor
+`encrypted`. Any future caller that reads locked and writes back fails loudly instead
+of silently destroying custody. Note this only fires *after* an operator runs
+`encrypt-keys` — the feature we recommend was what created the exposure.
+
+**D1 (high) — the documented install could not produce a runnable dispatcher.**
+`package.json` `files` shipped `src`, `templates` and the docs. The README makes
+`./scripts/build-image.sh` a mandatory pre-step and offers `docker build -f
+Dockerfile.job-agent` as the alternative — **neither was in the tarball**, and
+`cli.js` hard-codes `Image: 'j41/job-agent:latest'` with no pull and no build fallback.
+`scripts/`, `Dockerfile.job-agent` and `package.docker.json` are now published.
+
+**L3 (high) — a fourth clock, and it undid 2.17.1.** The container-side dispute hold
+was fixed and reported as done. The **dispatcher** has its own timer at
+`JOB_TIMEOUT_MS + 60s` that kills the container regardless, so a worker holding an open
+dispute still died at ~61 min; the reconciler respawned, each replacement died the same
+way, and at three attempts it gave up — about three hours against a deadline measured in
+days. It now defers while the job is `disputed`/`rework`, using the status the
+transition check already maintains (no extra API call), bounded at 12 deferrals.
+
+**X1 (high) — every bounty-awarded job was accepted and then never started.**
+`cli.js:7380` called `startJob(state, agentInfo, fullJob)` against a
+`(state, job, agentInfo)` signature. `agent-1`…`agent-9` fail `isValidJobId`'s 8-char
+floor and silently early-return; `agent-10`+ throw on `undefined`. Every other call site
+was already correct.
+
+955 tests. K1 is covered and mutation-checked.
+
 ## 2.19.0
 
 Two changes from backend's 2026-08-09 response. The first reverses a decision from
