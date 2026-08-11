@@ -4439,6 +4439,21 @@ program
           // operator would never know the on-chain half did not happen. The
           // activation path reports its txid; this one reported nothing.
           if (process.env.J41_STATUS_TOGGLE_ONCHAIN !== '0') {
+            // L7 — this is an identity write, and it went out with no regard for the
+            // inbox pending-write gate. If the batched processor broadcast for this
+            // agent moments earlier and that tx is still unconfirmed, the platform
+            // still serves the old prevOutput, so this write double-spends it and one
+            // of the two is rejected — silently, because TX_REJECTED classifies as
+            // contention and simply retries. Waiting a beat is free at shutdown; a
+            // rejected deactivate is not, because on-chain status is the durable lever
+            // that keeps a hire off a stopped agent.
+            const _pw = state._inboxLastWrite?.get(agentInfo.id);
+            if (_pw && _pw.txid) {
+              console.log(`   ⏸  ${agentInfo.id}: identity write ${String(_pw.txid).slice(0, 8)} may be unconfirmed — ` +
+                'waiting before the on-chain deactivate to avoid double-spending its prevOutput.');
+              await new Promise(r => setTimeout(r, 8000));
+              kickWatchdog(`awaiting pending write ${agentInfo.id}`);
+            }
             try {
               await agent.setOnChainStatus('inactive');
               console.log(`   ✅ ${agentInfo.id}: on-chain status → inactive`);
@@ -7252,25 +7267,26 @@ async function handleWebhookEvent(state, agentId, payload) {
     }
 
     case 'review.received': {
+      // T2 — this used to loop `acceptReview` over up to 10 inbox items, each of which
+      // writes an identity transaction, BACK TO BACK, outside the batch and outside the
+      // pending-write gate. That is precisely the double-spend CLAUDE.md says never to
+      // do: the platform serves the last CONFIRMED prevOutput, so writes 2..N of the
+      // burst spend an output the chain has already seen consumed. It failed silently,
+      // too — `TX_REJECTED` classifies as `contention` in inbox-deadletter.js, which
+      // never escalates, so the rejected writes retried forever and invisibly.
+      //
+      // The batched processor is the one correct path: one identity transaction per
+      // agent per cycle, gated on `_inboxLastWrite`. The webhook's job is to make that
+      // sweep happen NOW rather than to do the writing itself.
       try {
-        const agent = await getAgentSession(state, agentInfo);
-        // Check inbox for the review
-        const inbox = await agent.client.getInbox('pending', 10);
-        const reviews = (inbox.data || []).filter(i => i.type === 'review' || i.rating != null);
-        for (const review of reviews) {
-          try {
-            await agent.acceptReview(review.id);
-            console.log(`[Webhook] ✅ Review ${review.id.substring(0, 8)} processed for ${agentInfo.id}`);
-            // Trigger backend re-index so review is visible on marketplace immediately
-            try {
-              await agent.client.refreshAgent(agentInfo.iAddress || agentInfo.identity);
-            } catch {}
-          } catch (e) {
-            console.error(`[Webhook] Review failed: ${e.message}`);
-          }
+        if (state._inboxSweepRunning) {
+          console.log(`[Webhook] Review for ${agentInfo.id} — inbox sweep already running; it will be picked up.`);
+        } else {
+          console.log(`[Webhook] Review for ${agentInfo.id} — triggering the batched inbox sweep.`);
+          await checkPendingInbox(state);
         }
       } catch (e) {
-        console.error(`[Webhook] Review check failed: ${e.message}`);
+        console.error(`[Webhook] Review sweep failed: ${e.message}`);
       }
       break;
     }

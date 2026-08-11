@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+## 2.27.0
+
+The two remaining pending-write-gate bypasses. Same defect at two sites, both
+chain-damaging, both silent.
+
+**T2 — the `review.received` webhook wrote N identity transactions back to back.** It
+looped `acceptReview` over up to 10 pending inbox items, each of which writes an
+identity transaction, outside the batch and outside the pending-write gate. That is
+precisely the double-spend `CLAUDE.md` says never to do: the platform serves the last
+**confirmed** `prevOutput`, so writes 2..N of the burst spend an output the chain has
+already seen consumed.
+
+It also failed invisibly. `TX_REJECTED` classifies as `contention` in
+`inbox-deadletter.js`, which never escalates — so the rejected writes retried forever
+with no dead-letter, no health signal and no operator-visible symptom. The webhook now
+triggers the batched sweep (one identity transaction per agent per cycle, gated on
+`_inboxLastWrite`) instead of writing itself, and declines to start a second sweep while
+one is in flight.
+
+**L7 — shutdown's on-chain deactivate raced the same gate.** It is an identity write and
+it went out with no regard for an unconfirmed inbox write moments earlier, so it could
+double-spend that `prevOutput` and be rejected — silently, for the same reason. It now
+waits when a pending write is recorded for the agent. Waiting a few seconds at shutdown
+is free; a rejected deactivate is not, because on-chain status is the durable lever that
+keeps a hire off a stopped agent (backend confirmed their hire gate reads
+`agents.status`, which their indexer overwrites from chain).
+
+978 tests. Both mutation-checked.
+
 ## 2.26.0
 
 Two independent adversarial reviews of everything shipped since the audits
