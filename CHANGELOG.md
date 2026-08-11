@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+## 2.28.0
+
+An independent re-verification of all 41 audit mediums against current code. It found
+**6 already fixed**, and — more usefully — that **two of my own recent fixes had made
+things worse**. This release closes both, plus the halves 2.27.0 left open.
+
+**C1 — the pending-write gate was applied asymmetrically, and the gate itself was
+fake.** 2.27.0 guarded the shutdown on-chain deactivate and called the gate bypasses
+closed. Three problems:
+
+- The "gate" was a flat **8-second sleep**. A Verus block is ~60 s, so an unconfirmed
+  transaction is almost always still unconfirmed afterwards — it looked like a fix and
+  bought nothing. It now polls the real `shouldDeferForPendingWrite` state against the
+  chain, bounded at 90 s, and proceeds loudly rather than silently if it never confirms.
+- The **startup activation** — the identity write most likely to collide, because it
+  lands seconds before the inbox sweep timer first fires — was left bare. It now records
+  its txid into `_inboxLastWrite` so the first sweep defers.
+- The **inbox sweep kept running through the drain**, which can last 120 minutes, so the
+  reverse collision (sweep double-spends the deactivate) was untouched. It now stops
+  once `shuttingDown` is set.
+
+**C2 — 2.23.0's L2 fix made a double-spawn race reachable in the default runtime.** That
+fix moved `getAgentSession` + `getJob` + `startJobContainer` inside the bare 10-second
+cleanup interval. `state.retries` is read-then-written across those awaits with no lock,
+so two overlapping passes can each respawn the same job. Previously local-mode only; now
+the Docker default. The loop is non-reentrant and counts its skips, matching its two
+sibling loops.
+
+**C2/L4 — a Docker daemon blip tore down every in-flight job.** `ECONNREFUSED`/`ENOENT`
+from `inspect()` landed in the same catch as a genuine 404, and since `container.wait()`
+had recorded no exit code the crash path never ran — so every active job was silently
+torn down with **no refund**, and locked out of re-polling for 7 days by `seen`. A 404
+now means gone; anything else means the daemon is unreachable and the job is left alone.
+
+983 tests. All four mutation-checked — and two of the first-draft assertions passed
+under mutation because they checked that an identifier appeared rather than that the
+guard held. Both were rewritten to pin the condition.
+
 ## 2.27.0
 
 The two remaining pending-write-gate bypasses. Same defect at two sites, both

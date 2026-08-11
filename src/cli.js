@@ -4297,6 +4297,16 @@ program
           }
           const result = await agent.activate({ onChain: _toggleOnChain });
           agentInfo.platformStatus = 'active';
+          // C1/S7 — record this identity write so the FIRST inbox sweep defers instead
+          // of double-spending its prevOutput. 2.27.0 gated the shutdown deactivate and
+          // left this twin bare, which made the pair asymmetric: the write most likely
+          // to collide with a sweep is the one that happens seconds before the sweep
+          // timer first fires. `_inboxLastWrite` is memory-only, so a restart forgets
+          // any write the previous process left unconfirmed — this is the point where
+          // that gap is cheapest to close.
+          if (_toggleOnChain && result && result.onChainTxid) {
+            state._inboxLastWrite.set(agentInfo.id, { txid: result.onChainTxid, at: Date.now() });
+          }
           console.log(`  ✅ ${agentInfo.id}: active (on-chain txid: ${result.onChainTxid || 'skipped'})`);
           state._agentErrors.delete(agentInfo.id);
           state.emitEvent?.('agent.online', { agentId: agentInfo.id, identity: agentInfo.identity });
@@ -4447,12 +4457,37 @@ program
             // contention and simply retries. Waiting a beat is free at shutdown; a
             // rejected deactivate is not, because on-chain status is the durable lever
             // that keeps a hire off a stopped agent.
+            // Use the REAL gate, not a fixed sleep. 2.27.0 waited a flat 8s, but a
+            // Verus block is ~60s, so an unconfirmed tx is almost always still
+            // unconfirmed afterwards — the pause looked like a fix and bought nothing.
+            // Poll the actual confirmation state, bounded, and proceed loudly if it
+            // never confirms: leaving an agent active on-chain is worse than risking
+            // one rejected write, because backend's hire gate reads from chain.
             const _pw = state._inboxLastWrite?.get(agentInfo.id);
             if (_pw && _pw.txid) {
-              console.log(`   ⏸  ${agentInfo.id}: identity write ${String(_pw.txid).slice(0, 8)} may be unconfirmed — ` +
-                'waiting before the on-chain deactivate to avoid double-spending its prevOutput.');
-              await new Promise(r => setTimeout(r, 8000));
-              kickWatchdog(`awaiting pending write ${agentInfo.id}`);
+              const _deadline = Date.now() + 90000;
+              let _cleared = false;
+              while (Date.now() < _deadline) {
+                let prevOut = null;
+                let height = null;
+                try {
+                  const raw = await agent.client.getIdentityRaw(agentInfo.iAddress || agentInfo.identity);
+                  prevOut = raw?.data?.prevOutput?.txid || raw?.data?.txid || null;
+                  height = raw?.data?.blockHeight ?? null;
+                } catch { /* can't tell — keep waiting until the deadline */ }
+                const gate = shouldDeferForPendingWrite(_pw, prevOut, height, Date.now());
+                if (!gate.defer) { _cleared = true; break; }
+                await new Promise(r => setTimeout(r, 5000));
+                kickWatchdog(`awaiting pending write ${agentInfo.id}`);
+              }
+              if (_cleared) {
+                console.log(`   ✓ ${agentInfo.id}: prior identity write confirmed — safe to deactivate on-chain.`);
+              } else {
+                console.warn(`   ⚠️  ${agentInfo.id}: prior identity write ${String(_pw.txid).slice(0, 8)} still ` +
+                  'unconfirmed after 90s — deactivating anyway. If it is rejected, run: ' +
+                  `j41-dispatcher deactivate ${agentInfo.id}`);
+              }
+              state._inboxLastWrite.delete(agentInfo.id);
             }
             try {
               await agent.setOnChainStatus('inactive');
@@ -7979,6 +8014,13 @@ async function checkFeeTanks(state) {
 
 // Check for pending inbox items (reviews + job records) and process them
 async function checkPendingInbox(state) {
+  // C1 — the sweep is the OTHER identity writer. Shutdown broadcasts a per-agent
+  // on-chain deactivate and can then drain for up to 120 minutes; if the sweep keeps
+  // firing through that window it double-spends the deactivate's prevOutput (or vice
+  // versa) and one of the two is rejected — silently, because TX_REJECTED classifies
+  // as contention. 2.27.0 gave the deactivate a pause but left the sweep running,
+  // which only closed one direction of the collision.
+  if (state.shuttingDown) return;
   // Reentrancy guard: safeInterval is a plain setInterval, so a sweep slower than
   // the 60s floor would overlap the next one — two concurrent batches per agent,
   // racing _inboxLastWrite and re-creating the contention this all exists to stop.
@@ -9216,6 +9258,26 @@ async function startJob(state, job, agentInfo) {
 
 // Cleanup completed jobs — includes retry logic (F-14)
 async function cleanupCompletedJobs(state) {
+  // C2/S9 — this runs on a bare 10s setInterval, and 2.23.0's L2 fix put
+  // getAgentSession + getJob + startJobContainer INSIDE it. Those awaits mean a slow
+  // pass overlaps the next one, and `state.retries` is read-then-written across them
+  // with no lock — so two passes can each decide to respawn the same job. Before L2
+  // that race was local-mode only; the fix made it reachable in the default Docker
+  // runtime. The sibling loops (poll, inbox) already guard and publish a skip counter.
+  if (state._cleanupRunning) {
+    state._cleanupSkips = (state._cleanupSkips || 0) + 1;
+    console.warn(`[Cleanup] previous pass still running — skipping (${state._cleanupSkips} total)`);
+    return;
+  }
+  state._cleanupRunning = true;
+  try {
+    return await _cleanupCompletedJobs(state);
+  } finally {
+    state._cleanupRunning = false;
+  }
+}
+
+async function _cleanupCompletedJobs(state) {
   for (const [jobId, active] of state.active) {
     if (RUNTIME === 'local') {
       // Local mode: check if child process exited
@@ -9329,6 +9391,19 @@ async function cleanupCompletedJobs(state) {
         //
         // The exit code is already on the active entry: container.wait() records it
         // at the spawn site. Consult it instead of discarding the event.
+        // C2/L4 — distinguish "this container is gone" from "the Docker daemon is
+        // unreachable". Both land here, but they mean opposite things: a 404 means the
+        // container really exited; ECONNREFUSED/ENOENT on the socket means dockerd
+        // blipped and EVERY active job hits this catch in the same pass. Treating that
+        // as "gone" tore down every in-flight job at once — with no refund, because the
+        // refund lives on the `_crashed` branch and `container.wait()` never recorded
+        // an exit code. `stopJobContainer` already discriminates 404 one function away.
+        const _isGone = e && (e.statusCode === 404 || /no such container/i.test(e.message || ''));
+        if (!_isGone) {
+          console.error(`[Cleanup] ${jobId.substring(0, 8)}: cannot reach Docker (${e.message}) — ` +
+            'leaving the job in place. This is a daemon problem, not a dead container.');
+          continue;
+        }
         const _code = active?._exitCode;
         const _crashed = typeof _code === 'number' && _code !== 0;
         if (_crashed) {
