@@ -14,11 +14,11 @@ Multi-agent orchestration system that manages a pool of pre-registered AI agents
   - **Webhook mode** -- event-driven via HTTP webhooks. Requires a publicly reachable URL.
 - **PID file** -- prevents duplicate dispatcher processes. New instance auto-kills previous.
 - **TOML config** -- reads `~/.j41/dispatcher/config.toml` at startup (mode 0600). Legacy `.env` files are auto-migrated on first start.
-- **Workspace auto-connect** -- job-agent polls for workspace status and connects jailbox automatically (no IPC required in Docker mode).
+- **Workspace/jailbox (parked — opt-in)** -- the direct-file-access jailbox is **default-off** in favour of deliver-and-review; every entry point refuses to start a session until you set `JAILBOX_ENABLED=1` (see [JAILBOX_PARKED.md](JAILBOX_PARKED.md)). When re-enabled, the job-agent polls workspace status and connects automatically (no IPC required in Docker mode).
 - **UTXO chaining** -- send multiple payments per block without waiting for confirmations.
 - **Financial allowlists** -- deny-all by default, auto-adds seller addresses on job creation, reloads from disk on every check.
 - **SovGuard 429 handling** -- surfaces upgrade URLs on quota limits, longer backoff on rate limits.
-- **Crash recovery** -- detects orphaned jobs on startup, handles refunds/cleanup.
+- **Crash recovery** -- detects orphaned jobs on startup, cleans up, and **queues** buyer refunds for owner approval. Refunds are never auto-sent — run `j41-dispatcher refunds` to see and approve them (see [Refund Approval Queue](#refund-approval-queue)).
 - **Graceful drain shutdown** -- delivers in-progress jobs, submits attestations, and marks agents offline on Ctrl+C or SIGTERM.
 - **On-chain job records** -- auto-processes `job_record` and `review` inbox items, writes to identity.
 - **Docker IPC** -- file-based IPC (`/tmp/ipc-msg.json`) for reconnect/pause/resume in Docker containers.
@@ -116,7 +116,7 @@ Choose from 5 built-in templates or **create a custom template**:
 | `code-review` | Bug detection, security audit, optimization |
 | `data-analyst` | Statistical analysis, visualization, forecasting |
 | `character-roleplay` | In-character AI — stays in role, SovGuard enabled |
-| `workspace-reviewer` | Direct file access code review via workspace/connect |
+| `workspace-reviewer` | Direct file access code review via workspace/connect — **requires the parked jailbox** (`JAILBOX_ENABLED=1`, see [JAILBOX_PARKED.md](JAILBOX_PARKED.md)); with the default config its defining capability cannot run |
 
 **Custom Template Builder** prompts for every field:
 - Profile: name, type, description, category (fetched from platform API), tags, markup, models, protocols, capabilities
@@ -168,6 +168,7 @@ All commands are also available directly for scripted/headless use:
 | `wallet show <agent-id>` | One agent: both addresses and its per-UTXO breakdown |
 | `wallet sweep <agent-id>\|--all` | Force an i-address → R-address sweep now (self-funding; no floor) |
 | `wallet send <from> <to> <amt>` | Move VRSC between two fleet agents' R-addresses |
+| `refunds [action] [job-id]` | Buyer-refund approval queue: `list` (default), `approve <job-id>\|--all`, `reject <job-id>`, `unblock <job-id>`. Crash recovery and the dispute sweep **queue** refunds here — nothing is sent until you approve (see [Refund Approval Queue](#refund-approval-queue)) |
 | `ctl status` | Live status from running dispatcher (uptime, active, queue, agents) |
 | `ctl jobs` | List active jobs with PID, duration, workspace status |
 | `ctl agents` | List agents with workspace capability and service count |
@@ -425,7 +426,11 @@ Per-service settings passed during registration:
 
 Run `j41-dispatcher dashboard` → "[3] Configure Agent Executor" / "[4] Configure Global LLM Default" to set your provider and API key. Config is stored at `~/.j41/dispatcher/config.toml` (mode 0600).
 
-Provider API keys belong in the `[provider_keys]` table of `config.toml` — they are never read from the dispatcher's own environment. See `docs/config.toml.example` for the full format.
+Provider API keys belong in the `[provider_keys]` table of `config.toml` — they are never read from the dispatcher's own environment. See `docs/config.toml.example` for the format.
+
+**`[provider_keys]` is keyed by the exact preset name** you set in `[llm] provider` (or a per-agent `llmProvider`) — not by provider company. `provider = "gemini"` reads `provider_keys.gemini`; the `claude-*` presets read `provider_keys.claude-sonnet` etc. (an OpenRouter key, since Claude presets route through OpenRouter). A key stored under any other name — including `anthropic`, `google`, or `xai` — is read by **nothing**; the resolver falls back to `llm.api_key` and, if that is empty too, the preflight LLM probe fails auth and agents decline every job as "LLM unavailable" while you hold a valid key. Variant presets each need their own entry (`openai-mini` does not read `provider_keys.openai`), or use `llm.api_key` as the shared fallback.
+
+> **`.env` migration caveat:** the legacy auto-migration maps `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY` and `XAI_API_KEY` into `provider_keys.anthropic|google|xai` — slots no preset reads. After migrating, move those values to the preset name you actually use (`claude-*` → an OpenRouter key under the preset name, `gemini`/`gemini-flash` → the Google key, `grok` → the xAI key).
 
 ### Environment Variables (ops overrides)
 
@@ -543,7 +548,7 @@ j41-dispatcher start --dev-unsafe
 
 ### LLM Providers (25 presets)
 
-Configure via `j41-dispatcher dashboard` → "Global LLM Default", or set `[llm]` and `[provider_keys]` in `~/.j41/dispatcher/config.toml`. Env vars `J41_LLM_PROVIDER`, `J41_LLM_BASE_URL`, `J41_LLM_API_KEY`, `J41_LLM_MODEL` override config for ops convenience.
+Configure via `j41-dispatcher dashboard` → "Global LLM Default", or set `[llm]` and `[provider_keys]` in `~/.j41/dispatcher/config.toml` (`[provider_keys]` entries are keyed by the exact **preset** name — see [Provider & LLM Keys](#provider--llm-keys)). Env vars `J41_LLM_PROVIDER`, `J41_LLM_BASE_URL`, `J41_LLM_API_KEY`, `J41_LLM_MODEL` override config for ops convenience.
 
 | Provider | Preset | Variants | Default Model |
 |---|---|---|---|
@@ -631,9 +636,51 @@ j41-dispatcher respond-dispute <jobId> \
 | `job.dispute.rework_accepted` | Forwarded to job-agent → re-enters chat |
 | `job.completed` | Forwarded to job-agent → triggers cleanup |
 
+## Refund Approval Queue
+
+Refunds to buyers are **never sent automatically**. Two paths queue them into a
+durable ledger (`~/.j41/dispatcher/pending-refunds.json`) and stop there until
+the owner approves:
+
+- **Crash recovery** — jobs found orphaned at startup (paid but never delivered).
+- **The dispute sweep** — disputes where the agent has agreed to a refund.
+
+Each queued entry emits `refund.pending_approval` on the `/v1/events` feed
+(`refund.needs_review` when the buyer address could not be verified) and logs
+one line at startup. **Nothing else surfaces the queue** — pending refunds do
+not currently appear in `ctl status` or `/health` — so check
+`j41-dispatcher refunds` after any crash or dispute. Until an entry is
+approved, the buyer has not been paid.
+
+```bash
+j41-dispatcher refunds                    # list pending (default action)
+j41-dispatcher refunds list --all         # include refunded/rejected entries too
+j41-dispatcher refunds approve <job-id>   # re-verify the buyer address, then send
+j41-dispatcher refunds approve --all      # approve every pending_approval entry
+j41-dispatcher refunds reject <job-id> --reason "text"
+j41-dispatcher refunds unblock <job-id>   # clear an in-flight marker — only after
+                                          # confirming on-chain the send did NOT arrive
+```
+
+Job-ids may be typed as unambiguous prefixes from `refunds list` output.
+`approve` re-verifies the buyer address before sending and **refuses**
+`needs_review` entries — fix the underlying data or `reject` them. Sends go
+through the same hardened outbound-value path as everything else
+(`~/.j41/financial-allowlist.json`).
+
 ## Workspace Integration
 
-When a buyer grants workspace access on a job, the dispatcher handles the full lifecycle:
+> **Parked — opt-in.** The workspace/jailbox path ("agent works inside the
+> buyer's environment") is **default-off** in favour of deliver-and-review —
+> see [JAILBOX_PARKED.md](JAILBOX_PARKED.md) for the rationale. Three gates
+> refuse it until you opt back in: `[jailbox] enabled` in `config.toml`
+> (default `false`), the dispatcher-side `checkWorkspaceCapability()` gate,
+> and the in-container `connectWorkspace()` funnel. Re-enable with
+> `JAILBOX_ENABLED=1` (the env override accepts **only the literal `1`** —
+> `JAILBOX_ENABLED=true` is treated as unset) or `[jailbox] enabled = true`.
+> Everything below describes behaviour **after** re-enabling.
+
+When a buyer grants workspace access on a job and the jailbox is re-enabled, the dispatcher handles the full lifecycle:
 
 1. **`workspace.ready`** — Platform notifies that a workspace session is available
 2. **Dispatcher connects** — The job-agent connects via the SDK's `WorkspaceClient`
@@ -712,9 +759,27 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9843/v1/status
 **Events** (`/v1/events`) are a file-backed ring buffer with a monotonic `seq`
 that survives restart, so a polling client's `since` cursor stays valid across a
 bounce. The response is `{ events: [...], cursor: N }`; poll with the last
-`cursor` as `since`. Event types follow a stable vocabulary:
-`job.started|delivered|completed`, `extension.requested|approved|rejected`,
-`dispute.filed|resolved`, `container.started|died`, `agent.online|offline`.
+`cursor` as `since`.
+
+Event types emitted in **both modes** (poll and webhook):
+
+- `job.accepted|started|delivered|completed|declined_llm_down`
+- `extension.requested`
+- `container.started|died`
+- `agent.online|offline|llm_down`
+- `dispute.unresolved_agent|surfacing_expired|reconcile_gave_up`
+- `refund.pending_approval|needs_review` — a buyer refund is waiting on
+  `j41-dispatcher refunds approve`; see [Refund Approval Queue](#refund-approval-queue)
+- `inbox.dead_lettered|pending_write_expired|batch_escalated`
+- `fee_tank_empty`, `fee_sweep`
+
+**Webhook mode only:** `extension.approved|rejected` and
+`dispute.filed|resolved|responded|rework_accepted` are normalized from inbound
+platform webhooks and can therefore only fire when the dispatcher runs with a
+webhook URL. **In poll mode — the default — these types never appear**: a
+monitor watching `dispute.filed` will never see a dispute. In poll mode, watch
+the `dispute.*` and `refund.*` types listed above instead, and use `ctl jobs` /
+`/health` for job-level dispute state.
 
 > Write endpoints (`POST /v1/agents/:id/activate`, offerings, dispute responses,
 > and the buyer-side `/v1/hire/*`) land in later increments. This is the
@@ -851,7 +916,7 @@ Every job automatically gets a canary token injected via `J41_CANARY_TOKEN` env 
 - **Env isolation**: Local mode whitelists only necessary env vars
 - **SSRF protection**: Executor URLs validated against private IP ranges
 - **Path traversal**: Workspace file operations reject `..` and absolute paths
-- **VDXF policy enforcement**: Agents without on-chain `workspace.capability` are blocked from workspace connections
+- **VDXF policy enforcement**: with the jailbox re-enabled, agents without on-chain `workspace.capability` are blocked from workspace connections. With the default (parked) config the jailbox gate blocks **all** workspace sessions before the capability check runs — see [JAILBOX_PARKED.md](JAILBOX_PARKED.md)
 - **Key file safety**: Temp keys file permissions set to `0o600` (owner-read only)
 
 ### Security Self-Test

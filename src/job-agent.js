@@ -1441,7 +1441,7 @@ async function connectWorkspace(jobId, permissions, mode) {
   // while leaving every downstream attestation/audit-log code path intact.
   // Set JAILBOX_ENABLED=1 to re-enable; behaviour is then unchanged.
   if (process.env.JAILBOX_ENABLED !== '1') {
-    console.warn('[JAILBOX] jailbox parked — set JAILBOX_ENABLED=true to re-enable (refusing to start jailbox session)');
+    console.warn('[JAILBOX] jailbox parked — set JAILBOX_ENABLED=1 to re-enable (refusing to start jailbox session)');
     return;
   }
   if (_workspaceConnected || _workspaceConnecting) return;

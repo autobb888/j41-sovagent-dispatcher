@@ -31,18 +31,38 @@ mcp_url = ""
 max_tool_rounds = 10
 
 [llm]
-provider = ""               # openai, claude, gemini, ... (one of LLM_PRESETS keys)
+provider = ""               # EXACT LLM_PRESETS key: openai, claude-sonnet, gemini, grok, ...
+                            # ("claude" alone is NOT a preset — the Claude presets are
+                            # claude-opus / claude-sonnet / claude-haiku)
 model = ""
 base_url = ""               # override preset.baseUrl
-api_key = ""                # generic fallback if provider_keys.<name> empty
+api_key = ""                # generic fallback if provider_keys.<preset> empty
 
 [provider_keys]
-# Set the key for your active provider. Read by dispatcher when spawning
-# job containers — never enters dispatcher's own process.env.
-openai = ""
-anthropic = ""
-google = ""
-xai = ""
+# ⚠️ Keyed by the EXACT preset name set in [llm] provider (or a per-agent
+# llmProvider) — NOT by provider company. The dispatcher and the preflight
+# LLM probe both resolve the key as provider_keys.<preset-name>, then fall
+# back to llm.api_key. A key stored under any other name is read by NOTHING.
+# Symptom of a mis-keyed entry: the preflight probe fails auth and every job
+# is declined as "LLM unavailable" while you hold a valid key.
+#
+# Variant presets each need their own entry (openai-mini does NOT read
+# provider_keys.openai) — or set llm.api_key as the shared fallback.
+#
+# Migrating from a legacy .env? The auto-migration wrote ANTHROPIC_API_KEY /
+# GOOGLE_API_KEY / XAI_API_KEY into provider_keys.anthropic / google / xai —
+# names no preset reads. Move those values to the preset name you actually
+# use: claude-* presets take an OpenRouter key, gemini* takes the Google key,
+# grok takes the xAI key.
+#
+# Read by the dispatcher when spawning job containers — never enters the
+# dispatcher's own process.env.
+openai = ""                 # openai-mini / openai-o3 need their own entries
+claude-sonnet = ""          # claude-* presets route via OpenRouter — use an OpenRouter key
+claude-opus = ""
+claude-haiku = ""
+gemini = ""                 # Google AI Studio key; gemini-flash needs its own entry
+grok = ""                   # xAI key
 groq = ""
 deepseek = ""
 mistral = ""
@@ -52,7 +72,8 @@ nvidia = ""
 cohere = ""
 perplexity = ""
 openrouter = ""
-kimi = ""
+kimi = ""                   # kimi-nvidia needs its own entry
+azure = ""
 
 [proxy]
 upstream_timeout_ms = 60000     # raise to 300000 for long local-LLM queries
@@ -92,6 +113,15 @@ enabled = true                  # on by default; the failure it prevents is sile
 floor_writes = 100              # sweep when the tank affords fewer writes than this
 interval_ms = 1800000           # how often to check (30 min). NOTE: the CLI flag
                                 # --fee-sweep-interval takes MINUTES; this takes ms.
+
+[jailbox]
+# The "agent works inside the buyer's environment" sandbox (legacy
+# "workspace") is PARKED in favour of deliver-and-review — see
+# JAILBOX_PARKED.md in the repo root. Default OFF: the dispatcher refuses to
+# start a jailbox session unless you opt back in here or with
+# JAILBOX_ENABLED=1 (the env override accepts ONLY the literal 1 — "true"
+# is treated as unset).
+enabled = false
 
 [debug]
 chat = false                # enables [chat] event log when true (privacy-sensitive)

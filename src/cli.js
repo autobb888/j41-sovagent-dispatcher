@@ -5579,7 +5579,11 @@ async function sweepExpiredQueue(state, deps = {}) {
  */
 function checkWorkspaceCapability(state, agentId) {
   if (!cfg.jailbox.enabled) {
-    console.warn(`[JAILBOX] ${agentId}: jailbox parked — set JAILBOX_ENABLED=true to re-enable (refusing to start jailbox session)`);
+    // D4 — the remedy must match the reader. `JAILBOX_ENABLED` is parsed with `bool1`
+    // (`raw === '1'`), so the `=true` this used to print is silently false: an operator
+    // following the instruction printed AT THE MOMENT OF FAILURE got the same refusal
+    // and no clue why. Sibling site in job-agent.js fixed with it.
+    console.warn(`[JAILBOX] ${agentId}: jailbox parked — set JAILBOX_ENABLED=1 to re-enable (refusing to start jailbox session)`);
     return false;
   }
   const caps = state.capabilities.get(agentId);

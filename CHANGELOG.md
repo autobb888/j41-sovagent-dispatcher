@@ -31,6 +31,32 @@ keeps a hire off a stopped agent (backend confirmed their hire gate reads
 
 978 tests. Both mutation-checked.
 
+### Documentation truth (D2–D6)
+
+Five findings where the docs described a system one or two releases back. Docs were
+corrected to match the code, not the other way round.
+
+- **D2** — `config.toml.example` advertised `[provider_keys]` slots (`anthropic`,
+  `google`, `xai`) that **nothing reads**: lookup is by *preset* name. The `.env`
+  migration routed exactly those keys into the dead slots, so the fleet declined every
+  job as "LLM down". Slots now match real presets, with the keyed-by-preset rule, the
+  failure symptom and the migration caveat spelled out. `openai-mini` does not read
+  `provider_keys.openai` — variants need their own entry.
+- **D3** — workspace/jailbox was sold as live in an Overview bullet, a full section and
+  a shipped template. It is parked default-off at three gates. Now labelled
+  parked/opt-in throughout, and `JAILBOX_PARKED.md` is linked rather than orphaned.
+- **D4** — both refusal sites printed *"set `JAILBOX_ENABLED=true`"* while the reader is
+  `bool1` (`raw === '1'`), so the remedy printed **at the moment of failure** was itself
+  a no-op. Both now say `=1`, and the README states that `true` is treated as unset.
+- **D5** — `extension.approved|rejected` and `dispute.filed|resolved` reach `/v1/events`
+  only through the webhook route, so in poll mode (the default) they can never fire. The
+  event list is now verified against every `emitEvent` call site and split explicitly
+  into both-modes and webhook-only.
+- **D6** — `refunds` was absent from the README while the Overview claimed crash recovery
+  "handles refunds"; it queues them for a manual approval no operator doc named, ending
+  in an unpaid buyer. New Refund Approval Queue section, and the honest note that
+  pending refunds appear in neither `ctl status` nor `/health`.
+
 ## 2.26.0
 
 Two independent adversarial reviews of everything shipped since the audits
