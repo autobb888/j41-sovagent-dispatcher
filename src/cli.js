@@ -3363,6 +3363,7 @@ program
     const readyAgents = [];
     // Agents our own last shutdown turned off, and which this start restores.
     const _shutdownDeactivated = readShutdownDeactivated();
+    const _shutdownMarkerAt = readShutdownDeactivatedAt();
     const _reactivatedOnStart = [];
     let _lastSeenPlatformStatus = null;
     for (const agentId of agents) {
@@ -4282,6 +4283,25 @@ program
       // On-chain deactivate is the durable lever; opt out with J41_STATUS_TOGGLE_ONCHAIN=0.
       const _toggleOnChain = process.env.J41_STATUS_TOGGLE_ONCHAIN !== '0';
       console.log(`\n→ Setting agents active${_toggleOnChain ? '' : ' (PLATFORM ONLY — J41_STATUS_TOGGLE_ONCHAIN=0; a re-index can revert this and let a hire land on a stopped agent)'}...`);
+      // Our OWN shutdown deactivate is the thing this collides with. Stop writes
+      // N deactivates on-chain; start writes N activates seconds later against the
+      // same prevOutputs, before any of them can confirm — so every activate is
+      // rejected and the fleet ends up inactive on-chain while active on the platform.
+      // Observed live: 9/9 "Transaction rejected by the network", reported as ✅.
+      // The marker records which agents we deactivated and when; if that was under a
+      // block ago, let the chain catch up before writing again.
+      const _mAt = Date.parse(_shutdownMarkerAt || '');
+      if (_toggleOnChain && _reactivatedOnStart.length && Number.isFinite(_mAt)) {
+        const _since = Date.now() - _mAt;
+        const _blockMs = 75000; // Verus ~60s, plus margin
+        if (_since < _blockMs) {
+          const _waitMs = _blockMs - _since;
+          console.log(`  ⏳ Our last shutdown deactivated ${_reactivatedOnStart.length} agent(s) ` +
+            `${Math.round(_since / 1000)}s ago. Waiting ${Math.round(_waitMs / 1000)}s for those identity ` +
+            'transactions to confirm — activating now would double-spend their prevOutputs and be rejected.');
+          await new Promise(r => setTimeout(r, _waitMs));
+        }
+      }
       for (let i = 0; i < readyAgents.length; i++) {
         const agentInfo = readyAgents[i];
         // Stagger activation — 1s between agents to avoid rate limits at scale
@@ -4297,6 +4317,17 @@ program
           }
           const result = await agent.activate({ onChain: _toggleOnChain });
           agentInfo.platformStatus = 'active';
+          // A null txid means the on-chain write FAILED (no UTXOs, or rejected) — the
+          // SDK returns null in exactly those cases. We printed
+          // "✅ active (on-chain txid: skipped)", which reads like success and hid nine
+          // consecutive rejections behind a tick. On-chain status is the durable lever
+          // backend's hire gate reads, so a silent failure here is a hire landing on a
+          // stopped agent.
+          if (_toggleOnChain && !(result && result.onChainTxid)) {
+            state._agentErrors.set(agentInfo.id, 'on-chain activate failed — chain may still say inactive');
+            console.error(`   ⚠️  ${agentInfo.id}: ON-CHAIN activate FAILED (platform says active, chain may not). ` +
+              `Re-run once the previous identity tx confirms:  j41-dispatcher activate ${agentInfo.id}`);
+          }
           // C1/S7 — record this identity write so the FIRST inbox sweep defers instead
           // of double-spending its prevOutput. 2.27.0 gated the shutdown deactivate and
           // left this twin bare, which made the pair asymmetric: the write most likely
@@ -5364,6 +5395,17 @@ async function readDisputePolicyFor(agent) {
 // distinction is the whole reason this is a marker file and not "activate anything
 // that looks inactive".
 const SHUTDOWN_DEACTIVATED_FILE = path.join(DISPATCHER_DIR, 'shutdown-deactivated.json');
+
+/** When the marker was written (ISO string), or null. Used to avoid broadcasting an
+ *  activate on top of our own still-unconfirmed deactivate. */
+function readShutdownDeactivatedAt(file = SHUTDOWN_DEACTIVATED_FILE) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return typeof parsed?.at === 'string' ? parsed.at : null;
+  } catch {
+    return null;
+  }
+}
 
 function readShutdownDeactivated(file = SHUTDOWN_DEACTIVATED_FILE) {
   try {
@@ -11305,7 +11347,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');

@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+## 2.28.1
+
+**Every restart left the fleet inactive on-chain, and reported success.** Found by
+reading 2.28.0's own restart log: nine consecutive
+`On-chain status update failed: Transaction rejected by the network`, each printed as
+`✅ agent-N: active (on-chain txid: skipped)`.
+
+The collision is **self-inflicted and I missed it in C1**. C1 gated the inbox sweep
+against the deactivate and made startup record its own write — but shutdown's on-chain
+deactivate and startup's on-chain activate are themselves back-to-back writes against
+the same `prevOutput`, seconds apart with no block between them. The deactivate lands,
+the activate double-spends it, all nine are rejected. The fleet then sits `inactive`
+on-chain while `active` on the platform — exactly the state backend warned about, where
+a re-index reverts the platform value and a hire lands on a stopped agent with no escrow.
+
+Two fixes:
+
+- **A null txid is now reported as a failure.** The SDK returns `null` only when the
+  write failed (no UTXOs, or rejected), so `skipped` never meant "unnecessary" — it
+  meant "did not happen". Nine rejections hid behind a tick, and the recovery command
+  is now printed with them.
+- **Startup waits for its own deactivates to confirm.** If the shutdown marker was
+  written less than a block ago (~75 s), the activation loop waits before broadcasting.
+
+985 tests. Both mutation-checked — and three drafts of one assertion silently anchored
+on the wrong region of the file (a string that also appears in a comment; a loop that
+appears twice), passing while reading code tens of thousands of characters away. A test
+asserting against the wrong region is worse than no test; the final version anchors on
+text that occurs once.
+
 ## 2.28.0
 
 An independent re-verification of all 41 audit mediums against current code. It found

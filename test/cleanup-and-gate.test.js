@@ -40,7 +40,7 @@ test('C1b: the shutdown deactivate uses the real confirmation gate, not a fixed 
 
 test('C1c: the startup activation records its identity write', () => {
   const i = CLI.indexOf("agent.activate({ onChain: _toggleOnChain })");
-  const after = CLI.slice(i, i + 900);
+  const after = CLI.slice(i, i + 2500); // window must survive comments being added between
   assert.match(after, /_inboxLastWrite\.set/,
     'unrecorded, the first inbox sweep double-spends this prevOutput');
 });
@@ -67,4 +67,32 @@ test('C2/L4: a Docker daemon error is not treated as a dead container', () => {
   // string and the 404 check in place while restoring the original bug.
   assert.match(near, /if \(!_isGone\)\s*\{/,
     'the daemon-error branch must guard on the classification');
+});
+
+test('a failed on-chain activate is reported as a failure, not a tick', () => {
+  // Observed live on 2.28.0: nine consecutive "Transaction rejected by the network"
+  // printed as "✅ active (on-chain txid: skipped)". The SDK returns null for a failed
+  // write, so a null txid is a failure — and on-chain status is the lever backend's
+  // hire gate reads, so hiding it means a hire can land on a stopped agent.
+  const i = CLI.indexOf("agent.activate({ onChain: _toggleOnChain })");
+  const after = CLI.slice(i, i + 2500);
+  assert.match(after, /ON-CHAIN activate FAILED/, 'a rejected write must not read as success');
+  assert.match(after, /!\(result && result\.onChainTxid\)/, 'null txid IS the failure signal');
+});
+
+test('startup does not broadcast an activate on top of our own unconfirmed deactivate', () => {
+  // The collision is self-inflicted: stop writes N deactivates, start writes N
+  // activates seconds later against the same prevOutputs, before any can confirm.
+  // Anchor on the unique guard text. Two earlier attempts anchored on strings that
+  // occur more than once ("Setting agents active" appears in a comment; the
+  // readyAgents for-loop appears twice) and silently read a window tens of thousands
+  // of characters from the code under test — a test that asserts against the wrong
+  // region is worse than none.
+  const i = CLI.indexOf('Our last shutdown deactivated');
+  assert.ok(i > -1, 'the self-collision guard must exist');
+  const block = CLI.slice(Math.max(0, i - 700), i + 900);
+  assert.match(block, /_shutdownMarkerAt|_mAt/, 'the marker timestamp gates the wait');
+  assert.match(block, /await new Promise\(r => setTimeout\(r, _waitMs\)\)/,
+    'it must actually wait, not merely warn');
+  assert.match(block, /if \(_since < _blockMs\)/, 'the wait must be conditional on the gap');
 });
