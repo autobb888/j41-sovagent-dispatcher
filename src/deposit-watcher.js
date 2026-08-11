@@ -18,7 +18,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { creditDeposit } = require('./credit-meter');
+const { creditDeposit, reverseDeposit } = require('./credit-meter');
 const { clampCredit } = require('./deposit-credit.js');
 const { loadDispatcherConfig } = require('./config-loader.js');
 const { checkNonceAfterVerify } = require('./nonce-cache');
@@ -312,6 +312,10 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
       console.warn(`[deposit] credited ${credited} < reported ${expectedAmount} (confirmedAmount=${verification.confirmedAmount}) for tx ${txid}`);
     }
     const result = creditDeposit(agentId, buyerVerusId, credited, txid);
+    // M4: `required === 0` means we just credited straight out of the mempool.
+    // A mempool transaction is not money — flag it so pollPendingDeposits comes
+    // back and either confirms it or takes the credit away. See reconcile below.
+    const _unconfirmed = required === 0 && (txStatus.confirmations || 0) < 1;
 
     // Notify J41 platform (non-blocking, non-fatal) — uses per-agent context
     const ctx = _notifyContexts.get(agentId);
@@ -326,6 +330,7 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
       amount: credited,
       confirmations: txStatus.confirmations,
       creditedAt: new Date().toISOString(),
+      ...(_unconfirmed ? { unconfirmed: true, creditedAtMs: Date.now(), misses: 0 } : {}),
     });
     // Remove from pending if it was there
     fresh.pending = fresh.pending.filter(d => d.txid !== txid);
@@ -351,7 +356,130 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
  * @param agentId - Seller agent ID
  * @param client - Authenticated J41Client
  */
+// ── M4: reconcile 0-conf credits ────────────────────────────────────────────
+//
+// `requiredConfirmations` returns 0 below 2 VRSC, so a small deposit is credited
+// out of the mempool for instant proxy access. That is a deliberate UX call and
+// it matches the platform's own tiering — but it was one-way. The credit was
+// written to `processed` and nothing ever went back to ask whether the funding
+// transaction actually got mined. A mempool tx can be evicted, replaced, or never
+// mined at all, and the buyer keeps the credit either way. Repeatable with a
+// fresh txid each time, for free.
+//
+// The reconciler is deliberately biased toward KEEPING the credit. Reversing a
+// legitimate buyer's balance is worse than a delayed clawback, so a reversal
+// requires all three of:
+//   1. past the grace deadline (the tx has had time to be mined),
+//   2. RECONCILE_MIN_MISSES consecutive lookups that positively say "unknown",
+//      not merely a failed API call, and
+//   3. still no confirmation.
+// Any sighting — confirmed OR still visibly in the mempool — resets the miss
+// counter, because presence is positive evidence the tx exists.
+const RECONCILE_GRACE_MS = 30 * 60 * 1000; // ~30 blocks at Verus' ~60s target
+const RECONCILE_MIN_MISSES = 3;
+
+/** Does this error mean "the chain has never heard of this txid", as opposed to
+ *  "we could not reach the API"? Only the former is evidence of a dropped tx. */
+function _isTxUnknown(err) {
+  const m = String((err && err.message) || err || '');
+  if (/\b404\b/.test(m)) return true;
+  return /not\s*found|no\s*such\s*tx|unknown\s*transaction|invalid\s*or\s*non-?wallet/i.test(m);
+}
+
+async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
+  const deposits = loadDeposits(agentId);
+  const open = (deposits.processed || []).filter(d => d && d.unconfirmed);
+  if (open.length === 0) return { confirmed: 0, reversed: 0, waiting: 0 };
+
+  let confirmed = 0, reversed = 0, waiting = 0;
+
+  for (const rec of open) {
+    let seen = null;
+    let unknown = false;
+    try {
+      const st = await client.getTxStatus(rec.txid);
+      // A response we cannot interpret is NOT evidence of absence.
+      seen = st && Number.isFinite(st.confirmations) ? st.confirmations : null;
+    } catch (e) {
+      if (_isTxUnknown(e)) unknown = true;
+      else {
+        // Transient — an unreachable platform must never cost a buyer their balance.
+        waiting++;
+        continue;
+      }
+    }
+
+    // Re-load per record: crediting/reversing is a write, and other paths write
+    // `processed` too (audit M4's clobber lesson).
+    const fresh = loadDeposits(agentId);
+    const live = (fresh.processed || []).find(d => d && d.txid === rec.txid && d.unconfirmed);
+    if (!live) continue; // someone else resolved it while we were awaiting
+
+    if (seen !== null && seen >= 1) {
+      delete live.unconfirmed;
+      delete live.misses;
+      live.confirmations = seen;
+      saveDeposits(agentId, fresh);
+      confirmed++;
+      console.log(`[Deposits] ${agentId}: 0-conf credit ${rec.txid.substring(0, 12)}… confirmed at ${seen} block(s)`);
+      continue;
+    }
+
+    if (seen === 0) {
+      // Still in the mempool. It exists; keep waiting and reset the miss run.
+      if (live.misses) { live.misses = 0; saveDeposits(agentId, fresh); }
+      waiting++;
+      const ageMin = Math.round((now - (live.creditedAtMs || now)) / 60000);
+      if (ageMin >= 60 && ageMin % 60 < 2) {
+        console.warn(`[Deposits] ${agentId}: ${rec.txid.substring(0, 12)}… has sat unconfirmed in the mempool for ${ageMin} min ` +
+          `(${rec.amount} VRSC credited to ${rec.buyerVerusId}). It has not been reversed — it is still visible on the network.`);
+      }
+      continue;
+    }
+
+    // unknown === true: the chain does not know this txid.
+    live.misses = (live.misses || 0) + 1;
+    const pastGrace = now - (live.creditedAtMs || 0) >= RECONCILE_GRACE_MS;
+    if (!pastGrace || live.misses < RECONCILE_MIN_MISSES) {
+      saveDeposits(agentId, fresh);
+      waiting++;
+      continue;
+    }
+
+    reverseDeposit(agentId, live.buyerVerusId, live.amount, live.txid);
+    fresh.processed = fresh.processed.filter(d => d.txid !== live.txid);
+    fresh.reversed = fresh.reversed || [];
+    fresh.reversed.push({
+      txid: live.txid,
+      buyerVerusId: live.buyerVerusId,
+      amount: live.amount,
+      creditedAt: live.creditedAt,
+      reversedAt: new Date().toISOString(),
+      reason: 'funding transaction never confirmed and is unknown to the chain',
+    });
+    if (fresh.reversed.length > 1000) fresh.reversed = fresh.reversed.slice(-1000);
+    saveDeposits(agentId, fresh);
+    reversed++;
+    console.error(`[Deposits] ${agentId}: ⛔ REVERSED ${live.amount} VRSC of credit for ${live.buyerVerusId} — ` +
+      `funding tx ${live.txid.substring(0, 12)}… never confirmed and the chain does not know it. ` +
+      'If the buyer disputes this, check the txid on-chain before re-crediting.');
+  }
+
+  if (confirmed || reversed) {
+    console.log(`[Deposits] ${agentId}: reconciled 0-conf credits — ${confirmed} confirmed, ${reversed} reversed, ${waiting} still open`);
+  }
+  return { confirmed, reversed, waiting };
+}
+
 async function pollPendingDeposits(agentId, client) {
+  // Reconcile first: a 0-conf credit already spendable is a live exposure, and it
+  // is cheap to check. Failures here must not stop the pending sweep below.
+  try {
+    await reconcileUnconfirmedDeposits(agentId, client);
+  } catch (e) {
+    console.warn(`[Deposits] ${agentId}: 0-conf reconcile failed (${e.message})`);
+  }
+
   const deposits = loadDeposits(agentId);
   if (deposits.pending.length === 0) return;
 
@@ -572,4 +700,4 @@ async function notifyJ41CreditLow(sellerWif, sellerVerusId, buyerVerusId, balanc
   }
 }
 
-module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
+module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, RECONCILE_GRACE_MS, RECONCILE_MIN_MISSES, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };

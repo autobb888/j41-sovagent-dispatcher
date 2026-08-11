@@ -481,7 +481,10 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         // so nested objects like completion_tokens_details survive (the old regex broke on them).
         let inputTok = estimatedInput;
         let outputTok = estimatedOutput;
-        let sawUsage = false;
+        // Track a finite completion_tokens specifically — see the mirrored comment on
+        // the non-streaming path. A usage frame carrying only prompt_tokens must still
+        // fall through to the worst-case output settle.
+        let sawOutput = false;
         for (const line of fullResponse.split(/\r?\n/)) {
           if (!line.startsWith('data:')) continue;
           const json = line.slice(5).trim();
@@ -489,8 +492,8 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
           try {
             const frame = JSON.parse(json);
             if (frame && frame.usage && typeof frame.usage === 'object') {
-              if (Number.isFinite(frame.usage.prompt_tokens)) { inputTok = frame.usage.prompt_tokens; sawUsage = true; }
-              if (Number.isFinite(frame.usage.completion_tokens)) { outputTok = frame.usage.completion_tokens; sawUsage = true; }
+              if (Number.isFinite(frame.usage.prompt_tokens)) { inputTok = frame.usage.prompt_tokens; }
+              if (Number.isFinite(frame.usage.completion_tokens)) { outputTok = frame.usage.completion_tokens; sawOutput = true; }
             }
           } catch {
             // Malformed frame — skip. Upstream may send keep-alive comments starting with `:` too.
@@ -513,17 +516,20 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         // reservation for a failed request. `proxyReq.on('error')` does not fire —
         // the connection succeeded. The circuit breaker only opens after N consecutive
         // failures, so the first N are billed in full.
+        // The error check comes FIRST and is unconditional. It used to sit inside
+        // `if (!sawUsage)`, so an error response that happened to carry a usage frame
+        // was billed its reported tokens — the buyer paying for a 4xx/5xx, which is
+        // the very thing M1 fixed for the no-usage case. The non-streaming path zeroes
+        // on non-2xx regardless; these two must agree.
         const _upstreamOk = proxyRes.statusCode >= 200 && proxyRes.statusCode < 300;
-        if (!sawUsage) {
-          if (_upstreamOk) {
-            outputTok = reserveOutput;
-          } else {
-            // No completion was delivered. Charge nothing for output, and nothing for
-            // input either — the buyer got an error, not a service.
-            outputTok = 0;
-            inputTok = 0;
-            console.warn(`[proxy] upstream ${proxyRes.statusCode} on a streaming request — not billing (job ${key ? String(key).slice(0, 8) : '?'})`);
-          }
+        if (!_upstreamOk) {
+          // No completion was delivered. Charge nothing for output, and nothing for
+          // input either — the buyer got an error, not a service.
+          outputTok = 0;
+          inputTok = 0;
+          console.warn(`[proxy] upstream ${proxyRes.statusCode} on a streaming request — not billing (job ${key ? String(key).slice(0, 8) : '?'})`);
+        } else if (!sawOutput) {
+          outputTok = reserveOutput;
         }
 
         // Adjust reservation with actual token counts (or worst case if usage absent)
@@ -572,13 +578,24 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         let inputTok = estimatedInput;
         let outputTok = estimatedOutput;
 
-        let sawUsageNS = false;
+        // `sawOutputNS` tracks a finite completion_tokens SPECIFICALLY, not "a usage
+        // object was present". Two reasons:
+        //   • `||` treated a legitimate 0 as absent, so an upstream that genuinely
+        //     produced no output (a refusal, an empty choices array) billed the flat
+        //     ~2000-token estimate. The streaming path already used Number.isFinite;
+        //     this one never got the same treatment.
+        //   • `{usage: {prompt_tokens: 900}}` with no completion_tokens set the old
+        //     sawUsage flag and so escaped the worst-case settle below — the exact
+        //     hole that settle exists to close, reachable by omitting one field.
+        let sawOutputNS = false;
         try {
           const parsed = JSON.parse(responseBody.toString());
-          if (parsed.usage) {
-            sawUsageNS = true;
-            inputTok = parsed.usage.prompt_tokens || estimatedInput;
-            outputTok = parsed.usage.completion_tokens || estimatedOutput;
+          if (parsed && parsed.usage && typeof parsed.usage === 'object') {
+            if (Number.isFinite(parsed.usage.prompt_tokens)) inputTok = parsed.usage.prompt_tokens;
+            if (Number.isFinite(parsed.usage.completion_tokens)) {
+              outputTok = parsed.usage.completion_tokens;
+              sawOutputNS = true;
+            }
           }
         } catch {}
 
@@ -594,7 +611,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
           inputTok = 0;
           outputTok = 0;
           console.warn(`[proxy] upstream ${proxyRes.statusCode} — not billing (job ${key ? String(key).slice(0, 8) : '?'})`);
-        } else if (!sawUsageNS) {
+        } else if (!sawOutputNS) {
           // Mirror the streaming defence: settle against the declared worst case so a
           // non-compliant upstream cannot serve a large completion for a flat estimate.
           outputTok = reserveOutput;

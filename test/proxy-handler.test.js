@@ -74,6 +74,34 @@ function startUpstream() {
         } else if (upstreamMode === 'json-503') {
           res.writeHead(503, { 'Content-Type': 'application/json' });
           res.end('{"error":"upstream unavailable"}');
+        } else if (upstreamMode === 'json-zero-output') {
+          // A genuine empty completion — a refusal, a stop-sequence hit at position 0.
+          // `completion_tokens: 0` is real data, not missing data. M2r.
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            choices: [{ message: { content: '' } }],
+            usage: { prompt_tokens: 10, completion_tokens: 0 },
+          }));
+        } else if (upstreamMode === 'json-input-only') {
+          // A usage object that reports input but omits completion_tokens. Presence of
+          // `usage` used to be enough to skip the worst-case output settle.
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            choices: [{ message: { content: 'a very long completion' } }],
+            usage: { prompt_tokens: 10 },
+          }));
+        } else if (upstreamMode === 'stream-input-only') {
+          res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+          res.write('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n');
+          res.write('data: {"usage":{"prompt_tokens":10}}\n\n');
+          res.write('data: [DONE]\n\n');
+          res.end();
+        } else if (upstreamMode === 'stream-503-with-usage') {
+          // An error that nonetheless carries a usage frame. The error check used to
+          // live inside `if (!sawUsage)`, so this billed the buyer for a 503.
+          res.writeHead(503, { 'Content-Type': 'text/event-stream' });
+          res.write('data: {"usage":{"prompt_tokens":900,"completion_tokens":1200}}\n\n');
+          res.end();
         } else if (upstreamMode === 'stream-no-usage') {
           // Upstream ignores include_usage → never emits a usage frame.
           res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -305,4 +333,95 @@ test('M2: a non-streaming upstream 503 bills NOTHING', async () => {
   const remaining = getBalance(agentId, buyer);
   assert.ok(Math.abs(remaining - deposit) < 1e-9,
     `a non-streaming 503 must leave the balance untouched; deposited=${deposit} remaining=${remaining}`);
+});
+
+// ── M2r: "reported zero" and "reported nothing" are different facts ─────────
+//
+// The non-streaming settle read `parsed.usage.prompt_tokens || estimatedInput`, so
+// every falsy value — including a legitimate 0 — fell through to the flat estimate.
+// The streaming path had already been converted to Number.isFinite; this one had
+// not, which is the same "control applied at one of two sites" shape four audit
+// domains reported independently.
+//
+// The companion defect is subtler: `sawUsage` was set by the PRESENCE of a usage
+// object, so `{prompt_tokens: 900}` with no completion_tokens skipped the worst-case
+// output settle entirely and billed the flat estimate — the exact hole that settle
+// exists to close, reachable by omitting one field.
+
+test('M2r: a real completion_tokens:0 bills zero output, not the flat estimate', async () => {
+  inflight._reset();
+  upstreamMode = 'json-zero-output';
+  const agentId = 'agent-m2r-zero';
+  const buyer = 'iBuyerM2rZero';
+  const key = mintApiKey(agentId, buyer).key;
+  const deposit = calculateCost(PRICING, MODEL, 4000, 20000);
+  creditDeposit(agentId, buyer, deposit, 'tx-m2r-zero');
+
+  await runProxy(agentId, key, { model: MODEL, stream: false, max_tokens: 20000, messages: [] });
+  await new Promise((res) => setTimeout(res, 50));
+
+  // 10 in, 0 out. The old code billed 10 in / 2000 out.
+  const honest = calculateCost(PRICING, MODEL, 10, 0);
+  const overcharge = calculateCost(PRICING, MODEL, 10, 2000);
+  const spent = deposit - getBalance(agentId, buyer);
+  assert.ok(Math.abs(spent - honest) < 1e-9,
+    `should bill the reported 0 output; expected ${honest}, spent ${spent}`);
+  assert.ok(spent < overcharge,
+    'must not fall back to estimated_output when the upstream honestly reported none');
+});
+
+test('M2r: usage with prompt_tokens but no completion_tokens still settles worst-case', async () => {
+  inflight._reset();
+  upstreamMode = 'json-input-only';
+  const agentId = 'agent-m2r-inputonly';
+  const buyer = 'iBuyerM2rInputOnly';
+  const key = mintApiKey(agentId, buyer).key;
+  const maxTokens = 20000;
+  const worst = calculateCost(PRICING, MODEL, 4000, maxTokens);
+  creditDeposit(agentId, buyer, worst, 'tx-m2r-inputonly');
+
+  await runProxy(agentId, key, { model: MODEL, stream: false, max_tokens: maxTokens, messages: [] });
+  await new Promise((res) => setTimeout(res, 50));
+
+  // Output is unknown → charge the declared worst case, not estimated_output.
+  const expected = calculateCost(PRICING, MODEL, 10, maxTokens);
+  const spent = worst - getBalance(agentId, buyer);
+  assert.ok(Math.abs(spent - expected) < 1e-9,
+    `unknown output must settle at max_tokens; expected ${expected}, spent ${spent}`);
+});
+
+test('M2r: the same input-only usage frame settles worst-case on the streaming path', async () => {
+  inflight._reset();
+  upstreamMode = 'stream-input-only';
+  const agentId = 'agent-m2r-streaminput';
+  const buyer = 'iBuyerM2rStreamInput';
+  const key = mintApiKey(agentId, buyer).key;
+  const maxTokens = 20000;
+  const worst = calculateCost(PRICING, MODEL, 4000, maxTokens);
+  creditDeposit(agentId, buyer, worst, 'tx-m2r-streaminput');
+
+  await runProxy(agentId, key, { model: MODEL, stream: true, max_tokens: maxTokens, messages: [] });
+  await new Promise((res) => setTimeout(res, 50));
+
+  const expected = calculateCost(PRICING, MODEL, 10, maxTokens);
+  const spent = worst - getBalance(agentId, buyer);
+  assert.ok(Math.abs(spent - expected) < 1e-9,
+    `unknown output must settle at max_tokens; expected ${expected}, spent ${spent}`);
+});
+
+test('M2r: a 503 that carries a usage frame still bills NOTHING', async () => {
+  inflight._reset();
+  upstreamMode = 'stream-503-with-usage';
+  const agentId = 'agent-m2r-503usage';
+  const buyer = 'iBuyerM2r503Usage';
+  const key = mintApiKey(agentId, buyer).key;
+  const worst = calculateCost(PRICING, MODEL, 4000, 20000);
+  creditDeposit(agentId, buyer, worst, 'tx-m2r-503usage');
+
+  await runProxy(agentId, key, { model: MODEL, stream: true, max_tokens: 20000, messages: [] });
+  await new Promise((res) => setTimeout(res, 50));
+
+  const remaining = getBalance(agentId, buyer);
+  assert.ok(Math.abs(remaining - worst) < 1e-9,
+    `an error is an error whether or not it reports usage; deposited=${worst} remaining=${remaining}`);
 });

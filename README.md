@@ -711,6 +711,13 @@ Sell raw OpenAI-compatible inference time on your LLM server (local GPU, OpenRou
 
 **Credit metering** uses the reservation pattern: estimated cost is deducted upfront, the actual cost (computed from the upstream's `usage` response) corrects the reservation after the request completes. Streaming responses parse `usage` line-by-line via `JSON.parse` so nested fields like `completion_tokens_details` survive. Models not in the seller's `modelPricing` are rejected with a 400 listing the supported set.
 
+Two settle rules are worth knowing because they are deliberate, not defaults:
+
+- **A non-2xx upstream bills nothing** — not the reservation, not the estimate — on both the streaming and non-streaming paths, whether or not the error response happens to carry a `usage` block. The buyer received an error, not tokens.
+- **An unknown output count settles at the declared worst case** (`max_tokens`, bounded by `proxy.max_output_tokens_cap`), not at the flat estimate, so an upstream that ignores `stream_options.include_usage` cannot serve a large completion cheaply. A *reported* `completion_tokens: 0` is real data and bills zero — "reported none" and "reported nothing" are different facts.
+
+**Deposits under 2 VRSC are credited from the mempool at 0 confirmations** for instant access, then reconciled on every deposit poll. If the funding transaction confirms, the credit stands. If the chain positively does not know the txid — repeatedly, and past a 30-minute grace window — the credit is **reversed** and recorded under `reversed` in the agent's `deposits.json`. A reversal on an already-spent credit leaves a negative balance, which blocks further proxy use until it is topped up past the debt. A platform the dispatcher simply cannot reach never triggers a reversal.
+
 See [docs.junction41.io/dispatcher/api-endpoint-proxy](https://docs.junction41.io/dispatcher/api-endpoint-proxy) for the full buyer/seller flow and SDK helpers.
 
 ## Control Plane
@@ -895,8 +902,10 @@ All outbound financial operations are gated by `~/.j41/financial-allowlist.json`
 
 - **Deny-all by default** — empty allowlist blocks everything
 - **Dynamic lifecycle** — buyer refund address added on job accept, removed on complete
-- **Rate limiting** — max 3 sends/job, max value = job price + 10%, max 10 sends/hour, 30s cooldown
+- **Rate limiting** — max 3 sends/job, max value = job price + 10%, max 10 sends/hour, 30s cooldown. Enforced in `attemptPendingRefund`, the single point where VRSC leaves the host. Tune under `[refund_limits]` in `config.toml` (or `J41_REFUND_MAX_SENDS_PER_HOUR` etc.) — raise the hourly cap before draining a large approved backlog.
 - **Fail-closed sweep** — every 10 min checks active jobs against platform API; suspends all sends if API unreachable for 30 min
+
+A refund blocked by the hourly cap, the cooldown or the outage suspension is **deferred, not dropped** — it stays in the ledger and the next drain retries it. One blocked by the per-job cap or the value ceiling is left queued and reported, because retrying cannot fix it; clear it with `refunds reject <jobId>` after checking the chain.
 
 ### Local Mode
 

@@ -1,7 +1,7 @@
 {
   "name": "@junction41/dispatcher",
-  "version": "2.28.2",
-  "description": "Multi-agent orchestration for Junction41 — supports 22 LLM providers, 12 executor frameworks, workspace/connect, and on-chain VDXF identity",
+  "version": "2.29.0",
+  "description": "Multi-agent orchestration for Junction41 \u2014 supports 22 LLM providers, 12 executor frameworks, workspace/connect, and on-chain VDXF identity",
   "main": "src/cli.js",
   "bin": {
     "j41-dispatcher": "src/cli.js"

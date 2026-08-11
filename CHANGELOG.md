@@ -2,6 +2,97 @@
 
 ## Unreleased
 
+## 2.29.0
+
+Backend shipped `agents.platform_status` (089bf94, migration 058), which removes the
+reason we were writing agent status on-chain on every restart. **Routine restarts now
+perform zero on-chain transactions again**, and this time the durability hole that
+forced the 2.19.0 revert is closed on their side rather than worked around on ours.
+
+The shape of the fix: there are two status axes now. `status` mirrors the on-chain
+VDXF value and the indexer overwrites it from chain on every re-index — so anything we
+write there is best-effort. `platform_status` is set only by the signed
+`POST /v1/agents/:id/status` we already make, the indexer never touches it, and the
+hire gate is a fail-closed AND over both. Availability is durable without a chain
+write, so the two writes that self-collided — shutdown's deactivate and startup's
+activate, spending the same `prevOutput` — simply no longer exist.
+
+- `J41_STATUS_TOGGLE_ONCHAIN` **defaults to off**; `=1` opts a restart back in.
+  Explicit `activate` / `deactivate` still write on-chain, unchanged: that is what
+  on-chain status was always for.
+- Startup now reads **both** axes and ANDs them (`effectiveAgentStatus`). This is not
+  cosmetic. Once we stop writing `status` on-chain, a clean shutdown leaves the chain
+  saying `active` while availability says `inactive` — so a `status`-only read reports
+  a healthy fleet that cannot take work, and the activation loop's "already active, no
+  write needed" skip would never bring it back. Reading one axis would have re-created
+  the 2026-08-06 outage as a side effect of fixing the collision.
+- `/health` degrades on the ANDed value; `inspect` shows both axes plus the AND.
+- A backend that does not report `platformStatus` falls back to `status` alone.
+
+The 2.28.2 per-txid deactivate-confirmation wait is retained but is now inert unless
+an operator opts back into on-chain toggling.
+
+### Audit mediums — money cluster
+
+**M3 — the outbound-money rate limit did not exist.** The README has promised "max 3
+sends/job, max value = job price + 10%, max 10 sends/hour, 30s cooldown" and "suspends
+all sends if API unreachable for 30 min" since the security section was written.
+`checkDispatcherRateLimit` and `recordDispatcherSend` implemented all of it and had
+**zero callers**; `dispatcherFinancialSuspended` was written by the allowlist sweep and
+read by nobody. All four guarantees were documentation.
+
+Now enforced in `attemptPendingRefund`, the single point where VRSC leaves the host.
+This is defence in depth, not the primary control — every send is already behind
+operator approval, an allowlist, an inter-process lock and a durable ledger. What it
+adds is a bound on how much damage a bug in any of those can do, because each of them
+trusts the caller's arithmetic and none checks how much or how often.
+
+- Blocked-but-retryable (cooldown, hourly cap, outage suspension) → the entry stays in
+  the ledger and the next drain retries. Blocked-and-not (per-job cap, value ceiling)
+  → left queued and reported, since retrying cannot help.
+- Limits are configurable under `[refund_limits]`; a large approved backlog legitimately
+  needs a higher hourly cap, and a limit you cannot raise is a limit operators disable.
+- Fixed while wiring it: a missing job price made the value ceiling `NaN`, and every
+  `> NaN` is false — so the check passed for exactly the malformed entries it existed
+  to catch.
+
+**M2r — `||` treated a legitimate zero as missing.** The non-streaming settle read
+`parsed.usage.prompt_tokens || estimatedInput`, so an upstream honestly reporting
+`completion_tokens: 0` was billed the flat ~2000-token estimate. The streaming path had
+already been converted to `Number.isFinite`; this one had not — the same "control
+applied at one of two sites" shape four audit domains reported independently.
+
+Two related holes closed at the same time:
+
+- `sawUsage` was set by the *presence* of a usage object, so `{prompt_tokens: 900}`
+  with no `completion_tokens` skipped the worst-case output settle entirely — the exact
+  hole that settle exists to close, reachable by omitting one field. Both paths now
+  track a finite `completion_tokens` specifically.
+- On the streaming path the upstream-error check lived *inside* `if (!sawUsage)`, so a
+  4xx/5xx that carried a usage frame was billed its reported tokens. The error check is
+  now first and unconditional, matching the non-streaming path.
+
+**M4 — 0-conf deposit credits were never reconciled.** Deposits under 2 VRSC are
+credited straight from the mempool for instant proxy access. A mempool transaction is
+not money: it can be evicted, replaced, or never mined. The credit was written to
+`processed` and nothing ever went back to check, so a dropped sub-2-VRSC tx left the
+credit standing forever — repeatable with a fresh txid each time.
+
+`reconcileUnconfirmedDeposits` now runs on every deposit poll. It is deliberately
+biased toward keeping the credit, because clawing back a legitimate buyer's balance is
+worse than a delayed clawback: a reversal requires a *positive* "the chain does not
+know this txid", three consecutive times, past a 30-minute grace window. Any sighting —
+confirmed or still visibly in the mempool — resets the run, and an unreachable platform
+never costs a buyer anything. Reversals are recorded under `reversed` in the agent's
+`deposits.json`, not just logged. `reverseDeposit` does not clamp at zero: if the
+credit was already spent the balance goes negative, which blocks further proxy use
+until it is topped up past the debt. Clamping would forgive the debt and make the
+exploit free.
+
+1023 tests (+37). Every fix in this release was mutation-checked — including the M3
+wiring, where a unit test of the limiter would have passed against the broken build
+unchanged, since the defect was entirely the absence of a call.
+
 ## 2.28.2
 
 2.28.1 improved the restart collision from 9 rejected on-chain activates to 5, and made

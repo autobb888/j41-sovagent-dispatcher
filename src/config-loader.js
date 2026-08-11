@@ -67,6 +67,17 @@ const DEFAULTS = Object.freeze({
   // the docs took their own fleet down.
   poll: { interval_ms: 0 },
   deposit: { poll_interval_ms: 60000 },
+  // M3 — the outbound-money rate limit the README has always promised. These were
+  // hardcoded constants attached to two functions with ZERO callers, so none of it
+  // existed. Configurable because an operator draining a large approved backlog
+  // (we have queued 20 at a time) legitimately needs to raise the hourly cap, and a
+  // limit you cannot raise is a limit operators disable.
+  refund_limits: {
+    max_sends_per_job: 3,        // a refund is normally once; >1 means something retried
+    max_value_multiplier: 1.1,   // total refunded per job vs the job price
+    max_sends_per_hour: 10,      // fleet-wide; a pause, not a refusal — see attemptPendingRefund
+    cooldown_ms: 30000,          // between two sends for the SAME job
+  },
   health: { poll_interval_ms: 60000 },
   webhook: { max_body_bytes: 1048576 },
   retry: { rate_limit_backoff_multiplier: 3 },
@@ -128,6 +139,10 @@ const ENV_OVERRIDES = [
   ['J41_PROXY_CIRCUIT_OPEN_MS',        'proxy.circuit_open_ms',        'int'],
   ['J41_POLL_INTERVAL_MS',      'poll.interval_ms',         'int'],
   ['J41_DEPOSIT_POLL_INTERVAL', 'deposit.poll_interval_ms', 'int'],
+  ['J41_REFUND_MAX_SENDS_PER_JOB',  'refund_limits.max_sends_per_job',   'int'],
+  ['J41_REFUND_MAX_VALUE_MULT',     'refund_limits.max_value_multiplier','float'],
+  ['J41_REFUND_MAX_SENDS_PER_HOUR', 'refund_limits.max_sends_per_hour',  'int'],
+  ['J41_REFUND_COOLDOWN_MS',        'refund_limits.cooldown_ms',         'int'],
   // `bool` (not bool1) deliberately: this is default-ON, so J41_FEE_SWEEP=true
   // must not silently mean "disabled". See applyEnvOverrides.
   ['J41_FEE_SWEEP',            'fee_sweep.enabled',        'bool'],
