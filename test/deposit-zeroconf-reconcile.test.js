@@ -32,8 +32,23 @@ const {
   requiredConfirmations,
   RECONCILE_GRACE_MS,
   RECONCILE_MIN_MISSES,
+  RECONCILE_MISS_SPAN_MS,
+  _isTxUnknown,
 } = require('../src/deposit-watcher.js');
 const { getBalance } = require('../src/credit-meter.js');
+
+/**
+ * Drive a full miss run: RECONCILE_MIN_MISSES lookups spread over more than
+ * RECONCILE_MISS_SPAN_MS, all past the grace window. Returns the last result.
+ */
+async function fullMissRun(agentId, client, startAt) {
+  const step = Math.ceil(RECONCILE_MISS_SPAN_MS / (RECONCILE_MIN_MISSES - 1)) + 1000;
+  let last;
+  for (let i = 0; i < RECONCILE_MIN_MISSES; i++) {
+    last = await reconcileUnconfirmedDeposits(agentId, client, startAt + i * step);
+  }
+  return last;
+}
 
 const NET = 'verustest';
 const SMALL = 1.5; // under the 2 VRSC tier → credited at 0 confirmations
@@ -123,14 +138,7 @@ test('a dropped tx is reversed once — past grace AND repeatedly unknown', asyn
   const client = mockClient(kp, buyer, NOT_FOUND);
   const past = Date.now() + RECONCILE_GRACE_MS + 1;
 
-  // Misses accumulate; nothing is reversed until the run is long enough.
-  for (let i = 1; i < RECONCILE_MIN_MISSES; i++) {
-    const r = await reconcileUnconfirmedDeposits(agentId, client, past);
-    assert.equal(r.reversed, 0, `must not reverse on miss ${i} of ${RECONCILE_MIN_MISSES}`);
-    assert.equal(getBalance(agentId, buyer), SMALL);
-  }
-
-  const final = await reconcileUnconfirmedDeposits(agentId, client, past);
+  const final = await fullMissRun(agentId, client, past);
   assert.equal(final.reversed, 1);
   assert.equal(getBalance(agentId, buyer), 0, 'the unfunded credit is taken back');
 
@@ -140,9 +148,94 @@ test('a dropped tx is reversed once — past grace AND repeatedly unknown', asyn
   assert.equal(d.reversed[0].txid, txid);
 
   // And it does not keep reversing — the record is gone from the watch list.
-  const again = await reconcileUnconfirmedDeposits(agentId, client, past);
+  const again = await fullMissRun(agentId, client, past);
   assert.equal(again.reversed, 0);
   assert.equal(getBalance(agentId, buyer), 0, 'no double clawback');
+});
+
+test('three fast misses are NOT enough — the run must span real time', async () => {
+  // Three polls is three minutes, which one routine backend deploy window supplies
+  // on its own. A deploy is also exactly when the tx-status route is most likely to
+  // answer wrongly, so a short run must not be sufficient evidence.
+  const agentId = 'agent-fastmiss';
+  const buyer = 'buyerFastMiss@';
+  const { kp } = await creditZeroConf(agentId, buyer);
+  const client = mockClient(kp, buyer, NOT_FOUND);
+  const past = Date.now() + RECONCILE_GRACE_MS + 1;
+
+  for (let i = 0; i < RECONCILE_MIN_MISSES + 2; i++) {
+    const r = await reconcileUnconfirmedDeposits(agentId, client, past + i * 60_000);
+    assert.equal(r.reversed, 0, 'a burst of misses inside the span window proves nothing');
+  }
+  assert.equal(getBalance(agentId, buyer), SMALL);
+});
+
+test('a RESOLVED response we cannot interpret never reverses', async () => {
+  // The original code set `seen = null` for an unreadable success response and then
+  // fell straight through to the reversal path — so a backend response-shape change
+  // would have clawed back every open 0-conf credit on the fleet within three polls.
+  // This codebase already documents four separate `{data:}` unwrap gotchas; the
+  // shape changing is a when, not an if.
+  const shapes = [
+    ['empty body', async () => undefined],
+    ['empty object', async () => ({})],
+    ['stringified count', async () => ({ confirmations: '3' })],
+    ['re-wrapped in data', async () => ({ data: { confirmations: 3 } })],
+    ['null', async () => null],
+  ];
+  for (const [label, getTxStatus] of shapes) {
+    const agentId = `agent-shape-${label.replace(/\W+/g, '')}`;
+    const buyer = `buyerShape${label.replace(/\W+/g, '')}@`;
+    const { kp } = await creditZeroConf(agentId, buyer);
+    const client = mockClient(kp, buyer, getTxStatus);
+    await fullMissRun(agentId, client, Date.now() + RECONCILE_GRACE_MS + 1);
+    assert.equal(getBalance(agentId, buyer), SMALL, `${label}: must not reverse`);
+  }
+});
+
+test('a route-level 404 is not evidence that the chain lacks the txid', () => {
+  // The SDK surfaces a missing/renamed endpoint as a bare `HTTP 404`, identically
+  // for every txid. Matching a bare 404 would reverse the whole fleet's open
+  // credits during one deploy window.
+  assert.equal(_isTxUnknown(new Error('HTTP 404')), false);
+  assert.equal(_isTxUnknown(new Error('Non-JSON response from GET /v1/tx/status/abc (HTTP 404)')), false);
+  assert.equal(_isTxUnknown(new Error('404 Not Found')), false);
+  assert.equal(_isTxUnknown(new Error('ECONNREFUSED')), false);
+  assert.equal(_isTxUnknown(new Error('502 Bad Gateway')), false);
+
+  // Transaction-specific signals do count.
+  assert.equal(_isTxUnknown(new Error('404 Transaction not found')), true);
+  assert.equal(_isTxUnknown(new Error('No such transaction')), true);
+  assert.equal(_isTxUnknown(new Error('{"code":"TX_NOT_FOUND"}')), true);
+  assert.equal(_isTxUnknown(new Error('Invalid or non-wallet transaction id')), true);
+});
+
+test('a crash mid-reversal completes the bookkeeping without debiting twice', async () => {
+  // reverseDeposit writes credit-meters.json; clearing the record writes
+  // deposits.json. Two atomic writes, one crash window. The `reversing` stamp is
+  // persisted BEFORE the debit so the recovery path knows the money may already
+  // have moved — the same shape as markRefundInflight on the refund path.
+  const agentId = 'agent-crashmid';
+  const buyer = 'buyerCrashMid@';
+  const { kp, txid } = await creditZeroConf(agentId, buyer);
+
+  // Simulate the crash: the meter was debited and the stamp persisted, but the
+  // record was never removed.
+  const { reverseDeposit } = require('../src/credit-meter.js');
+  reverseDeposit(agentId, buyer, SMALL, txid);
+  const d = readDeposits(agentId);
+  const rec = d.processed.find(x => x.txid === txid);
+  rec.reversing = true;
+  fs.writeFileSync(depositsFile(agentId), JSON.stringify(d));
+  assert.equal(getBalance(agentId, buyer), 0);
+
+  const client = mockClient(kp, buyer, NOT_FOUND);
+  await reconcileUnconfirmedDeposits(agentId, client, Date.now() + RECONCILE_GRACE_MS + 1);
+
+  assert.equal(getBalance(agentId, buyer), 0, 'must NOT debit a second time');
+  const after = readDeposits(agentId);
+  assert.equal(after.processed.some(x => x.txid === txid), false, 'the record is finally cleared');
+  assert.equal(after.reversed.length, 1);
 });
 
 test('inside the grace window nothing is reversed, however many misses', async () => {
@@ -153,9 +246,7 @@ test('inside the grace window nothing is reversed, however many misses', async (
   const { kp } = await creditZeroConf(agentId, buyer);
   const client = mockClient(kp, buyer, NOT_FOUND);
 
-  for (let i = 0; i < RECONCILE_MIN_MISSES + 3; i++) {
-    await reconcileUnconfirmedDeposits(agentId, client, Date.now());
-  }
+  await fullMissRun(agentId, client, Date.now());
   assert.equal(getBalance(agentId, buyer), SMALL, 'grace window not elapsed — hands off');
 });
 
@@ -168,10 +259,8 @@ test('an unreachable platform never costs a buyer their balance', async () => {
   const client = mockClient(kp, buyer, async () => { throw new Error('ECONNREFUSED api.junction41.io'); });
   const past = Date.now() + RECONCILE_GRACE_MS + 1;
 
-  for (let i = 0; i < RECONCILE_MIN_MISSES + 3; i++) {
-    const r = await reconcileUnconfirmedDeposits(agentId, client, past);
-    assert.equal(r.reversed, 0);
-  }
+  const r = await fullMissRun(agentId, client, past);
+  assert.equal(r.reversed, 0);
   assert.equal(getBalance(agentId, buyer), SMALL);
 });
 
@@ -186,11 +275,13 @@ test('a sighting in the mempool resets the miss run', async () => {
   const missing = mockClient(kp, buyer, NOT_FOUND);
   const inMempool = mockClient(kp, buyer, async () => ({ confirmations: 0 }));
 
+  const step = RECONCILE_MISS_SPAN_MS;
+  let t = past;
   for (let cycle = 0; cycle < 3; cycle++) {
     for (let i = 0; i < RECONCILE_MIN_MISSES - 1; i++) {
-      await reconcileUnconfirmedDeposits(agentId, missing, past);
+      await reconcileUnconfirmedDeposits(agentId, missing, (t += step));
     }
-    await reconcileUnconfirmedDeposits(agentId, inMempool, past);
+    await reconcileUnconfirmedDeposits(agentId, inMempool, (t += step));
   }
   assert.equal(getBalance(agentId, buyer), SMALL, 'never reached a full miss run');
 });
@@ -209,10 +300,7 @@ test('a reversal on an already-spent credit drives the balance negative, not to 
   assert.ok(Math.abs(getBalance(agentId, buyer) - 0.1) < 1e-9);
 
   const client = mockClient(kp, buyer, NOT_FOUND);
-  const past = Date.now() + RECONCILE_GRACE_MS + 1;
-  for (let i = 0; i < RECONCILE_MIN_MISSES; i++) {
-    await reconcileUnconfirmedDeposits(agentId, client, past);
-  }
+  await fullMissRun(agentId, client, Date.now() + RECONCILE_GRACE_MS + 1);
 
   const bal = getBalance(agentId, buyer);
   assert.ok(bal < 0, `spent-then-reversed must leave a debt, got ${bal}`);

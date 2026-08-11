@@ -89,9 +89,70 @@ credit was already spent the balance goes negative, which blocks further proxy u
 until it is topped up past the debt. Clamping would forgive the debt and make the
 exploit free.
 
-1023 tests (+37). Every fix in this release was mutation-checked — including the M3
-wiring, where a unit test of the limiter would have passed against the broken build
-unchanged, since the defect was entirely the absence of a call.
+### Adversarial review of the above, before release
+
+Two independent reviews of this changeset found ten defects in it. Seven were real
+and are fixed here; the two most serious were introduced by the release itself.
+
+**The upgrade stranded the fleet.** Flipping the on-chain toggle off is the easy half.
+2.28.x deactivated on-chain at shutdown, so *every* operator upgrading arrives with
+the chain axis reading `inactive`. The new code correctly computed `inactive`,
+restored the agent, performed a platform-only activate — and never repaired the chain
+axis. The hire gate ANDs both, so all nine agents were unhireable while the start log
+printed nine ✅ and `/health` reported `ok`: the exact 2026-08-06 shape, reproduced by
+the release written to prevent it. The startup loop now repairs a stale chain axis
+once (safe — this cycle broadcasts no competing deactivate, and any deactivate from
+the previous process is waited out first), and `chainStatus` is carried separately
+through to `/health` so a successful platform write can no longer erase the evidence.
+
+**The reconciler reversed honest buyers on an uninterpretable response.** The comment
+said "a response we cannot interpret is NOT evidence of absence"; the control flow fell
+straight through that case into the reversal path. An empty body, a `{}`, a
+`{data:{…}}` re-wrap — any backend response-shape change would have clawed back every
+open 0-conf credit on the fleet within three polls. Reproduced, then fixed. Related:
+`_isTxUnknown` matched a bare `404`, which the SDK also emits for a *route*-level 404,
+so one deploy window looked identical to "the chain does not know this txid" for every
+txid at once. It now requires a transaction-specific signal, and a reversal requires
+the miss run to span ten minutes rather than three polls.
+
+Also fixed:
+
+- **Three settle sites, three policies.** `proxyRes.on('error')` billed a flat
+  worst case with no statusCode check, so the same 503 cost either nothing or the
+  entire `max_tokens` reservation depending on whether the socket closed cleanly.
+  Worse, `proxyReq.on('error')` *also* fires on a dead socket and refunded in full —
+  so the price of an aborted stream depended on which listener Node reached first.
+  One settle function now serves all three.
+- **`effectiveAgentStatus` failed open on mixed values.** `{active, suspended}`
+  resolved to `active`. Since the chain axis reads `active` for every running agent,
+  that mixed case is the realistic one. Only both-active is now active, and values
+  are normalized for case and whitespace.
+- **The 2.28.2 confirmation wait was dead in every configuration.** The marker file
+  holding the deactivate txids is unlinked (or rewritten without them) ~1000 lines
+  before the wait reads them, so `_dtxids` was always `{}`. Captured up front now.
+- **A crash between the two reversal writes double-clawed the buyer.** A `reversing`
+  stamp is persisted before the debit, mirroring `markRefundInflight`.
+- **Rate-limit deferrals were invisible.** A backlog past the hourly cap left entries
+  `approved`-but-unsent, which `refunds list` filtered out, `refunds approve` answered
+  with "already approved — no action", and `approve --all` reported as "no pending
+  entries" — while counting deferrals as "processed". All four now tell the truth, and
+  re-approving retries the send.
+- **The limits were per-process.** Counters and the outage suspension lived in memory,
+  so an out-of-band `refunds approve` had its own 10/hour budget and never saw a
+  suspension the daemon had raised. Now shared via `send-history.json`. The per-job
+  lifetime cap also stopped being cleared when a job went terminal — which is exactly
+  when a duplicate refund would be attempted.
+
+Two review findings were deliberately not "fixed": an attacker can still get one
+sub-2-VRSC deposit's worth of compute inside the grace window (inherent to the 0-conf
+tier, now bounded rather than unbounded), and a crash with both axes left `active` can
+still land a hire on a dead agent (pre-existing, and the cutover does not widen it).
+
+1047 tests (+61). Every fix mutation-checked. Two lessons recorded rather than
+smoothed over: the first round's mutation testing covered the pure function and not
+the call site, so reverting the two-axis read passed the entire suite; and two of the
+new proxy tests initially passed for the wrong reason, because a mock that destroyed
+its socket synchronously never produced the mid-stream abort it claimed to.
 
 ## 2.28.2
 

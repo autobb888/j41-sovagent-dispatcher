@@ -377,13 +377,32 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
 // counter, because presence is positive evidence the tx exists.
 const RECONCILE_GRACE_MS = 30 * 60 * 1000; // ~30 blocks at Verus' ~60s target
 const RECONCILE_MIN_MISSES = 3;
+// Misses must also SPAN this long. Three polls is three minutes, which a routine
+// backend deploy window can supply on its own — and a deploy is precisely when the
+// tx-status route is most likely to answer wrongly. Requiring the run to persist
+// makes a transient platform-side fault insufficient on its own.
+const RECONCILE_MISS_SPAN_MS = 10 * 60 * 1000;
 
-/** Does this error mean "the chain has never heard of this txid", as opposed to
- *  "we could not reach the API"? Only the former is evidence of a dropped tx. */
+/**
+ * Does this error mean "the chain has never heard of this txid", as opposed to
+ * "we could not reach the API" or "that route is not there right now"?
+ *
+ * Only a transaction-specific signal counts. A bare 404 does NOT: the SDK
+ * surfaces route-level failures as `HTTP 404` and
+ * `Non-JSON response from GET /v1/tx/status/… (HTTP 404)`, which a renamed
+ * endpoint or a reverse proxy mid-deploy produces for every txid at once. Three
+ * of those in a row would otherwise reverse every open credit on the fleet
+ * simultaneously — the loudest possible way to get this wrong.
+ *
+ * Erring here costs us nothing: an unrecognised error just means we keep waiting,
+ * and the credit stays. Erring the other way takes money from a buyer who paid.
+ */
 function _isTxUnknown(err) {
   const m = String((err && err.message) || err || '');
-  if (/\b404\b/.test(m)) return true;
-  return /not\s*found|no\s*such\s*tx|unknown\s*transaction|invalid\s*or\s*non-?wallet/i.test(m);
+  return /(transaction|tx|txid)[^.]{0,40}(not\s*found|unknown|does\s*not\s*exist)/i.test(m)
+    || /no\s*such\s*(transaction|tx)\b/i.test(m)
+    || /\bTX_NOT_FOUND\b/.test(m)
+    || /invalid\s*or\s*non-?wallet\s*transaction/i.test(m);
 }
 
 async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
@@ -409,6 +428,17 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
       }
     }
 
+    // The call RESOLVED but we could not read a confirmation count out of it —
+    // an empty body, `{}`, a stringified count, a re-wrapped `{data:{…}}` shape.
+    // That is not evidence of absence either, and the original code fell straight
+    // through this gap into the reversal path: a backend response-shape change
+    // would have clawed back every open 0-conf credit on the fleet within three
+    // polls. The comment above claimed this was handled; only this line makes it so.
+    if (!unknown && seen === null) {
+      waiting++;
+      continue;
+    }
+
     // Re-load per record: crediting/reversing is a write, and other paths write
     // `processed` too (audit M4's clobber lesson).
     const fresh = loadDeposits(agentId);
@@ -427,7 +457,11 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
 
     if (seen === 0) {
       // Still in the mempool. It exists; keep waiting and reset the miss run.
-      if (live.misses) { live.misses = 0; saveDeposits(agentId, fresh); }
+      if (live.misses || live.firstMissAtMs) {
+        live.misses = 0;
+        delete live.firstMissAtMs;
+        saveDeposits(agentId, fresh);
+      }
       waiting++;
       const ageMin = Math.round((now - (live.creditedAtMs || now)) / 60000);
       if (ageMin >= 60 && ageMin % 60 < 2) {
@@ -438,15 +472,36 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
     }
 
     // unknown === true: the chain does not know this txid.
+    //
+    // A `reversing` stamp from a previous pass means we may already have debited
+    // the meter and died before clearing the record — reverseDeposit writes
+    // credit-meters.json and the record removal writes deposits.json, two separate
+    // atomic writes with a crash window between them. Finish the bookkeeping
+    // WITHOUT debiting again. The residual is that a crash between the stamp and
+    // the debit forgives ≤2 VRSC; debiting twice would take 2 VRSC from a buyer,
+    // and only one of those two is reversible by the person it happens to.
+    const _alreadyDebited = live.reversing === true;
     live.misses = (live.misses || 0) + 1;
+    if (!live.firstMissAtMs) live.firstMissAtMs = now;
     const pastGrace = now - (live.creditedAtMs || 0) >= RECONCILE_GRACE_MS;
-    if (!pastGrace || live.misses < RECONCILE_MIN_MISSES) {
+    const missRunLongEnough = live.misses >= RECONCILE_MIN_MISSES
+      && now - live.firstMissAtMs >= RECONCILE_MISS_SPAN_MS;
+    if (!_alreadyDebited && (!pastGrace || !missRunLongEnough)) {
       saveDeposits(agentId, fresh);
       waiting++;
       continue;
     }
 
-    reverseDeposit(agentId, live.buyerVerusId, live.amount, live.txid);
+    if (!_alreadyDebited) {
+      // Persist the intent BEFORE the irreversible debit, so a crash in between is
+      // recoverable rather than a guess. Same shape as markRefundInflight.
+      live.reversing = true;
+      saveDeposits(agentId, fresh);
+      reverseDeposit(agentId, live.buyerVerusId, live.amount, live.txid);
+    } else {
+      console.warn(`[Deposits] ${agentId}: ${live.txid.substring(0, 12)}… was mid-reversal at the last crash — ` +
+        'completing the bookkeeping without debiting again.');
+    }
     fresh.processed = fresh.processed.filter(d => d.txid !== live.txid);
     fresh.reversed = fresh.reversed || [];
     fresh.reversed.push({
@@ -700,4 +755,4 @@ async function notifyJ41CreditLow(sellerWif, sellerVerusId, buyerVerusId, balanc
   }
 }
 
-module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, RECONCILE_GRACE_MS, RECONCILE_MIN_MISSES, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
+module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, RECONCILE_GRACE_MS, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, _isTxUnknown, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };

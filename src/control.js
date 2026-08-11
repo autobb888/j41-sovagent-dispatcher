@@ -384,6 +384,13 @@ function buildFeeTank(state, agentId, now) {
   };
 }
 
+/** Does this status value block a hire? Mirrors the platform's fail-closed AND.
+ *  `unknown` does not block — it means "not checked yet", and treating absence of
+ *  information as failure makes every cold start look like an outage. */
+function _axisBlocks(v) {
+  return v === 'inactive' || v === 'disabled';
+}
+
 function buildHealthDocument(state, startedAt) {
   const uptime = Date.now() - startedAt;
   const now = Date.now();
@@ -400,6 +407,13 @@ function buildHealthDocument(state, startedAt) {
       // stayed green throughout. An agent that is inactive upstream cannot receive
       // work no matter how idle it looks here.
       platformStatus: a.platformStatus || 'unknown',
+      // The SECOND axis, and a hire needs both. On-chain `status` is no longer
+      // written on a routine restart, so it can sit at `inactive` from an older
+      // dispatcher while the platform axis reads `active`. The startup loop stamps
+      // `platformStatus = 'active'` after a successful platform write, so reporting
+      // only that field would hide a fleet the hire gate is blocking — every local
+      // surface green, zero work possible, which is the 2026-08-06 shape.
+      chainStatus: a.chainStatus || 'unknown',
       currentJob: busyEntry ? busyEntry[0] : null,
       lastError: state._agentErrors?.get(a.id) || null,
       feeTank: buildFeeTank(state, a.id, now),
@@ -445,7 +459,7 @@ function buildHealthDocument(state, startedAt) {
     status: (containersUnhealthy > 0
       || inbox.deadLettered.length > 0
       || (state.startupComplete === true
-          && agents.some(a => a.platformStatus === 'inactive' || a.platformStatus === 'disabled')))
+          && agents.some(a => _axisBlocks(a.platformStatus) || _axisBlocks(a.chainStatus))))
       ? 'degraded' : 'ok',
     inbox,
     uptime,

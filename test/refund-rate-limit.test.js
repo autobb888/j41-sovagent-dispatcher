@@ -19,11 +19,25 @@ process.env.NODE_ENV = 'test';
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const nodePath = require('node:path');
+
+// Sandbox HOME BEFORE requiring cli.js. The rate limiter is now backed by a file
+// under DISPATCHER_DIR, which cli.js resolves from os.homedir() at require time —
+// so without this the suite writes to (and truncates) the LIVE dispatcher's
+// send-history.json. It did exactly that once before this line existed.
+const TEST_HOME = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'j41-ratelimit-test-'));
+process.env.HOME = TEST_HOME;
+os.homedir = () => TEST_HOME;
+fs.mkdirSync(nodePath.join(TEST_HOME, '.j41', 'dispatcher'), { recursive: true });
 
 const {
   checkDispatcherRateLimit,
   recordDispatcherSend,
   _resetDispatcherRateLimit,
+  setFinancialSuspended,
+  SEND_HISTORY_PATH,
 } = require('../src/cli');
 
 const T0 = 1_700_000_000_000; // fixed clock — no wall-clock flake
@@ -131,4 +145,83 @@ test('the per-job counter is NOT expired by the hourly prune', () => {
   const r = checkDispatcherRateLimit('job-i', 0.001, 100, T0 + 7_200_000);
   assert.equal(r.allowed, false);
   assert.match(r.reason, /Max sends per job/);
+});
+
+// ── F6: the limits must be FLEET-WIDE, not per-process ──────────────────────
+//
+// The first version kept the counters and the suspension flag in process memory.
+// The operator's documented workflow is to drive the daemon out-of-band with a
+// second CLI process, so "two independent 10/hour budgets" was the normal case.
+// Worse, the API-outage suspension is only ever SET by the daemon's sweep, so a
+// CLI `refunds approve` sent freely through an outage that had already suspended
+// the daemon — the one guarantee whose entire purpose is to stop sending when the
+// platform cannot be reached.
+
+const { execFileSync } = require('node:child_process');
+
+/** Run a snippet in a SEPARATE node process against the same sandboxed HOME. */
+function inAnotherProcess(js) {
+  const cli = nodePath.join(__dirname, '..', 'src', 'cli.js');
+  return execFileSync(process.execPath, ['-e', `
+    process.env.NODE_ENV = 'test';
+    const m = require(${JSON.stringify(cli)});
+    ${js}
+  `], { encoding: 'utf8', env: { ...process.env, HOME: TEST_HOME, NODE_ENV: 'test' } }).trim();
+}
+
+test('a send recorded in one process counts against the cap in another', () => {
+  _resetDispatcherRateLimit();
+  for (let i = 0; i < 10; i++) recordDispatcherSend(`job-x${i}`, 0.01);
+
+  const verdict = inAnotherProcess(`
+    const r = m.checkDispatcherRateLimit('job-fresh', 0.01, 100);
+    console.log(JSON.stringify(r));
+  `);
+  const r = JSON.parse(verdict);
+  assert.equal(r.allowed, false, 'a second process must see the first process’s sends');
+  assert.match(r.reason, /Hourly global limit/);
+});
+
+test('the outage suspension set by the daemon blocks a separate CLI process', () => {
+  _resetDispatcherRateLimit(true);
+
+  const verdict = inAnotherProcess(`
+    const r = m.checkDispatcherRateLimit('job-any', 0.01, 100);
+    console.log(JSON.stringify(r));
+  `);
+  const r = JSON.parse(verdict);
+  assert.equal(r.allowed, false, 'the suspension must reach every process, not just the daemon');
+  assert.match(r.reason, /suspended/);
+});
+
+test('lifting the suspension in one process unblocks another', () => {
+  _resetDispatcherRateLimit(true);
+  setFinancialSuspended(false);
+
+  const verdict = inAnotherProcess(`
+    console.log(JSON.stringify(m.checkDispatcherRateLimit('job-any2', 0.01, 100)));
+  `);
+  assert.equal(JSON.parse(verdict).allowed, true);
+});
+
+test('the per-job lifetime cap survives a restart', () => {
+  // Process-local counters made "max 3 sends per job" mean "3 per process".
+  _resetDispatcherRateLimit();
+  for (let i = 0; i < 3; i++) recordDispatcherSend('job-persist', 0.001);
+
+  const verdict = inAnotherProcess(`
+    console.log(JSON.stringify(m.checkDispatcherRateLimit('job-persist', 0.001, 100)));
+  `);
+  const r = JSON.parse(verdict);
+  assert.equal(r.allowed, false);
+  assert.match(r.reason, /Max sends per job/);
+});
+
+test('a corrupt history file fails OPEN, not closed', () => {
+  // This file bounds damage; it does not authorise anything. Refusing to send on an
+  // unreadable counter would strand every owed refund behind a one-byte corruption.
+  const fs = require('node:fs');
+  _resetDispatcherRateLimit();
+  fs.writeFileSync(SEND_HISTORY_PATH, '{not json');
+  assert.equal(checkDispatcherRateLimit('job-corrupt', 0.01, 100).allowed, true);
 });

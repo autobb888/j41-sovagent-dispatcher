@@ -39,8 +39,9 @@ test('C1b: the shutdown deactivate uses the real confirmation gate, not a fixed 
 });
 
 test('C1c: the startup activation records its identity write', () => {
-  const i = CLI.indexOf("agent.activate({ onChain: _toggleOnChain })");
-  const after = CLI.slice(i, i + 2500); // window must survive comments being added between
+  const i = CLI.indexOf("agent.activate({ onChain: _plan.onChain })");
+  assert.ok(i > -1, 'the activation call must exist');
+  const after = CLI.slice(i, i + 3500); // window must survive comments being added between
   assert.match(after, /_inboxLastWrite\.set/,
     'unrecorded, the first inbox sweep double-spends this prevOutput');
 });
@@ -74,10 +75,14 @@ test('a failed on-chain activate is reported as a failure, not a tick', () => {
   // printed as "✅ active (on-chain txid: skipped)". The SDK returns null for a failed
   // write, so a null txid is a failure — and on-chain status is the lever backend's
   // hire gate reads, so hiding it means a hire can land on a stopped agent.
-  const i = CLI.indexOf("agent.activate({ onChain: _toggleOnChain })");
-  const after = CLI.slice(i, i + 2500);
+  const i = CLI.indexOf("agent.activate({ onChain: _plan.onChain })");
+  assert.ok(i > -1, 'the activation call must exist');
+  const after = CLI.slice(i, i + 3500);
   assert.match(after, /ON-CHAIN activate FAILED/, 'a rejected write must not read as success');
   assert.match(after, /!\(result && result\.onChainTxid\)/, 'null txid IS the failure signal');
+  // And the chain axis must be repaired when it is stale, or the fleet is
+  // unhireable with every local surface reporting green (the 2.28.x upgrade case).
+  assert.match(after, /_plan\.repairChain/, 'a stale chain axis must be repaired, not ignored');
 });
 
 test('startup waits for its own deactivates to CONFIRM before re-activating', () => {
@@ -93,7 +98,17 @@ test('startup waits for its own deactivates to CONFIRM before re-activating', ()
   const block = CLI.slice(Math.max(0, i - 900), i + 1800);
   // Per-TXID confirmation, not a wall-clock guess: a flat 75s wait left 5 of 9
   // activates rejected because Verus block time varies.
-  assert.match(block, /readShutdownDeactivatedTxids\(\)/, 'the marker must carry the txids');
+  assert.match(block, /const _dtxids = _shutdownDeactivateTxids/, 'the wait must read real txids');
   assert.match(block, /prevOut === _dtxids\[id\]/, 'confirmation is prevOutput matching the txid');
   assert.ok(!/_blockMs/.test(block), 'the wall-clock guess must be gone');
+
+  // The txids MUST be captured before the marker-clearing block, which either
+  // unlinks the file or rewrites it without them. Reading them at the wait site
+  // returned `{}` every time, making this whole guard dead code in every
+  // configuration — including the one 2.28.2 shipped it for.
+  const capture = CLI.indexOf('const _shutdownDeactivateTxids = readShutdownDeactivatedTxids()');
+  const clear = CLI.indexOf('clearShutdownDeactivated()');
+  assert.ok(capture > -1, 'the txids must be captured explicitly');
+  assert.ok(capture < clear, 'capture must happen BEFORE the marker is cleared');
+  assert.ok(clear < i, 'and the marker is cleared before the wait — hence the capture');
 });

@@ -231,11 +231,51 @@ function addToRefundAllowlist(address, jobId) {
 // in any of those can do before a human notices — the case those four don't cover,
 // because each of them trusts the caller's arithmetic.
 //
-// In-memory and reset by a restart, deliberately: a stale hourly count that
-// outlives the process would block a legitimate drain with no way to clear it.
-// The durable no-double-pay guarantee is refunded-jobs.json, not this.
-const dispatcherSendHistory = { global: [], perJob: new Map() };
-let dispatcherFinancialSuspended = false;
+// PERSISTED, not in-memory. The first version kept this in process memory, which
+// quietly made all four guarantees per-process rather than fleet-wide — and the
+// operator's documented workflow is to drive the daemon out-of-band with a second
+// CLI process, so two independent 10/hour budgets was the normal case, not the
+// exotic one. Worse, the API-outage suspension is only ever SET by the daemon's
+// sweep, so a CLI `refunds approve` sent freely straight through an outage that
+// had already suspended the daemon. A restart also reset the "lifetime" per-job cap.
+//
+// The file is the shared state; the in-memory object is only a scratch buffer.
+const SEND_HISTORY_PATH = path.join(DISPATCHER_DIR, 'send-history.json');
+
+function loadSendHistory() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(SEND_HISTORY_PATH, 'utf8'));
+    return {
+      global: Array.isArray(raw.global) ? raw.global : [],
+      perJob: (raw.perJob && typeof raw.perJob === 'object') ? raw.perJob : {},
+      suspendedAt: Number.isFinite(raw.suspendedAt) ? raw.suspendedAt : null,
+    };
+  } catch {
+    // Absent OR corrupt. Starting from empty is the right failure mode here: this
+    // file bounds damage, it does not authorise anything, and refusing to send on
+    // an unreadable counter file would strand every owed refund.
+    return { global: [], perJob: {}, suspendedAt: null };
+  }
+}
+
+function saveSendHistory(h) {
+  try {
+    fs.mkdirSync(path.dirname(SEND_HISTORY_PATH), { recursive: true });
+    const tmp = `${SEND_HISTORY_PATH}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(h), { mode: 0o600 });
+    fs.renameSync(tmp, SEND_HISTORY_PATH);
+  } catch (e) {
+    console.warn(`[refund] could not persist send history: ${e.message}`);
+  }
+}
+
+/** Set/clear the fleet-wide financial suspension. Written by the daemon's sweep,
+ *  read by EVERY process — including a one-shot CLI approve. */
+function setFinancialSuspended(on, now = Date.now()) {
+  const h = loadSendHistory();
+  h.suspendedAt = on ? (h.suspendedAt || now) : null;
+  saveSendHistory(h);
+}
 
 function dispatcherRateLimits() {
   try {
@@ -261,10 +301,11 @@ function dispatcherRateLimits() {
  */
 function checkDispatcherRateLimit(jobId, amount, jobPrice, now = Date.now()) {
   const LIM = dispatcherRateLimits();
-  if (dispatcherFinancialSuspended) {
+  const H = loadSendHistory();
+  if (H.suspendedAt) {
     return { allowed: false, retryable: true, reason: 'Financial operations suspended (API outage)' };
   }
-  const jobHistory = dispatcherSendHistory.perJob.get(jobId) || [];
+  const jobHistory = H.perJob[jobId] || [];
 
   if (jobHistory.length >= LIM.maxSendsPerJob) {
     return { allowed: false, retryable: false, reason: `Max sends per job (${LIM.maxSendsPerJob})` };
@@ -288,7 +329,7 @@ function checkDispatcherRateLimit(jobId, amount, jobPrice, now = Date.now()) {
   }
 
   const oneHourAgo = now - 3_600_000;
-  const recentGlobal = dispatcherSendHistory.global.filter(r => r.timestamp > oneHourAgo);
+  const recentGlobal = H.global.filter(r => r.timestamp > oneHourAgo);
   if (recentGlobal.length >= LIM.maxSendsPerHour) {
     return { allowed: false, retryable: true, reason: `Hourly global limit (${LIM.maxSendsPerHour})` };
   }
@@ -304,12 +345,11 @@ function checkDispatcherRateLimit(jobId, amount, jobPrice, now = Date.now()) {
 }
 
 function recordDispatcherSend(jobId, amount, now = Date.now()) {
+  const H = loadSendHistory();
   const record = { timestamp: now, amount };
-  if (!dispatcherSendHistory.perJob.has(jobId)) {
-    dispatcherSendHistory.perJob.set(jobId, []);
-  }
-  dispatcherSendHistory.perJob.get(jobId).push(record);
-  dispatcherSendHistory.global.push(record);
+  if (!H.perJob[jobId]) H.perJob[jobId] = [];
+  H.perJob[jobId].push(record);
+  H.global.push(record);
 
   // Prune the GLOBAL list only — it backs the hourly window, so anything older is
   // dead weight. `perJob` is deliberately NOT pruned: "max 3 sends per job" is a
@@ -317,16 +357,25 @@ function recordDispatcherSend(jobId, amount, now = Date.now()) {
   // to a job that has already been paid three times. It grows by one small record
   // per refund per process lifetime, which is tens of entries in practice.
   const oneHourAgo = now - 3_600_000;
-  dispatcherSendHistory.global = dispatcherSendHistory.global.filter(r => r.timestamp > oneHourAgo);
+  H.global = H.global.filter(r => r.timestamp > oneHourAgo);
+  // Bound perJob so a very long-lived install cannot grow it without limit. Keep
+  // the most recent 5000 jobs — far beyond any real refund volume, so the lifetime
+  // per-job cap holds in practice while the file stays small.
+  const jobIds = Object.keys(H.perJob);
+  if (jobIds.length > 5000) {
+    const keep = jobIds.slice(-5000);
+    const trimmed = {};
+    for (const id of keep) trimmed[id] = H.perJob[id];
+    H.perJob = trimmed;
+  }
+  saveSendHistory(H);
 }
 
 /** Test hook: the limiter is process-global in-memory state, so a suite that
  *  exercises it has to be able to start from a known point and to simulate the
  *  API-outage suspension the sweep sets. Not used in production paths. */
 function _resetDispatcherRateLimit(suspended = false) {
-  dispatcherSendHistory.global = [];
-  dispatcherSendHistory.perJob = new Map();
-  dispatcherFinancialSuspended = suspended;
+  saveSendHistory({ global: [], perJob: {}, suspendedAt: suspended ? Date.now() : null });
 }
 
 // ── Dispatcher-side allowlist sweep timer ──
@@ -340,7 +389,7 @@ function startDispatcherSweep(state) {
       if (list.active_jobs.length === 0) {
         if (dispatcherApiOutageSince) {
           dispatcherApiOutageSince = null;
-          dispatcherFinancialSuspended = false;
+          setFinancialSuspended(false);
         }
         return;
       }
@@ -360,7 +409,6 @@ function startDispatcherSweep(state) {
           const activeStatuses = ['requested', 'accepted', 'in_progress', 'delivered', 'rework'];
           if (!activeStatuses.includes(job.status)) {
             removeActiveJobFromAllowlist(entry.jobId);
-            dispatcherSendHistory.perJob.delete(entry.jobId);
             console.log(`[allowlist-sweep] Removed stale job ${entry.jobId} (${job.status})`);
           }
         } catch (err) {
@@ -372,15 +420,17 @@ function startDispatcherSweep(state) {
         if (dispatcherApiOutageSince) {
           console.log('[allowlist-sweep] API restored — resuming financial operations');
           dispatcherApiOutageSince = null;
-          dispatcherFinancialSuspended = false;
+          setFinancialSuspended(false);
         }
       } else {
         const now = Date.now();
         if (!dispatcherApiOutageSince) dispatcherApiOutageSince = now;
         if (now - dispatcherApiOutageSince >= 30 * 60 * 1000) {
-          if (!dispatcherFinancialSuspended) {
-            dispatcherFinancialSuspended = true;
-            console.error('[allowlist-sweep] API outage >30min — ALL financial ops suspended');
+          if (!loadSendHistory().suspendedAt) {
+            // Persisted, so a one-shot `refunds approve` in another process sees it
+            // too. Held only in memory, this suspended the daemon and nothing else.
+            setFinancialSuspended(true, now);
+            console.error('[allowlist-sweep] API outage >30min — ALL financial ops suspended (fleet-wide)');
           }
         }
       }
@@ -3428,9 +3478,16 @@ program
     const readyAgents = [];
     // Agents our own last shutdown turned off, and which this start restores.
     const _shutdownDeactivated = readShutdownDeactivated();
+    // Read the txids NOW. The marker-clearing block below either unlinks this file
+    // or rewrites it without the txids, and the activation loop reads them ~1000
+    // lines later — so `readShutdownDeactivatedTxids()` down there has always
+    // returned `{}`, making the confirmation wait added in 2.28.2 dead code in
+    // every configuration, not just the default one.
+    const _shutdownDeactivateTxids = readShutdownDeactivatedTxids();
     const _shutdownMarkerAt = readShutdownDeactivatedAt();
     const _reactivatedOnStart = [];
     let _lastSeenPlatformStatus = null;
+    let _lastSeenChainStatus = null;
     for (const agentId of agents) {
       const keys = loadAgentKeys(agentId);
       if (!keys?.identity) {
@@ -3457,6 +3514,11 @@ program
             // for routine restarts.
             const _eff = effectiveAgentStatus(profile);
             _lastSeenPlatformStatus = _eff;
+            // Keep the CHAIN axis separately. The activation loop repairs the
+            // platform axis and then stamps the agent `active`; without this the
+            // knowledge that the chain axis is still `inactive` is destroyed, and
+            // with it any chance of /health reporting the fleet's real state.
+            _lastSeenChainStatus = chainAgentStatus(profile);
             // Already active and listed in the marker: nothing to restore, but it IS
             // dealt with. Leaving it in the marker would make a LATER deliberate
             // `deactivate` get silently undone by the next start.
@@ -3499,8 +3561,14 @@ program
 
       // platformStatus feeds /health (B1) and lets the activation loop skip a
       // redundant on-chain write (B5).
-      readyAgents.push({ id: agentId, ...keys, platformStatus: _lastSeenPlatformStatus || 'unknown' });
+      readyAgents.push({
+        id: agentId,
+        ...keys,
+        platformStatus: _lastSeenPlatformStatus || 'unknown',
+        chainStatus: _lastSeenChainStatus || 'unknown',
+      });
       _lastSeenPlatformStatus = null;
+      _lastSeenChainStatus = null;
     }
     
     // Clear the marker only once every agent in it has been dealt with, so a start
@@ -3511,7 +3579,7 @@ program
       }
       const _unrestored = _shutdownDeactivated.filter(id => !_reactivatedOnStart.includes(id));
       if (_unrestored.length === 0) clearShutdownDeactivated();
-      else writeShutdownDeactivated(_unrestored);
+      else writeShutdownDeactivated(_unrestored, SHUTDOWN_DEACTIVATED_FILE, _shutdownDeactivateTxids);
     }
 
     if (readyAgents.length === 0) {
@@ -4371,9 +4439,12 @@ program
       // deterministic question is "has this agent's deactivate confirmed", and the
       // marker now carries the txid to ask it with. Bounded, so a stuck chain delays
       // startup rather than blocking it, and we say plainly what we are waiting for.
-      const _dtxids = readShutdownDeactivatedTxids();
+      const _dtxids = _shutdownDeactivateTxids;
       const _pendingIds = _reactivatedOnStart.filter(id => _dtxids[id]);
-      if (_toggleOnChain && _pendingIds.length) {
+      // NOT gated on `_toggleOnChain` any more. The chain-axis repair below can
+      // write on-chain even in the default configuration, and it collides with an
+      // unconfirmed shutdown deactivate exactly as the old activate did.
+      if (_pendingIds.length) {
         console.log(`  ⏳ Waiting for ${_pendingIds.length} shutdown deactivate(s) to confirm before ` +
           're-activating — both writes spend the same prevOutput, so activating early is rejected.');
         const _deadline = Date.now() + 180000;
@@ -4408,15 +4479,49 @@ program
         if (i > 0) await new Promise(r => setTimeout(r, 1000));
         try {
           const agent = await getAgentSession(state, agentInfo);
-          if (agentInfo.platformStatus === 'active' && !_toggleOnChain) {
-            agentInfo.platformStatus = 'active';
+          const _plan = planAgentActivation(agentInfo, { toggleOnChain: _toggleOnChain });
+          if (_plan.skip) {
             console.log(`  ✅ ${agentInfo.id}: already active — no write needed`);
             state._agentErrors.delete(agentInfo.id);
             state.emitEvent?.('agent.online', { agentId: agentInfo.id, identity: agentInfo.identity });
             continue;
           }
-          const result = await agent.activate({ onChain: _toggleOnChain });
+          const result = await agent.activate({ onChain: _plan.onChain });
           agentInfo.platformStatus = 'active';
+          if (_plan.onChain && result && result.onChainTxid) agentInfo.chainStatus = 'active';
+
+          // ── Chain-axis repair (the upgrade case) ──
+          // On-chain `status` is now write-once-per-lifecycle, so an agent left
+          // `inactive` on chain by an OLDER dispatcher stays that way forever, and
+          // the platform's hire gate ANDs both axes — the fleet is unhireable while
+          // every local surface says active. Every operator upgrading from 2.28.x
+          // is in exactly this state, because that version deactivated on-chain at
+          // shutdown by default.
+          //
+          // Repairing it here is safe in a way the old per-restart toggle was not:
+          // this cycle broadcasts no deactivate, so there is no competing write to
+          // double-spend against, and any deactivate from the PREVIOUS process was
+          // waited out above. It happens once — after it lands the chain reads
+          // `active` and stays there, so later restarts write nothing.
+          if (_plan.repairChain && agentInfo.chainStatus !== 'active') {
+            try {
+              const _rtx = await agent.setOnChainStatus('active');
+              if (_rtx) {
+                agentInfo.chainStatus = 'active';
+                state._inboxLastWrite.set(agentInfo.id, { txid: String(_rtx), at: Date.now() });
+                console.log(`  🔧 ${agentInfo.id}: chain said inactive — repaired on-chain (${String(_rtx).slice(0, 8)}). One-time.`);
+              } else {
+                state._agentErrors.set(agentInfo.id, 'on-chain status still inactive — hires are blocked');
+                console.error(`  ⚠️  ${agentInfo.id}: chain says INACTIVE and the repair write returned no txid. ` +
+                  'The platform hire gate blocks this agent. Usually a dry fee tank — ' +
+                  `check \`j41-dispatcher wallet show ${agentInfo.id}\`, then: j41-dispatcher activate ${agentInfo.id}`);
+              }
+            } catch (e) {
+              state._agentErrors.set(agentInfo.id, `on-chain repair failed: ${e.message}`);
+              console.error(`  ⚠️  ${agentInfo.id}: on-chain repair FAILED (${e.message}). Hires are blocked until ` +
+                `this succeeds. Run: j41-dispatcher activate ${agentInfo.id}`);
+            }
+          }
           // A null txid means the on-chain write FAILED (no UTXOs, or rejected) — the
           // SDK returns null in exactly those cases. We printed
           // "✅ active (on-chain txid: skipped)", which reads like success and hid nine
@@ -5508,16 +5613,78 @@ async function readDisputePolicyFor(agent) {
 //
 // `platformStatus` absent (an older backend) falls back to `status` alone, which
 // is precisely the pre-2026-08-11 behaviour.
+function _normStatus(v) {
+  if (typeof v !== 'string') return null;
+  const t = v.trim().toLowerCase();
+  return t === '' ? null : t;
+}
+
+/** The chain-mirrored axis, normalized. */
+function chainAgentStatus(profile) {
+  if (!profile || typeof profile !== 'object') return null;
+  return _normStatus(profile.status);
+}
+
+/** The durable availability axis, normalized. Null when the backend omits it. */
+function platformAgentStatus(profile) {
+  if (!profile || typeof profile !== 'object') return null;
+  return _normStatus(profile.platformStatus ?? profile.platform_status);
+}
+
 function effectiveAgentStatus(profile) {
-  if (!profile || typeof profile !== 'object') return 'unknown';
-  const chain = profile.status || null;
-  const platform = profile.platformStatus ?? profile.platform_status ?? null;
+  const axes = [chainAgentStatus(profile), platformAgentStatus(profile)].filter(v => v !== null);
+  if (axes.length === 0) return 'unknown';
   // `disabled` is a platform-side decision and outranks everything — it is never
   // auto-restored, so it must not be flattened into a plain `inactive`.
-  if (chain === 'disabled' || platform === 'disabled') return 'disabled';
-  if (chain === 'inactive' || platform === 'inactive') return 'inactive';
-  if (chain === 'active' || platform === 'active') return 'active';
-  return chain || platform || 'unknown';
+  if (axes.includes('disabled')) return 'disabled';
+  if (axes.includes('inactive')) return 'inactive';
+  // Anything we do not recognise wins over `active`. The original wrote this as
+  // "any axis saying active makes it active", which meant {active, suspended}
+  // resolved to ACTIVE — the fail-open direction. Since the chain axis reads
+  // `active` for every running agent, that mixed case is the realistic one, not
+  // the exotic one: the day the backend adds a blocking state on the platform
+  // axis, the hire gate would block while we reported healthy and skipped
+  // re-activation. Only both-active is active.
+  const unrecognised = axes.find(v => v !== 'active');
+  if (unrecognised) return unrecognised;
+  return 'active';
+}
+
+/**
+ * What the startup activation loop should do for one agent — extracted as a pure
+ * function so it can be tested, because the loop itself lives inside the `start`
+ * command closure with no coverage at all. Reverting the two-axis read passed the
+ * entire 1023-test suite; every defect this function encodes was invisible to it.
+ *
+ * @param {{platformStatus?: string, chainStatus?: string}} agentInfo
+ * @param {{toggleOnChain?: boolean}} opts
+ * @returns {{skip: boolean, onChain: boolean, repairChain: boolean, reason: string}}
+ */
+function planAgentActivation(agentInfo, opts = {}) {
+  const toggleOnChain = opts.toggleOnChain === true;
+  const platform = _normStatus(agentInfo && agentInfo.platformStatus);
+  const chain = _normStatus(agentInfo && agentInfo.chainStatus);
+
+  // The chain axis needs repairing whenever we positively know it is not active.
+  // `unknown` is NOT a repair trigger: we could not read it, and writing on-chain
+  // on a guess costs a fee and risks a collision.
+  const chainNeedsRepair = chain === 'inactive';
+
+  if (platform === 'active' && !chainNeedsRepair && !toggleOnChain) {
+    // Both axes already good (or the chain axis unreadable) and we are not being
+    // asked to write on-chain — nothing to do. Skipping here is what makes a
+    // routine restart cost zero transactions.
+    return { skip: true, onChain: false, repairChain: false, reason: 'both axes already active' };
+  }
+  return {
+    skip: false,
+    onChain: toggleOnChain,
+    // Do not repair separately when the activate itself is already writing
+    // on-chain — that would be two identity writes for one agent in one pass,
+    // which is the double-spend this whole release exists to remove.
+    repairChain: chainNeedsRepair && !toggleOnChain,
+    reason: chainNeedsRepair ? 'chain axis inactive — needs repair' : 'platform axis needs a write',
+  };
 }
 
 // ── Shutdown/start fleet-state handoff ───────────────────────────────────────
@@ -6535,7 +6702,15 @@ function refundsList(state, opts = {}, ledgerPath) {
   }
   const visible = opts.all
     ? entries
-    : entries.filter(e => blockedIds.has(e.jobId) || e.status === 'pending_approval' || e.status === 'needs_review');
+    // `approved` belongs in the default view: it is an owed refund that has been
+    // authorised and NOT yet sent. Hiding it meant a rate-limit deferral vanished
+    // from every CLI surface — `list` showed nothing, `approve` said "no action",
+    // and `approve --all` said "no pending_approval entries" — while the money was
+    // still owed.
+    : entries.filter(e => blockedIds.has(e.jobId)
+        || e.status === 'pending_approval'
+        || e.status === 'needs_review'
+        || e.status === 'approved');
 
   if (blocked.length) {
     console.log(`\n⛔ ${blocked.length} refund(s) BLOCKED — a send failed and we cannot tell whether it broadcast.`);
@@ -6616,9 +6791,20 @@ async function refundsApprove(state, jobId, opts = {}, ledgerPath) {
   const entry = ledger[jobId];
   if (!entry) throw new Error(`No pending refund entry for job ${jobId}`);
 
-  if (entry.status === 'refunded' || entry.status === 'rejected' || entry.status === 'approved') {
+  if (entry.status === 'refunded' || entry.status === 'rejected') {
     console.log(`[refunds] Job ${jobId.substring(0, 8)} already ${entry.status} — no action`);
     return entry;
+  }
+
+  // `approved` is NOT terminal. It means the owner said yes and the send has not
+  // happened yet — which is now a routine outcome, because the rate limiter defers
+  // a send past the hourly cap, the cooldown, or an API-outage suspension. Treating
+  // it as terminal meant the operator's obvious recovery ("approve it again") was
+  // answered with "already approved — no action" while the buyer waited on a refund
+  // that only a running daemon's drain would ever send. Re-approving retries the
+  // send; the re-verify, the allowlist add and the durable ledger all still gate it.
+  if (entry.status === 'approved') {
+    console.log(`[refunds] Job ${jobId.substring(0, 8)} was approved but not yet sent — retrying the send`);
   }
 
   // needs_review: refuse — never attempt to send an address that failed verification
@@ -6770,16 +6956,23 @@ async function refundsApprove(state, jobId, opts = {}, ledgerPath) {
  */
 async function refundsApproveAll(state, opts = {}, ledgerPath) {
   const ledger = loadPendingRefunds(ledgerPath);
-  const pendingIds = Object.keys(ledger).filter(id => ledger[id].status === 'pending_approval');
+  // Include already-approved-but-unsent entries. A backlog larger than
+  // refund_limits.max_sends_per_hour leaves exactly these behind, and without them
+  // in the set a second `approve --all` reported "nothing to approve" while the
+  // remainder sat unsent.
+  const pendingIds = Object.keys(ledger).filter(id => ledger[id].status === 'pending_approval'
+    || ledger[id].status === 'approved');
+  const retryCount = Object.keys(ledger).filter(id => ledger[id].status === 'approved').length;
   const skippedCount = Object.keys(ledger).filter(id => ledger[id].status === 'needs_review').length;
 
   if (pendingIds.length === 0) {
     console.log(
-      'No pending_approval entries to approve.' +
+      'No refunds awaiting approval or sending.' +
       (skippedCount > 0 ? ` (${skippedCount} needs_review skipped — handle individually)` : '')
     );
     return [];
   }
+  if (retryCount > 0) console.log(`[refunds] ${retryCount} previously-approved entr(ies) still unsent — retrying those too.`);
   if (skippedCount > 0) console.log(`[refunds] Skipping ${skippedCount} needs_review entries.`);
 
   const results = [];
@@ -6787,7 +6980,17 @@ async function refundsApproveAll(state, opts = {}, ledgerPath) {
     const entry = await refundsApprove(state, jobId, opts, ledgerPath);
     results.push({ jobId, entry });
   }
-  console.log(`[refunds] approve-all: processed ${results.length} entries`);
+  const _sent = results.filter(r => r.entry && r.entry.status === 'refunded').length;
+  const _unsent = results.filter(r => r.entry && r.entry.status === 'approved').length;
+  const _held = results.length - _sent - _unsent;
+  console.log(`[refunds] approve-all: ${_sent} sent, ${_unsent} approved but NOT yet sent, ${_held} held for review`);
+  if (_unsent > 0) {
+    // "processed N entries" counted a deferral as a success. It is not one — the
+    // buyer has not been paid.
+    console.log('[refunds]   The unsent ones hit a rate limit (hourly cap, cooldown, or an API-outage');
+    console.log('[refunds]   suspension). They stay queued. Re-run this command, or raise');
+    console.log('[refunds]   refund_limits.max_sends_per_hour in config.toml for a large backlog.');
+  }
   return results;
 }
 
@@ -9170,7 +9373,10 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
 
   // ── Allowlist lifecycle: remove buyer address ──
   removeActiveJobFromAllowlist(jobId);
-  dispatcherSendHistory.perJob.delete(jobId);
+  // NOTE: the per-job send count is deliberately NOT cleared here. "Max 3 sends per
+  // job" is a lifetime cap, and a job going terminal is exactly when a late or
+  // duplicate refund would be attempted — clearing the counter handed that attempt
+  // a fresh budget. It is pruned by volume in recordDispatcherSend instead.
 
   if (!skipReturnAgent) {
     console.log(`✅ Job ${jobId} complete, agent returned to pool`);
@@ -9459,7 +9665,10 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
 
   // ── Allowlist lifecycle: remove buyer address ──
   removeActiveJobFromAllowlist(jobId);
-  dispatcherSendHistory.perJob.delete(jobId);
+  // NOTE: the per-job send count is deliberately NOT cleared here. "Max 3 sends per
+  // job" is a lifetime cap, and a job going terminal is exactly when a late or
+  // duplicate refund would be attempted — clearing the counter handed that attempt
+  // a fresh budget. It is pruned by volume in recordDispatcherSend instead.
 
   if (!skipReturnAgent) {
     console.log(`✅ Job ${jobId} complete, agent returned to pool`);
@@ -11524,7 +11733,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, setFinancialSuspended, loadSendHistory, SEND_HISTORY_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');

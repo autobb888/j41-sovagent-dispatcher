@@ -435,6 +435,10 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     ? (hostname, opts, cb) => cb(null, pinnedIp, pinnedIp.includes(':') ? 6 : 4)
     : undefined;
 
+  // Set once a streaming response is in flight, so the request-level error handler
+  // below settles through the SAME policy instead of its own.
+  let settleActiveStream = null;
+
   const proxyReq = transport.request(upstreamUrl.href, {
     method: 'POST',
     headers: {
@@ -474,8 +478,18 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         res.write(chunk);
       });
 
-      proxyRes.on('end', () => {
-        if (!res.writableEnded) res.end();
+      // ONE settle policy for the streaming response, shared by BOTH terminal
+      // events. `end` and `error` used to implement different rules: `error`
+      // charged `estimatedInput + reserveOutput` flat, with no statusCode check and
+      // ignoring any usage frames already received — so a 503 stream that died
+      // before a clean `end` billed the entire worst-case reservation (the exact
+      // 204,000-token scenario M1 fixed), while the same 503 reaching `end` billed
+      // zero. Three settle sites had three policies. The bug class this whole
+      // change addresses is "a control applied at one of two sites"; leaving a
+      // third site with its own rules reproduces it.
+      const settleStream = (why, aborted = false) => {
+        if (deducted) return;
+        deducted = true;
 
         // Parse SSE chunks for usage data — scan each `data: {...}` frame with JSON.parse
         // so nested objects like completion_tokens_details survive (the old regex broke on them).
@@ -524,36 +538,56 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         const _upstreamOk = proxyRes.statusCode >= 200 && proxyRes.statusCode < 300;
         if (!_upstreamOk) {
           // No completion was delivered. Charge nothing for output, and nothing for
-          // input either — the buyer got an error, not a service.
+          // input either — the buyer got an error, not a service. This applies to a
+          // mid-stream abort too: the status line already told us it was an error.
           outputTok = 0;
           inputTok = 0;
-          console.warn(`[proxy] upstream ${proxyRes.statusCode} on a streaming request — not billing (job ${key ? String(key).slice(0, 8) : '?'})`);
+          console.warn(`[proxy] upstream ${proxyRes.statusCode} on a streaming request (${why}) — not billing (job ${key ? String(key).slice(0, 8) : '?'})`);
+        } else if (aborted) {
+          // A 2xx whose socket died mid-stream. Bill only what a usage frame
+          // actually proved; if none arrived, bill nothing.
+          //
+          // Not the worst-case settle, deliberately. That settle is an anti-abuse
+          // measure against an upstream that returns real output while withholding
+          // its usage count — a party gaming US. An abort is a failure the BUYER did
+          // not cause and cannot cause: they have no way to make the seller's
+          // upstream drop its socket. Charging them the full `max_tokens`
+          // reservation for a broken response would be the only place in this file
+          // where the victim of a fault pays for it. The inverse risk is a seller
+          // whose upstream serves output and then kills the socket to avoid
+          // billing — that costs the seller their own revenue, so it is self-limiting.
+          if (!sawOutput) { outputTok = 0; }
+          console.warn(`[proxy] streaming abort after ${proxyRes.statusCode} — billing ${inputTok}+${outputTok} (job ${key ? String(key).slice(0, 8) : '?'})`);
         } else if (!sawOutput) {
           outputTok = reserveOutput;
         }
 
-        // Adjust reservation with actual token counts (or worst case if usage absent)
-        if (!deducted) {
-          deducted = true;
-          const result = adjustCredit(agentId, record.buyerVerusId, model, inputTok, outputTok, creditCheck.reserved, config.modelPricing || []);
-          recordUsage(agentId, key, inputTok, outputTok);
-          releaseOnce();
-          maybeNotifyCreditLow(agentId, record.buyerVerusId, result.remaining, cfg, config);
-          console.log(`[PROXY] ${agentId} ${model} ${inputTok}+${outputTok} tok, cost ${result.cost.toFixed(6)} VRSC, remaining ${result.remaining.toFixed(4)}`);
-        }
+        const result = adjustCredit(agentId, record.buyerVerusId, model, inputTok, outputTok, creditCheck.reserved, config.modelPricing || []);
+        recordUsage(agentId, key, inputTok, outputTok);
+        releaseOnce();
+        maybeNotifyCreditLow(agentId, record.buyerVerusId, result.remaining, cfg, config);
+        console.log(`[PROXY] ${agentId} ${model} ${inputTok}+${outputTok} tok, cost ${result.cost.toFixed(6)} VRSC, remaining ${result.remaining.toFixed(4)}`);
+      };
+
+      proxyRes.on('end', () => {
+        if (!res.writableEnded) res.end();
+        settleStream('end');
       });
 
       proxyRes.on('error', () => {
         if (!res.writableEnded) res.end();
-        // Settle defensively at the worst case so a mid-stream abort after the
-        // upstream already served output can't escape billing. Guard with
-        // `deducted` so we don't double-settle if 'end' also fires.
-        if (!deducted) {
-          deducted = true;
-          adjustCredit(agentId, record.buyerVerusId, model, estimatedInput, reserveOutput, creditCheck.reserved, config.modelPricing || []);
-          releaseOnce();
-        }
+        // Same policy as `end`, including the statusCode check and any usage frames
+        // that did arrive before the socket failed. `deducted` inside settleStream
+        // guards against double-settling if both events fire.
+        settleStream('stream error', true);
       });
+
+      // Publish the settle so `proxyReq.on('error')` can call it. A socket that dies
+      // mid-response fires BOTH `proxyRes.on('error')` and `proxyReq.on('error')`,
+      // and they used to implement different outcomes — worst-case billing vs. a
+      // full refund — so the price a buyer paid for an aborted stream depended on
+      // which listener Node happened to reach first. Same event, two prices.
+      settleActiveStream = settleStream;
     } else {
       // Non-streaming: read full response, adjust reservation, then send
       let chunks = [];
@@ -641,7 +675,17 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     // Always free the in-flight slot, even if the response already started
     // streaming (releaseOnce is idempotent). Only refund/respond when the
     // request never produced a (billable) response.
-    if (res.headersSent || res.writableEnded) { releaseOnce(); return; }
+    if (res.headersSent || res.writableEnded) {
+      // A streaming response was already in flight. A socket that dies mid-response
+      // fires this AND `proxyRes.on('error')`, and the two used to disagree — this
+      // one refunded in full, that one billed the worst case — so an aborted stream
+      // cost the buyer either nothing or the entire `max_tokens` reservation
+      // depending on which listener Node reached first. Route both through the one
+      // settle; `deducted` makes the second call a no-op.
+      if (settleActiveStream) settleActiveStream('request error', true);
+      releaseOnce();
+      return;
+    }
     console.error(`[PROXY] Upstream error: ${err.message}`);
     refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
     releaseOnce();

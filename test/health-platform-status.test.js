@@ -91,3 +91,39 @@ test('the startup window does not degrade — agents are not activated yet', () 
   assert.equal(buildHealthDocument(st, Date.now() - 1000).status, 'degraded',
     'once startup is done, an inactive agent is a real fault');
 });
+
+// ── The second axis (Fable, review of 2.29.0) ───────────────────────────────
+//
+// Once the dispatcher stopped writing on-chain status on a routine restart, the
+// chain axis became able to sit at `inactive` from an older dispatcher while the
+// platform axis reads `active`. The startup loop stamps `platformStatus='active'`
+// after a successful platform write, so a document built from that field alone
+// reports a green fleet the platform's hire gate is blocking — the 2026-08-06
+// shape, reproduced by the release meant to prevent it.
+
+test('an agent inactive on the CHAIN axis degrades, even when the platform axis is active', () => {
+  const doc = buildHealthDocument(stateWith([
+    { id: 'agent-1', identity: 'a1@', platformStatus: 'active', chainStatus: 'inactive' },
+  ]), Date.now() - 1000);
+
+  assert.equal(doc.agents[0].chainStatus, 'inactive', 'the axis must be visible, not just folded in');
+  assert.equal(doc.status, 'degraded',
+    'the hire gate ANDs both axes; /health must agree or it lies about a blocked fleet');
+});
+
+test('both axes active is ok', () => {
+  const doc = buildHealthDocument(stateWith([
+    { id: 'agent-1', identity: 'a1@', platformStatus: 'active', chainStatus: 'active' },
+  ]), Date.now() - 1000);
+  assert.equal(doc.status, 'ok');
+});
+
+test('an unknown chain axis does not degrade', () => {
+  // Same rule as the platform axis: "not checked yet" is not "broken", or every
+  // cold start looks like an outage.
+  const doc = buildHealthDocument(stateWith([
+    { id: 'agent-1', identity: 'a1@', platformStatus: 'active' },
+  ]), Date.now() - 1000);
+  assert.equal(doc.agents[0].chainStatus, 'unknown');
+  assert.equal(doc.status, 'ok');
+});

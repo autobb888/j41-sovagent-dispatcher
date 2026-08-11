@@ -102,6 +102,23 @@ function startUpstream() {
           res.writeHead(503, { 'Content-Type': 'text/event-stream' });
           res.write('data: {"usage":{"prompt_tokens":900,"completion_tokens":1200}}\n\n');
           res.end();
+        } else if (upstreamMode === 'stream-503-abort') {
+          // A 503 whose socket dies before a clean end — so `proxyRes.on('error')`
+          // settles it, not `on('end')`. That handler had its own policy: flat
+          // worst case, no statusCode check.
+          res.writeHead(503, { 'Content-Type': 'text/event-stream' });
+          res.write('data: {"error":"upstream unavailable"}\n\n');
+          // Destroy on a later tick. Destroying synchronously resets the connection
+          // before the response head is flushed, so the client never emits
+          // 'response' at all — that is a connect failure, not a mid-stream abort,
+          // and it exercises a completely different code path. Both of these tests
+          // passed for that wrong reason until the exact-charge assertion caught it.
+          setTimeout(() => res.destroy(), 40);
+        } else if (upstreamMode === 'stream-200-abort') {
+          // A 2xx that dies mid-stream after serving real output.
+          res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+          res.write('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n');
+          setTimeout(() => res.destroy(), 40);
         } else if (upstreamMode === 'stream-no-usage') {
           // Upstream ignores include_usage → never emits a usage frame.
           res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -407,6 +424,62 @@ test('M2r: the same input-only usage frame settles worst-case on the streaming p
   const spent = worst - getBalance(agentId, buyer);
   assert.ok(Math.abs(spent - expected) < 1e-9,
     `unknown output must settle at max_tokens; expected ${expected}, spent ${spent}`);
+});
+
+test('F3: a 503 that ABORTS mid-stream bills nothing, same as one that ends cleanly', async () => {
+  // The third settle site. `proxyRes.on('error')` charged estimatedInput +
+  // reserveOutput flat, with no statusCode check — so the SAME 503 cost the buyer
+  // the entire worst-case reservation or nothing at all, depending only on whether
+  // the socket closed cleanly. Three settle sites, three policies.
+  inflight._reset();
+  upstreamMode = 'stream-503-abort';
+  const agentId = 'agent-f3-abort';
+  const buyer = 'iBuyerF3Abort';
+  const key = mintApiKey(agentId, buyer).key;
+  const maxTokens = 50000;
+  const worst = calculateCost(PRICING, MODEL, 4000, maxTokens);
+  creditDeposit(agentId, buyer, worst, 'tx-f3-abort');
+
+  await runProxy(agentId, key, { model: MODEL, stream: true, max_tokens: maxTokens, messages: [] });
+  await new Promise((res) => setTimeout(res, 250));
+
+  const remaining = getBalance(agentId, buyer);
+  assert.ok(Math.abs(remaining - worst) < 1e-9,
+    `an aborted 503 must bill nothing; deposited=${worst} remaining=${remaining}`);
+});
+
+test('F3: a 2xx that aborts mid-stream bills only what a usage frame proved', async () => {
+  // NOT the worst-case settle. That settle is anti-abuse against an upstream that
+  // serves output while withholding its usage count — a party gaming us. An abort is
+  // a fault the BUYER did not cause and cannot cause: they have no way to make the
+  // seller's upstream drop its socket. Charging them the full max_tokens
+  // reservation for a broken response would be the one place in this file where the
+  // victim of a fault pays for it.
+  //
+  // This case previously had TWO answers. `proxyRes.on('error')` billed the worst
+  // case; `proxyReq.on('error')` refunded in full; both fire on a dead socket, so
+  // the price depended on listener order. Now there is one settle and one answer.
+  inflight._reset();
+  upstreamMode = 'stream-200-abort';
+  const agentId = 'agent-f3-ok-abort';
+  const buyer = 'iBuyerF3OkAbort';
+  const key = mintApiKey(agentId, buyer).key;
+  const maxTokens = 20000;
+  const worst = calculateCost(PRICING, MODEL, 4000, maxTokens);
+  creditDeposit(agentId, buyer, worst, 'tx-f3-ok-abort');
+
+  await runProxy(agentId, key, { model: MODEL, stream: true, max_tokens: maxTokens, messages: [] });
+  await new Promise((res) => setTimeout(res, 250));
+
+  // No usage frame arrived before the abort → zero output. Input falls back to the
+  // estimate, which is the one thing we do know was sent. Pin the exact number: a
+  // range assertion here would also pass if the settle never ran and the whole
+  // reservation were simply refunded, which is a different bug with the same shape.
+  const expected = calculateCost(PRICING, MODEL, 4000, 0);      // 0.004
+  const worstCase = calculateCost(PRICING, MODEL, 4000, maxTokens); // 2.004
+  const spent = worst - getBalance(agentId, buyer);
+  assert.ok(Math.abs(spent - expected) < 1e-9,
+    `an abort bills input only; expected ${expected}, spent ${spent} (worst case would be ${worstCase})`);
 });
 
 test('M2r: a 503 that carries a usage frame still bills NOTHING', async () => {
