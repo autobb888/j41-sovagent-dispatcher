@@ -4290,16 +4290,42 @@ program
       // Observed live: 9/9 "Transaction rejected by the network", reported as ✅.
       // The marker records which agents we deactivated and when; if that was under a
       // block ago, let the chain catch up before writing again.
-      const _mAt = Date.parse(_shutdownMarkerAt || '');
-      if (_toggleOnChain && _reactivatedOnStart.length && Number.isFinite(_mAt)) {
-        const _since = Date.now() - _mAt;
-        const _blockMs = 75000; // Verus ~60s, plus margin
-        if (_since < _blockMs) {
-          const _waitMs = _blockMs - _since;
-          console.log(`  ⏳ Our last shutdown deactivated ${_reactivatedOnStart.length} agent(s) ` +
-            `${Math.round(_since / 1000)}s ago. Waiting ${Math.round(_waitMs / 1000)}s for those identity ` +
-            'transactions to confirm — activating now would double-spend their prevOutputs and be rejected.');
-          await new Promise(r => setTimeout(r, _waitMs));
+      // Wait for OUR OWN deactivates to CONFIRM — per agent, by txid.
+      //
+      // First attempt was a flat 75 s from the marker timestamp. Wrong instrument:
+      // Verus block time varies, and it left 5 of 9 activates still rejected. The
+      // deterministic question is "has this agent's deactivate confirmed", and the
+      // marker now carries the txid to ask it with. Bounded, so a stuck chain delays
+      // startup rather than blocking it, and we say plainly what we are waiting for.
+      const _dtxids = readShutdownDeactivatedTxids();
+      const _pendingIds = _reactivatedOnStart.filter(id => _dtxids[id]);
+      if (_toggleOnChain && _pendingIds.length) {
+        console.log(`  ⏳ Waiting for ${_pendingIds.length} shutdown deactivate(s) to confirm before ` +
+          're-activating — both writes spend the same prevOutput, so activating early is rejected.');
+        const _deadline = Date.now() + 180000;
+        const _left = new Set(_pendingIds);
+        while (_left.size && Date.now() < _deadline) {
+          for (const id of [..._left]) {
+            const ai = readyAgents.find(a => a.id === id);
+            if (!ai) { _left.delete(id); continue; }
+            try {
+              const sess = await getAgentSession(state, ai);
+              const raw = await sess.client.getIdentityRaw(ai.iAddress || ai.identity);
+              const prevOut = raw?.data?.prevOutput?.txid || raw?.data?.txid || null;
+              if (prevOut && prevOut === _dtxids[id]) {
+                _left.delete(id);
+                console.log(`     ✓ ${id}: deactivate confirmed`);
+              }
+            } catch { /* transient — retry until the deadline */ }
+          }
+          if (_left.size) {
+            await new Promise(r => setTimeout(r, 10000));
+            kickWatchdog?.(`awaiting deactivate confirmations (${_left.size} left)`);
+          }
+        }
+        if (_left.size) {
+          console.warn(`  ⚠️  ${_left.size} deactivate(s) still unconfirmed after 3 min — activating anyway. ` +
+            'Any rejected activate is reported below; re-run `j41-dispatcher activate <id>` for those.');
         }
       }
       for (let i = 0; i < readyAgents.length; i++) {
@@ -4439,6 +4465,7 @@ program
       // J41_NO_STATUS_TOGGLE=1: don't flip platform state on shutdown.
       const _skipStatusToggle = process.env.J41_NO_STATUS_TOGGLE === '1';
       const _deactivatedByShutdown = [];
+      const _deactivateTxids = {};
       for (const agentInfo of state.agents) {
         if (_skipStatusToggle) {
           console.log(`   ⏭️  ${agentInfo.id}: skipping deactivate (J41_NO_STATUS_TOGGLE=1)`);
@@ -4467,7 +4494,7 @@ program
           // can blow the stall budget mid-loop. The marker written only at the end
           // meant a watchdog exit recorded NOTHING, and the next start skipped every
           // agent it had just deactivated with "No agents available to poll".
-          writeShutdownDeactivated(_deactivatedByShutdown);
+          writeShutdownDeactivated(_deactivatedByShutdown, SHUTDOWN_DEACTIVATED_FILE, _deactivateTxids);
           // Deactivating an agent is progress; the budget is for a WEDGED call, not
           // for the loop as a whole.
           kickWatchdog(`deactivated ${agentInfo.id}`);
@@ -4521,8 +4548,9 @@ program
               state._inboxLastWrite.delete(agentInfo.id);
             }
             try {
-              await agent.setOnChainStatus('inactive');
-              console.log(`   ✅ ${agentInfo.id}: on-chain status → inactive`);
+              const _dtx = await agent.setOnChainStatus('inactive');
+              if (_dtx) _deactivateTxids[agentInfo.id] = String(_dtx);
+              console.log(`   ✅ ${agentInfo.id}: on-chain status → inactive${_dtx ? ` (${String(_dtx).slice(0, 8)})` : ''}`);
             } catch (e) {
               console.error(`   ⚠️  ${agentInfo.id}: on-chain deactivate FAILED (${e.message}). ` +
                 'The platform shows inactive, but a re-index can revert that from chain — ' +
@@ -4541,7 +4569,7 @@ program
 
       // Already persisted incrementally above (L1); this is the final confirmation
       // for the case where the loop completed normally.
-      writeShutdownDeactivated(_deactivatedByShutdown);
+      writeShutdownDeactivated(_deactivatedByShutdown, SHUTDOWN_DEACTIVATED_FILE, _deactivateTxids);
       if (_deactivatedByShutdown.length) {
         console.log(`   📝 Recorded ${_deactivatedByShutdown.length} agent(s) to reactivate on next start`);
       }
@@ -5398,6 +5426,15 @@ const SHUTDOWN_DEACTIVATED_FILE = path.join(DISPATCHER_DIR, 'shutdown-deactivate
 
 /** When the marker was written (ISO string), or null. Used to avoid broadcasting an
  *  activate on top of our own still-unconfirmed deactivate. */
+function readShutdownDeactivatedTxids(file = SHUTDOWN_DEACTIVATED_FILE) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return (parsed && typeof parsed.txids === 'object' && parsed.txids) || {};
+  } catch {
+    return {};
+  }
+}
+
 function readShutdownDeactivatedAt(file = SHUTDOWN_DEACTIVATED_FILE) {
   try {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -5416,11 +5453,15 @@ function readShutdownDeactivated(file = SHUTDOWN_DEACTIVATED_FILE) {
   }
 }
 
-function writeShutdownDeactivated(agentIds, file = SHUTDOWN_DEACTIVATED_FILE) {
+function writeShutdownDeactivated(agentIds, file = SHUTDOWN_DEACTIVATED_FILE, txids = {}) {
   try {
     if (!agentIds.length) return;
     const tmp = `${file}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ at: new Date().toISOString(), agents: agentIds }, null, 2), { mode: 0o600 });
+    // `txids` maps agentId -> the on-chain deactivate txid. Startup waits for each to
+    // CONFIRM before writing its activate, because the two spend the same prevOutput.
+    // A wall-clock wait was the first attempt and it is the wrong instrument: Verus
+    // block time varies, so a fixed 75s left 5 of 9 activates still rejected.
+    fs.writeFileSync(tmp, JSON.stringify({ at: new Date().toISOString(), agents: agentIds, txids }, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, file); // atomic: a torn file must not strand the fleet
   } catch (e) {
     console.error(`   ⚠️  Could not record deactivated agents (${e.message}) — next start may need: j41-dispatcher activate-all`);
@@ -11347,7 +11388,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');

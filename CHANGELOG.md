@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 2.28.2
+
+2.28.1 improved the restart collision from 9 rejected on-chain activates to 5, and made
+the failures loud. Five is still five — the wall-clock wait was the wrong instrument.
+
+A flat 75-second pause assumed a Verus block arrives in 75 seconds. Block time varies,
+so the guess was marginal by construction. The deterministic question is *"has this
+agent's deactivate confirmed"*, and the shutdown marker now records each deactivate's
+**txid** so startup can ask it directly: poll `getIdentityRaw` until `prevOutput`
+matches, per agent, bounded at 3 minutes, then proceed with the (now loud) failure
+report for any that never confirmed.
+
+986 tests.
+
 ## 2.28.1
 
 **Every restart left the fleet inactive on-chain, and reported success.** Found by

@@ -80,7 +80,7 @@ test('a failed on-chain activate is reported as a failure, not a tick', () => {
   assert.match(after, /!\(result && result\.onChainTxid\)/, 'null txid IS the failure signal');
 });
 
-test('startup does not broadcast an activate on top of our own unconfirmed deactivate', () => {
+test('startup waits for its own deactivates to CONFIRM before re-activating', () => {
   // The collision is self-inflicted: stop writes N deactivates, start writes N
   // activates seconds later against the same prevOutputs, before any can confirm.
   // Anchor on the unique guard text. Two earlier attempts anchored on strings that
@@ -88,11 +88,12 @@ test('startup does not broadcast an activate on top of our own unconfirmed deact
   // readyAgents for-loop appears twice) and silently read a window tens of thousands
   // of characters from the code under test — a test that asserts against the wrong
   // region is worse than none.
-  const i = CLI.indexOf('Our last shutdown deactivated');
+  const i = CLI.indexOf('shutdown deactivate(s) to confirm');
   assert.ok(i > -1, 'the self-collision guard must exist');
-  const block = CLI.slice(Math.max(0, i - 700), i + 900);
-  assert.match(block, /_shutdownMarkerAt|_mAt/, 'the marker timestamp gates the wait');
-  assert.match(block, /await new Promise\(r => setTimeout\(r, _waitMs\)\)/,
-    'it must actually wait, not merely warn');
-  assert.match(block, /if \(_since < _blockMs\)/, 'the wait must be conditional on the gap');
+  const block = CLI.slice(Math.max(0, i - 900), i + 1800);
+  // Per-TXID confirmation, not a wall-clock guess: a flat 75s wait left 5 of 9
+  // activates rejected because Verus block time varies.
+  assert.match(block, /readShutdownDeactivatedTxids\(\)/, 'the marker must carry the txids');
+  assert.match(block, /prevOut === _dtxids\[id\]/, 'confirmation is prevOutput matching the txid');
+  assert.ok(!/_blockMs/.test(block), 'the wall-clock guess must be gone');
 });
