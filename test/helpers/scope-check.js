@@ -12,7 +12,13 @@
 // a syntax error, and the reference is only wrong relative to scope. A scope-
 // tracking AST walk finds it statically, for the whole class, in milliseconds.
 //
-// Usage: node scripts/scope-check.js <file.js> [...]  (exit 1 if anything is found)
+// Usage: node test/helpers/scope-check.js <file.js> [...]  (exit 1 if anything found)
+//
+// Lives under test/ deliberately. `package.json`'s `files` ships `scripts/`, and
+// this needs `acorn`, which is a devDependency — so parking it there would put a
+// tool in every published install that throws MODULE_NOT_FOUND when run. That is
+// the same "unrunnable npm install" class as audit finding D1, which this repo has
+// already shipped once.
 'use strict';
 const fs = require('fs');
 const acorn = require('acorn');

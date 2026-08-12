@@ -17,7 +17,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 
-const { checkFile } = require('../scripts/scope-check.js');
+const { checkFile } = require('./helpers/scope-check.js');
 
 function sourceFiles(dir) {
   const out = [];

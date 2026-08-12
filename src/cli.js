@@ -3743,6 +3743,11 @@ program
       _lastExtensionCheck: new Map(), // ext.id -> { ts, jobId } (dedup of dispatched extension requests; pruned by jobId at job teardown)
       _pendingWorkspace: new Map(), // jobId -> workspace connect promise
       _agentErrors: new Map(), // agentId -> last error string (health document)
+      // When this process began. Read by the inbox sweep's bounded startup gate —
+      // `state.startedAt || 0` against a missing field yields Date.now(), which is
+      // always past any grace window, so the gate would never have deferred at all.
+      // The fix for one silent failure quietly became another.
+      startedAt: Date.now(),
       _containerCrashes: new Map(), // agentId -> unexpected-exit count (health document)
       // agentId -> { txid, at } for the last identity write WE made. The inbox sweep
       // created this lazily on its first fire (+60s), but the startup activation loop
@@ -8708,6 +8713,11 @@ async function checkFeeTanks(state) {
 }
 
 // Check for pending inbox items (reviews + job records) and process them
+// How long the inbox sweep defers to an in-progress startup. Long enough to cover
+// the 3-minute confirmation wait plus a staggered activation of a large fleet;
+// short enough that a wedged startup does not silently stop reputation writes.
+const INBOX_STARTUP_GRACE_MS = 10 * 60 * 1000;
+
 async function checkPendingInbox(state) {
   // C1 — the sweep is the OTHER identity writer. Shutdown broadcasts a per-agent
   // on-chain deactivate and can then drain for up to 120 minutes; if the sweep keeps
@@ -8716,15 +8726,31 @@ async function checkPendingInbox(state) {
   // as contention. 2.27.0 gave the deactivate a pause but left the sweep running,
   // which only closed one direction of the collision.
   if (state.shuttingDown) return;
-  // ...and not before startup has finished writing identities either. The sweep and
-  // the startup chain repair are both identity writers for the same agent, both
-  // consult `_inboxLastWrite` only AFTER broadcasting, and the sweep's first firing
-  // (+60s) lands squarely inside a startup that can spend three minutes in the
-  // confirmation wait — on an upgrade, when downtime has piled up inbox items. Two
-  // builders against the same confirmed prevOutput means one is rejected as -25.
-  // C1 closed the shutdown direction of this collision and left the startup one
-  // open; this is the symmetric gate.
-  if (state.startupComplete !== true) return;
+  // ...and not while startup is still writing identities. The sweep and the startup
+  // chain repair are both identity writers for the same agent, both consult
+  // `_inboxLastWrite` only AFTER broadcasting, and the sweep's first firing (+60s)
+  // lands squarely inside a startup that can spend three minutes in the confirmation
+  // wait — on an upgrade, when downtime has piled up inbox items. Two builders
+  // against the same confirmed prevOutput means one is rejected as -25. C1 closed the
+  // shutdown direction of this collision and left the startup one open.
+  //
+  // BOUNDED, though. `startupComplete` is set at exactly one line, at the very end of
+  // startup, so a plain `!== true` gate would mean that ANY error before that point
+  // silently disables on-chain reputation writes — reviews, attestations, job records
+  // — for the entire life of the process. That trades a narrow, self-healing
+  // double-spend window for a permanent, invisible data-loss one. Past the window we
+  // proceed and say why: a rejected identity tx is retried, a review that is never
+  // written is simply gone.
+  if (state.startupComplete !== true) {
+    const _sinceStart = Date.now() - (state.startedAt || 0);
+    if (_sinceStart < INBOX_STARTUP_GRACE_MS) return;
+    if (!state._warnedInboxUngated) {
+      state._warnedInboxUngated = true;
+      console.warn('[Inbox] startup never reported complete after ' +
+        `${Math.round(INBOX_STARTUP_GRACE_MS / 60000)} min — resuming inbox processing anyway. ` +
+        'Something failed during startup; check the log above for it.');
+    }
+  }
   // Reentrancy guard: safeInterval is a plain setInterval, so a sweep slower than
   // the 60s floor would overlap the next one — two concurrent batches per agent,
   // racing _inboxLastWrite and re-creating the contention this all exists to stop.

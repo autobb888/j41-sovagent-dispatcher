@@ -234,3 +234,21 @@ test('the repair aborts — does not broadcast — when the pending write never 
   assert.match(body.slice(gate, write), /continue;/,
     'the gate-timeout path must abort the iteration, not fall through to the write');
 });
+
+test('the inbox startup gate is BOUNDED — a wedged startup cannot silence it forever', () => {
+  // `startupComplete` is set at exactly one line, at the very end of startup. A
+  // plain `!== true` gate therefore meant that ANY error before that point silently
+  // disabled on-chain reputation writes — reviews, attestations, job records — for
+  // the life of the process. That trades a narrow, self-healing double-spend window
+  // for a permanent, invisible data-loss one. A rejected identity tx is retried; a
+  // review that is never written is simply gone.
+  const i = CLI.indexOf('async function checkPendingInbox');
+  const body = CLI.slice(i, i + 2200);
+  assert.match(body, /state\.startupComplete !== true/, 'the gate must exist');
+  assert.match(body, /INBOX_STARTUP_GRACE_MS/, 'and it must be time-bounded');
+  assert.match(body, /_warnedInboxUngated/, 'and it must say so when it gives up waiting');
+  // The bound is only real if the fallback compares against something that exists.
+  const si = CLI.indexOf('const state = {');
+  assert.match(CLI.slice(si, si + 2600), /startedAt:/,
+    'state.startedAt must exist or the bound silently never defers');
+});
