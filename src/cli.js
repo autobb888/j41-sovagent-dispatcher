@@ -457,18 +457,34 @@ function startDispatcherSweep(state) {
     try {
       const list = loadFinancialAllowlist();
       if (list.active_jobs.length === 0) {
-        // Clear UNCONDITIONALLY, not only when this process observed the outage
-        // start. The flag is durable across restarts (deliberately — a suspension
-        // that a restart lifts is not a suspension); `dispatcherApiOutageSince` is
-        // process-local and is null in a fresh process. Gating the clear on it meant
-        // an outage that began before a restart could NEVER be lifted: every sweep
-        // saw a healthy API, skipped the clear, and every refund fleet-wide deferred
-        // forever, while the operator was told "clears automatically when the
-        // platform responds" (it would not) and "remove the file if the daemon is
-        // not running" (it was). Making the flag durable without moving the clear
-        // off process-local state is what created this.
-        dispatcherApiOutageSince = null;
-        setFinancialSuspended(false);
+        // No active job to probe the platform with. "Nothing to check" is NOT
+        // evidence the platform is up — clearing here on that basis would lift the
+        // kill switch during a real outage simply because the fleet happened to be
+        // idle, which is the normal state during an outage.
+        //
+        // But the clear must also not depend on `dispatcherApiOutageSince`, which is
+        // process-local and null in a fresh process: gating on it meant an outage
+        // spanning a restart could NEVER be lifted, deferring every refund
+        // fleet-wide forever while the operator was told it "clears automatically".
+        //
+        // So: probe explicitly, and only when a suspension is actually in force.
+        if (isFinanciallySuspended()) {
+          const probeAgent = state.agents?.[0];
+          if (probeAgent) {
+            try {
+              const probeSession = await getAgentSession(state, probeAgent);
+              await probeSession.client.getChainInfo();
+              dispatcherApiOutageSince = null;
+              setFinancialSuspended(false);
+              console.log('[allowlist-sweep] API reachable — resuming financial operations');
+            } catch (e) {
+              console.warn('[allowlist-sweep] financial ops still suspended — platform probe failed ' +
+                `(${String(e.message || e).slice(0, 60)})`);
+            }
+          }
+        } else {
+          dispatcherApiOutageSince = null;
+        }
         return;
       }
 
