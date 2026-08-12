@@ -151,34 +151,6 @@ function creditDeposit(agentId, buyerVerusId, amount, txid) {
 }
 
 /**
- * Reverse a deposit that was credited but whose funding transaction never landed.
- *
- * M4: deposits under 2 VRSC are credited at 0 confirmations — straight from the
- * mempool — so the buyer gets instant proxy access. A mempool transaction is not
- * money: it can be evicted, replaced, or simply never mined. Nothing ever went
- * back to check, so a dropped sub-2-VRSC tx left the credit standing forever, and
- * the trick is repeatable with a fresh txid each time.
- *
- * Deliberately NOT clamped at zero. If the buyer already spent the credit the
- * balance goes negative, which is the honest state — they consumed compute they
- * did not pay for. `reserveCredit` refuses while balance < cost, so a negative
- * balance blocks further spending until it is topped up past the debt. Clamping
- * to zero would forgive the debt and make the exploit free.
- *
- * @returns {{newBalance: number}}
- */
-function reverseDeposit(agentId, buyerVerusId, amount, txid) {
-  const data = loadMeters(agentId);
-  const buyer = ensureBuyer(data, buyerVerusId);
-  buyer.balance -= amount;
-  buyer.totalDeposited -= amount;
-  buyer.lastActivity = new Date().toISOString();
-  if (txid) buyer.lastReversedTxid = txid;
-  saveMeters(agentId, data);
-  return { newBalance: buyer.balance };
-}
-
-/**
  * Edge-triggered, debounced credit-low detection.
  *
  * Returns true exactly ONCE per downward threshold crossing — when `balance`
@@ -229,4 +201,4 @@ function getMetrics(agentId) {
   return data.buyers;
 }
 
-module.exports = { reserveCredit, adjustCredit, refundReservation, creditDeposit, reverseDeposit, getBalance, getMetrics, calculateCost, checkAndFlagLow, getMeter };
+module.exports = { reserveCredit, adjustCredit, refundReservation, creditDeposit, getBalance, getMetrics, calculateCost, checkAndFlagLow, getMeter };

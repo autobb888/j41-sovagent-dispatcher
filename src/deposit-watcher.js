@@ -18,7 +18,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { creditDeposit, reverseDeposit } = require('./credit-meter');
+const { creditDeposit } = require('./credit-meter');
 const { clampCredit } = require('./deposit-credit.js');
 const { loadDispatcherConfig } = require('./config-loader.js');
 const { checkNonceAfterVerify } = require('./nonce-cache');
@@ -146,12 +146,6 @@ function depositsPath(agentId) {
 const _claimsInProgress = new Set(); // key: `${agentId}\0${txid}`
 
 function _claimKey(agentId, txid) { return `${String(agentId).length}:${agentId}\0${txid}`; }
-
-/** Test hook: `_claimsInProgress` is in-memory, so a real process restart forgets
- *  every claim. Tests that need to model a restart (a buyer re-reporting a txid
- *  after we reversed it, say) have to be able to forget one too. Not used in
- *  production paths. */
-function _forgetClaimForTest(agentId, txid) { _claimsInProgress.delete(_claimKey(agentId, txid)); }
 
 /**
  * Atomically claim (agentId, txid) for crediting. Returns false if it's already
@@ -318,10 +312,6 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
       console.warn(`[deposit] credited ${credited} < reported ${expectedAmount} (confirmedAmount=${verification.confirmedAmount}) for tx ${txid}`);
     }
     const result = creditDeposit(agentId, buyerVerusId, credited, txid);
-    // M4: `required === 0` means we just credited straight out of the mempool.
-    // A mempool transaction is not money — flag it so pollPendingDeposits comes
-    // back and either confirms it or takes the credit away. See reconcile below.
-    const _unconfirmed = required === 0 && (txStatus.confirmations || 0) < 1;
 
     // Notify J41 platform (non-blocking, non-fatal) — uses per-agent context
     const ctx = _notifyContexts.get(agentId);
@@ -336,13 +326,9 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
       amount: credited,
       confirmations: txStatus.confirmations,
       creditedAt: new Date().toISOString(),
-      ...(_unconfirmed ? { unconfirmed: true, creditedAtMs: Date.now(), misses: 0 } : {}),
     });
     // Remove from pending if it was there
     fresh.pending = fresh.pending.filter(d => d.txid !== txid);
-    // This txid may have been reversed earlier and is now being credited afresh.
-    // Settle that ledger entry or the reversal recheck will credit it AGAIN.
-    _settleReversedForTxid(fresh, txid, 're-reported and credited');
     // Keep only last 1000 processed (prevent unbounded growth)
     if (fresh.processed.length > 1000) fresh.processed = fresh.processed.slice(-1000);
     saveDeposits(agentId, fresh);
@@ -365,412 +351,7 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
  * @param agentId - Seller agent ID
  * @param client - Authenticated J41Client
  */
-// ── M4: reconcile 0-conf credits ────────────────────────────────────────────
-//
-// `requiredConfirmations` returns 0 below 2 VRSC, so a small deposit is credited
-// out of the mempool for instant proxy access. That is a deliberate UX call and
-// it matches the platform's own tiering — but it was one-way. The credit was
-// written to `processed` and nothing ever went back to ask whether the funding
-// transaction actually got mined. A mempool tx can be evicted, replaced, or never
-// mined at all, and the buyer keeps the credit either way. Repeatable with a
-// fresh txid each time, for free.
-//
-// The reconciler is deliberately biased toward KEEPING the credit. Reversing a
-// legitimate buyer's balance is worse than a delayed clawback, so a reversal
-// requires all three of:
-//   1. past the grace deadline (the tx has had time to be mined),
-//   2. RECONCILE_MIN_MISSES consecutive lookups that positively say "unknown",
-//      not merely a failed API call, and
-//   3. still no confirmation.
-// Any sighting — confirmed OR still visibly in the mempool — resets the miss
-// counter, because presence is positive evidence the tx exists.
-const RECONCILE_GRACE_MS = 30 * 60 * 1000; // ~30 blocks at Verus' ~60s target
-const RECONCILE_MIN_MISSES = 3;
-// Misses must also SPAN this long. Three polls is three minutes, which a routine
-// backend deploy window can supply on its own — and a deploy is precisely when the
-// tx-status route is most likely to answer wrongly. Requiring the run to persist
-// makes a transient platform-side fault insufficient on its own.
-const RECONCILE_MISS_SPAN_MS = 10 * 60 * 1000;
-// A 'weak' signal (a bare 404) needs far more before it may move money: a generic
-// 404 is what a renamed route or a proxy answers with, identically for every txid.
-const RECONCILE_WEAK_MIN_MISSES = 6;
-const RECONCILE_WEAK_SPAN_MS = 2 * 60 * 60 * 1000;
-// How long a REVERSED credit stays eligible for automatic restoration if its
-// transaction turns up on-chain after all. A reversal is our judgement call on
-// incomplete evidence, so it has to be revisitable — otherwise the one case where
-// we get it wrong (a route fault we mistook for a dropped tx) is also the one case
-// the buyer can never recover from without an operator noticing.
-const REVERSAL_RECHECK_WINDOW_MS = 24 * 60 * 60 * 1000;
-
-/**
- * Does this error mean "the chain has never heard of this txid", as opposed to
- * "we could not reach the API" or "that route is not there right now"?
- *
- * Only a transaction-specific signal counts. A bare 404 does NOT: the SDK
- * surfaces route-level failures as `HTTP 404` and
- * `Non-JSON response from GET /v1/tx/status/… (HTTP 404)`, which a renamed
- * endpoint or a reverse proxy mid-deploy produces for every txid at once. Three
- * of those in a row would otherwise reverse every open credit on the fleet
- * simultaneously — the loudest possible way to get this wrong.
- *
- * Erring here costs us nothing: an unrecognised error just means we keep waiting,
- * and the credit stays. Erring the other way takes money from a buyer who paid.
- */
-function _isTxUnknown(err) {
-  return _classifyLookupFailure(err) === 'strong';
-}
-
-/**
- * How much does this error tell us? Three answers, because two are not enough.
- *
- *   'strong' — a transaction-specific signal. The chain was asked about THIS txid
- *              and said no.
- *   'weak'   — a bare 404 / generic NOT_FOUND. Consistent with a dropped tx, and
- *              equally consistent with the route being renamed or a proxy answering
- *              during a deploy, which would look identical for every txid at once.
- *   null     — tells us nothing (connection refused, 5xx, a timeout).
- *
- * Why 'weak' exists at all: review round 3 found that the platform's OWN published
- * error shape for a 404 is `{"error":{"code":"NOT_FOUND","message":"The requested
- * resource does not exist"}}` (j41-docs api/overview.md), and `/v1/tx/status/:txid`
- * documents no tx-specific code. The SDK surfaces `error.message` as the Error's
- * message and `error.code` as `err.code` — which the first version never inspected.
- * So on the documented evidence the strong patterns match NOTHING the real backend
- * produces, the reconciler would wait forever, and the whole feature would be inert
- * against the leak it exists to close. Treating a generic 404 as weak evidence —
- * requiring a much longer run, and only when the failure is not fleet-wide — keeps
- * the deploy-window protection while making the feature actually able to fire.
- *
- * The question is out to the backend team; if they add a stable `TX_NOT_FOUND`,
- * that path is already 'strong' here and the weak tier stops mattering.
- */
-function _classifyLookupFailure(err) {
-  const m = String((err && err.message) || err || '');
-  const code = String((err && err.code) || '');
-
-  if (code === 'TX_NOT_FOUND' || /\bTX_NOT_FOUND\b/.test(m)) return 'strong';
-  if (/(transaction|tx|txid)[^.]{0,40}(not\s*found|unknown|does\s*not\s*exist)/i.test(m)) return 'strong';
-  if (/no\s*such\s*(transaction|tx)\b/i.test(m)) return 'strong';
-  if (/invalid\s*or\s*non-?wallet\s*transaction/i.test(m)) return 'strong';
-  // verusd's own phrasing for a txid it cannot index.
-  if (/no\s*information\s*available\s*about\s*transaction/i.test(m)) return 'strong';
-
-  const status = err && (err.statusCode || err.status);
-  if (status === 404 || code === 'NOT_FOUND' || /\b404\b/.test(m)) return 'weak';
-  return null;
-}
-
-/**
- * Mark any open `reversed` ledger entry for this txid as settled, because some
- * OTHER path just credited it.
- *
- * A reversed txid is not in `processed`, so `claimTxid` does not block a re-report
- * of it — which is correct (a buyer whose payment did confirm should be able to
- * re-report it). But the orphaned ledger entry then still looked restorable, and
- * `_recheckReversals` credited it a second time. Reproduced in review: 0 →
- * re-report 1.5 → restore 3.0.
- */
-function _settleReversedForTxid(deposits, txid, reason) {
-  let touched = false;
-  for (const r of deposits.reversed || []) {
-    if (r && r.txid === txid && !r.restoredAt) {
-      r.restoredAt = new Date().toISOString();
-      r.resolvedBy = reason;
-      touched = true;
-    }
-  }
-  return touched;
-}
-
-async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
-  const deposits = loadDeposits(agentId);
-  const open = (deposits.processed || []).filter(d => d && d.unconfirmed);
-  if (open.length === 0) {
-    // No OPEN credits, but a reversal may still be waiting to be undone — and a
-    // reversal is precisely the state in which nothing is open any more. Returning
-    // here skipped phase 4 in the only situation it exists for.
-    const restoredOnly = await _recheckReversals(agentId, client, now);
-    return { confirmed: 0, reversed: 0, waiting: 0, restored: restoredOnly };
-  }
-
-  let confirmed = 0, reversed = 0, waiting = 0;
-
-  // ── Phase 1: LOOK UP EVERYTHING, decide nothing ──────────────────────────
-  //
-  // The systemic check has to compare each record against the whole pass, so the
-  // whole pass must exist before any record is judged. The first version tried to
-  // do both in one loop and was therefore broken two ways: it incremented (and
-  // persisted) a miss BEFORE testing for systemic, and it compared a counter still
-  // being accumulated mid-loop against the total — so the guard could only ever be
-  // true for the LAST record. Every earlier record was judged as if the failure
-  // were isolated. Reproduced in review: three credits, one route-level 404
-  // outage, all three buyers clawed back. A guard that protects only the last item
-  // of each pass is not a guard.
-  const lookups = [];
-  for (const rec of open) {
-    let seen = null;
-    let strength = null;
-    let transient = false;
-    try {
-      const st = await client.getTxStatus(rec.txid);
-      // A response we cannot interpret is NOT evidence of absence.
-      seen = st && Number.isFinite(st.confirmations) ? st.confirmations : null;
-      // The call RESOLVED but we could not read a confirmation count out of it —
-      // an empty body, `{}`, a stringified count, a re-wrapped `{data:{…}}` shape.
-      // A backend response-shape change must not claw back every open credit.
-      if (seen === null) transient = true;
-    } catch (e) {
-      strength = _classifyLookupFailure(e);
-      // Transient — an unreachable platform must never cost a buyer their balance.
-      if (!strength) transient = true;
-    }
-    lookups.push({ rec, seen, strength, transient });
-  }
-
-  // ── Phase 2: is this about the transactions, or about the route? ─────────
-  //
-  // A route-level failure answers identically for EVERY txid; a genuinely dropped
-  // transaction is isolated among its peers. Judged across the completed pass, so
-  // every record gets the same verdict — and a systemic pass counts NOTHING, no
-  // miss increments, no persistence, so an outage cannot accumulate its way to a
-  // reversal one pass at a time.
-  const weakUnknowns = lookups.filter(l => l.strength === 'weak').length;
-  const systemic = lookups.length > 1 && weakUnknowns === lookups.length;
-  if (systemic) {
-    console.warn(`[Deposits] ${agentId}: all ${lookups.length} open 0-conf lookups failed identically — ` +
-      'treating as a route-level fault, not as evidence about any transaction. Nothing counted.');
-    return { confirmed: 0, reversed: 0, waiting: lookups.length };
-  }
-
-  // ── Phase 3: act, one record at a time ───────────────────────────────────
-  for (const { rec, seen, strength, transient } of lookups) {
-    const unknown = strength !== null;
-    if (transient) {
-      waiting++;
-      continue;
-    }
-
-    // Re-load per record: crediting/reversing is a write, and other paths write
-    // `processed` too (audit M4's clobber lesson).
-    const fresh = loadDeposits(agentId);
-    const live = (fresh.processed || []).find(d => d && d.txid === rec.txid && d.unconfirmed);
-    if (!live) continue; // someone else resolved it while we were awaiting
-
-    if (seen !== null && seen >= 1) {
-      // If we already debited this one on a previous pass (crash between the meter
-      // write and the record removal) and the transaction has now CONFIRMED, the
-      // debit was wrong — the buyer funded it after all. Put the credit back before
-      // clearing the flag, or they are charged for a genuinely funded deposit.
-      if (live.reversal === 'debited') {
-        // We know the meter was debited, so putting it back is safe and correct.
-        // Clear the flag and persist FIRST: if we crash between the two writes,
-        // a lost re-credit leaves the buyer short by a recorded amount an operator
-        // can see and fix, whereas a repeated re-credit silently mints money on
-        // every subsequent pass. Neither window can be closed without a
-        // transactional store; this picks the one that fails visibly.
-        live.reversal = 'recredited';
-        saveDeposits(agentId, fresh);
-        creditDeposit(agentId, live.buyerVerusId, live.amount, live.txid);
-        console.warn(`[Deposits] ${agentId}: ${rec.txid.substring(0, 12)}… confirmed AFTER a completed reversal — ` +
-          `re-credited ${live.amount} VRSC to ${live.buyerVerusId}.`);
-        delete live.reversal;
-      } else if (live.reversal) {
-        // 'debiting' (crashed between the intent stamp and the debit) or
-        // 'recredited' (crashed between the flag write and the credit). We cannot
-        // tell whether the money moved, and this is a confirmed, genuinely funded
-        // deposit — so DO NOT guess. Every other ambiguous-money path in this
-        // codebase stops and asks a human (see the refund in-flight marker); a
-        // silent guess here is either a buyer charged for a deposit they funded or
-        // a seller paying twice.
-        live.needsOperator = `reversal state '${live.reversal}' when the tx confirmed — balance may be off by ${live.amount}`;
-        delete live.reversal;
-        console.error(`[Deposits] ${agentId}: ⚠️  ${rec.txid.substring(0, 12)}… confirmed while a reversal was ` +
-          `mid-flight. We CANNOT tell whether ${live.amount} VRSC was debited from ${live.buyerVerusId}. ` +
-          'No money moved. Check the meter against the chain and correct it by hand.');
-      }
-      delete live.unconfirmed;
-      delete live.misses;
-      delete live.firstMissAtMs;
-      delete live.weak;
-      live.confirmations = seen;
-      saveDeposits(agentId, fresh);
-      confirmed++;
-      console.log(`[Deposits] ${agentId}: 0-conf credit ${rec.txid.substring(0, 12)}… confirmed at ${seen} block(s)`);
-      continue;
-    }
-
-    if (seen === 0) {
-      // Still in the mempool. It exists; keep waiting and reset the miss run.
-      if (live.misses || live.firstMissAtMs || live.weak) {
-        live.misses = 0;
-        delete live.firstMissAtMs;
-        delete live.weak;
-        saveDeposits(agentId, fresh);
-      }
-      waiting++;
-      const ageMin = Math.round((now - (live.creditedAtMs || now)) / 60000);
-      if (ageMin >= 60 && ageMin % 60 < 2) {
-        console.warn(`[Deposits] ${agentId}: ${rec.txid.substring(0, 12)}… has sat unconfirmed in the mempool for ${ageMin} min ` +
-          `(${rec.amount} VRSC credited to ${rec.buyerVerusId}). It has not been reversed — it is still visible on the network.`);
-      }
-      continue;
-    }
-
-    // unknown === true: the chain does not know this txid.
-    //
-    // A `reversing` stamp from a previous pass means we may already have debited
-    // the meter and died before clearing the record — reverseDeposit writes
-    // credit-meters.json and the record removal writes deposits.json, two separate
-    // atomic writes with a crash window between them. Finish the bookkeeping
-    // WITHOUT debiting again. The residual is that a crash between the stamp and
-    // the debit forgives ≤2 VRSC; debiting twice would take 2 VRSC from a buyer,
-    // and only one of those two is reversible by the person it happens to.
-    // 'debited' is proof. 'debiting' only proves we INTENDED to — the stamp is
-    // written before the debit precisely so a crash is recoverable, which means it
-    // cannot also stand as evidence that the debit ran. Treat the ambiguous case as
-    // already-debited: forgiving ≤2 VRSC beats debiting a buyer twice.
-    const _alreadyDebited = live.reversal === 'debited' || live.reversal === 'debiting';
-    live.misses = (live.misses || 0) + 1;
-    if (!live.firstMissAtMs) live.firstMissAtMs = now;
-    // A weak signal anywhere in the run holds the whole run to the weak thresholds.
-    if (strength === 'weak') live.weak = true;
-    const _weak = live.weak === true;
-    const _minMisses = _weak ? RECONCILE_WEAK_MIN_MISSES : RECONCILE_MIN_MISSES;
-    const _minSpan = _weak ? RECONCILE_WEAK_SPAN_MS : RECONCILE_MISS_SPAN_MS;
-    const pastGrace = now - (live.creditedAtMs || 0) >= RECONCILE_GRACE_MS;
-    const missRunLongEnough = live.misses >= _minMisses
-      && now - live.firstMissAtMs >= _minSpan;
-    if (!_alreadyDebited && (!pastGrace || !missRunLongEnough)) {
-      saveDeposits(agentId, fresh);
-      waiting++;
-      continue;
-    }
-
-    let _debitCertain = false;
-    if (!_alreadyDebited) {
-      // Persist the intent BEFORE the irreversible debit, so a crash in between is
-      // recoverable rather than a guess. Same shape as markRefundInflight.
-      live.reversal = 'debiting';
-      saveDeposits(agentId, fresh);
-      reverseDeposit(agentId, live.buyerVerusId, live.amount, live.txid);
-      live.reversal = 'debited';
-      saveDeposits(agentId, fresh);
-      _debitCertain = true;
-    } else {
-      console.warn(`[Deposits] ${agentId}: ${live.txid.substring(0, 12)}… was mid-reversal at the last crash — ` +
-        'completing the bookkeeping without debiting again.');
-    }
-    fresh.processed = fresh.processed.filter(d => d.txid !== live.txid);
-    fresh.reversed = fresh.reversed || [];
-    fresh.reversed.push({
-      txid: live.txid,
-      buyerVerusId: live.buyerVerusId,
-      amount: live.amount,
-      creditedAt: live.creditedAt,
-      reversedAt: new Date().toISOString(),
-      reason: 'funding transaction never confirmed and is unknown to the chain',
-      // Did the meter ACTUALLY move? Only `true` licenses an automatic restore.
-      // The forgiveness branch above reaches here having deliberately NOT debited
-      // (we could not prove the pre-crash debit ran, and forgiving beats
-      // double-debiting) — so a ledger entry exists for a buyer who was never
-      // charged. Restoring that on a later confirmation credits them a second time.
-      // Reproduced in review: 1.5 → forgiven → 3.0.
-      debited: _debitCertain,
-    });
-    if (fresh.reversed.length > 1000) fresh.reversed = fresh.reversed.slice(-1000);
-    saveDeposits(agentId, fresh);
-    reversed++;
-    console.error(`[Deposits] ${agentId}: ⛔ REVERSED ${live.amount} VRSC of credit for ${live.buyerVerusId} — ` +
-      `funding tx ${live.txid.substring(0, 12)}… never confirmed and the chain does not know it. ` +
-      'If the buyer disputes this, check the txid on-chain before re-crediting.');
-  }
-
-  // ── Phase 4: was a reversal wrong? ───────────────────────────────────────
-  //
-  // Reversal moves the record out of `processed` into `reversed`, and nothing used
-  // to look at `reversed` again — so a credit clawed back during a route-level
-  // fault stayed clawed back even once the transaction was visibly confirmed on
-  // chain. The buyer paid, the chain agrees, and the money was gone with no
-  // automatic recovery. Re-check recent reversals and put the credit back.
-  const restored = await _recheckReversals(agentId, client, now);
-
-  if (confirmed || reversed || restored) {
-    console.log(`[Deposits] ${agentId}: reconciled 0-conf credits — ${confirmed} confirmed, ${reversed} reversed, ` +
-      `${restored} restored, ${waiting} still open`);
-  }
-  return { confirmed, reversed, waiting, restored };
-}
-
-/**
- * Restore a reversed credit whose transaction later confirmed.
- *
- * Bounded by REVERSAL_RECHECK_WINDOW_MS so this does not grow into an unbounded
- * re-scan, and idempotent via `restoredAt` on the ledger entry. Only ever acts on
- * a POSITIVE confirmation — an unknown or unreachable lookup leaves the reversal
- * standing, exactly as the forward path leaves a credit standing.
- */
-async function _recheckReversals(agentId, client, now = Date.now()) {
-  const d = loadDeposits(agentId);
-  const candidates = (d.reversed || []).filter(r => {
-    if (!r || r.restoredAt || !r.txid) return false;
-    const at = Date.parse(r.reversedAt || '');
-    return Number.isFinite(at) && now - at <= REVERSAL_RECHECK_WINDOW_MS;
-  });
-  if (candidates.length === 0) return 0;
-
-  let restored = 0;
-  for (const cand of candidates) {
-    // Only an entry we KNOW debited may be restored automatically. `debited: false`
-    // means the reversal forgave an ambiguous crash and never charged the buyer;
-    // crediting it back would hand them the deposit twice. `undefined` is an entry
-    // written before this field existed — same treatment, because we cannot tell.
-    if (cand.debited !== true) {
-      const fresh0 = loadDeposits(agentId);
-      const e0 = (fresh0.reversed || []).find(r => r && r.txid === cand.txid && !r.restoredAt);
-      if (e0 && !e0.needsOperator) {
-        e0.needsOperator = 'reversed without a certain debit, and the tx later confirmed — ' +
-          `check whether ${e0.buyerVerusId} is owed ${e0.amount}`;
-        saveDeposits(agentId, fresh0);
-        console.error(`[Deposits] ${agentId}: ⚠️  reversed tx ${String(cand.txid).substring(0, 12)}… has confirmed, ` +
-          'but we cannot prove the reversal ever debited. No money moved. Check the meter by hand.');
-      }
-      continue;
-    }
-    let confs = null;
-    try {
-      const st = await client.getTxStatus(cand.txid);
-      confs = st && Number.isFinite(st.confirmations) ? st.confirmations : null;
-    } catch {
-      continue; // no news is not good news, and not bad news either
-    }
-    if (confs === null || confs < 1) continue;
-
-    const fresh = loadDeposits(agentId);
-    const live = (fresh.reversed || []).find(r => r && r.txid === cand.txid && !r.restoredAt);
-    if (!live) continue;
-    // Mark BEFORE crediting, for the same reason the debit stamps before debiting:
-    // a crash then loses a restoration (visible, recorded, fixable) rather than
-    // repeating one on every subsequent pass (silent, compounding).
-    live.restoredAt = new Date(now).toISOString();
-    saveDeposits(agentId, fresh);
-    creditDeposit(agentId, live.buyerVerusId, live.amount, live.txid);
-    restored++;
-    console.warn(`[Deposits] ${agentId}: ↩️  RESTORED ${live.amount} VRSC to ${live.buyerVerusId} — ` +
-      `reversed tx ${String(live.txid).substring(0, 12)}… has confirmed (${confs} block(s)) after all. ` +
-      'The reversal was wrong; the credit is back.');
-  }
-  return restored;
-}
-
 async function pollPendingDeposits(agentId, client) {
-  // Reconcile first: a 0-conf credit already spendable is a live exposure, and it
-  // is cheap to check. Failures here must not stop the pending sweep below.
-  try {
-    await reconcileUnconfirmedDeposits(agentId, client);
-  } catch (e) {
-    console.warn(`[Deposits] ${agentId}: 0-conf reconcile failed (${e.message})`);
-  }
-
   const deposits = loadDeposits(agentId);
   if (deposits.pending.length === 0) return;
 
@@ -798,7 +379,6 @@ async function pollPendingDeposits(agentId, client) {
           continue; // already credited by another path
         }
         creditDeposit(agentId, dep.buyerVerusId, dep.amount, dep.txid);
-        _settleReversedForTxid(fresh, dep.txid, 'credited by the pending-deposit poller');
         fresh.processed.push({
           ...dep,
           confirmations: txStatus.confirmations,
@@ -992,4 +572,4 @@ async function notifyJ41CreditLow(sellerWif, sellerVerusId, buyerVerusId, balanc
   }
 }
 
-module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, _settleReversedForTxid, _forgetClaimForTest, RECONCILE_GRACE_MS, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_WEAK_MIN_MISSES, RECONCILE_WEAK_SPAN_MS, REVERSAL_RECHECK_WINDOW_MS, _isTxUnknown, _classifyLookupFailure, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
+module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };

@@ -717,7 +717,6 @@ Two settle rules are worth knowing because they are deliberate, not defaults:
 - **An unknown output count settles at the declared worst case** (`max_tokens`, bounded by `proxy.max_output_tokens_cap`), not at the flat estimate, so an upstream that ignores `stream_options.include_usage` cannot serve a large completion cheaply. A *reported* `completion_tokens: 0` is real data and bills zero — "reported none" and "reported nothing" are different facts.
 - **A stream that aborts mid-response bills only what a usage frame proved**, and nothing for output if none arrived. The worst-case settle above is an anti-abuse measure against an upstream withholding its usage count; an abort is a fault the buyer cannot cause, so it is the one case where the worst case does not apply.
 
-**Deposits under 2 VRSC are credited from the mempool at 0 confirmations** for instant access, then reconciled on every deposit poll. If the funding transaction confirms, the credit stands. If the chain positively does not know the txid — repeatedly, and past a 30-minute grace window — the credit is **reversed** and recorded under `reversed` in the agent's `deposits.json`. A reversal on an already-spent credit leaves a negative balance, which blocks further proxy use until it is topped up past the debt. A platform the dispatcher simply cannot reach never triggers a reversal.
 
 See [docs.junction41.io/dispatcher/api-endpoint-proxy](https://docs.junction41.io/dispatcher/api-endpoint-proxy) for the full buyer/seller flow and SDK helpers.
 
