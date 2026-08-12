@@ -33,6 +33,9 @@ const {
   RECONCILE_GRACE_MS,
   RECONCILE_MIN_MISSES,
   RECONCILE_MISS_SPAN_MS,
+  RECONCILE_WEAK_MIN_MISSES,
+  RECONCILE_WEAK_SPAN_MS,
+  REVERSAL_RECHECK_WINDOW_MS,
   _isTxUnknown,
 } = require('../src/deposit-watcher.js');
 const { getBalance } = require('../src/credit-meter.js');
@@ -69,7 +72,7 @@ function mockClient(kp, buyerVerusId, txStatus) {
     async verifyPayment() {
       return { verified: true, senderVerified: true, senderVerusId: buyerVerusId, confirmedAmount: SMALL };
     },
-    getTxStatus: txStatus,
+    getTxStatus: (txid) => txStatus(txid),
   };
 }
 
@@ -405,4 +408,214 @@ test('the reversal is a two-phase state machine, so a crash is never a guess', (
     assert.equal(d.processed.some(x => x.txid === txid), false, 'record finalised');
     assert.equal(d.reversed.length, 1);
   })();
+});
+
+// ── The systemic guard, which did not work (round 4) ────────────────────────
+//
+// A route-level 404 — a renamed endpoint, a proxy answering during a deploy —
+// looks identical to "the chain does not know this txid", for every txid at once.
+// The guard meant to tell those apart was written inside the per-record loop, so
+// it (a) incremented and PERSISTED a miss before testing, and (b) compared a
+// counter still being accumulated against the total, making it true only for the
+// last record of each pass. Reproduced in review: three credits, one outage, all
+// three buyers clawed back. It is now judged across a completed pass.
+
+test('a fleet-wide identical 404 outage reverses NOBODY, however long it lasts', async () => {
+  const agentId = 'agent-systemic';
+  const buyers = ['buyerSysA@', 'buyerSysB@', 'buyerSysC@'];
+  const kps = [];
+  for (const b of buyers) kps.push((await creditZeroConf(agentId, b)).kp);
+  for (const b of buyers) assert.equal(getBalance(agentId, b), SMALL);
+
+  // The platform's own documented generic 404 body, identical for every txid.
+  const routeDown = mockClient(kps[0], buyers[0], () => {
+    const e = new Error('The requested resource does not exist');
+    e.code = 'NOT_FOUND';
+    e.statusCode = 404;
+    throw e;
+  });
+
+  // Two and a half hours of it — well past both the grace window and the weak span.
+  let t = Date.now() + RECONCILE_GRACE_MS + 1;
+  for (let i = 0; i < 12; i++) {
+    const r = await reconcileUnconfirmedDeposits(agentId, routeDown, t);
+    assert.equal(r.reversed, 0, `pass ${i}: a route fault is not evidence about any transaction`);
+    t += 15 * 60 * 1000;
+  }
+  for (const b of buyers) {
+    assert.equal(getBalance(agentId, b), SMALL, `${b} must keep their credit through a route outage`);
+  }
+});
+
+test('a systemic pass counts NO misses — an outage cannot accumulate its way to a reversal', async () => {
+  // The original persisted an incremented miss on every systemic pass, so the
+  // guard delayed the clawback rather than preventing it.
+  const agentId = 'agent-systemic-counts';
+  for (const b of ['buyerCntA@', 'buyerCntB@']) await creditZeroConf(agentId, b);
+
+  const routeDown = mockClient({ address: 'x' }, 'buyerCntA@', () => {
+    const e = new Error('HTTP 404'); e.statusCode = 404; throw e;
+  });
+  const past = Date.now() + RECONCILE_GRACE_MS + 1;
+  for (let i = 0; i < 8; i++) await reconcileUnconfirmedDeposits(agentId, routeDown, past + i * 20 * 60 * 1000);
+
+  for (const rec of readDeposits(agentId).processed) {
+    assert.ok(!rec.misses, `no miss may be recorded during a systemic fault (got ${rec.misses})`);
+  }
+});
+
+test('an ISOLATED weak 404 still reverses, on the slower weak schedule', async () => {
+  // The guard must not make the feature inert: one dropped tx among healthy peers
+  // is exactly the case it exists to catch. Weak evidence, so 6 misses over 2h.
+  const agentId = 'agent-isolated-weak';
+  const dropped = 'buyerIsoDropped@';
+  const healthy = 'buyerIsoHealthy@';
+  const d = await creditZeroConf(agentId, dropped);
+  const h = await creditZeroConf(agentId, healthy);
+
+  // One txid 404s; the other is happily sitting in the mempool.
+  const mixed = mockClient(d.kp, dropped, async (txid) => {
+    if (txid === d.txid) { const e = new Error('HTTP 404'); e.statusCode = 404; throw e; }
+    return { confirmations: 0 };
+  });
+
+  let t = Date.now() + RECONCILE_GRACE_MS + 1;
+  for (let i = 0; i < RECONCILE_WEAK_MIN_MISSES; i++) {
+    await reconcileUnconfirmedDeposits(agentId, mixed, t);
+    t += Math.ceil(RECONCILE_WEAK_SPAN_MS / (RECONCILE_WEAK_MIN_MISSES - 1)) + 1000;
+  }
+
+  assert.equal(getBalance(agentId, dropped), 0, 'the isolated dropped tx IS reversed');
+  assert.equal(getBalance(agentId, healthy), SMALL, 'its healthy peer is untouched');
+});
+
+test('the weak tier is slower than the strong tier — a bare 404 buys more time', async () => {
+  // Nothing referenced RECONCILE_WEAK_* before, so deleting the weak downgrade
+  // silently demoted every 404 to the 3-miss/10-minute schedule.
+  assert.ok(RECONCILE_WEAK_MIN_MISSES > RECONCILE_MIN_MISSES);
+  assert.ok(RECONCILE_WEAK_SPAN_MS > RECONCILE_MISS_SPAN_MS);
+
+  const agentId = 'agent-weak-schedule';
+  const buyer = 'buyerWeakSched@';
+  const { kp } = await creditZeroConf(agentId, buyer);
+  const weak404 = mockClient(kp, buyer, () => {
+    const e = new Error('HTTP 404'); e.statusCode = 404; throw e;
+  });
+
+  // A run that would be more than enough on the STRONG schedule.
+  let t = Date.now() + RECONCILE_GRACE_MS + 1;
+  for (let i = 0; i < RECONCILE_MIN_MISSES + 1; i++) {
+    await reconcileUnconfirmedDeposits(agentId, weak404, t);
+    t += RECONCILE_MISS_SPAN_MS;
+  }
+  assert.equal(getBalance(agentId, buyer), SMALL,
+    'weak evidence must not reverse on the strong schedule');
+});
+
+test('a reversal the chain later contradicts is RESTORED automatically', async () => {
+  // Reversal moves the record out of `processed` into `reversed`, and nothing used
+  // to read `reversed` again. So the one case where our judgement is wrong — a
+  // route fault mistaken for a dropped tx — was also the one case a buyer could
+  // never recover from without an operator noticing. Reproduced in review.
+  const agentId = 'agent-restore';
+  const buyer = 'buyerRestore@';
+  const { kp } = await creditZeroConf(agentId, buyer);
+
+  // Drive a real reversal via an isolated strong signal.
+  const gone = mockClient(kp, buyer, NOT_FOUND);
+  await fullMissRun(agentId, gone, Date.now() + RECONCILE_GRACE_MS + 1);
+  assert.equal(getBalance(agentId, buyer), 0, 'reversed');
+  assert.equal(readDeposits(agentId).reversed.length, 1);
+
+  // The tx was on-chain all along; the route was broken.
+  const back = mockClient(kp, buyer, async () => ({ confirmations: 7 }));
+  const r = await reconcileUnconfirmedDeposits(agentId, back, Date.now() + RECONCILE_GRACE_MS + 2);
+
+  assert.equal(r.restored, 1);
+  assert.equal(getBalance(agentId, buyer), SMALL, 'the credit comes back');
+  assert.ok(readDeposits(agentId).reversed[0].restoredAt, 'and the restoration is recorded');
+});
+
+test('a restoration happens once, not on every subsequent pass', async () => {
+  const agentId = 'agent-restore-once';
+  const buyer = 'buyerRestoreOnce@';
+  const { kp } = await creditZeroConf(agentId, buyer);
+  await fullMissRun(agentId, mockClient(kp, buyer, NOT_FOUND), Date.now() + RECONCILE_GRACE_MS + 1);
+
+  const back = mockClient(kp, buyer, async () => ({ confirmations: 7 }));
+  const base = Date.now() + RECONCILE_GRACE_MS + 2;
+  for (let i = 0; i < 4; i++) await reconcileUnconfirmedDeposits(agentId, back, base + i * 60_000);
+
+  assert.equal(getBalance(agentId, buyer), SMALL, 'exactly one restoration, not four');
+});
+
+test('a still-missing transaction does NOT get its reversal undone', async () => {
+  const agentId = 'agent-restore-nope';
+  const buyer = 'buyerRestoreNope@';
+  const { kp } = await creditZeroConf(agentId, buyer);
+  await fullMissRun(agentId, mockClient(kp, buyer, NOT_FOUND), Date.now() + RECONCILE_GRACE_MS + 1);
+
+  // Still unknown, and separately: unreachable.
+  await reconcileUnconfirmedDeposits(agentId, mockClient(kp, buyer, NOT_FOUND), Date.now() + RECONCILE_GRACE_MS + 2);
+  await reconcileUnconfirmedDeposits(agentId, mockClient(kp, buyer, async () => { throw new Error('ECONNREFUSED'); }),
+    Date.now() + RECONCILE_GRACE_MS + 3);
+  assert.equal(getBalance(agentId, buyer), 0, 'only a positive confirmation may restore');
+});
+
+test('restoration is bounded — an ancient reversal is not re-checked forever', async () => {
+  const agentId = 'agent-restore-old';
+  const buyer = 'buyerRestoreOld@';
+  const { kp } = await creditZeroConf(agentId, buyer);
+  await fullMissRun(agentId, mockClient(kp, buyer, NOT_FOUND), Date.now() + RECONCILE_GRACE_MS + 1);
+
+  // Age the reversal past the window.
+  const d = readDeposits(agentId);
+  d.reversed[0].reversedAt = new Date(Date.now() - REVERSAL_RECHECK_WINDOW_MS - 60_000).toISOString();
+  fs.writeFileSync(depositsFile(agentId), JSON.stringify(d));
+
+  const back = mockClient(kp, buyer, async () => ({ confirmations: 7 }));
+  const r = await reconcileUnconfirmedDeposits(agentId, back, Date.now());
+  assert.equal(r.restored, 0, 'outside the window it is an operator matter, not an automatic one');
+  assert.equal(getBalance(agentId, buyer), 0);
+});
+
+test('restoration also runs on the busy path, not just when nothing is open', async () => {
+  // Two call sites reach the recheck: the early return when nothing is open, and
+  // the end of a normal pass. Every restoration test above happened to exercise
+  // only the first, so deleting the second changed nothing — a mutant survived.
+  const agentId = 'agent-restore-busy';
+  const reversedBuyer = 'buyerRestoreBusy@';
+  const openBuyer = 'buyerStillOpen@';
+
+  const rv = await creditZeroConf(agentId, reversedBuyer);
+  await fullMissRun(agentId, mockClient(rv.kp, reversedBuyer, NOT_FOUND), Date.now() + RECONCILE_GRACE_MS + 1);
+  assert.equal(getBalance(agentId, reversedBuyer), 0);
+
+  // Now there IS an open record, so the pass does not take the early return.
+  const op = await creditZeroConf(agentId, openBuyer);
+  const mixed = mockClient(op.kp, openBuyer, async (txid) => {
+    if (txid === rv.txid) return { confirmations: 9 };  // the reversal was wrong
+    return { confirmations: 0 };                         // the open one is in the mempool
+  });
+
+  const r = await reconcileUnconfirmedDeposits(agentId, mixed, Date.now() + RECONCILE_GRACE_MS + 2);
+  assert.equal(r.restored, 1, 'the busy path must recheck reversals too');
+  assert.equal(getBalance(agentId, reversedBuyer), SMALL);
+  assert.equal(getBalance(agentId, openBuyer), SMALL, 'the open credit is untouched');
+});
+
+test('a reversed tx merely BACK in the mempool is not restored', async () => {
+  // 0-conf is what got it credited in the first place, and being unknown for two
+  // hours is what took it away. Reappearing unconfirmed is not stronger evidence
+  // than either — it would just start the whole cycle again. Only a block counts.
+  const agentId = 'agent-restore-mempool';
+  const buyer = 'buyerRestoreMempool@';
+  const { kp } = await creditZeroConf(agentId, buyer);
+  await fullMissRun(agentId, mockClient(kp, buyer, NOT_FOUND), Date.now() + RECONCILE_GRACE_MS + 1);
+  assert.equal(getBalance(agentId, buyer), 0);
+
+  const backInMempool = mockClient(kp, buyer, async () => ({ confirmations: 0 }));
+  const r = await reconcileUnconfirmedDeposits(agentId, backInMempool, Date.now() + RECONCILE_GRACE_MS + 2);
+  assert.equal(r.restored, 0);
+  assert.equal(getBalance(agentId, buyer), 0, 'restoration requires a confirmation, not a sighting');
 });

@@ -386,6 +386,12 @@ const RECONCILE_MISS_SPAN_MS = 10 * 60 * 1000;
 // 404 is what a renamed route or a proxy answers with, identically for every txid.
 const RECONCILE_WEAK_MIN_MISSES = 6;
 const RECONCILE_WEAK_SPAN_MS = 2 * 60 * 60 * 1000;
+// How long a REVERSED credit stays eligible for automatic restoration if its
+// transaction turns up on-chain after all. A reversal is our judgement call on
+// incomplete evidence, so it has to be revisitable — otherwise the one case where
+// we get it wrong (a route fault we mistook for a dropped tx) is also the one case
+// the buyer can never recover from without an operator noticing.
+const REVERSAL_RECHECK_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Does this error mean "the chain has never heard of this txid", as opposed to
@@ -448,43 +454,67 @@ function _classifyLookupFailure(err) {
 async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
   const deposits = loadDeposits(agentId);
   const open = (deposits.processed || []).filter(d => d && d.unconfirmed);
-  if (open.length === 0) return { confirmed: 0, reversed: 0, waiting: 0 };
+  if (open.length === 0) {
+    // No OPEN credits, but a reversal may still be waiting to be undone — and a
+    // reversal is precisely the state in which nothing is open any more. Returning
+    // here skipped phase 4 in the only situation it exists for.
+    const restoredOnly = await _recheckReversals(agentId, client, now);
+    return { confirmed: 0, reversed: 0, waiting: 0, restored: restoredOnly };
+  }
 
   let confirmed = 0, reversed = 0, waiting = 0;
 
-  // A route-level failure answers identically for EVERY txid, so "all of them are
-  // unknown at once" is evidence about the route, not about any transaction. A
-  // genuinely dropped tx is isolated among its peers. Only usable when there is
-  // more than one open record, so it supplements the weak/strong tiering rather
-  // than replacing it.
-  let weakCount = 0;
-  const openCount = open.length;
-
+  // ── Phase 1: LOOK UP EVERYTHING, decide nothing ──────────────────────────
+  //
+  // The systemic check has to compare each record against the whole pass, so the
+  // whole pass must exist before any record is judged. The first version tried to
+  // do both in one loop and was therefore broken two ways: it incremented (and
+  // persisted) a miss BEFORE testing for systemic, and it compared a counter still
+  // being accumulated mid-loop against the total — so the guard could only ever be
+  // true for the LAST record. Every earlier record was judged as if the failure
+  // were isolated. Reproduced in review: three credits, one route-level 404
+  // outage, all three buyers clawed back. A guard that protects only the last item
+  // of each pass is not a guard.
+  const lookups = [];
   for (const rec of open) {
     let seen = null;
-    let unknown = false;
     let strength = null;
+    let transient = false;
     try {
       const st = await client.getTxStatus(rec.txid);
       // A response we cannot interpret is NOT evidence of absence.
       seen = st && Number.isFinite(st.confirmations) ? st.confirmations : null;
+      // The call RESOLVED but we could not read a confirmation count out of it —
+      // an empty body, `{}`, a stringified count, a re-wrapped `{data:{…}}` shape.
+      // A backend response-shape change must not claw back every open credit.
+      if (seen === null) transient = true;
     } catch (e) {
       strength = _classifyLookupFailure(e);
-      if (strength) { unknown = true; if (strength === 'weak') weakCount++; }
-      else {
-        // Transient — an unreachable platform must never cost a buyer their balance.
-        waiting++;
-        continue;
-      }
+      // Transient — an unreachable platform must never cost a buyer their balance.
+      if (!strength) transient = true;
     }
+    lookups.push({ rec, seen, strength, transient });
+  }
 
-    // The call RESOLVED but we could not read a confirmation count out of it —
-    // an empty body, `{}`, a stringified count, a re-wrapped `{data:{…}}` shape.
-    // That is not evidence of absence either, and the original code fell straight
-    // through this gap into the reversal path: a backend response-shape change
-    // would have clawed back every open 0-conf credit on the fleet within three
-    // polls. The comment above claimed this was handled; only this line makes it so.
-    if (!unknown && seen === null) {
+  // ── Phase 2: is this about the transactions, or about the route? ─────────
+  //
+  // A route-level failure answers identically for EVERY txid; a genuinely dropped
+  // transaction is isolated among its peers. Judged across the completed pass, so
+  // every record gets the same verdict — and a systemic pass counts NOTHING, no
+  // miss increments, no persistence, so an outage cannot accumulate its way to a
+  // reversal one pass at a time.
+  const weakUnknowns = lookups.filter(l => l.strength === 'weak').length;
+  const systemic = lookups.length > 1 && weakUnknowns === lookups.length;
+  if (systemic) {
+    console.warn(`[Deposits] ${agentId}: all ${lookups.length} open 0-conf lookups failed identically — ` +
+      'treating as a route-level fault, not as evidence about any transaction. Nothing counted.');
+    return { confirmed: 0, reversed: 0, waiting: lookups.length };
+  }
+
+  // ── Phase 3: act, one record at a time ───────────────────────────────────
+  for (const { rec, seen, strength, transient } of lookups) {
+    const unknown = strength !== null;
+    if (transient) {
       waiting++;
       continue;
     }
@@ -530,6 +560,7 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
       delete live.unconfirmed;
       delete live.misses;
       delete live.firstMissAtMs;
+      delete live.weak;
       live.confirmations = seen;
       saveDeposits(agentId, fresh);
       confirmed++;
@@ -578,13 +609,6 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
     const pastGrace = now - (live.creditedAtMs || 0) >= RECONCILE_GRACE_MS;
     const missRunLongEnough = live.misses >= _minMisses
       && now - live.firstMissAtMs >= _minSpan;
-    // Every open record failing in the same pass is a statement about the route.
-    const systemic = openCount > 1 && weakCount === openCount;
-    if (systemic) {
-      saveDeposits(agentId, fresh);
-      waiting++;
-      continue;
-    }
     if (!_alreadyDebited && (!pastGrace || !missRunLongEnough)) {
       saveDeposits(agentId, fresh);
       waiting++;
@@ -621,10 +645,65 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
       'If the buyer disputes this, check the txid on-chain before re-crediting.');
   }
 
-  if (confirmed || reversed) {
-    console.log(`[Deposits] ${agentId}: reconciled 0-conf credits — ${confirmed} confirmed, ${reversed} reversed, ${waiting} still open`);
+  // ── Phase 4: was a reversal wrong? ───────────────────────────────────────
+  //
+  // Reversal moves the record out of `processed` into `reversed`, and nothing used
+  // to look at `reversed` again — so a credit clawed back during a route-level
+  // fault stayed clawed back even once the transaction was visibly confirmed on
+  // chain. The buyer paid, the chain agrees, and the money was gone with no
+  // automatic recovery. Re-check recent reversals and put the credit back.
+  const restored = await _recheckReversals(agentId, client, now);
+
+  if (confirmed || reversed || restored) {
+    console.log(`[Deposits] ${agentId}: reconciled 0-conf credits — ${confirmed} confirmed, ${reversed} reversed, ` +
+      `${restored} restored, ${waiting} still open`);
   }
-  return { confirmed, reversed, waiting };
+  return { confirmed, reversed, waiting, restored };
+}
+
+/**
+ * Restore a reversed credit whose transaction later confirmed.
+ *
+ * Bounded by REVERSAL_RECHECK_WINDOW_MS so this does not grow into an unbounded
+ * re-scan, and idempotent via `restoredAt` on the ledger entry. Only ever acts on
+ * a POSITIVE confirmation — an unknown or unreachable lookup leaves the reversal
+ * standing, exactly as the forward path leaves a credit standing.
+ */
+async function _recheckReversals(agentId, client, now = Date.now()) {
+  const d = loadDeposits(agentId);
+  const candidates = (d.reversed || []).filter(r => {
+    if (!r || r.restoredAt || !r.txid) return false;
+    const at = Date.parse(r.reversedAt || '');
+    return Number.isFinite(at) && now - at <= REVERSAL_RECHECK_WINDOW_MS;
+  });
+  if (candidates.length === 0) return 0;
+
+  let restored = 0;
+  for (const cand of candidates) {
+    let confs = null;
+    try {
+      const st = await client.getTxStatus(cand.txid);
+      confs = st && Number.isFinite(st.confirmations) ? st.confirmations : null;
+    } catch {
+      continue; // no news is not good news, and not bad news either
+    }
+    if (confs === null || confs < 1) continue;
+
+    const fresh = loadDeposits(agentId);
+    const live = (fresh.reversed || []).find(r => r && r.txid === cand.txid && !r.restoredAt);
+    if (!live) continue;
+    // Mark BEFORE crediting, for the same reason the debit stamps before debiting:
+    // a crash then loses a restoration (visible, recorded, fixable) rather than
+    // repeating one on every subsequent pass (silent, compounding).
+    live.restoredAt = new Date(now).toISOString();
+    saveDeposits(agentId, fresh);
+    creditDeposit(agentId, live.buyerVerusId, live.amount, live.txid);
+    restored++;
+    console.warn(`[Deposits] ${agentId}: ↩️  RESTORED ${live.amount} VRSC to ${live.buyerVerusId} — ` +
+      `reversed tx ${String(live.txid).substring(0, 12)}… has confirmed (${confs} block(s)) after all. ` +
+      'The reversal was wrong; the credit is back.');
+  }
+  return restored;
 }
 
 async function pollPendingDeposits(agentId, client) {
@@ -856,4 +935,4 @@ async function notifyJ41CreditLow(sellerWif, sellerVerusId, buyerVerusId, balanc
   }
 }
 
-module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, RECONCILE_GRACE_MS, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_WEAK_MIN_MISSES, RECONCILE_WEAK_SPAN_MS, _isTxUnknown, _classifyLookupFailure, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
+module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, RECONCILE_GRACE_MS, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_WEAK_MIN_MISSES, RECONCILE_WEAK_SPAN_MS, REVERSAL_RECHECK_WINDOW_MS, _isTxUnknown, _classifyLookupFailure, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
