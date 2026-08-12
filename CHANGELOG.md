@@ -272,7 +272,36 @@ the bug at 1c42d42, a87d07e and 8165676 and reports clean from 82063ac on. It sh
 with two self-tests, because a checker that reports "all clear" because it is broken
 is worse than no checker.
 
-1077 tests (+91). Every fix mutation-checked — and the second round is why that
+### Fifth review round — the safety net was itself broken
+
+Both halves executed rather than read: the money reviewer reproduced two credit
+mints against the real modules, and the status reviewer rebuilt a sandboxed harness
+and ran the real `start` action through five scenarios including the upgrade.
+
+- **The phase-4 restore minted credit two ways.** A forgiven reversal never debited
+  but still filed a ledger entry, and a re-reported deposit was credited by the
+  forward path *and* the restore: 1.5 → 3.0 in both cases. The ledger now records
+  whether the debit was certain, only a certain debit restores, and any forward
+  credit settles the matching entry. Same "one control, two sites" shape — the
+  forward confirm path already refused to move money on an ambiguous state.
+- **The scope checker shipped in round 4 had a false-negative class.** Block-scoped
+  `let`/`const` leaked into the enclosing function scope, so every "used outside its
+  block" ReferenceError read as clean. The tool built to catch what had survived
+  three rounds was itself half-blind — the exact hazard its own header warns about.
+- **`/health` read `ok` through two real fleet-down shapes.** It never consulted
+  `_agentErrors`, and `unknown` axes deliberately do not degrade — so a restart
+  during the daily platform outage (both axes unknown, every activation failed)
+  reported healthy, as did a wedged startup that never completed.
+- **Round 4's `_agentErrors` fix was a logical no-op.** `if (!has(id)) delete(id)`
+  deletes only when the key is absent: right behaviour by accident, wrong behaviour
+  in the comment, which is worse than either.
+- An unresolvable deactivate txid is dropped rather than re-armed, so a superseded
+  write no longer costs three minutes on every subsequent start.
+
+Five rounds, 34 defects. The majority were introduced by the previous round's
+fixes, which is the finding that outlasts any individual bug here.
+
+1088 tests. Every fix mutation-checked — and the second round is why that
 phrase now means something: seven mutations that the reviewer proved survived the
 first round's "mutation-checked" claim now fail. Three tests in this file had also
 silently stopped testing their subject, because they anchored on a distance from a
