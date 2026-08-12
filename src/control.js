@@ -384,6 +384,11 @@ function buildFeeTank(state, agentId, now) {
   };
 }
 
+// How long a startup may reasonably take before not-finishing is itself a fault.
+// Covers the 3-minute deactivate-confirmation wait, a staggered activation of a
+// large fleet, and the inbox sweep's own 10-minute startup grace, with room over.
+const STARTUP_EXPECTED_MS = 20 * 60 * 1000;
+
 /** Does this status value block a hire? Mirrors the platform's fail-closed AND.
  *  `unknown` does not block — it means "not checked yet", and treating absence of
  *  information as failure makes every cold start look like an outage. */
@@ -467,6 +472,20 @@ function buildHealthDocument(state, startedAt) {
     // unnoticed in the first place.
     status: (containersUnhealthy > 0
       || inbox.deadLettered.length > 0
+      // An agent carrying a live error cannot work, whatever its status axes say.
+      // Both axes read `unknown` when the pre-start status check fails — which is
+      // what happens during the daily platform outage — so a restart into that
+      // window activated nothing, recorded "activation failed: 503" on all nine,
+      // and still reported `ok`. `unknown` deliberately does not degrade on its own
+      // ("not checked yet" is not "broken"), and that is exactly why the error
+      // itself has to.
+      || (state.startupComplete === true && agents.some(a => a.lastError))
+      // Startup that never finishes is the zombie shape: the axis degrade below is
+      // gated on startupComplete, so a startup that dies partway leaves /health
+      // green forever while the process sits there doing nothing. Past a generous
+      // bound, not having finished IS the fault.
+      || (state.startupComplete !== true && state.startedAt
+          && (now - state.startedAt) > STARTUP_EXPECTED_MS)
       || (state.startupComplete === true
           && agents.some(a => _axisBlocks(a.platformStatus) || _axisBlocks(a.chainStatus))))
       ? 'degraded' : 'ok',

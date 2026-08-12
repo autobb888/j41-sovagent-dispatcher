@@ -63,6 +63,43 @@ test('the checker actually detects the shape it was written for', () => {
   }
 });
 
+test('the checker catches BLOCK-scoped leaks, not just cross-function ones', () => {
+  // The shipped checker leaked let/const into the enclosing function scope, so
+  // every "used outside its block" ReferenceError read as clean. A checker that
+  // passes because it is broken is worse than no checker — and this file's own
+  // header says so, which did not stop it happening here.
+  const tmp = path.join(require('os').tmpdir(), `scope-block-${process.pid}.js`);
+  fs.writeFileSync(tmp, `
+    'use strict';
+    function a() { { const blocked = 1; console.log(blocked); } return blocked; }
+    function b(xs) { for (const item of xs) { console.log(item); } return item; }
+    function c() { if (true) { let inner = 2; console.log(inner); } return inner; }
+    module.exports = { a, b, c };
+  `);
+  try {
+    const names = checkFile(tmp).map(p => p.name).sort();
+    assert.deepEqual(names, ['blocked', 'inner', 'item'],
+      'all three block-scope escapes must be reported');
+  } finally {
+    fs.unlinkSync(tmp);
+  }
+});
+
+test('a `var` genuinely does hoist out of its block — no false positive', () => {
+  const tmp = path.join(require('os').tmpdir(), `scope-var-${process.pid}.js`);
+  fs.writeFileSync(tmp, `
+    'use strict';
+    function a() { { var hoisted = 1; } return hoisted; }
+    function b(xs) { for (var i = 0; i < xs.length; i++) {} return i; }
+    module.exports = { a, b };
+  `);
+  try {
+    assert.deepEqual(checkFile(tmp), [], 'var hoists to the function scope');
+  } finally {
+    fs.unlinkSync(tmp);
+  }
+});
+
 test('the checker does not cry wolf on ordinary constructs', () => {
   const tmp = path.join(require('os').tmpdir(), `scope-clean-${process.pid}.js`);
   fs.writeFileSync(tmp, `

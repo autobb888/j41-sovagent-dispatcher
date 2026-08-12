@@ -60,10 +60,12 @@ const {
  * Single prefix for every "this agent cannot pay fees" alert, shared by the
  * inbox batch handler and the fee-tank sweep.
  *
- * Load-bearing: the sweep retracts a stale alert by matching this prefix, and
- * nothing else clears _agentErrors except a successful activation. Two different
- * strings for the same condition means one of them never retracts, leaving a
- * critical alert on a money surface lit after the problem is fixed.
+ * Load-bearing: the sweep retracts a stale alert by matching this prefix. The only
+ * other clear is the startup activation loop, and only for an agent whose own pass
+ * recorded no error — so an alert this sweep sets is never silently dropped by a
+ * later activation. Two different strings for the same condition means one of them
+ * never retracts, leaving a critical alert on a money surface lit after the problem
+ * is fixed.
  */
 const FEE_TANK_ERROR_PREFIX = 'FEE TANK EMPTY';
 const log = require('./logger');
@@ -4664,7 +4666,17 @@ program
               if (chainNow) ai.chainStatus = chainNow;
             } catch { /* keep the snapshot; `unknown` never triggers a repair write */ }
           }
-          for (const id of _left) _unresolvedWaits.add(id);
+          for (const id of _left) {
+            _unresolvedWaits.add(id);
+            // Drop the txid we could not match. If a later identity write superseded
+            // our deactivate (an operator `activate-all` while we were down), the
+            // chain reads `active` and prevOutput is that other write — so neither
+            // release condition can EVER fire for it. Carrying the txid forward
+            // re-armed the same unresolvable three-minute wait on every subsequent
+            // start. The agent still stays in the marker (we could not establish its
+            // chain state, so retention is right); only the dead txid goes.
+            delete _shutdownDeactivateTxids[id];
+          }
           console.warn(`  ⚠️  ${_left.size} deactivate(s) still unconfirmed after 3 min — activating anyway. ` +
             'Any rejected activate is reported below; re-run `j41-dispatcher activate <id>` for those.');
         }
@@ -4673,6 +4685,7 @@ program
         const agentInfo = readyAgents[i];
         // Stagger activation — 1s between agents to avoid rate limits at scale
         if (i > 0) await new Promise(r => setTimeout(r, 1000));
+        let _errorRecordedThisPass = false;
         try {
           const agent = await getAgentSession(state, agentInfo);
           const _plan = planAgentActivation(agentInfo, { toggleOnChain: _toggleOnChain });
@@ -4727,6 +4740,7 @@ program
                   'on-chain repair this pass rather than risking a rejected write. ' +
                   `It retries on the next start, or run: j41-dispatcher activate ${agentInfo.id}`);
                 state._agentErrors.set(agentInfo.id, 'chain status inactive — repair deferred (pending identity write)');
+              _errorRecordedThisPass = true;
                 state.emitEvent?.('agent.online', { agentId: agentInfo.id, identity: agentInfo.identity });
                 continue;
               }
@@ -4740,12 +4754,14 @@ program
                 console.log(`  🔧 ${agentInfo.id}: chain said inactive — repaired on-chain (${String(_rtx).slice(0, 8)}). One-time.`);
               } else {
                 state._agentErrors.set(agentInfo.id, 'on-chain status still inactive — hires are blocked');
+              _errorRecordedThisPass = true;
                 console.error(`  ⚠️  ${agentInfo.id}: chain says INACTIVE and the repair write returned no txid. ` +
                   'The platform hire gate blocks this agent. Usually a dry fee tank — ' +
                   `check \`j41-dispatcher wallet show ${agentInfo.id}\`, then: j41-dispatcher activate ${agentInfo.id}`);
               }
             } catch (e) {
               state._agentErrors.set(agentInfo.id, `on-chain repair failed: ${e.message}`);
+              _errorRecordedThisPass = true;
               console.error(`  ⚠️  ${agentInfo.id}: on-chain repair FAILED (${e.message}). Hires are blocked until ` +
                 `this succeeds. Run: j41-dispatcher activate ${agentInfo.id}`);
             }
@@ -4758,6 +4774,7 @@ program
           // stopped agent.
           if (_toggleOnChain && !(result && result.onChainTxid)) {
             state._agentErrors.set(agentInfo.id, 'on-chain activate failed — chain may still say inactive');
+              _errorRecordedThisPass = true;
             console.error(`   ⚠️  ${agentInfo.id}: ON-CHAIN activate FAILED (platform says active, chain may not). ` +
               `Re-run once the previous identity tx confirms:  j41-dispatcher activate ${agentInfo.id}`);
           }
@@ -4773,14 +4790,16 @@ program
           }
           console.log(`  ✅ ${agentInfo.id}: active` +
             (result.onChainTxid ? ` (on-chain txid: ${result.onChainTxid})` : ''));
-          // Only clear the diagnostic if nothing in THIS pass set one. The
-          // unconditional delete ran 28 lines after the repair-failure branches and
-          // erased them, so `/health` degraded (the chain axis still trips the
-          // gate) while every agent reported `lastError: null` — monitoring saw a
-          // fault with no stated reason anywhere, which is the exact observability
-          // this release was adding. Only the deferred branch survived, and only
-          // because it `continue`s past this line.
-          if (!state._agentErrors.has(agentInfo.id)) {
+          // Clear the diagnostic only if nothing in THIS pass recorded one.
+          //
+          // The unconditional delete used to run 28 lines after the repair-failure
+          // branches and erased them, so `/health` degraded while every agent
+          // reported `lastError: null` — a fault with no stated reason anywhere.
+          // The first attempt at a fix was `if (!has(id)) delete(id)`, which deletes
+          // only when the key is ABSENT: a no-op dressed as a guard. It produced the
+          // right behaviour by accident and described the wrong one in a comment,
+          // which is worse than either. This is the actual condition.
+          if (!_errorRecordedThisPass) {
             state._agentErrors.delete(agentInfo.id);
           }
           state.emitEvent?.('agent.online', { agentId: agentInfo.id, identity: agentInfo.identity });

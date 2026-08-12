@@ -128,9 +128,19 @@ function check(file) {
   function hoistVarsOnly(nodes, scope) {
     for (const n of nodes || []) {
       if (!n) continue;
-      if (n.type === 'VariableDeclaration' && n.kind === 'var') {
-        for (const d of n.declarations) bindNames(d.id, scope, 'var');
-      } else if (n.type !== 'FunctionDeclaration' && n.type !== 'FunctionExpression'
+      // Handle declarations EXHAUSTIVELY here. A let/const used to fall through to
+      // the recursive branch below, and `hoistNode`'s VariableDeclaration case binds
+      // any kind — so block-scoped names leaked into the enclosing function scope
+      // and every "used outside its block" ReferenceError read as clean. That is the
+      // "checker that passes because it is broken" hazard this file's own header
+      // warns about, in the file itself.
+      if (n.type === 'VariableDeclaration') {
+        if (n.kind === 'var') {
+          for (const d of n.declarations) bindNames(d.id, scope, 'var');
+        }
+        continue; // let/const belong to their own block, not to this scope
+      }
+      if (n.type !== 'FunctionDeclaration' && n.type !== 'FunctionExpression'
           && n.type !== 'ArrowFunctionExpression' && n.type !== 'ClassDeclaration') {
         hoistNode(n, scope); // recurse through nested statements for `var`
       }

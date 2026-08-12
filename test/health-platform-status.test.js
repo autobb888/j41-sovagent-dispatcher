@@ -127,3 +127,43 @@ test('an unknown chain axis does not degrade', () => {
   assert.equal(doc.agents[0].chainStatus, 'unknown');
   assert.equal(doc.status, 'ok');
 });
+
+// ── Two fleet-down shapes that still read "ok" (round 5) ────────────────────
+
+test('an agent carrying a live error degrades, even with both axes unknown', () => {
+  // A restart during the daily ~04:00 platform outage: the pre-start status check
+  // fails, both axes read `unknown` (fail-open include), every activation fails,
+  // zero agents can work — and the document said `ok`. `unknown` deliberately does
+  // not degrade on its own, which is precisely why the recorded error must.
+  const st = stateWith([
+    { id: 'agent-1', identity: 'a1@' },
+    { id: 'agent-2', identity: 'a2@' },
+  ]);
+  st._agentErrors.set('agent-1', 'activation failed: 503 CHAIN_SYNCING');
+  const doc = buildHealthDocument(st, Date.now() - 1000);
+
+  assert.equal(doc.status, 'degraded', 'a fleet that activated nothing is not ok');
+  assert.match(doc.agents[0].lastError, /503/);
+});
+
+test('a startup that never completes eventually degrades on its own', () => {
+  // The zombie: startup dies partway, the axis degrade is gated on
+  // startupComplete, and /health stays green forever while the process does
+  // nothing. Past a generous bound, not having finished IS the fault.
+  const st = stateWith([{ id: 'agent-1', identity: 'a1@', platformStatus: 'active', chainStatus: 'active' }]);
+  st.startupComplete = false;
+
+  st.startedAt = Date.now() - 60_000;              // one minute in
+  assert.equal(buildHealthDocument(st, Date.now() - 1000).status, 'ok',
+    'a normal startup window must not alert');
+
+  st.startedAt = Date.now() - 21 * 60 * 1000;      // well past any real startup
+  assert.equal(buildHealthDocument(st, Date.now() - 1000).status, 'degraded',
+    'a startup still unfinished after 20 minutes is wedged');
+});
+
+test('a clean fleet with no errors is still ok', () => {
+  const st = stateWith([{ id: 'agent-1', identity: 'a1@', platformStatus: 'active', chainStatus: 'active' }]);
+  st.startedAt = Date.now() - 60_000;
+  assert.equal(buildHealthDocument(st, Date.now() - 1000).status, 'ok');
+});

@@ -261,7 +261,7 @@ found defects in round 3's own work; one more was self-caught before the round b
   probes the platform and wrong for the branch that cannot. An idle fleet is not
   evidence the platform is up — during an outage the fleet is idle by definition.
 
-**`scripts/scope-check.js` + `test/no-undeclared-identifiers.test.js`.** The round-3
+**`test/helpers/scope-check.js` + `test/no-undeclared-identifiers.test.js`.** The round-3
 `ReferenceError` — an identifier referenced in one function and declared in another,
 reached through optional chaining that made it look safe — survived three
 adversarial review rounds and a 1057-test suite, because the failing path had never

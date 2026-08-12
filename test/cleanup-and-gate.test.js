@@ -219,7 +219,7 @@ test('the marker retains agents whose chain state could not be established', () 
   const body = CLI.slice(i, i + 700);
   assert.match(body, /_normStatus\(a\.chainStatus\) === 'inactive'/, 'positively-inactive agents are retained');
   assert.match(body, /\.\.\._unresolvedWaits/, 'so are agents whose wait never resolved');
-  assert.match(CLI, /for \(const id of _left\) _unresolvedWaits\.add\(id\);/,
+  assert.match(CLI, /_unresolvedWaits\.add\(id\)/,
     'a timed-out wait must record which agents were unresolved');
 });
 
@@ -251,4 +251,45 @@ test('the inbox startup gate is BOUNDED — a wedged startup cannot silence it f
   const si = CLI.indexOf('const state = {');
   assert.match(CLI.slice(si, si + 2600), /startedAt:/,
     'state.startedAt must exist or the bound silently never defers');
+});
+
+test('an unresolvable deactivate txid is dropped, not re-armed every restart', () => {
+  // If a later identity write superseded our deactivate, neither release condition
+  // can ever match it — chain reads `active`, prevOutput is the other write. Keeping
+  // the txid in the marker re-armed the same three-minute wait on every subsequent
+  // start, forever. The agent stays retained (its chain state is genuinely unknown);
+  // only the dead txid is dropped.
+  // Anchor on the unique statement, not on the loop header — there are TWO
+  // `for (const id of _left)` loops now (this one and the timeout re-read), and
+  // indexOf finds the wrong one. Same distance-anchor trap as three earlier tests.
+  const i = CLI.indexOf('_unresolvedWaits.add(id)');
+  assert.ok(i > -1, 'the unresolved-wait handler must exist');
+  const body = CLI.slice(i, i + 900);
+  assert.match(body, /delete _shutdownDeactivateTxids\[id\]/, 'the unmatched txid is dropped');
+});
+
+test('every activation error branch marks the pass, so none is silently cleared', () => {
+  // The success line clears `_agentErrors`. If an error branch forgets to record
+  // that it set one, its diagnostic is erased seconds later and /health degrades
+  // with no stated reason — the round-4 defect. The first fix was
+  // `if (!has(id)) delete(id)`, a no-op dressed as a guard. This pins the real one.
+  // Bound the region precisely: from the flag's declaration to the guarded clear.
+  // Only writers BEFORE the clear can have their diagnostic erased by it — the one
+  // in the outer catch runs after, and requiring it to mark would be wrong. A fixed
+  // char window got this wrong in both directions before landing here.
+  const i = CLI.indexOf('let _errorRecordedThisPass = false;');
+  assert.ok(i > -1, 'the activation loop must track whether this pass recorded an error');
+  const g = CLI.indexOf('if (!_errorRecordedThisPass)', i);
+  assert.ok(g > i, 'the guarded clear must follow the declaration');
+  const region = CLI.slice(i, g);
+
+  const setsErr = (region.match(/state\._agentErrors\.set\(agentInfo\.id/g) || []).length;
+  const marksPass = (region.match(/_errorRecordedThisPass = true;/g) || []).length;
+  assert.ok(setsErr > 0, 'sanity: the loop does record errors before the clear');
+  assert.equal(marksPass, setsErr,
+    `every _agentErrors.set before the clear must mark the pass (${setsErr} sets, ${marksPass} marks)`);
+  // Asserted against the whole file, not a window: the guard sits well past the
+  // error branches and a fixed window is the anchor trap this file keeps hitting.
+  assert.match(CLI, /if \(!_errorRecordedThisPass\)\s*\{\s*\n\s*state\._agentErrors\.delete/,
+    'the clear must be guarded on the flag');
 });
