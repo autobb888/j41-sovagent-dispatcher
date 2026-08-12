@@ -230,7 +230,49 @@ in-flight-blocked.
 Four mutations that survived the round-2 suite now fail, including the deadline and
 the marker-retention fix from round 2 itself.
 
-1064 tests (+78). Every fix mutation-checked — and the second round is why that
+### Fourth review round — and a static check for the class that keeps escaping
+
+Round 4 executed the real `start` action in a sandboxed harness rather than reading
+it, and reproduced its money finding rather than reasoning about it. Both halves
+found defects in round 3's own work; one more was self-caught before the round began.
+
+- **The systemic guard did not guard.** The check meant to tell "the chain does not
+  know this txid" apart from "the route is 404ing for every txid at once" lived
+  inside the per-record loop: it persisted a miss *before* testing, and compared a
+  counter still being accumulated against the total — true only for the last record
+  of a pass. Every earlier record was judged as if the failure were isolated.
+  Reproduced: three credits, one route outage, all three buyers clawed back.
+  Reconciliation is now classify-the-whole-pass-then-decide, and a systemic pass
+  counts nothing at all rather than counting more slowly.
+- **A wrong reversal was permanent.** Reversal moved a record into `reversed`, which
+  nothing ever read again — so the one case where our judgement is wrong was the one
+  case a buyer could not recover from. Recent reversals are re-checked and restored
+  on a positive confirmation, bounded and idempotent.
+- **A failed chain repair erased its own diagnostic** 28 lines later, so `/health`
+  degraded with `lastError: null` on every agent — a fault with no stated reason,
+  which is exactly the observability this release was adding.
+- **The inbox sweep had no `startupComplete` gate**, so it could broadcast an
+  identity write for an agent the startup repair was about to write. C1 closed the
+  shutdown direction of that collision and left the startup one open.
+- **The suspension probe authenticated as `agents[0]`** to call an endpoint the SDK
+  documents as public — one revoked identity would hold every refund fleet-wide
+  behind a durable flag. It is sessionless now.
+- Self-caught first: ungating the suspension clear was right for the branch that
+  probes the platform and wrong for the branch that cannot. An idle fleet is not
+  evidence the platform is up — during an outage the fleet is idle by definition.
+
+**`scripts/scope-check.js` + `test/no-undeclared-identifiers.test.js`.** The round-3
+`ReferenceError` — an identifier referenced in one function and declared in another,
+reached through optional chaining that made it look safe — survived three
+adversarial review rounds and a 1057-test suite, because the failing path had never
+executed in any shipped version. `node --check` cannot see it; neither can any
+runtime test, in a file whose largest functions are unexported closures. A
+scope-tracking AST walk sees all of it in milliseconds. Run against history it flags
+the bug at 1c42d42, a87d07e and 8165676 and reports clean from 82063ac on. It ships
+with two self-tests, because a checker that reports "all clear" because it is broken
+is worse than no checker.
+
+1077 tests (+91). Every fix mutation-checked — and the second round is why that
 phrase now means something: seven mutations that the reviewer proved survived the
 first round's "mutation-checked" claim now fail. Three tests in this file had also
 silently stopped testing their subject, because they anchored on a distance from a

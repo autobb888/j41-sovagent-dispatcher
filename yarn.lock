@@ -108,10 +108,10 @@
   resolved "https://registry.yarnpkg.com/@junction41/secure-setup/-/secure-setup-0.3.0.tgz#3c7ddd9601ae3ec4a7c032b75ff6421ca0c613c1"
   integrity sha512-M3bX0lxx5gg0PIsVYUH98cK8sdQcfbqzXm8kgEs8t+Z/st7glNbRqfVtiXEGDvurUGkgiJEs3x9its+JIG1syQ==
 
-"@junction41/sovagent-sdk@2.10.0":
-  version "2.10.0"
-  resolved "https://registry.yarnpkg.com/@junction41/sovagent-sdk/-/sovagent-sdk-2.10.0.tgz#8e10358867bd583cb0275400d222b7458d97d770"
-  integrity sha512-ngvIAxFlqVijHkHMUICSzn0C2MwNYfzYEKn8Co/iASrWEf6cIWRyQJym5n6Hv573ldPrNx20uYiV0y+HZ/uGtg==
+"@junction41/sovagent-sdk@2.14.1":
+  version "2.14.1"
+  resolved "https://registry.yarnpkg.com/@junction41/sovagent-sdk/-/sovagent-sdk-2.14.1.tgz#f80ab7818f4805428888fe3cb2b6103ef3f9b335"
+  integrity sha512-bcMsByOBOHLXbzNxhGlh/PxflMoxq+n5xwYtmWWnyEjTes+mNQwR32HomQloV2aQcePBrthrPnsnL6hgqbVfBg==
   dependencies:
     "@bitgo/utxo-lib" "github:VerusCoin/BitGoJS#5e82f4fda2975ca1af7f2b01590093b4a1439dc9"
     bn.js "^5.2.0"
@@ -201,6 +201,11 @@
   integrity sha512-jp2P3tQMSxWugkCUKLRPVUpGaL5MVFwF8RDuSRztfwgN1wmqJeMSbKlnEtQqU8UrhTmzEmZdu2I6v2dpp7XIxw==
   dependencies:
     undici-types "~7.18.0"
+
+acorn@^8.18.0:
+  version "8.18.0"
+  resolved "https://registry.yarnpkg.com/acorn/-/acorn-8.18.0.tgz#4faf01b2d6d326bfeed97aea1f52220b5f4c1940"
+  integrity sha512-lGq+9yr1/GuAWaVYIHRjvvySG5/4VfKIvC8EWxStPdcDh/Ka7FG3twP6v4d5BkravUilhIAsG4Qj83t02LWUPQ==
 
 ansi-escapes@^4.3.2:
   version "4.3.2"

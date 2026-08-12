@@ -469,18 +469,21 @@ function startDispatcherSweep(state) {
         //
         // So: probe explicitly, and only when a suspension is actually in force.
         if (isFinanciallySuspended()) {
-          const probeAgent = state.agents?.[0];
-          if (probeAgent) {
-            try {
-              const probeSession = await getAgentSession(state, probeAgent);
-              await probeSession.client.getChainInfo();
-              dispatcherApiOutageSince = null;
-              setFinancialSuspended(false);
-              console.log('[allowlist-sweep] API reachable — resuming financial operations');
-            } catch (e) {
-              console.warn('[allowlist-sweep] financial ops still suspended — platform probe failed ' +
-                `(${String(e.message || e).slice(0, 60)})`);
-            }
+          // Sessionless: `getChainInfo` is a public endpoint, so asking it costs no
+          // credentials. Routing the probe through `getAgentSession(state.agents[0])`
+          // made the whole fleet's financial suspension depend on ONE agent being
+          // able to authenticate — a revoked identity or a corrupt key on agent-1
+          // would hold every refund forever behind a now-durable flag, while the
+          // operator was told it clears automatically.
+          try {
+            const { J41Client } = require('@junction41/sovagent-sdk/dist/index.js');
+            await new J41Client({ apiUrl: J41_API_URL }).getChainInfo();
+            dispatcherApiOutageSince = null;
+            setFinancialSuspended(false);
+            console.log('[allowlist-sweep] API reachable — resuming financial operations');
+          } catch (e) {
+            console.warn('[allowlist-sweep] financial ops still suspended — platform probe failed ' +
+              `(${String(e.message || e).slice(0, 60)})`);
           }
         } else {
           dispatcherApiOutageSince = null;
@@ -4765,7 +4768,16 @@ program
           }
           console.log(`  ✅ ${agentInfo.id}: active` +
             (result.onChainTxid ? ` (on-chain txid: ${result.onChainTxid})` : ''));
-          state._agentErrors.delete(agentInfo.id);
+          // Only clear the diagnostic if nothing in THIS pass set one. The
+          // unconditional delete ran 28 lines after the repair-failure branches and
+          // erased them, so `/health` degraded (the chain axis still trips the
+          // gate) while every agent reported `lastError: null` — monitoring saw a
+          // fault with no stated reason anywhere, which is the exact observability
+          // this release was adding. Only the deferred branch survived, and only
+          // because it `continue`s past this line.
+          if (!state._agentErrors.has(agentInfo.id)) {
+            state._agentErrors.delete(agentInfo.id);
+          }
           state.emitEvent?.('agent.online', { agentId: agentInfo.id, identity: agentInfo.identity });
           // Trigger backend re-index so marketplace reflects active status immediately
           try {
@@ -8704,6 +8716,15 @@ async function checkPendingInbox(state) {
   // as contention. 2.27.0 gave the deactivate a pause but left the sweep running,
   // which only closed one direction of the collision.
   if (state.shuttingDown) return;
+  // ...and not before startup has finished writing identities either. The sweep and
+  // the startup chain repair are both identity writers for the same agent, both
+  // consult `_inboxLastWrite` only AFTER broadcasting, and the sweep's first firing
+  // (+60s) lands squarely inside a startup that can spend three minutes in the
+  // confirmation wait — on an upgrade, when downtime has piled up inbox items. Two
+  // builders against the same confirmed prevOutput means one is rejected as -25.
+  // C1 closed the shutdown direction of this collision and left the startup one
+  // open; this is the symmetric gate.
+  if (state.startupComplete !== true) return;
   // Reentrancy guard: safeInterval is a plain setInterval, so a sweep slower than
   // the 60s floor would overlap the next one — two concurrent batches per agent,
   // racing _inboxLastWrite and re-creating the contention this all exists to stop.
