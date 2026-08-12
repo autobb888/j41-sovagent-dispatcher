@@ -559,7 +559,8 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
           console.warn(`[proxy] upstream ${proxyRes.statusCode} on a streaming request (${why}) — not billing (job ${key ? String(key).slice(0, 8) : '?'})`);
         } else if (aborted) {
           // A 2xx whose socket died mid-stream. Bill only what a usage frame
-          // actually proved; if none arrived, bill nothing.
+          // actually proved. With no usage frame that means zero OUTPUT; input still
+          // settles at the estimate, which is the one quantity we know was sent.
           //
           // Not the worst-case settle, deliberately. That settle is an anti-abuse
           // measure against an upstream that returns real output while withholding

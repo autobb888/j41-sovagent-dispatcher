@@ -180,3 +180,57 @@ test('startup waits for its own deactivates to CONFIRM before re-activating', ()
   assert.ok(capture < clear, 'capture must happen BEFORE the marker is cleared');
   assert.ok(clear < i, 'and the marker is cleared before the wait — hence the capture');
 });
+
+// ── Round-3 findings: three mutations that survived the whole 1057-test suite ──
+
+test('the startup wait has no out-of-scope watchdog reference', () => {
+  // `kickWatchdog` is declared inside gracefulShutdown. Referencing it from the
+  // `start` action is a ReferenceError, NOT a no-op — optional chaining guards a
+  // null value, never an undeclared binding. It threw on the wait's first sleep,
+  // the rejection was logged "non-fatal", and startup silently stopped: no
+  // activation, no repair, no signal handlers, no startupComplete (so /health
+  // stayed green) — a zombie process on exactly the upgrade this release performs.
+  // Strip line comments first — the fix's own explanation names the identifier,
+  // and a scan that cannot tell code from prose would fail on the documentation.
+  const CODE = CLI.split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n');
+  const i = CODE.indexOf('const kickWatchdog = (label) => {');
+  assert.ok(i > -1, 'the shutdown watchdog must still exist');
+  assert.ok(!/kickWatchdog\s*[(?]/.test(CODE.slice(0, i)),
+    'kickWatchdog must not be referenced before its declaration — optional chaining ' +
+    'does not make an undeclared binding safe');
+});
+
+test('the confirmation wait has a real deadline', () => {
+  // `Date.now() + 0` makes the wait exit on its first check and go straight to
+  // "activating anyway" — dead in place, with every log line still present. The
+  // suite passed against exactly that.
+  const i = CLI.indexOf('shutdown deactivate(s) to confirm');
+  assert.match(CLI.slice(i, i + 400), /_deadline = Date\.now\(\) \+ 180000/,
+    'the wait must actually wait');
+});
+
+test('the marker retains agents whose chain state could not be established', () => {
+  // Retention keyed only on a positive `inactive` read dropped exactly the agents
+  // whose wait timed out — so a deactivate landing after the deadline left them
+  // unhireable AND unrestorable, since the next start skips anything not in the
+  // marker.
+  const i = CLI.indexOf('const _stillBroken = new Set(');
+  assert.ok(i > -1);
+  const body = CLI.slice(i, i + 700);
+  assert.match(body, /_normStatus\(a\.chainStatus\) === 'inactive'/, 'positively-inactive agents are retained');
+  assert.match(body, /\.\.\._unresolvedWaits/, 'so are agents whose wait never resolved');
+  assert.match(CLI, /for \(const id of _left\) _unresolvedWaits\.add\(id\);/,
+    'a timed-out wait must record which agents were unresolved');
+});
+
+test('the repair aborts — does not broadcast — when the pending write never clears', () => {
+  // Removing the `continue` lets the repair broadcast on top of an unconfirmed
+  // identity write: the -25 double-spend class this release exists to remove.
+  const i = CLI.indexOf("if (_plan.repairChain && agentInfo.chainStatus !== 'active') {");
+  const body = CLI.slice(i, i + 2600);
+  const gate = body.indexOf('SKIPPING the');
+  const write = body.indexOf("setOnChainStatus('active')");
+  assert.ok(gate > -1 && write > gate, 'the skip path must precede the broadcast');
+  assert.match(body.slice(gate, write), /continue;/,
+    'the gate-timeout path must abort the iteration, not fall through to the write');
+});

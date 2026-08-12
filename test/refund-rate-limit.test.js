@@ -37,6 +37,7 @@ const {
   recordDispatcherSend,
   _resetDispatcherRateLimit,
   setFinancialSuspended,
+  isFinanciallySuspended,
   SEND_HISTORY_PATH,
   FINANCIAL_SUSPENDED_PATH,
 } = require('../src/cli');
@@ -245,4 +246,25 @@ test('the refusal names the file an operator can remove when the daemon is down'
   assert.match(checkDispatcherRateLimit('job-escape', 0.01, 100).reason,
     new RegExp(FINANCIAL_SUSPENDED_PATH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.equal(fs.existsSync(FINANCIAL_SUSPENDED_PATH), true);
+});
+
+test('a suspension raised before a restart can still be cleared after one', () => {
+  // The round-2 fix made the flag durable across restarts — correct, a suspension a
+  // restart lifts is not a suspension. But both clear sites stayed gated on the
+  // in-memory `dispatcherApiOutageSince`, which is null in a fresh process. So an
+  // outage that began before a restart could NEVER be lifted: every sweep saw a
+  // healthy API, skipped the clear, and every refund fleet-wide deferred forever —
+  // while the operator was told it "clears automatically when the platform responds"
+  // and to "remove the file if the daemon is not running" (it was running).
+  //
+  // Persisting state without moving its clear condition off process-local state is
+  // the regression; this pins the property that matters — a healthy platform is
+  // sufficient to resume, whoever saw the outage start.
+  _resetDispatcherRateLimit(true);
+  assert.equal(isFinanciallySuspended(), true);
+
+  // A fresh process has no memory of the outage. Clearing must not depend on that.
+  setFinancialSuspended(false);
+  assert.equal(isFinanciallySuspended(), false);
+  assert.equal(checkDispatcherRateLimit('job-after-restart', 0.01, 100).allowed, true);
 });

@@ -225,7 +225,7 @@ test('a crash mid-reversal completes the bookkeeping without debiting twice', as
   reverseDeposit(agentId, buyer, SMALL, txid);
   const d = readDeposits(agentId);
   const rec = d.processed.find(x => x.txid === txid);
-  rec.reversing = true;
+  rec.reversal = 'debited';   // the debit provably ran
   fs.writeFileSync(depositsFile(agentId), JSON.stringify(d));
   assert.equal(getBalance(agentId, buyer), 0);
 
@@ -344,7 +344,7 @@ test('a partially-reversed credit whose tx later confirms is RE-CREDITED', () =>
     const { reverseDeposit } = require('../src/credit-meter.js');
     reverseDeposit(agentId, buyer, SMALL, txid);
     const d = readDeposits(agentId);
-    d.processed.find(x => x.txid === txid).reversing = true;
+    d.processed.find(x => x.txid === txid).reversal = 'debited';
     fs.writeFileSync(depositsFile(agentId), JSON.stringify(d));
     assert.equal(getBalance(agentId, buyer), 0);
 
@@ -355,7 +355,54 @@ test('a partially-reversed credit whose tx later confirms is RE-CREDITED', () =>
     assert.equal(r.confirmed, 1);
     assert.equal(getBalance(agentId, buyer), SMALL, 'the wrongly-debited credit must come back');
     const after = readDeposits(agentId).processed.find(x => x.txid === txid);
-    assert.equal(after.reversing, undefined);
+    assert.equal(after.reversal, undefined);
     assert.equal(after.unconfirmed, undefined);
+  })();
+});
+
+test('an AMBIGUOUS reversal state moves no money and escalates to the operator', () => {
+  // `reversal: 'debiting'` means the intent was stamped but we cannot prove the
+  // debit ran — the stamp is written BEFORE the debit precisely so a crash is
+  // recoverable, which is exactly why it cannot also stand as proof the debit
+  // happened. The first version conflated the two: on the confirm path it re-credited
+  // unconditionally, so a crash between stamp and debit gave the buyer 2× the
+  // deposit; on the unknown path it skipped the debit. Opposite assumptions from one
+  // flag.
+  //
+  // Where we genuinely cannot tell, no money moves and a human is told — the same
+  // rule the refund in-flight marker follows.
+  return (async () => {
+    const agentId = 'agent-ambiguous-reversal';
+    const buyer = 'buyerAmbiguous@';
+    const { kp, txid } = await creditZeroConf(agentId, buyer);
+
+    const d = readDeposits(agentId);
+    d.processed.find(x => x.txid === txid).reversal = 'debiting';
+    fs.writeFileSync(depositsFile(agentId), JSON.stringify(d));
+    const before = getBalance(agentId, buyer);
+
+    const client = mockClient(kp, buyer, async () => ({ confirmations: 4 }));
+    await reconcileUnconfirmedDeposits(agentId, client, Date.now() + RECONCILE_GRACE_MS + 1);
+
+    assert.equal(getBalance(agentId, buyer), before, 'no money may move on a guess');
+    const after = readDeposits(agentId).processed.find(x => x.txid === txid);
+    assert.ok(after.needsOperator, 'the ambiguity must be recorded for a human');
+    assert.equal(after.unconfirmed, undefined, 'and it must stop being re-checked forever');
+  })();
+});
+
+test('the reversal is a two-phase state machine, so a crash is never a guess', () => {
+  // Walks the happy path and asserts the record ends up debited-and-finalised.
+  return (async () => {
+    const agentId = 'agent-twophase';
+    const buyer = 'buyerTwoPhase@';
+    const { kp, txid } = await creditZeroConf(agentId, buyer);
+    const client = mockClient(kp, buyer, NOT_FOUND);
+    await fullMissRun(agentId, client, Date.now() + RECONCILE_GRACE_MS + 1);
+
+    assert.equal(getBalance(agentId, buyer), 0, 'debited exactly once');
+    const d = readDeposits(agentId);
+    assert.equal(d.processed.some(x => x.txid === txid), false, 'record finalised');
+    assert.equal(d.reversed.length, 1);
   })();
 });

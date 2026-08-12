@@ -457,10 +457,18 @@ function startDispatcherSweep(state) {
     try {
       const list = loadFinancialAllowlist();
       if (list.active_jobs.length === 0) {
-        if (dispatcherApiOutageSince) {
-          dispatcherApiOutageSince = null;
-          setFinancialSuspended(false);
-        }
+        // Clear UNCONDITIONALLY, not only when this process observed the outage
+        // start. The flag is durable across restarts (deliberately — a suspension
+        // that a restart lifts is not a suspension); `dispatcherApiOutageSince` is
+        // process-local and is null in a fresh process. Gating the clear on it meant
+        // an outage that began before a restart could NEVER be lifted: every sweep
+        // saw a healthy API, skipped the clear, and every refund fleet-wide deferred
+        // forever, while the operator was told "clears automatically when the
+        // platform responds" (it would not) and "remove the file if the daemon is
+        // not running" (it was). Making the flag durable without moving the clear
+        // off process-local state is what created this.
+        dispatcherApiOutageSince = null;
+        setFinancialSuspended(false);
         return;
       }
 
@@ -487,11 +495,13 @@ function startDispatcherSweep(state) {
       }
 
       if (apiReachable) {
-        if (dispatcherApiOutageSince) {
+        // Same reasoning as above: a reachable API is sufficient evidence to resume,
+        // whoever observed the outage and whenever it started.
+        if (dispatcherApiOutageSince || isFinanciallySuspended()) {
           console.log('[allowlist-sweep] API restored — resuming financial operations');
-          dispatcherApiOutageSince = null;
-          setFinancialSuspended(false);
         }
+        dispatcherApiOutageSince = null;
+        setFinancialSuspended(false);
       } else {
         const now = Date.now();
         if (!dispatcherApiOutageSince) dispatcherApiOutageSince = now;
@@ -3554,8 +3564,8 @@ program
     // returned `{}`, making the confirmation wait added in 2.28.2 dead code in
     // every configuration, not just the default one.
     const _shutdownDeactivateTxids = readShutdownDeactivatedTxids();
-    const _shutdownMarkerAt = readShutdownDeactivatedAt();
     const _reactivatedOnStart = [];
+    const _unresolvedWaits = new Set();
     let _lastSeenPlatformStatus = null;
     let _lastSeenChainStatus = null;
     for (const agentId of agents) {
@@ -3583,7 +3593,12 @@ program
             // alone stopped being correct the moment we stopped writing it on-chain
             // for routine restarts.
             const _eff = effectiveAgentStatus(profile);
-            _lastSeenPlatformStatus = _eff;
+            // The PLATFORM axis specifically. Storing the ANDed value here made
+            // /health's `platformStatus` field mean something other than its name,
+            // and forced a redundant POST for an agent whose platform axis was
+            // already active. `chainStatus` carries the other axis; the AND is
+            // recomputed where it is needed.
+            _lastSeenPlatformStatus = platformAgentStatus(profile) || _eff;
             // Keep the CHAIN axis separately. The activation loop repairs the
             // platform axis and then stamps the agent `active`; without this the
             // knowledge that the chain axis is still `inactive` is destroyed, and
@@ -3660,9 +3675,13 @@ program
       // An agent whose chain axis is still not active has NOT been fully restored,
       // whatever the platform axis says — leave it in the marker so the next start
       // tries again instead of skipping it.
-      const _stillBroken = new Set(
-        readyAgents.filter(a => _normStatus(a.chainStatus) === 'inactive').map(a => a.id),
-      );
+      const _stillBroken = new Set([
+        ...readyAgents.filter(a => _normStatus(a.chainStatus) === 'inactive').map(a => a.id),
+        // An unresolved wait means we do not KNOW the chain axis — and "we could not
+        // tell" must retain, not release. Keying retention on a positive `inactive`
+        // read alone dropped exactly the agents whose state we failed to establish.
+        ..._unresolvedWaits,
+      ]);
       const _unrestored = _shutdownDeactivated.filter(
         id => !_reactivatedOnStart.includes(id) || _stillBroken.has(id),
       );
@@ -4520,6 +4539,19 @@ program
       // `deactivate` commands do (unchanged — they still write on-chain).
       // J41_STATUS_TOGGLE_ONCHAIN=1 opts a restart back into the on-chain write.
       const _toggleOnChain = process.env.J41_STATUS_TOGGLE_ONCHAIN === '1';
+
+      // Startup has no stall watchdog. The one the next two call sites reached for
+      // is `const kickWatchdog` declared INSIDE gracefulShutdown, so
+      // `kickWatchdog?.(...)` here was not a no-op — optional chaining guards a null
+      // VALUE, never an undeclared BINDING, so it threw ReferenceError. It sat
+      // harmless only while the confirmation wait was dead code; arming that wait
+      // (capturing the txids before the marker is cleared) made the first sleep
+      // throw, and `program.parse()` routes the rejection to a handler that logs
+      // "non-fatal" — so the process kept its timers, printed a status line every
+      // 60s forever, and never activated, never repaired, never registered its
+      // signal handlers, and never set startupComplete (so /health stayed green).
+      // A zombie, on exactly the fleet upgrade this release exists to perform.
+      const noteStartupProgress = (label) => console.log(`     … ${label}`);
       console.log(`\n→ Setting agents active${_toggleOnChain ? ' (plus on-chain — J41_STATUS_TOGGLE_ONCHAIN=1)' : ''}...`);
       // Our OWN shutdown deactivate is the thing this collides with. Stop writes
       // N deactivates on-chain; start writes N activates seconds later against the
@@ -4537,6 +4569,11 @@ program
       // startup rather than blocking it, and we say plainly what we are waiting for.
       const _dtxids = _shutdownDeactivateTxids;
       const _pendingIds = _reactivatedOnStart.filter(id => _dtxids[id]);
+      // Agents whose deactivate we never saw confirm. Their chain axis is unknown,
+      // NOT active — so they must stay in the marker even if the snapshot still
+      // reads `active`, or a deactivate that lands after the deadline leaves them
+      // unhireable AND unrestorable (the next start skips anything not in the
+      // marker, so the automatic recovery is simply gone).
       // NOT gated on `_toggleOnChain` any more. The chain-axis repair below can
       // write on-chain even in the default configuration, and it collides with an
       // unconfirmed shutdown deactivate exactly as the old activate did.
@@ -4553,11 +4590,16 @@ program
               const sess = await getAgentSession(state, ai);
               // Ask the question we actually care about — "has the chain axis gone
               // inactive yet" — rather than only "does prevOutput equal the txid we
-              // recorded". The txid comparison alone never releases if ANY later
-              // identity write superseded that output (an operator `activate-all`
-              // after the 2026-08-06 strand, an `update-profile` while we were down),
-              // so it burned the full 3 minutes in exactly the recovery situations
-              // that are already confusing.
+              // recorded".
+              //
+              // Honest limit: this does NOT rescue the case where a later write
+              // superseded our deactivate (an operator `activate-all` while we were
+              // down). There the chain reads `active` and prevOutput is that other
+              // write's txid, so neither disjunct fires and the wait still burns the
+              // full three minutes. It is indistinguishable from "the deactivate is
+              // merely unconfirmed", which is the case we genuinely must wait for.
+              // The outcome is a bounded startup delay, and the plan afterwards
+              // correctly skips the repair — no wrong write, just a slow start.
               const prof = await sess.client.getAgent(ai.iAddress || ai.identity).catch(() => null);
               const chainNow = chainAgentStatus(prof);
               // REFRESH THE SNAPSHOT. This is the whole reason the wait is dangerous:
@@ -4583,7 +4625,7 @@ program
           }
           if (_left.size) {
             await new Promise(r => setTimeout(r, 10000));
-            kickWatchdog?.(`awaiting deactivate confirmations (${_left.size} left)`);
+            noteStartupProgress(`awaiting deactivate confirmations (${_left.size} left)`);
           }
         }
         if (_left.size) {
@@ -4598,6 +4640,7 @@ program
               if (chainNow) ai.chainStatus = chainNow;
             } catch { /* keep the snapshot; `unknown` never triggers a repair write */ }
           }
+          for (const id of _left) _unresolvedWaits.add(id);
           console.warn(`  ⚠️  ${_left.size} deactivate(s) still unconfirmed after 3 min — activating anyway. ` +
             'Any rejected activate is reported below; re-run `j41-dispatcher activate <id>` for those.');
         }
@@ -4653,7 +4696,7 @@ program
                 } catch { /* can't tell — keep waiting until the deadline */ }
                 if (!shouldDeferForPendingWrite(_pwr, prevOut, height, Date.now()).defer) { _rok = true; break; }
                 await new Promise(r => setTimeout(r, 5000));
-                kickWatchdog?.(`awaiting pending write before repair ${agentInfo.id}`);
+                noteStartupProgress(`awaiting pending write before repair ${agentInfo.id}`);
               }
               if (!_rok) {
                 console.warn(`  ⚠️  ${agentInfo.id}: a prior identity write is still unconfirmed — SKIPPING the ` +
@@ -4704,7 +4747,8 @@ program
           if (_toggleOnChain && result && result.onChainTxid) {
             state._inboxLastWrite.set(agentInfo.id, { txid: result.onChainTxid, at: Date.now() });
           }
-          console.log(`  ✅ ${agentInfo.id}: active (on-chain txid: ${result.onChainTxid || 'skipped'})`);
+          console.log(`  ✅ ${agentInfo.id}: active` +
+            (result.onChainTxid ? ` (on-chain txid: ${result.onChainTxid})` : ''));
           state._agentErrors.delete(agentInfo.id);
           state.emitEvent?.('agent.online', { agentId: agentInfo.id, identity: agentInfo.identity });
           // Trigger backend re-index so marketplace reflects active status immediately
@@ -7160,6 +7204,13 @@ async function refundsApproveAll(state, opts = {}, ledgerPath) {
       'No refunds awaiting approval or sending.' +
       (skippedCount > 0 ? ` (${skippedCount} needs_review skipped — handle individually)` : '')
     );
+    // Report the blocked ones here too. Returning before this message meant that a
+    // backlog consisting ENTIRELY of in-flight entries reported "nothing owed" —
+    // the surface an operator checks to answer "do I owe anyone money".
+    if (inflightIds.length > 0) {
+      console.log(`[refunds] ⛔ ${inflightIds.length} entr(ies) are BLOCKED — an earlier send failed ambiguously.`);
+      console.log('[refunds]    Verify each on-chain, then: j41-dispatcher refunds unblock <jobId>');
+    }
     return [];
   }
   if (retryCount > 0) console.log(`[refunds] ${retryCount} previously-approved entr(ies) still unsent — retrying those too.`);

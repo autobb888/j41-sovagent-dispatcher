@@ -190,7 +190,47 @@ folded into the counters a one-byte corruption silently disarmed it; a non-strea
 RST refunded the reservation twice and left the buyer richer; and a partially
 reversed deposit that later confirms is re-credited.
 
-1057 tests (+71). Every fix mutation-checked — and the second round is why that
+### Third review round — the one that stopped the restart
+
+**The upgrade restart would not have worked at all.** `kickWatchdog` is declared
+inside `gracefulShutdown`; the confirmation wait calls it from the `start` action.
+`kickWatchdog?.(…)` is not a no-op there — optional chaining guards a null *value*,
+never an undeclared *binding* — so the wait's first sleep threw `ReferenceError`,
+`program.parse()` routed it to a handler that logs "non-fatal", and the rest of
+startup silently stopped: no activation, no repair, no signal handlers, and
+`startupComplete` never set, so `/health` reported `ok` forever while the process
+printed a status line every 60 seconds. A zombie, on precisely the fleet upgrade
+this release exists to perform.
+
+That line predates this work. It was unreachable dead code until round 2 fixed the
+txid capture and armed the wait — so arming a guard is what exposed it, and no
+amount of reading the diff would have caught it, because the failing path had never
+executed in any version.
+
+**A suspension raised before a restart could never be lifted.** Round 2 made the
+outage flag durable across restarts (correct — a suspension a restart lifts is not
+one), but left both clear sites gated on the in-memory `dispatcherApiOutageSince`,
+which is null in a fresh process. An outage spanning a restart therefore deferred
+every refund fleet-wide forever, while the operator was told it "clears
+automatically when the platform responds" and to remove the file "if the daemon is
+not running" — it was running. Persisting state without moving its clear condition
+off process-local state is the whole bug.
+
+Also closed: the marker now retains agents whose chain state could not be
+established (keying retention on a positive `inactive` read dropped exactly the
+agents whose wait timed out); the reversal stamp became a two-phase state machine,
+because `reversing: true` was being read as "the debit ran" on one path and "the
+debit may not have run" on the other, from the same flag — where it is genuinely
+ambiguous no money now moves and a human is told; `_isTxUnknown` gained a weak/strong
+tiering after the reviewer found the platform's own documented 404 body matches none
+of the strong patterns, which would have left the M4 leak inert in production; and
+`refunds approve --all` no longer reports "nothing owed" when the entire backlog is
+in-flight-blocked.
+
+Four mutations that survived the round-2 suite now fail, including the deadline and
+the marker-retention fix from round 2 itself.
+
+1064 tests (+78). Every fix mutation-checked — and the second round is why that
 phrase now means something: seven mutations that the reviewer proved survived the
 first round's "mutation-checked" claim now fail. Three tests in this file had also
 silently stopped testing their subject, because they anchored on a distance from a
