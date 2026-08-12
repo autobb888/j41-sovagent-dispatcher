@@ -72,22 +72,23 @@ Two related holes closed at the same time:
   4xx/5xx that carried a usage frame was billed its reported tokens. The error check is
   now first and unconditional, matching the non-streaming path.
 
-**M4 — 0-conf deposit credits were never reconciled.** Deposits under 2 VRSC are
-credited straight from the mempool for instant proxy access. A mempool transaction is
-not money: it can be evicted, replaced, or never mined. The credit was written to
-`processed` and nothing ever went back to check, so a dropped sub-2-VRSC tx left the
-credit standing forever — repeatable with a fresh txid each time.
+**M4 — DEFERRED out of this release, deliberately.** The 0-conf deposit reconciler
+(credits taken from the mempool are never revisited, so a dropped sub-2-VRSC tx leaves
+free credit standing) was built, reviewed five times, and then pulled back out.
 
-`reconcileUnconfirmedDeposits` now runs on every deposit poll. It is deliberately
-biased toward keeping the credit, because clawing back a legitimate buyer's balance is
-worse than a delayed clawback: a reversal requires a *positive* "the chain does not
-know this txid", three consecutive times, past a 30-minute grace window. Any sighting —
-confirmed or still visibly in the mempool — resets the run, and an unreachable platform
-never costs a buyer anything. Reversals are recorded under `reversed` in the agent's
-`deposits.json`, not just logged. `reverseDeposit` does not clamp at zero: if the
-credit was already spent the balance goes negative, which blocks further proxy use
-until it is topped up past the debt. Clamping would forgive the debt and make the
-exploit free.
+It was a third of the source diff and produced roughly a quarter of every defect found
+across five review rounds — an uninterpretable-response reversal, a route-404 misread,
+a crash double-claw, a systemic guard that protected only the last record of each pass,
+and two distinct ways of minting credit. What it closes is a ≤2 VRSC-per-event leak
+that has existed for months with nobody exploiting it. Meanwhile the genuinely
+time-sensitive part of this release — the `platform_status` cutover, whose backend half
+is already deployed and waiting on us — had been stable for three rounds.
+
+Bundling them meant the proven, urgent work was gated on the unproven, risky work. The
+branch `feature/m4-deposit-reconcile` keeps every line and all 29 of its tests; it
+lands on its own once an execution harness exists, so it can be tested rather than
+grepped. The absence of that harness is precisely why its defects survived three rounds
+of people reading the code.
 
 ### Adversarial review of the above, before release
 
