@@ -36,6 +36,7 @@ const {
   RECONCILE_WEAK_MIN_MISSES,
   RECONCILE_WEAK_SPAN_MS,
   REVERSAL_RECHECK_WINDOW_MS,
+  _forgetClaimForTest,
   _isTxUnknown,
 } = require('../src/deposit-watcher.js');
 const { getBalance } = require('../src/credit-meter.js');
@@ -618,4 +619,89 @@ test('a reversed tx merely BACK in the mempool is not restored', async () => {
   const r = await reconcileUnconfirmedDeposits(agentId, backInMempool, Date.now() + RECONCILE_GRACE_MS + 2);
   assert.equal(r.restored, 0);
   assert.equal(getBalance(agentId, buyer), 0, 'restoration requires a confirmation, not a sighting');
+});
+
+// ── Two ways the phase-4 restore minted credit (round 5) ────────────────────
+//
+// `_recheckReversals` credited any un-restored `reversed` entry whose tx later
+// confirmed, on two assumptions that are both violable: that the reversal actually
+// debited the buyer, and that no other path would credit the same txid. Both were
+// reproduced against the real modules. This is the "guard at one of two sites"
+// shape again: the forward confirm path already refuses to move money on an
+// ambiguous `debiting` state, and the restore path had no equivalent.
+
+test('a FORGIVEN reversal is never auto-restored — it never debited', async () => {
+  // Crash between the `debiting` stamp and the debit: the buyer keeps their credit
+  // and the unknown path later forgives (no second debit) but still writes a
+  // `reversed` entry. Restoring that entry hands them the deposit twice.
+  const agentId = 'agent-mint-forgiven';
+  const buyer = 'buyerMintForgiven@';
+  const { kp, txid } = await creditZeroConf(agentId, buyer);
+
+  // Stamp the intent without ever debiting — the crash window, exactly.
+  const d = readDeposits(agentId);
+  d.processed.find(x => x.txid === txid).reversal = 'debiting';
+  fs.writeFileSync(depositsFile(agentId), JSON.stringify(d));
+  assert.equal(getBalance(agentId, buyer), SMALL, 'never debited');
+
+  // The unknown path forgives and files a reversal.
+  await fullMissRun(agentId, mockClient(kp, buyer, NOT_FOUND), Date.now() + RECONCILE_GRACE_MS + 1);
+  assert.equal(getBalance(agentId, buyer), SMALL, 'forgiven, so still credited once');
+  const led = readDeposits(agentId).reversed.find(r => r.txid === txid);
+  assert.equal(led.debited, false, 'the ledger must record that no debit happened');
+
+  // Now it confirms. Restoring would be a second credit.
+  const back = mockClient(kp, buyer, async () => ({ confirmations: 6 }));
+  const r = await reconcileUnconfirmedDeposits(agentId, back, Date.now() + RECONCILE_GRACE_MS + 2);
+  assert.equal(r.restored, 0);
+  assert.equal(getBalance(agentId, buyer), SMALL, 'must stay at ONE credit, not two');
+  assert.ok(readDeposits(agentId).reversed.find(rr => rr.txid === txid).needsOperator,
+    'and the ambiguity is escalated rather than guessed');
+});
+
+test('a re-reported deposit does not ALSO get restored', async () => {
+  // A reversed txid is not in `processed`, so claimTxid does not block a re-report —
+  // correct, a buyer whose payment did confirm should be able to re-report it. But
+  // the orphaned ledger entry still looked restorable.
+  const agentId = 'agent-mint-rereport';
+  const buyer = 'buyerMintRereport@';
+  const kp = generateKeypair(NET);
+  const txid = 'tx_' + crypto.randomBytes(8).toString('hex');
+
+  // Credit at 0-conf, then reverse it for real.
+  const mempool = mockClient(kp, buyer, async () => ({ confirmations: 0 }));
+  await reportDeposit(agentId, mempool, signedReport(kp, buyer, 'seller@', txid, SMALL), 'RpayAddr', NET);
+  await fullMissRun(agentId, mockClient(kp, buyer, NOT_FOUND), Date.now() + RECONCILE_GRACE_MS + 1);
+  assert.equal(getBalance(agentId, buyer), 0, 'reversed');
+
+  // Model the restart: claims are in-memory, so a live process would have
+  // forgotten this one. Without that, the same-process re-report is blocked by the
+  // claim and the bug is unreachable from a test — which is why it survived.
+  _forgetClaimForTest(agentId, txid);
+
+  // The buyer re-reports the same payment, now confirmed.
+  const confirmed = mockClient(kp, buyer, async () => ({ confirmations: 5 }));
+  await reportDeposit(agentId, confirmed, signedReport(kp, buyer, 'seller@', txid, SMALL), 'RpayAddr', NET);
+  assert.equal(getBalance(agentId, buyer), SMALL, 're-report credits once');
+
+  // The reversal recheck must now find nothing to do.
+  const r = await reconcileUnconfirmedDeposits(agentId, confirmed, Date.now() + RECONCILE_GRACE_MS + 2);
+  assert.equal(r.restored, 0);
+  assert.equal(getBalance(agentId, buyer), SMALL, 'must stay at ONE credit, not two');
+  assert.ok(readDeposits(agentId).reversed.find(rr => rr.txid === txid).restoredAt,
+    'the ledger entry is settled by the forward credit');
+});
+
+test('a genuine reversal still restores — the guard is not a blanket refusal', async () => {
+  const agentId = 'agent-mint-control';
+  const buyer = 'buyerMintControl@';
+  const { kp, txid } = await creditZeroConf(agentId, buyer);
+  await fullMissRun(agentId, mockClient(kp, buyer, NOT_FOUND), Date.now() + RECONCILE_GRACE_MS + 1);
+  assert.equal(getBalance(agentId, buyer), 0);
+  assert.equal(readDeposits(agentId).reversed.find(r => r.txid === txid).debited, true);
+
+  const back = mockClient(kp, buyer, async () => ({ confirmations: 6 }));
+  const r = await reconcileUnconfirmedDeposits(agentId, back, Date.now() + RECONCILE_GRACE_MS + 2);
+  assert.equal(r.restored, 1);
+  assert.equal(getBalance(agentId, buyer), SMALL);
 });

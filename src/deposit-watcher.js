@@ -147,6 +147,12 @@ const _claimsInProgress = new Set(); // key: `${agentId}\0${txid}`
 
 function _claimKey(agentId, txid) { return `${String(agentId).length}:${agentId}\0${txid}`; }
 
+/** Test hook: `_claimsInProgress` is in-memory, so a real process restart forgets
+ *  every claim. Tests that need to model a restart (a buyer re-reporting a txid
+ *  after we reversed it, say) have to be able to forget one too. Not used in
+ *  production paths. */
+function _forgetClaimForTest(agentId, txid) { _claimsInProgress.delete(_claimKey(agentId, txid)); }
+
 /**
  * Atomically claim (agentId, txid) for crediting. Returns false if it's already
  * claimed in-process OR already in the persisted `processed` list. MUST be
@@ -334,6 +340,9 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
     });
     // Remove from pending if it was there
     fresh.pending = fresh.pending.filter(d => d.txid !== txid);
+    // This txid may have been reversed earlier and is now being credited afresh.
+    // Settle that ledger entry or the reversal recheck will credit it AGAIN.
+    _settleReversedForTxid(fresh, txid, 're-reported and credited');
     // Keep only last 1000 processed (prevent unbounded growth)
     if (fresh.processed.length > 1000) fresh.processed = fresh.processed.slice(-1000);
     saveDeposits(agentId, fresh);
@@ -449,6 +458,28 @@ function _classifyLookupFailure(err) {
   const status = err && (err.statusCode || err.status);
   if (status === 404 || code === 'NOT_FOUND' || /\b404\b/.test(m)) return 'weak';
   return null;
+}
+
+/**
+ * Mark any open `reversed` ledger entry for this txid as settled, because some
+ * OTHER path just credited it.
+ *
+ * A reversed txid is not in `processed`, so `claimTxid` does not block a re-report
+ * of it — which is correct (a buyer whose payment did confirm should be able to
+ * re-report it). But the orphaned ledger entry then still looked restorable, and
+ * `_recheckReversals` credited it a second time. Reproduced in review: 0 →
+ * re-report 1.5 → restore 3.0.
+ */
+function _settleReversedForTxid(deposits, txid, reason) {
+  let touched = false;
+  for (const r of deposits.reversed || []) {
+    if (r && r.txid === txid && !r.restoredAt) {
+      r.restoredAt = new Date().toISOString();
+      r.resolvedBy = reason;
+      touched = true;
+    }
+  }
+  return touched;
 }
 
 async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
@@ -615,6 +646,7 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
       continue;
     }
 
+    let _debitCertain = false;
     if (!_alreadyDebited) {
       // Persist the intent BEFORE the irreversible debit, so a crash in between is
       // recoverable rather than a guess. Same shape as markRefundInflight.
@@ -623,6 +655,7 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
       reverseDeposit(agentId, live.buyerVerusId, live.amount, live.txid);
       live.reversal = 'debited';
       saveDeposits(agentId, fresh);
+      _debitCertain = true;
     } else {
       console.warn(`[Deposits] ${agentId}: ${live.txid.substring(0, 12)}… was mid-reversal at the last crash — ` +
         'completing the bookkeeping without debiting again.');
@@ -636,6 +669,13 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
       creditedAt: live.creditedAt,
       reversedAt: new Date().toISOString(),
       reason: 'funding transaction never confirmed and is unknown to the chain',
+      // Did the meter ACTUALLY move? Only `true` licenses an automatic restore.
+      // The forgiveness branch above reaches here having deliberately NOT debited
+      // (we could not prove the pre-crash debit ran, and forgiving beats
+      // double-debiting) — so a ledger entry exists for a buyer who was never
+      // charged. Restoring that on a later confirmation credits them a second time.
+      // Reproduced in review: 1.5 → forgiven → 3.0.
+      debited: _debitCertain,
     });
     if (fresh.reversed.length > 1000) fresh.reversed = fresh.reversed.slice(-1000);
     saveDeposits(agentId, fresh);
@@ -680,6 +720,22 @@ async function _recheckReversals(agentId, client, now = Date.now()) {
 
   let restored = 0;
   for (const cand of candidates) {
+    // Only an entry we KNOW debited may be restored automatically. `debited: false`
+    // means the reversal forgave an ambiguous crash and never charged the buyer;
+    // crediting it back would hand them the deposit twice. `undefined` is an entry
+    // written before this field existed — same treatment, because we cannot tell.
+    if (cand.debited !== true) {
+      const fresh0 = loadDeposits(agentId);
+      const e0 = (fresh0.reversed || []).find(r => r && r.txid === cand.txid && !r.restoredAt);
+      if (e0 && !e0.needsOperator) {
+        e0.needsOperator = 'reversed without a certain debit, and the tx later confirmed — ' +
+          `check whether ${e0.buyerVerusId} is owed ${e0.amount}`;
+        saveDeposits(agentId, fresh0);
+        console.error(`[Deposits] ${agentId}: ⚠️  reversed tx ${String(cand.txid).substring(0, 12)}… has confirmed, ` +
+          'but we cannot prove the reversal ever debited. No money moved. Check the meter by hand.');
+      }
+      continue;
+    }
     let confs = null;
     try {
       const st = await client.getTxStatus(cand.txid);
@@ -742,6 +798,7 @@ async function pollPendingDeposits(agentId, client) {
           continue; // already credited by another path
         }
         creditDeposit(agentId, dep.buyerVerusId, dep.amount, dep.txid);
+        _settleReversedForTxid(fresh, dep.txid, 'credited by the pending-deposit poller');
         fresh.processed.push({
           ...dep,
           confirmations: txStatus.confirmations,
@@ -935,4 +992,4 @@ async function notifyJ41CreditLow(sellerWif, sellerVerusId, buyerVerusId, balanc
   }
 }
 
-module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, RECONCILE_GRACE_MS, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_WEAK_MIN_MISSES, RECONCILE_WEAK_SPAN_MS, REVERSAL_RECHECK_WINDOW_MS, _isTxUnknown, _classifyLookupFailure, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
+module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, _settleReversedForTxid, _forgetClaimForTest, RECONCILE_GRACE_MS, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_WEAK_MIN_MISSES, RECONCILE_WEAK_SPAN_MS, REVERSAL_RECHECK_WINDOW_MS, _isTxUnknown, _classifyLookupFailure, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
