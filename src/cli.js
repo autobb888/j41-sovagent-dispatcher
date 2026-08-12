@@ -248,14 +248,25 @@ function loadSendHistory() {
     return {
       global: Array.isArray(raw.global) ? raw.global : [],
       perJob: (raw.perJob && typeof raw.perJob === 'object') ? raw.perJob : {},
-      suspendedAt: Number.isFinite(raw.suspendedAt) ? raw.suspendedAt : null,
     };
   } catch {
-    // Absent OR corrupt. Starting from empty is the right failure mode here: this
-    // file bounds damage, it does not authorise anything, and refusing to send on
-    // an unreadable counter file would strand every owed refund.
-    return { global: [], perJob: {}, suspendedAt: null };
+    // Absent OR corrupt. Starting from empty is the right failure mode for the
+    // COUNTERS: they bound damage, they do not authorise anything, and refusing to
+    // send on an unreadable counter file would strand every owed refund.
+    return { global: [], perJob: {} };
   }
+}
+
+// The outage suspension lives in its OWN file, deliberately. Folded into the counter
+// file, a one-byte corruption did not merely reset the counters (defensible) — it
+// also silently lifted an active kill-switch, because the fail-open default returned
+// `suspendedAt: null`. A safety flag must not inherit the failure mode of a
+// bookkeeping file. Existence IS the state, so it survives any parse failure, and an
+// operator with a dead daemon can clear it with `rm`.
+const FINANCIAL_SUSPENDED_PATH = path.join(DISPATCHER_DIR, 'financial-suspended');
+
+function isFinanciallySuspended() {
+  try { return fs.existsSync(FINANCIAL_SUSPENDED_PATH); } catch { return false; }
 }
 
 function saveSendHistory(h) {
@@ -269,12 +280,61 @@ function saveSendHistory(h) {
   }
 }
 
+// Cross-process mutex for the counter file. The rate check runs inside a per-JOB
+// send lock, so two DIFFERENT jobs in two processes — the daemon drain and an
+// out-of-band `refunds approve`, which is the documented operator workflow — do
+// unsynchronized read-modify-write on the same file. Interleaved, one process's
+// record is lost and the fleet-wide cap silently under-counts; the same race lets a
+// `recordDispatcherSend` whose read predated a `setFinancialSuspended(true)` clobber
+// the outage kill-switch back to null.
+//
+// O_EXCL create is the lock. Stale locks are stolen after 10s — this guards a
+// counter, so a crashed holder must never wedge refunds permanently.
+const SEND_HISTORY_LOCK = () => `${SEND_HISTORY_PATH}.lock`;
+
+function withSendHistoryLock(fn) {
+  const lockPath = SEND_HISTORY_LOCK();
+  const deadline = Date.now() + 5000;
+  let held = false;
+  while (Date.now() < deadline) {
+    try {
+      fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+      const fd = fs.openSync(lockPath, 'wx');
+      fs.writeSync(fd, `${process.pid}:${Date.now()}`);
+      fs.closeSync(fd);
+      held = true;
+      break;
+    } catch {
+      try {
+        const age = Date.now() - fs.statSync(lockPath).mtimeMs;
+        if (age > 10000) { fs.unlinkSync(lockPath); continue; }
+      } catch { /* vanished — retry the create */ }
+      // Spin briefly. This is a sub-millisecond critical section in practice.
+      const until = Date.now() + 25;
+      while (Date.now() < until) { /* busy-wait */ }
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    if (held) { try { fs.unlinkSync(lockPath); } catch { /* already gone */ } }
+  }
+}
+
 /** Set/clear the fleet-wide financial suspension. Written by the daemon's sweep,
  *  read by EVERY process — including a one-shot CLI approve. */
 function setFinancialSuspended(on, now = Date.now()) {
-  const h = loadSendHistory();
-  h.suspendedAt = on ? (h.suspendedAt || now) : null;
-  saveSendHistory(h);
+  try {
+    if (on) {
+      if (isFinanciallySuspended()) return;
+      fs.mkdirSync(path.dirname(FINANCIAL_SUSPENDED_PATH), { recursive: true });
+      fs.writeFileSync(FINANCIAL_SUSPENDED_PATH, JSON.stringify({ since: new Date(now).toISOString() }), { mode: 0o600 });
+    } else {
+      try { fs.unlinkSync(FINANCIAL_SUSPENDED_PATH); } catch { /* already clear */ }
+    }
+  } catch (e) {
+    console.error(`[refund] could not ${on ? 'set' : 'clear'} the financial suspension flag: ${e.message}`);
+  }
 }
 
 function dispatcherRateLimits() {
@@ -301,10 +361,15 @@ function dispatcherRateLimits() {
  */
 function checkDispatcherRateLimit(jobId, amount, jobPrice, now = Date.now()) {
   const LIM = dispatcherRateLimits();
-  const H = loadSendHistory();
-  if (H.suspendedAt) {
-    return { allowed: false, retryable: true, reason: 'Financial operations suspended (API outage)' };
+  if (isFinanciallySuspended()) {
+    return {
+      allowed: false,
+      retryable: true,
+      reason: `Financial operations suspended (API outage). Clears automatically when the platform ` +
+        `responds; if the daemon is not running, remove ${FINANCIAL_SUSPENDED_PATH}`,
+    };
   }
+  const H = loadSendHistory();
   const jobHistory = H.perJob[jobId] || [];
 
   if (jobHistory.length >= LIM.maxSendsPerJob) {
@@ -345,6 +410,10 @@ function checkDispatcherRateLimit(jobId, amount, jobPrice, now = Date.now()) {
 }
 
 function recordDispatcherSend(jobId, amount, now = Date.now()) {
+  return withSendHistoryLock(() => _recordDispatcherSendLocked(jobId, amount, now));
+}
+
+function _recordDispatcherSendLocked(jobId, amount, now) {
   const H = loadSendHistory();
   const record = { timestamp: now, amount };
   if (!H.perJob[jobId]) H.perJob[jobId] = [];
@@ -375,7 +444,8 @@ function recordDispatcherSend(jobId, amount, now = Date.now()) {
  *  exercises it has to be able to start from a known point and to simulate the
  *  API-outage suspension the sweep sets. Not used in production paths. */
 function _resetDispatcherRateLimit(suspended = false) {
-  saveSendHistory({ global: [], perJob: {}, suspendedAt: suspended ? Date.now() : null });
+  saveSendHistory({ global: [], perJob: {} });
+  setFinancialSuspended(suspended);
 }
 
 // ── Dispatcher-side allowlist sweep timer ──
@@ -426,7 +496,7 @@ function startDispatcherSweep(state) {
         const now = Date.now();
         if (!dispatcherApiOutageSince) dispatcherApiOutageSince = now;
         if (now - dispatcherApiOutageSince >= 30 * 60 * 1000) {
-          if (!loadSendHistory().suspendedAt) {
+          if (!isFinanciallySuspended()) {
             // Persisted, so a one-shot `refunds approve` in another process sees it
             // too. Held only in memory, this suspended the daemon and nothing else.
             setFinancialSuspended(true, now);
@@ -3573,14 +3643,32 @@ program
     
     // Clear the marker only once every agent in it has been dealt with, so a start
     // that dies partway through still restores the rest on the next attempt.
-    if (_shutdownDeactivated.length) {
+    //
+    // DEFERRED until after the activation loop. Consuming it here made the self-heal
+    // one-shot: the marker is what tells the next start "we turned these off, bring
+    // them back", and everything that actually repairs an agent — the confirmation
+    // wait and the on-chain repair — runs later. A Ctrl+C during the 3-minute wait,
+    // a crash, or a repair that failed on a dry tank then left the next start with
+    // agents that read `inactive` and are NOT in the marker, so all of them were
+    // skipped and the process exited "No agents available to poll". Loud, but the
+    // automatic recovery was gone.
+    const _finishShutdownMarker = () => {
+      if (!_shutdownDeactivated.length) return;
       if (_reactivatedOnStart.length) {
         console.log(`↻  Reactivated ${_reactivatedOnStart.length}/${_shutdownDeactivated.length} agent(s) deactivated by the last shutdown`);
       }
-      const _unrestored = _shutdownDeactivated.filter(id => !_reactivatedOnStart.includes(id));
+      // An agent whose chain axis is still not active has NOT been fully restored,
+      // whatever the platform axis says — leave it in the marker so the next start
+      // tries again instead of skipping it.
+      const _stillBroken = new Set(
+        readyAgents.filter(a => _normStatus(a.chainStatus) === 'inactive').map(a => a.id),
+      );
+      const _unrestored = _shutdownDeactivated.filter(
+        id => !_reactivatedOnStart.includes(id) || _stillBroken.has(id),
+      );
       if (_unrestored.length === 0) clearShutdownDeactivated();
       else writeShutdownDeactivated(_unrestored, SHUTDOWN_DEACTIVATED_FILE, _shutdownDeactivateTxids);
-    }
+    };
 
     if (readyAgents.length === 0) {
       // Never send the operator to `register` for a fleet that is merely offline —
@@ -3618,6 +3706,14 @@ program
       _pendingWorkspace: new Map(), // jobId -> workspace connect promise
       _agentErrors: new Map(), // agentId -> last error string (health document)
       _containerCrashes: new Map(), // agentId -> unexpected-exit count (health document)
+      // agentId -> { txid, at } for the last identity write WE made. The inbox sweep
+      // created this lazily on its first fire (+60s), but the startup activation loop
+      // writes to it well inside that window — so `.set` threw, the outer catch
+      // reported a SUCCESSFUL on-chain write as "repair FAILED", and the operator was
+      // told to run `activate`, broadcasting a second identity tx on top of the
+      // unconfirmed first. That is the -25 double-spend this release exists to remove,
+      // triggered by our own error message.
+      _inboxLastWrite: new Map(),
       _inboxFailures: new Map(), // inbox itemId -> { attempts, deadLettered, lastError } — bounds accept retries (dead-letter)
       _resumeCursor: 0, // round-robin cursor for the poll-mode queued-resume sweep (Task 4)
       _proxyStarted: false, // true once the api-endpoint proxy is wired at boot; drives the heal-time "restart to activate proxy" notice
@@ -4455,10 +4551,32 @@ program
             if (!ai) { _left.delete(id); continue; }
             try {
               const sess = await getAgentSession(state, ai);
+              // Ask the question we actually care about — "has the chain axis gone
+              // inactive yet" — rather than only "does prevOutput equal the txid we
+              // recorded". The txid comparison alone never releases if ANY later
+              // identity write superseded that output (an operator `activate-all`
+              // after the 2026-08-06 strand, an `update-profile` while we were down),
+              // so it burned the full 3 minutes in exactly the recovery situations
+              // that are already confusing.
+              const prof = await sess.client.getAgent(ai.iAddress || ai.identity).catch(() => null);
+              const chainNow = chainAgentStatus(prof);
+              // REFRESH THE SNAPSHOT. This is the whole reason the wait is dangerous:
+              // `chainStatus` was read ~1000 lines above, and the wait exists
+              // precisely because the deactivate had not confirmed yet — so by the
+              // time it does, the snapshot says `active` while the chain says
+              // `inactive`. Planning against the stale value skipped the repair and
+              // left the agent unhireable with every local surface green. On a real
+              // upgrade the nine deactivates confirm at different times, so this
+              // produced a MIX of repaired and silently stranded agents.
+              if (chainNow) ai.chainStatus = chainNow;
+
               const raw = await sess.client.getIdentityRaw(ai.iAddress || ai.identity);
               const prevOut = raw?.data?.prevOutput?.txid || raw?.data?.txid || null;
-              if (prevOut && prevOut === _dtxids[id]) {
+              if (chainNow === 'inactive' || (prevOut && prevOut === _dtxids[id])) {
                 _left.delete(id);
+                // Definitionally inactive once the deactivate has landed, whichever
+                // signal told us.
+                ai.chainStatus = 'inactive';
                 console.log(`     ✓ ${id}: deactivate confirmed`);
               }
             } catch { /* transient — retry until the deadline */ }
@@ -4469,6 +4587,17 @@ program
           }
         }
         if (_left.size) {
+          // Do one last read so the plan below runs on the freshest chain axis we can
+          // get, rather than on a snapshot taken before a 3-minute wait.
+          for (const id of _left) {
+            const ai = readyAgents.find(a => a.id === id);
+            if (!ai) continue;
+            try {
+              const sess = await getAgentSession(state, ai);
+              const chainNow = chainAgentStatus(await sess.client.getAgent(ai.iAddress || ai.identity));
+              if (chainNow) ai.chainStatus = chainNow;
+            } catch { /* keep the snapshot; `unknown` never triggers a repair write */ }
+          }
           console.warn(`  ⚠️  ${_left.size} deactivate(s) still unconfirmed after 3 min — activating anyway. ` +
             'Any rejected activate is reported below; re-run `j41-dispatcher activate <id>` for those.');
         }
@@ -4504,6 +4633,38 @@ program
           // waited out above. It happens once — after it lands the chain reads
           // `active` and stays there, so later restarts write nothing.
           if (_plan.repairChain && agentInfo.chainStatus !== 'active') {
+            // Respect the pending-write gate before broadcasting — the shutdown
+            // deactivate does this and its startup twin did not, which is the exact
+            // asymmetry the C1 comment below criticises in 2.27.0. The inbox interval
+            // is registered BEFORE this loop and first fires at +60s, and an upgrade
+            // implies downtime, which is when reviews and attestations pile up — so a
+            // batched identity write for this agent landing moments before the repair
+            // is routine, not exotic. Two writes on one prevOutput is a -25.
+            const _pwr = state._inboxLastWrite.get(agentInfo.id);
+            if (_pwr && _pwr.txid) {
+              const _rdl = Date.now() + 90000;
+              let _rok = false;
+              while (Date.now() < _rdl) {
+                let prevOut = null; let height = null;
+                try {
+                  const raw = await agent.client.getIdentityRaw(agentInfo.iAddress || agentInfo.identity);
+                  prevOut = raw?.data?.prevOutput?.txid || raw?.data?.txid || null;
+                  height = raw?.data?.blockHeight ?? null;
+                } catch { /* can't tell — keep waiting until the deadline */ }
+                if (!shouldDeferForPendingWrite(_pwr, prevOut, height, Date.now()).defer) { _rok = true; break; }
+                await new Promise(r => setTimeout(r, 5000));
+                kickWatchdog?.(`awaiting pending write before repair ${agentInfo.id}`);
+              }
+              if (!_rok) {
+                console.warn(`  ⚠️  ${agentInfo.id}: a prior identity write is still unconfirmed — SKIPPING the ` +
+                  'on-chain repair this pass rather than risking a rejected write. ' +
+                  `It retries on the next start, or run: j41-dispatcher activate ${agentInfo.id}`);
+                state._agentErrors.set(agentInfo.id, 'chain status inactive — repair deferred (pending identity write)');
+                state.emitEvent?.('agent.online', { agentId: agentInfo.id, identity: agentInfo.identity });
+                continue;
+              }
+              state._inboxLastWrite.delete(agentInfo.id);
+            }
             try {
               const _rtx = await agent.setOnChainStatus('active');
               if (_rtx) {
@@ -4560,6 +4721,10 @@ program
         }
       }
     }
+
+    // Every agent has now been through activation (and repair, if it needed it), so
+    // the marker can finally be retired for the ones that genuinely came back.
+    _finishShutdownMarker();
 
     console.log('\n✅ Dispatcher running. Press Ctrl+C to stop.\n');
 
@@ -6796,6 +6961,28 @@ async function refundsApprove(state, jobId, opts = {}, ledgerPath) {
     return entry;
   }
 
+  // An inflight marker means a send FAILED AMBIGUOUSLY — a timeout or a dropped
+  // connection mid-broadcast — so the transaction may well be on-chain. Paying
+  // again to resolve that doubt is the one outcome that cannot be undone.
+  //
+  // `drainPendingRefunds` has always excluded these (`!readRefundInflight(id)`).
+  // Making `approved` retryable below opened a second door into the same send that
+  // did NOT carry the guard: an ambiguous failure leaves status `approved`, the job
+  // never enters refunded-jobs.json, the send lock has no live holder — so
+  // `refunds approve --all --yes` from a script sailed through every remaining check
+  // and re-broadcast. Reproduced during review. Before this fix the `approved`
+  // early-return happened to block it; the fix removed the accident, not the risk.
+  const _inflight = readRefundInflight(jobId);
+  if (_inflight) {
+    console.error(`[refunds] ⛔ REFUSED: ${jobId.substring(0, 8)} has an unresolved in-flight send.`);
+    console.error(`  A previous attempt failed in a way that cannot tell us whether ${_inflight.amount} ` +
+      `${_inflight.currency || 'VRSC'} reached ${_inflight.buyerAddress}.`);
+    if (_inflight.lastError) console.error(`  Last error: ${_inflight.lastError}`);
+    console.error('  Check that address on-chain. If the funds did NOT arrive:');
+    console.error(`    j41-dispatcher refunds unblock ${jobId}`);
+    return entry;
+  }
+
   // `approved` is NOT terminal. It means the owner said yes and the send has not
   // happened yet — which is now a routine outcome, because the rate limiter defers
   // a send past the hourly cap, the cooldown, or an API-outage suspension. Treating
@@ -6960,9 +7147,12 @@ async function refundsApproveAll(state, opts = {}, ledgerPath) {
   // refund_limits.max_sends_per_hour leaves exactly these behind, and without them
   // in the set a second `approve --all` reported "nothing to approve" while the
   // remainder sat unsent.
-  const pendingIds = Object.keys(ledger).filter(id => ledger[id].status === 'pending_approval'
-    || ledger[id].status === 'approved');
-  const retryCount = Object.keys(ledger).filter(id => ledger[id].status === 'approved').length;
+  // Exclude in-flight entries here too, so `--all` neither attempts them nor reports
+  // them as failures — they need the operator to check the chain and `unblock`.
+  const inflightIds = Object.keys(ledger).filter(id => readRefundInflight(id));
+  const pendingIds = Object.keys(ledger).filter(id => !readRefundInflight(id)
+    && (ledger[id].status === 'pending_approval' || ledger[id].status === 'approved'));
+  const retryCount = pendingIds.filter(id => ledger[id].status === 'approved').length;
   const skippedCount = Object.keys(ledger).filter(id => ledger[id].status === 'needs_review').length;
 
   if (pendingIds.length === 0) {
@@ -6973,6 +7163,10 @@ async function refundsApproveAll(state, opts = {}, ledgerPath) {
     return [];
   }
   if (retryCount > 0) console.log(`[refunds] ${retryCount} previously-approved entr(ies) still unsent — retrying those too.`);
+  if (inflightIds.length > 0) {
+    console.log(`[refunds] ⛔ ${inflightIds.length} entr(ies) SKIPPED — an earlier send failed ambiguously and may be on-chain.`);
+    console.log('[refunds]    Verify each on-chain, then: j41-dispatcher refunds unblock <jobId>');
+  }
   if (skippedCount > 0) console.log(`[refunds] Skipping ${skippedCount} needs_review entries.`);
 
   const results = [];
@@ -11733,7 +11927,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, setFinancialSuspended, loadSendHistory, SEND_HISTORY_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');

@@ -446,8 +446,19 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
     if (!live) continue; // someone else resolved it while we were awaiting
 
     if (seen !== null && seen >= 1) {
+      // If we already debited this one on a previous pass (crash between the meter
+      // write and the record removal) and the transaction has now CONFIRMED, the
+      // debit was wrong — the buyer funded it after all. Put the credit back before
+      // clearing the flag, or they are charged for a genuinely funded deposit.
+      if (live.reversing === true) {
+        creditDeposit(agentId, live.buyerVerusId, live.amount, live.txid);
+        console.warn(`[Deposits] ${agentId}: ${rec.txid.substring(0, 12)}… confirmed AFTER a partial reversal — ` +
+          `re-credited ${live.amount} VRSC to ${live.buyerVerusId}.`);
+        delete live.reversing;
+      }
       delete live.unconfirmed;
       delete live.misses;
+      delete live.firstMissAtMs;
       live.confirmations = seen;
       saveDeposits(agentId, fresh);
       confirmed++;

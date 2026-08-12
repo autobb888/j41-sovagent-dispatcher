@@ -329,3 +329,33 @@ test('deposits at or above the 2 VRSC tier are never flagged — they waited for
   const r = await reconcileUnconfirmedDeposits(agentId, client, Date.now() + RECONCILE_GRACE_MS + 1);
   assert.deepEqual([r.confirmed, r.reversed, r.waiting], [0, 0, 0]);
 });
+
+test('a partially-reversed credit whose tx later confirms is RE-CREDITED', () => {
+  // Reachable only when a crash lands between the meter debit and the record
+  // removal, and the tx — declared unknown to the chain for over 40 minutes — then
+  // actually confirms. Vanishingly rare, but the outcome was a buyer charged for a
+  // deposit they genuinely funded, which is the one direction that must never stand.
+  return (async () => {
+    const agentId = 'agent-reversed-then-confirms';
+    const buyer = 'buyerReversedThenConfirms@';
+    const { kp, txid } = await creditZeroConf(agentId, buyer);
+
+    // Simulate the crash: debited, stamped, record not yet removed.
+    const { reverseDeposit } = require('../src/credit-meter.js');
+    reverseDeposit(agentId, buyer, SMALL, txid);
+    const d = readDeposits(agentId);
+    d.processed.find(x => x.txid === txid).reversing = true;
+    fs.writeFileSync(depositsFile(agentId), JSON.stringify(d));
+    assert.equal(getBalance(agentId, buyer), 0);
+
+    // It confirms after all.
+    const client = mockClient(kp, buyer, async () => ({ confirmations: 4 }));
+    const r = await reconcileUnconfirmedDeposits(agentId, client, Date.now() + RECONCILE_GRACE_MS + 1);
+
+    assert.equal(r.confirmed, 1);
+    assert.equal(getBalance(agentId, buyer), SMALL, 'the wrongly-debited credit must come back');
+    const after = readDeposits(agentId).processed.find(x => x.txid === txid);
+    assert.equal(after.reversing, undefined);
+    assert.equal(after.unconfirmed, undefined);
+  })();
+});

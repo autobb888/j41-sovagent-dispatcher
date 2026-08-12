@@ -439,6 +439,20 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   // below settles through the SAME policy instead of its own.
   let settleActiveStream = null;
 
+  // ONE refund, whoever gets there first. A TCP reset mid-response fires BOTH
+  // `proxyReq.on('error')` (headers not yet sent → refunds, writes 502, which makes
+  // headersSent true) and then `proxyRes.on('error')` (its own local `settled` still
+  // false → refunds AGAIN). Reproduced during review: the buyer GAINED a full
+  // worst-case reservation of free credit. The two handlers each had a guard; neither
+  // guard was shared, which is the same "one control, two sites" shape as the
+  // streaming settle — fixed there in this release, missed here.
+  let _refunded = false;
+  const refundOnce = () => {
+    if (_refunded) return;
+    _refunded = true;
+    refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
+  };
+
   const proxyReq = transport.request(upstreamUrl.href, {
     method: 'POST',
     headers: {
@@ -601,13 +615,15 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         }
         if (!settled) {
           settled = true;
-          refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
+          refundOnce();
           releaseOnce();
         }
       });
       proxyRes.on('end', () => {
         if (settled) return;
         settled = true;
+        // Billing has happened; no later handler may hand the reservation back.
+        _refunded = true;
         const responseBody = Buffer.concat(chunks);
         let inputTok = estimatedInput;
         let outputTok = estimatedOutput;
@@ -687,7 +703,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
       return;
     }
     console.error(`[PROXY] Upstream error: ${err.message}`);
-    refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
+    refundOnce();
     releaseOnce();
     res.writeHead(502, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
     res.end(JSON.stringify({ error: 'Upstream endpoint unavailable' }));
@@ -696,7 +712,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   proxyReq.on('timeout', () => {
     proxyReq.destroy();
     if (res.headersSent || res.writableEnded) { releaseOnce(); return; }
-    refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
+    refundOnce();
     releaseOnce();
     res.writeHead(504, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
     res.end(JSON.stringify({ error: 'Upstream endpoint timed out' }));

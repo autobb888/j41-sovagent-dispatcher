@@ -119,6 +119,14 @@ function startUpstream() {
           res.writeHead(200, { 'Content-Type': 'text/event-stream' });
           res.write('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n');
           setTimeout(() => res.destroy(), 40);
+        } else if (upstreamMode === 'json-rst') {
+          // Non-streaming, RST mid-body. A plain FIN fires only proxyRes.on('error');
+          // a RESET fires proxyReq.on('error') FIRST (headers not yet sent → refund +
+          // 502) and then proxyRes.on('error') (its own guard still false → refund
+          // again). Two refunds, one reservation.
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': '9999' });
+          res.write('{"choices"');
+          setTimeout(() => { try { req.socket.resetAndDestroy(); } catch { res.destroy(); } }, 40);
         } else if (upstreamMode === 'stream-no-usage') {
           // Upstream ignores include_usage → never emits a usage frame.
           res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -497,4 +505,30 @@ test('M2r: a 503 that carries a usage frame still bills NOTHING', async () => {
   const remaining = getBalance(agentId, buyer);
   assert.ok(Math.abs(remaining - worst) < 1e-9,
     `an error is an error whether or not it reports usage; deposited=${worst} remaining=${remaining}`);
+});
+
+
+test('a non-streaming RST refunds the reservation ONCE, not twice', async () => {
+  // Found by adversarial review with a working repro: the buyer GAINED a full
+  // worst-case reservation of free credit. `proxyRes.on('error')` and
+  // `proxyReq.on('error')` each had a guard; neither guard was shared — the same
+  // "one control, two sites" shape this release fixed for the streaming settle and
+  // missed here.
+  inflight._reset();
+  upstreamMode = 'json-rst';
+  const agentId = 'agent-rst-double-refund';
+  const buyer = 'iBuyerRst';
+  const key = mintApiKey(agentId, buyer).key;
+  const maxTokens = 20000;
+  const deposit = calculateCost(PRICING, MODEL, 4000, maxTokens);
+  creditDeposit(agentId, buyer, deposit, 'tx-rst');
+
+  await runProxy(agentId, key, { model: MODEL, stream: false, max_tokens: maxTokens, messages: [] });
+  await new Promise((res) => setTimeout(res, 300));
+
+  const remaining = getBalance(agentId, buyer);
+  assert.ok(remaining <= deposit + 1e-9,
+    `a failed request must never leave the buyer richer; deposited=${deposit} remaining=${remaining}`);
+  assert.ok(Math.abs(remaining - deposit) < 1e-9,
+    `the reservation should be refunded exactly once; deposited=${deposit} remaining=${remaining}`);
 });

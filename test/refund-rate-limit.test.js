@@ -38,6 +38,7 @@ const {
   _resetDispatcherRateLimit,
   setFinancialSuspended,
   SEND_HISTORY_PATH,
+  FINANCIAL_SUSPENDED_PATH,
 } = require('../src/cli');
 
 const T0 = 1_700_000_000_000; // fixed clock — no wall-clock flake
@@ -217,11 +218,31 @@ test('the per-job lifetime cap survives a restart', () => {
   assert.match(r.reason, /Max sends per job/);
 });
 
-test('a corrupt history file fails OPEN, not closed', () => {
-  // This file bounds damage; it does not authorise anything. Refusing to send on an
+test('a corrupt history file fails OPEN for the COUNTERS', () => {
+  // Counters bound damage; they do not authorise anything. Refusing to send on an
   // unreadable counter would strand every owed refund behind a one-byte corruption.
-  const fs = require('node:fs');
   _resetDispatcherRateLimit();
   fs.writeFileSync(SEND_HISTORY_PATH, '{not json');
   assert.equal(checkDispatcherRateLimit('job-corrupt', 0.01, 100).allowed, true);
+});
+
+test('a corrupt history file does NOT lift an active outage suspension', () => {
+  // The suspension used to live inside the same JSON, so the fail-open default
+  // returned `suspendedAt: null` and one byte of corruption silently disarmed the
+  // kill-switch. A safety flag must not inherit a bookkeeping file's failure mode —
+  // it is now its own file, where existence IS the state.
+  _resetDispatcherRateLimit(true);
+  fs.writeFileSync(SEND_HISTORY_PATH, '{not json');
+  const r = checkDispatcherRateLimit('job-corrupt-suspended', 0.01, 100);
+  assert.equal(r.allowed, false, 'corruption must not disarm the suspension');
+  assert.match(r.reason, /suspended/);
+});
+
+test('the refusal names the file an operator can remove when the daemon is down', () => {
+  // setFinancialSuspended(false) is only ever called by the daemon sweep. With the
+  // daemon down there was no way to clear it and no hint that one was needed.
+  _resetDispatcherRateLimit(true);
+  assert.match(checkDispatcherRateLimit('job-escape', 0.01, 100).reason,
+    new RegExp(FINANCIAL_SUSPENDED_PATH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.equal(fs.existsSync(FINANCIAL_SUSPENDED_PATH), true);
 });

@@ -148,7 +148,54 @@ sub-2-VRSC deposit's worth of compute inside the grace window (inherent to the 0
 tier, now bounded rather than unbounded), and a crash with both axes left `active` can
 still land a hire on a dead agent (pre-existing, and the cutover does not widen it).
 
-1047 tests (+61). Every fix mutation-checked. Two lessons recorded rather than
+### Second review round — seven more, four of them regressions from the first round
+
+The fix commit was reviewed again. It had introduced three new defects and left
+four findings incompletely closed. This is the round that matters most, because it
+is where "we fixed it" stopped being true twice in a row.
+
+**A successful chain write reported as a failure, instructing a double-spend.**
+`state._inboxLastWrite` was created lazily by the inbox sweep, whose interval first
+fires 60 seconds in — long after the activation loop reaches every agent. So the
+repair broadcast, succeeded, then threw on recording it; the catch printed
+"repair FAILED … Run: j41-dispatcher activate <id>"; and an operator following that
+instruction broadcasts a second identity write on top of the unconfirmed first.
+Our own error message prescribing the exact `-25` this release exists to delete.
+
+**The repair read a snapshot the wait guarantees is stale.** `chainStatus` is
+captured ~1000 lines before the activation loop, and the confirmation wait in
+between exists precisely because the deactivate has not landed yet — so by the time
+it does, the snapshot says `active` while the chain says `inactive`, and the repair
+is skipped. Since the deactivates confirm at different times, a real upgrade
+produced a MIX of repaired and silently stranded agents. The wait now refreshes the
+snapshot and releases on the chain axis rather than on txid equality alone (which
+also never released once any later write superseded that output, burning the full
+three minutes in exactly the recovery cases that are already confusing).
+
+**Making `approved` retryable opened a double-send.** `drainPendingRefunds` has
+always excluded entries carrying an in-flight marker — that marker means a send
+failed *ambiguously* and may already be on-chain. `refundsApprove` had no such
+guard and never needed one while `approved` was terminal. Removing that accident
+exposed the missing check: `refunds approve --all --yes` re-broadcast. Reproduced
+by the reviewer. Both `approve` and `approve --all` now refuse in-flight entries and
+point at `refunds unblock`.
+
+Also closed: the repair now respects the pending-write gate (its shutdown twin had
+it; the startup twin did not — the same asymmetry a comment two commits earlier
+criticised); `_axisBlocks` blocks on any non-active, non-unknown value instead of an
+enumerated pair; the shutdown marker is retired only after activation, so an
+interruption no longer downgrades the self-heal to manual recovery; the counter file
+gained a cross-process lock; the outage suspension moved to its own file, because
+folded into the counters a one-byte corruption silently disarmed it; a non-streaming
+RST refunded the reservation twice and left the buyer richer; and a partially
+reversed deposit that later confirms is re-credited.
+
+1057 tests (+71). Every fix mutation-checked — and the second round is why that
+phrase now means something: seven mutations that the reviewer proved survived the
+first round's "mutation-checked" claim now fail. Three tests in this file had also
+silently stopped testing their subject, because they anchored on a distance from a
+call site and the new code was inserted in between. They anchor on guard
+expressions now. Two lessons recorded rather than
 smoothed over: the first round's mutation testing covered the pure function and not
 the call site, so reverting the two-axis read passed the entire suite; and two of the
 new proxy tests initially passed for the wrong reason, because a mock that destroyed

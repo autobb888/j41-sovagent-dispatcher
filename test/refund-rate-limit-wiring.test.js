@@ -184,3 +184,52 @@ test('a send that fails to BUILD does not consume the hourly budget', async () =
   await attemptPendingRefund(makeState(makeSession(sendCalls)), jid, e);
   assert.equal(sendCalls.length, 1, 'ten failed builds must not have spent the hourly budget');
 });
+
+// ── The double-send that making `approved` retryable opened up ───────────────
+//
+// Found by adversarial review, with a working repro. `drainPendingRefunds` has
+// always excluded entries carrying an in-flight marker (`!readRefundInflight(id)`),
+// because that marker means a send failed AMBIGUOUSLY — a timeout or a dropped
+// connection mid-broadcast — so the transaction may already be on-chain. Paying
+// again to resolve that doubt is the one outcome nobody can undo.
+//
+// `refundsApprove` had no such guard. It did not need one while `approved` was a
+// terminal state that returned early. Making it retryable (so rate-limit deferrals
+// could be retried) removed that accident and exposed the missing check: an
+// ambiguous failure leaves status `approved`, the job never reaches
+// refunded-jobs.json, and the send lock has no live holder — so every remaining
+// gate passes and `refunds approve --all --yes` re-broadcasts.
+
+const { refundsApprove, refundsApproveAll, markRefundInflight } = require('../src/cli.js');
+
+test('approve REFUSES an entry with an unresolved in-flight send', async () => {
+  reset();
+  const sendCalls = [];
+  const jobId = 'job-inflight-single';
+  const entry = { ...entryFor(1.0, 1.0), status: 'approved' };
+  fs.writeFileSync(PENDING_REFUNDS_PATH, JSON.stringify({ [jobId]: entry }));
+  markRefundInflight(jobId, { buyerAddress: 'iBuyerTest', amount: 1.0, currency: 'VRSC' });
+
+  await refundsApprove(makeState(makeSession(sendCalls)), jobId, { yes: true }, PENDING_REFUNDS_PATH);
+  assert.equal(sendCalls.length, 0,
+    'a send that may already be on-chain must never be re-broadcast by an approve');
+});
+
+test('approve --all SKIPS in-flight entries and says so', async () => {
+  reset();
+  const sendCalls = [];
+  const safeId = 'job-inflight-safe';
+  const riskyId = 'job-inflight-risky';
+  fs.writeFileSync(PENDING_REFUNDS_PATH, JSON.stringify({
+    [safeId]: { ...entryFor(1.0, 1.0), status: 'approved' },
+    [riskyId]: { ...entryFor(1.0, 1.0), status: 'approved' },
+  }));
+  markRefundInflight(riskyId, { buyerAddress: 'iBuyerTest', amount: 1.0, currency: 'VRSC' });
+
+  await refundsApproveAll(makeState(makeSession(sendCalls)), { yes: true }, PENDING_REFUNDS_PATH);
+
+  assert.equal(sendCalls.length, 1, 'exactly the non-inflight entry may send');
+  const refunded = JSON.parse(fs.readFileSync(REFUNDED_JOBS_PATH, 'utf8'));
+  assert.ok(refunded.includes(safeId), 'the safe entry was paid');
+  assert.ok(!refunded.includes(riskyId), 'the ambiguous entry was NOT paid');
+});

@@ -39,11 +39,71 @@ test('C1b: the shutdown deactivate uses the real confirmation gate, not a fixed 
 });
 
 test('C1c: the startup activation records its identity write', () => {
-  const i = CLI.indexOf("agent.activate({ onChain: _plan.onChain })");
-  assert.ok(i > -1, 'the activation call must exist');
-  const after = CLI.slice(i, i + 3500); // window must survive comments being added between
-  assert.match(after, /_inboxLastWrite\.set/,
+  // Anchor on the C1 recording's OWN guard, not on a window measured from the
+  // activate call. The window approach broke silently when the chain-repair block
+  // was inserted between them: the repair has its own `_inboxLastWrite.set` at
+  // +1367, so a 3500-char window matched THAT and stopped testing this. Widening
+  // the window is what caused it — the fix is to stop using distance as an anchor.
+  const i = CLI.indexOf('if (_toggleOnChain && result && result.onChainTxid) {');
+  assert.ok(i > -1, 'the C1 recording guard must exist');
+  assert.match(CLI.slice(i, i + 300), /_inboxLastWrite\.set/,
     'unrecorded, the first inbox sweep double-spends this prevOutput');
+});
+
+test('_inboxLastWrite exists before the activation loop can write to it', () => {
+  // It was created lazily inside the inbox sweep, whose interval first fires at
+  // +60s — well after the activation loop reaches every agent. The repair's
+  // `.set` therefore threw, the catch reported a SUCCESSFUL on-chain write as
+  // "repair FAILED", and the operator was told to run `activate` — broadcasting a
+  // second identity write on top of the unconfirmed first. Our own error message
+  // instructing the double-spend the release exists to remove.
+  const i = CLI.indexOf('const state = {');
+  assert.ok(i > -1);
+  assert.match(CLI.slice(i, i + 3000), /_inboxLastWrite: new Map\(\)/,
+    'must be initialized in the state literal, not lazily by a timer');
+});
+
+test('the chain-axis repair is GUARDED, gated, and recorded', () => {
+  // The highest-risk code in the release: it broadcasts a blockchain transaction.
+  // Pin the guard condition, not the identifier — `if (false && _plan.repairChain)`
+  // leaves every identifier in place while restoring the stranded-fleet bug, and
+  // the whole 1047-test suite passed against exactly that mutation.
+  const i = CLI.indexOf("if (_plan.repairChain && agentInfo.chainStatus !== 'active') {");
+  assert.ok(i > -1, 'the repair must be guarded on the plan AND a non-active chain axis');
+  const body = CLI.slice(i, i + 2600);
+  assert.match(body, /shouldDeferForPendingWrite/,
+    'broadcasting without the pending-write gate is the -25 double-spend');
+  // Pin the SOURCE of the gate value, not just the call. `const _pwr = null` leaves
+  // every identifier and the call site intact while disabling the gate entirely —
+  // a mutant that survived the first version of this assertion.
+  assert.match(body, /const _pwr = state\._inboxLastWrite\.get\(agentInfo\.id\)/,
+    'the gate must read the real pending write');
+  assert.match(body, /setOnChainStatus\('active'\)/, 'the repair must actually write');
+  assert.match(body, /_inboxLastWrite\.set/, 'the repair write must be recorded for the next sweep');
+});
+
+test('the startup read captures the chain axis from the profile, not a constant', () => {
+  // Hardcoding `_lastSeenChainStatus = 'active'` disables every downstream repair
+  // decision while leaving the variable, the field and the plan intact. This is the
+  // mutation class that motivated extracting planAgentActivation in the first place,
+  // and it still survived the extraction — because nothing pinned the READ.
+  assert.match(CLI, /_lastSeenChainStatus = chainAgentStatus\(profile\)/,
+    'the chain axis must come from the profile');
+  assert.match(CLI, /chainStatus: _lastSeenChainStatus \|\| 'unknown'/,
+    'and must be carried onto the agent record');
+});
+
+test('the confirmation wait REFRESHES the chain snapshot it invalidates', () => {
+  // The wait exists because the deactivate has not confirmed yet — so by the time
+  // it does, the snapshot read ~1000 lines earlier says `active` while the chain
+  // says `inactive`. Planning against the stale value skipped the repair and left
+  // the agent unhireable with every local surface green. On a real upgrade the
+  // deactivates confirm at different times, producing a MIX of repaired and
+  // silently stranded agents.
+  const i = CLI.indexOf('shutdown deactivate(s) to confirm');
+  const block = CLI.slice(i, i + 3000);
+  assert.match(block, /ai\.chainStatus = chainNow/, 'the snapshot must be refreshed during the wait');
+  assert.match(block, /ai\.chainStatus = 'inactive'/, 'a confirmed deactivate means the chain axis IS inactive');
 });
 
 test('C2/S9: the cleanup loop is non-reentrant and counts its skips', () => {
@@ -75,14 +135,13 @@ test('a failed on-chain activate is reported as a failure, not a tick', () => {
   // printed as "✅ active (on-chain txid: skipped)". The SDK returns null for a failed
   // write, so a null txid is a failure — and on-chain status is the lever backend's
   // hire gate reads, so hiding it means a hire can land on a stopped agent.
-  const i = CLI.indexOf("agent.activate({ onChain: _plan.onChain })");
-  assert.ok(i > -1, 'the activation call must exist');
-  const after = CLI.slice(i, i + 3500);
-  assert.match(after, /ON-CHAIN activate FAILED/, 'a rejected write must not read as success');
-  assert.match(after, /!\(result && result\.onChainTxid\)/, 'null txid IS the failure signal');
-  // And the chain axis must be repaired when it is stale, or the fleet is
-  // unhireable with every local surface reporting green (the 2.28.x upgrade case).
-  assert.match(after, /_plan\.repairChain/, 'a stale chain axis must be repaired, not ignored');
+  // Anchored on the guard itself, not on a distance from the activate call. Two
+  // tests in this file silently stopped testing their subject when the repair block
+  // was inserted and pushed it out of a fixed-size window — including this one.
+  const i = CLI.indexOf('if (_toggleOnChain && !(result && result.onChainTxid)) {');
+  assert.ok(i > -1, 'null txid IS the failure signal, and must be the guard condition');
+  assert.match(CLI.slice(i, i + 500), /ON-CHAIN activate FAILED/,
+    'a rejected write must not read as success');
 });
 
 test('startup waits for its own deactivates to CONFIRM before re-activating', () => {
@@ -95,11 +154,20 @@ test('startup waits for its own deactivates to CONFIRM before re-activating', ()
   // region is worse than none.
   const i = CLI.indexOf('shutdown deactivate(s) to confirm');
   assert.ok(i > -1, 'the self-collision guard must exist');
-  const block = CLI.slice(Math.max(0, i - 900), i + 1800);
+  // Pin the GUARD. `if (false && _pendingIds.length)` leaves the log line, the
+  // txid capture and the whole loop body in place while making the wait dead code
+  // again — which is how it stayed dead from 2.28.2 through two reviews.
+  assert.match(CLI, /\n      if \(_pendingIds\.length\) \{/,
+    'the wait must be guarded on real pending txids, not disabled in place');
+  const block = CLI.slice(Math.max(0, i - 900), i + 3400);
   // Per-TXID confirmation, not a wall-clock guess: a flat 75s wait left 5 of 9
   // activates rejected because Verus block time varies.
   assert.match(block, /const _dtxids = _shutdownDeactivateTxids/, 'the wait must read real txids');
   assert.match(block, /prevOut === _dtxids\[id\]/, 'confirmation is prevOutput matching the txid');
+  // Release on the real condition too. Txid equality alone never releases once any
+  // later identity write has superseded that output, so it burned the full three
+  // minutes in exactly the recovery situations that are already confusing.
+  assert.match(block, /chainNow === 'inactive'/, 'the wait must also release on the chain axis');
   assert.ok(!/_blockMs/.test(block), 'the wall-clock guess must be gone');
 
   // The txids MUST be captured before the marker-clearing block, which either

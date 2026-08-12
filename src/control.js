@@ -388,7 +388,16 @@ function buildFeeTank(state, agentId, now) {
  *  `unknown` does not block — it means "not checked yet", and treating absence of
  *  information as failure makes every cold start look like an outage. */
 function _axisBlocks(v) {
-  return v === 'inactive' || v === 'disabled';
+  // Anything that is not positively `active` and not `unknown` blocks. Listing only
+  // `inactive`/`disabled` contradicted the rule effectiveAgentStatus enforces — that
+  // an unrecognised value beats `active` — so the day the backend adds a blocking
+  // state (`suspended`, `throttled`, …) the hire gate would refuse work while
+  // /health reported ok. That "fleet unhireable, every surface green" shape is the
+  // one this whole area exists to make impossible, and it must not depend on us
+  // having enumerated the backend's vocabulary in advance.
+  if (v === undefined || v === null || v === '') return false;
+  const t = String(v).trim().toLowerCase();
+  return t !== 'active' && t !== 'unknown';
 }
 
 function buildHealthDocument(state, startedAt) {
