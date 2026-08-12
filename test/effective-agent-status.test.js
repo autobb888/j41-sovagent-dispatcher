@@ -24,6 +24,9 @@ const {
   chainAgentStatus,
   platformAgentStatus,
   planAgentActivation,
+  decidePlatformStatusSupport,
+  backendSupportsPlatformStatus,
+  PLATFORM_STATUS_FEATURE,
 } = require('../src/cli');
 
 test('inactive on the platform axis alone is inactive — the post-shutdown state', () => {
@@ -161,4 +164,63 @@ test('the on-chain opt-in never skips — the operator asked for the write', () 
   const plan = planAgentActivation({ platformStatus: 'active', chainStatus: 'active' }, { toggleOnChain: true });
   assert.equal(plan.skip, false);
   assert.equal(plan.onChain, true);
+});
+
+// ── The default must be earned from the backend, not assumed ────────────────
+//
+// 2.29.0 stops writing agent status on-chain for routine restarts. That is safe
+// ONLY against a backend whose hire gate ANDs `status` and `platform_status` and
+// whose indexer never overwrites the latter. Against an older one, a platform-set
+// `inactive` is reverted by the next re-index and a hire lands on a stopped agent
+// with no escrow. We publish to npm, so "our backend has it" is not a safety
+// argument for anyone else's install.
+//
+// Falling back to on-chain toggling is the fail-CLOSED direction: it is the pre-2.29
+// behaviour, works against any backend, and costs a noisy rejected write rather than
+// a buyer's money.
+
+test('a backend advertising the feature earns the on-chain-off default', () => {
+  const r = decidePlatformStatusSupport({ features: ['x', PLATFORM_STATUS_FEATURE, 'y'] });
+  assert.equal(r.supported, true);
+});
+
+test('a backend WITHOUT the feature keeps on-chain writes on', () => {
+  assert.equal(decidePlatformStatusSupport({ features: ['signing.canonical-v1'] }).supported, false);
+});
+
+test('every unreadable answer fails CLOSED, never open', () => {
+  // The dangerous direction is deciding "no on-chain write needed" on bad evidence.
+  for (const v of [null, undefined, {}, { features: null }, { features: 'nope' }, 'garbage', 42]) {
+    assert.equal(decidePlatformStatusSupport(v).supported, false,
+      `${JSON.stringify(v)} must not be read as support`);
+  }
+});
+
+test('the reason is always populated, so the warning can say why', () => {
+  for (const v of [null, {}, { features: [] }]) {
+    assert.ok(decidePlatformStatusSupport(v).reason,
+      'an operator seeing on-chain writes stay on must be told what we could not confirm');
+  }
+});
+
+test('an unreachable backend fails CLOSED — the async wrapper, not just the decider', async () => {
+  // The pure decider was covered; its catch was not. A mutant returning
+  // `supported: true` from the catch survived the suite — which would mean a
+  // dispatcher that cannot reach the platform at startup decides, on that basis,
+  // that it is safe to stop writing on-chain status. Exactly backwards.
+  const r = await backendSupportsPlatformStatus('http://127.0.0.1:1');
+  assert.equal(r.supported, false);
+  assert.match(r.reason, /could not read \/v1\/version/);
+});
+
+test('a backend that answers with garbage fails CLOSED too', async () => {
+  const http = require('node:http');
+  const srv = http.createServer((_, res) => { res.writeHead(200, {'Content-Type':'application/json'}); res.end('<html>nope'); });
+  await new Promise(r => srv.listen(0, '127.0.0.1', r));
+  try {
+    const r = await backendSupportsPlatformStatus(`http://127.0.0.1:${srv.address().port}`);
+    assert.equal(r.supported, false);
+  } finally {
+    await new Promise(r => srv.close(r));
+  }
 });

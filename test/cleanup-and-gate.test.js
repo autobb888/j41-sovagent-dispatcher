@@ -293,3 +293,17 @@ test('every activation error branch marks the pass, so none is silently cleared'
   assert.match(CLI, /if \(!_errorRecordedThisPass\)\s*\{\s*\n\s*state\._agentErrors\.delete/,
     'the clear must be guarded on the flag');
 });
+
+test('the on-chain default is derived from the backend, and env still overrides', () => {
+  // Pin the wiring, not just the helper: the helper being correct is worthless if
+  // the call site ignores it. Both explicit env values must still win — an operator
+  // who knows their situation outranks our probe.
+  const i = CLI.indexOf("const _envToggle = process.env.J41_STATUS_TOGGLE_ONCHAIN;");
+  assert.ok(i > -1, 'the toggle must read the env var');
+  const body = CLI.slice(i, i + 1400);
+  assert.match(body, /_envToggle === '1' \|\| _envToggle === '0'/, 'both explicit values override');
+  assert.match(body, /await backendSupportsPlatformStatus\(J41_API_URL\)/,
+    'otherwise the default is asked of the backend');
+  assert.match(body, /_toggleOnChain = !_sup\.supported/,
+    'and an unsupported/unknown backend keeps on-chain writes ON');
+});

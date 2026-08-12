@@ -4564,7 +4564,22 @@ program
       // genuine long-term deactivation, which is what the explicit `activate` /
       // `deactivate` commands do (unchanged — they still write on-chain).
       // J41_STATUS_TOGGLE_ONCHAIN=1 opts a restart back into the on-chain write.
-      const _toggleOnChain = process.env.J41_STATUS_TOGGLE_ONCHAIN === '1';
+      // Derived from what the backend can actually guarantee, not assumed.
+      const _envToggle = process.env.J41_STATUS_TOGGLE_ONCHAIN;
+      let _toggleOnChain;
+      if (_envToggle === '1' || _envToggle === '0') {
+        _toggleOnChain = _envToggle === '1';
+        console.log(`  (J41_STATUS_TOGGLE_ONCHAIN=${_envToggle} — on-chain status writes ` +
+          `${_toggleOnChain ? 'ENABLED' : 'disabled'} by explicit operator setting)`);
+      } else {
+        const _sup = await backendSupportsPlatformStatus(J41_API_URL);
+        _toggleOnChain = !_sup.supported;
+        if (!_sup.supported) {
+          console.warn(`  ⚠️  ${_sup.reason} — keeping on-chain status writes ON for this restart.`);
+          console.warn('     Without the platform_status AND-gate a platform-set `inactive` is reverted ' +
+            'by the next re-index, and a hire can land on a stopped agent. There is no escrow.');
+        }
+      }
 
       // Startup has no stall watchdog. The one the next two call sites reached for
       // is `const kickWatchdog` declared INSIDE gracefulShutdown, so
@@ -4578,7 +4593,7 @@ program
       // signal handlers, and never set startupComplete (so /health stayed green).
       // A zombie, on exactly the fleet upgrade this release exists to perform.
       const noteStartupProgress = (label) => console.log(`     … ${label}`);
-      console.log(`\n→ Setting agents active${_toggleOnChain ? ' (plus on-chain — J41_STATUS_TOGGLE_ONCHAIN=1)' : ''}...`);
+      console.log(`\n→ Setting agents active${_toggleOnChain ? ' (plus on-chain)' : ''}...`);
       // Our OWN shutdown deactivate is the thing this collides with. Stop writes
       // N deactivates on-chain; start writes N activates seconds later against the
       // same prevOutputs, before any of them can confirm — so every activate is
@@ -5850,6 +5865,42 @@ async function readDisputePolicyFor(agent) {
   const { decodeContentMultimap } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
   const decoded = decodeContentMultimap(identity.contentmultimap);
   return decoded?.disputePolicy || null;
+}
+
+
+// ── Does this backend actually have the platform_status AND-gate? ───────────
+//
+// 2.29.0 stops writing agent status on-chain for routine restarts. That is only
+// safe if the platform's hire gate ANDs `status` AND `platform_status`, and its
+// indexer never overwrites the latter. Against an OLDER backend the platform-set
+// `inactive` is reverted by the next re-index and a hire lands on a stopped agent
+// with no escrow — the exact failure the 2.19.0 revert existed to prevent.
+//
+// We ship on npm, so "our backend has it" is not a safety argument for someone
+// else's install. Backend advertises the capability now, so ask instead of assume.
+//
+// Fail-CLOSED here means falling back to on-chain toggling: that is the pre-2.29
+// behaviour, it works against any backend, and its cost is a noisy rejected write
+// rather than a buyer's money.
+const PLATFORM_STATUS_FEATURE = 'agent.platform-status-v1';
+
+function decidePlatformStatusSupport(version) {
+  const feats = version && Array.isArray(version.features) ? version.features : null;
+  if (!feats) return { supported: false, reason: '/v1/version returned no feature list' };
+  if (!feats.includes(PLATFORM_STATUS_FEATURE)) {
+    return { supported: false, reason: `backend does not advertise ${PLATFORM_STATUS_FEATURE}` };
+  }
+  return { supported: true, reason: `backend advertises ${PLATFORM_STATUS_FEATURE}` };
+}
+
+async function backendSupportsPlatformStatus(apiUrl) {
+  try {
+    const { J41Client } = require('@junction41/sovagent-sdk/dist/index.js');
+    return decidePlatformStatusSupport(await new J41Client({ apiUrl }).request('GET', '/v1/version'));
+  } catch (e) {
+    // Unreachable or unparseable is NOT permission to skip the on-chain write.
+    return { supported: false, reason: `could not read /v1/version (${String(e.message || e).slice(0, 80)})` };
+  }
 }
 
 // ── Which of an agent's two status axes actually gates a hire ────────────────
@@ -12060,7 +12111,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
