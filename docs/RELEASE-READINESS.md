@@ -1,65 +1,126 @@
 # Dispatcher — release readiness
 
-**Date:** 2026-08-10 (updated — all audit highs closed)
-**Assessed build:** 2.24.0, 971 tests, 9-agent fleet on VRSCTEST
-**Verdict: still NOT shippable, but for a different reason than a week ago.** The
-1 critical and all 17 high findings from the eight domain audits are fixed. What blocks
-release now is coverage, not known defects: ~40 mediums are untriaged, one high is only
-partially fixed, and the full operator lifecycle has never been run end to end.
+**Date:** 2026-08-13
+**Assessed build:** 2.29.0 (`fe0abb0`), 1066 tests, live on a 9-agent VRSCTEST fleet
+**Verdict: shippable to npm for the paths that have been exercised. The operator
+lifecycle is still the one gate that has never been walked end to end.**
 
 ---
 
-## What changed since the audits
+## What changed since the last assessment (2.24.0)
 
-| Rel | Findings closed |
+The `platform_status` cutover shipped and was **proven on the live fleet on
+2026-08-12**. Backend deployed migration 058 (hire gate ANDs `status` and
+`platform_status`; the indexer never writes the latter), so the dispatcher stopped
+writing agent status on-chain for routine restarts.
+
+The upgrade restart, executed:
+
+| | result |
 |---|---|
-| 2.20.0 | **K1 (crit)** key destruction · **D1** unrunnable npm install · **L3** 4th dispute clock · **X1** bounty arg swap |
-| 2.21.0 | **F1/F2/F3/F7** the four first-run fail-opens |
-| 2.22.0 | **M1/M2** proxy billed for upstream errors · **I1 (partial)** file traversal · **I2** symlink write |
-| 2.23.0 | **L2** invisible container crashes · **L1** shutdown fleet-strand · **K2** `init` key downgrade |
-| 2.24.0 | **S3** deposit nonce/rate-limit · **S1** the scale remedy that killed your fleet |
+| agents restored from the shutdown marker | 9/9 |
+| chain-axis repairs, one per agent | 9/9, all confirmed |
+| **rejected on-chain writes** | **0** (previous three restarts: 9, then 5, then 3) |
+| both axes active afterwards | 9/9 hireable |
 
-Two of these are worth remembering beyond the fix:
+It also repaired two agents that were **already broken before the restart**:
+`agent-6` and `agent-7` were `chain=inactive, platform=active`, so the hire gate was
+silently refusing them while every local surface said healthy — `agent-7` reported
+`lastError: None`. That is the exact failure mode this release exists to remove, found
+and fixed in production.
 
-- **L2** means `summary.containers_unhealthy` — the README's canonical "tell me when
-  anything is wrong" watch — had **never been able to fire** in the Docker runtime. It
-  now reports, and the live fleet immediately went `degraded` on real crashes that were
-  previously discarded.
-- **K1** only fired *after* an operator ran `encrypt-keys`. The hardening we recommend
-  was what created the exposure.
+Also shipped: **M3** (the outbound-refund rate limit, which had been documented for
+months with zero callers — none of the four guarantees existed), **M2r** (proxy
+billing: a real `completion_tokens: 0` no longer bills a flat estimate, errors bill
+nothing on both paths, and the three settle sites now share one policy), and a static
+scope checker.
 
-## Still open, ranked
+**Deferred deliberately: M4**, the 0-conf deposit reconciler, on
+`feature/m4-deposit-reconcile`. See "Why M4 was cut" below.
 
-**I1-residual (high, partial).** A downloaded file is verified to have landed inside
-the job directory and removed if it escaped — but it exists briefly at the escaped path
-first, and a broker poll could read it. The durable fix is broker-side: act only on
-request files the host itself created. **This is the one genuinely unfinished high.**
+## What is proven versus merely tested
 
-**~40 mediums, untriaged.** Distribution: trust-boundary 7, liveness 8, scale 7,
-isolation 5, docs-truth 5, money 3, keys 2, first-run 3. Triage is the next task.
+**Proven live:** the upgrade restart; the chain repair; the confirmation wait (dead
+code in every prior version); the `/v1/version` capability check; dispute → rework →
+re-delivery; orphaned-dispute respawn; refund escalation end-to-end; bounty `/select`
+under signature enforcement; fee-tank sweep.
 
-**~45 lows.** Mostly documentation drift.
+**Tested, not yet exercised in production:** the refund rate limiter's blocking paths
+(no backlog has hit the hourly cap since it was wired); the proxy settle changes (they
+only fire on upstream misbehaviour); the wedged-startup `/health` degrade.
 
-## The gate that has not moved
+**Neither:** see the gate below.
 
-The full operator lifecycle — clean install → register → encrypt keys → dashboard start
-→ take a job → restart mid-job → confirm the fleet returns — **has still never been run
-start to finish by anyone.** Two audits (first-run, docs-truth) found four highs in
-exactly that path, including an install that could not produce a runnable dispatcher.
-Until someone walks it on a clean machine, "shippable" is an assertion, not a finding.
+## The gate that still has not moved
 
-## What the audits taught, worth keeping
+The full operator lifecycle — **clean install → register → encrypt keys → start from
+the dashboard → take a job → restart mid-job → confirm the fleet returns** — has still
+never been run start to finish by anyone. We have now done the restart half on a
+warm fleet, which is real progress and is the half that was scariest. The install and
+first-run half remains untested since the four first-run highs were fixed in 2.21.0.
 
-Four independent domains reported the same defect shape: **a control that exists in
-this codebase, correctly implemented, simply not applied at a second site.**
-`O_NOFOLLOW` on the read path but not the write. `checkNonceAfterVerify` on one route
-but not its neighbour — with the attack documented in the same file. A rate limit
-whose comment says it prevents amplification DoS, on one of two adjacent routes. A
-scan on arrival but not on re-entry.
+Until someone walks it on a clean machine, "a new operator can run this" is an
+assertion.
 
-Every one of those was cheap to fix once named. The cheap systemic defence is a
-"where else does this pattern appear?" pass whenever a control is added — which is now
-encoded as a derived test for the encryption guard, and should be for the others.
+## Why M4 was cut, and what it needs before it lands
+
+M4 was a third of the release's source diff and produced roughly a quarter of every
+defect found across five adversarial review rounds: an uninterpretable-response
+reversal, a route-404 misread, a crash double-claw, a systemic guard that protected
+only the last record of each pass, and two distinct ways of minting credit. What it
+closes is a ≤2 VRSC-per-event leak that has existed for months with nobody exploiting
+it, while the genuinely time-sensitive cutover had been stable for three rounds.
+Bundling them meant the proven urgent work was gated on the unproven risky work.
+
+Blocking items on that branch:
+
+1. **Node-lag false positives.** Backend confirmed `TX_NOT_FOUND` is tx-specific and
+   distinguishable from a route 404 — but it reflects *that node's current view*. A
+   node behind the tip reports it for a transaction that really landed. Node-down is a
+   safe 502; node-lag is a 404 that would claw back a paying buyer. The reversal path
+   must require a caught-up node, not just the grace window.
+2. **`needsOperator` and the `reversed` ledger are write-only.** Nothing reads them —
+   not `/health`, not the control API, not the dashboard, not any CLI command. Every
+   ambiguous-money path in that branch escalates to a console line.
+3. **No execution harness.** Its defects survived three rounds of people reading the
+   code and fell in one pass to a reviewer who built a harness and ran it. That harness
+   should exist before M4 re-lands.
+
+## What five review rounds actually taught
+
+34 defects across five adversarial rounds, and **the majority were introduced by the
+previous round's fixes.** That is the finding that outlasts any individual bug:
+
+- **Fix the class, not the instance.** A guard that protected only the last record of
+  a pass. A restore that assumed a reversal meant a debit. A traversal check that was
+  lexical when it needed `realpath`.
+- **Execute the fix; do not just write it.** Three separate defects were lines
+  referencing state that did not exist (`_inboxLastWrite`, `state.startedAt`,
+  a `has()`-guarded `delete()`), none of which had ever been run.
+- **Source-text assertions are theatre.** Tests that grep for an identifier pass
+  against `if (false)`. Pin the guard expression, and pin it to a unique anchor —
+  three tests in one file silently stopped testing their subject when new code was
+  inserted between their anchor and their target.
+- **Chunk by concern.** Four concerns in one release is why each round's fixes landed
+  on top of each other.
+
+## Known-open, not blocking
+
+| # | Finding | Why it can wait |
+|---|---|---|
+| N1 | `performCleanup` writes the job record from a snapshot taken at container start | Broker mode (the default) defers to the host inbox processor and is immune |
+| N2 | `_budgetGateHit` only reset on `_agentLoop` entry | Latent until the jailbox is re-enabled. **Will bite the day it is.** |
+| N3 | Fork mode double-handles post-delivery IPC | `--dev-unsafe` gated, but dev then differs from prod |
+| N4 | `events.jsonl` has no single-writer guard | Only reachable during a contested restart |
+| N5 | pid-file reuse: SIGTERM sent without verifying the pid | Environmental |
+| N6 | File-IPC read-then-unlink race | Milliseconds wide; retry now possible |
+| N7 | Rate-limit check reads `send-history.json` outside its lock | Bounded overshoot (~2 concurrent processes); the durable no-double-pay guarantee is elsewhere |
+
+## Recommendation
+
+Publish 2.29.0. Then walk the operator lifecycle on a clean machine — that is the
+remaining gate and it has been outstanding for the whole cycle. M4 lands after the
+harness exists and its two blocking items are closed.
 
 ---
 

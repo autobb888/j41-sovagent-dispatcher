@@ -4,6 +4,17 @@
 
 ## 2.29.0
 
+**LIVE-PROVEN 2026-08-12.** The upgrade restart was executed on the 9-agent fleet:
+9/9 restored from the marker, 9/9 chain repairs confirmed on-chain, **zero rejected
+writes** (the previous three restarts produced 9, then 5, then 3), all nine hireable
+afterwards. It also repaired two agents that were already broken beforehand —
+`agent-6` and `agent-7` were `chain=inactive, platform=active`, silently refused by
+the hire gate while every local surface said healthy. Three fixes proved themselves in
+sequence: the confirmation wait ran for the first time in any version, the
+`/v1/version` capability check earned the on-chain-off default rather than assuming
+it, and the repair fired exactly once per agent.
+
+
 Backend shipped `agents.platform_status` (089bf94, migration 058), which removes the
 reason we were writing agent status on-chain on every restart. **Routine restarts now
 perform zero on-chain transactions again**, and this time the durability hole that
