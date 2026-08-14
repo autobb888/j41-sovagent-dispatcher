@@ -305,15 +305,19 @@ test('the audit trim must not discard an unresolved mid-credit record', async ()
   // erase the sole evidence that anyone needs to look — so open records are
   // exempt from the cap even when that pushes the log one over.
   const agentId = 'agent-trim-exempt';
-  const stuckTxid = 'tx_stuck_' + crypto.randomBytes(6).toString('hex');
 
-  const processed = [{
-    txid: stuckTxid,
-    buyerVerusId: 'buyer-stuck@',
-    amount: 2,
-    crediting: true,
-    intentAt: new Date(Date.now() - 30 * 86400_000).toISOString(),
-  }];
+  // All three open states, at the head of the log where the trim bites first.
+  // `unconfirmed` matters as much as `crediting`: trimming a credit the
+  // reconciler is still tracking silently retires it, and the claw-back can
+  // never happen. `needsOperator` is the only record of a balance a human must
+  // check. None of them may be dropped for size.
+  const openTxids = { crediting: 'tx_stuck_c', unconfirmed: 'tx_stuck_u', needsOperator: 'tx_stuck_n' };
+  const processed = [
+    { txid: openTxids.crediting, buyerVerusId: 'buyer-stuck@', amount: 2, crediting: true, intentAt: new Date(Date.now() - 30 * 86400_000).toISOString() },
+    { txid: openTxids.unconfirmed, buyerVerusId: 'buyer-open@', amount: 1.5, confirmations: 0, unconfirmed: true, creditedAtMs: Date.now() - 3600_000, misses: 2 },
+    { txid: openTxids.needsOperator, buyerVerusId: 'buyer-amb@', amount: 1, confirmations: 3, needsOperator: 'balance may be off' },
+  ];
+  const stuckTxid = openTxids.crediting;
   for (let i = 1; i < 1000; i++) {
     processed.push({
       txid: `tx_pad_${i}`,
@@ -336,6 +340,10 @@ test('the audit trim must not discard an unresolved mid-credit record', async ()
   assert.ok(after.processed.some((d) => d.txid === stuckTxid && d.crediting),
     'the unresolved mid-credit record was trimmed away — the only evidence that a ' +
     'buyer\'s balance may be wrong is now gone');
+  assert.ok(after.processed.some((d) => d.txid === openTxids.unconfirmed && d.unconfirmed),
+    'an open 0-conf credit was trimmed away — the reconciler can never claw it back now');
+  assert.ok(after.processed.some((d) => d.txid === openTxids.needsOperator && d.needsOperator),
+    'a record flagged for operator review was trimmed away');
 });
 
 test('a meter write that fails after the intent is recorded reports honestly', async () => {

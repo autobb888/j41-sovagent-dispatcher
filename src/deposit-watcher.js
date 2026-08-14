@@ -18,7 +18,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { creditDeposit } = require('./credit-meter');
+const { creditDeposit, reverseDeposit } = require('./credit-meter');
 const { clampCredit } = require('./deposit-credit.js');
 const { loadDispatcherConfig } = require('./config-loader.js');
 const { checkNonceAfterVerify } = require('./nonce-cache');
@@ -156,6 +156,7 @@ function _normalizeDeposits(d) {
   const out = d && typeof d === 'object' ? d : {};
   if (!Array.isArray(out.processed)) out.processed = [];
   if (!Array.isArray(out.pending)) out.pending = [];
+  if (!Array.isArray(out.reversed)) out.reversed = [];
   if (!Array.isArray(out.creditedTxids)) {
     out.creditedTxids = out.processed.map((r) => r && r.txid).filter(Boolean);
   }
@@ -180,17 +181,24 @@ function _rememberCreditedTxid(deposits, txid) {
   }
 }
 
+/** An open money question: the record is not finished being decided. */
+function _isOpenRecord(r) {
+  return !!(r && (r.crediting || r.unconfirmed || r.needsOperator));
+}
+
 /**
  * Trim the audit log, never the unresolved.
  *
- * A record still marked `crediting` is an open money question — it means the
- * meter may or may not have moved — so it is exempt from the cap. Dropping one
- * would erase the only evidence that a human needs to look.
+ * A record still marked `crediting`, `unconfirmed` or `needsOperator` is an open
+ * money question — the meter may or may not have moved, or the reconciler has
+ * not finished deciding — so it is exempt from the cap. Dropping one would erase
+ * the only evidence that a human needs to look, and in the `unconfirmed` case
+ * would silently retire a credit the reconciler was still tracking.
  */
 function _trimProcessed(deposits) {
   if (deposits.processed.length <= PROCESSED_AUDIT_CAP) return;
-  const open = deposits.processed.filter((r) => r && r.crediting);
-  const settled = deposits.processed.filter((r) => !(r && r.crediting));
+  const open = deposits.processed.filter(_isOpenRecord);
+  const settled = deposits.processed.filter((r) => !_isOpenRecord(r));
   const keep = Math.max(0, PROCESSED_AUDIT_CAP - open.length);
   deposits.processed = [...open, ...settled.slice(-keep)];
 }
@@ -202,7 +210,7 @@ function _trimProcessed(deposits) {
  *
  * @param deposits - a FRESHLY loaded snapshot (never one that predates an await)
  */
-function _recordCreditIntent(agentId, deposits, { txid, buyerVerusId, amount, confirmations }) {
+function _recordCreditIntent(agentId, deposits, { txid, buyerVerusId, amount, confirmations, unconfirmed }) {
   deposits.processed.push({
     txid,
     buyerVerusId,
@@ -210,8 +218,15 @@ function _recordCreditIntent(agentId, deposits, { txid, buyerVerusId, amount, co
     confirmations,
     crediting: true,
     intentAt: new Date().toISOString(),
+    // M4: credited straight out of the mempool. A mempool transaction is not
+    // money — flag it so the reconciler comes back and either confirms it or
+    // takes the credit away. `creditedAtMs` anchors the block-denominated grace.
+    ...(unconfirmed ? { unconfirmed: true, creditedAtMs: Date.now(), misses: 0 } : {}),
   });
   deposits.pending = deposits.pending.filter((d) => d.txid !== txid);
+  // This txid may have been reversed earlier and is now being credited afresh.
+  // Settle that ledger entry or _recheckReversals will credit it AGAIN.
+  _settleReversedForTxid(deposits, txid, 'credited afresh');
   _rememberCreditedTxid(deposits, txid);
   _trimProcessed(deposits);
   saveDeposits(agentId, deposits);
@@ -450,6 +465,7 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
     // sees. Same two-phase shape the reversal path uses (`debiting`/`debited`).
     _recordCreditIntent(agentId, fresh, {
       txid, buyerVerusId, amount: credited, confirmations: txStatus.confirmations,
+      unconfirmed: required === 0 && (txStatus.confirmations || 0) < 1,
     });
     committed = true; // the txid is durably claimed from here on
 
@@ -492,6 +508,565 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
   }
 }
 
+// ── M4: reconcile 0-conf credits ────────────────────────────────────────────
+//
+// `requiredConfirmations` returns 0 below 2 VRSC, so a small deposit is credited
+// out of the mempool for instant proxy access. That is a deliberate UX call and
+// it matches the platform's own tiering — but it was one-way. The credit was
+// written and nothing ever went back to ask whether the funding transaction
+// actually got mined. A mempool tx can be evicted, replaced, or never mined at
+// all, and the buyer keeps the credit either way. Repeatable with a fresh txid
+// each time, for free.
+//
+// The reconciler is deliberately biased toward KEEPING the credit. Reversing a
+// legitimate buyer's balance is worse than a delayed clawback, so every
+// ambiguous input — an unreachable platform, an unreadable response, an
+// unrecognised error, a lagging node — leaves the credit standing.
+const RECONCILE_MIN_MISSES = 3;
+// Misses must also SPAN this long. Three polls is three minutes, which a routine
+// backend deploy window can supply on its own — and a deploy is precisely when
+// the tx-status route is most likely to answer wrongly.
+const RECONCILE_MISS_SPAN_MS = 10 * 60 * 1000;
+// The grace is denominated in BLOCKS, not wall time. "30 minutes elapsed" is
+// satisfied by a frozen node that ingested nothing; "this node ingested 30
+// blocks while staying at its peers' tip and still says the txid does not
+// exist" is actual evidence. Same reasoning as shouldDeferForPendingWrite in
+// inbox-deadletter.js, whose comment says outright that wall-clock windows lie
+// about chain progress. ~30 blocks is ~30 min at Verus' ~60s target.
+const RECONCILE_MIN_ADVANCE_BLOCKS = 30;
+// How long a REVERSED credit stays eligible for automatic restoration if its
+// transaction turns up on-chain after all. A reversal is our judgement call on
+// incomplete evidence, so it has to be revisitable.
+const REVERSAL_RECHECK_WINDOW_MS = 24 * 60 * 60 * 1000;
+// Pre-port 0-conf credits carry no `unconfirmed` flag, so the reconciler cannot
+// see them. Adopt the recent ones; anything older than this is past any
+// plausible mempool lifetime, and re-litigating it on a node whose txindex may
+// have been pruned risks reversing a credit that was genuinely funded.
+const RECONCILE_BACKFILL_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+// Blast-radius cap. A backend fault that answers TX_NOT_FOUND for every txid
+// while the node reports itself synced would otherwise reverse every open
+// credit on the fleet at once. The systemic guard catches that within a single
+// agent's pass; this catches it across agents and across passes.
+const REVERSAL_BUDGET_WINDOW_MS = 60 * 60 * 1000;
+const REVERSAL_BUDGET_MAX = 10;
+
+const _recentReversals = []; // epoch ms, module-wide (i.e. fleet-wide)
+
+function _reversalBudgetAvailable(now) {
+  while (_recentReversals.length && now - _recentReversals[0] > REVERSAL_BUDGET_WINDOW_MS) {
+    _recentReversals.shift();
+  }
+  return _recentReversals.length < REVERSAL_BUDGET_MAX;
+}
+
+/**
+ * Does the backend advertise a transaction-specific not-found code?
+ *
+ * Fails CLOSED: no flag, no reachable /v1/version, no answer at all → we
+ * classify nothing as strong evidence and never reverse. That is the correct
+ * money direction, but it is also SILENT — an inert reconciler looks exactly
+ * like a working one, and reproduces the very leak this exists to close. The
+ * caller logs the state; `reconcilerState()` exposes it.
+ *
+ * Uses the SDK's cached helper (5-minute TTL) rather than a bare fetch: this
+ * runs per-agent per-poll, and an uncached /v1/version GET on each pass would
+ * hammer the platform for an answer that changes on deploys.
+ */
+async function _strongCodeSupported() {
+  try {
+    const { hasFeature } = require('@junction41/sovagent-sdk/dist/backend-features.js');
+    return (await hasFeature(loadDispatcherConfig().platform.api_url, 'tx.status-notfound-code')) === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * How much does this lookup failure tell us?
+ *
+ *   'strong' — the platform was asked about THIS txid and said it does not exist.
+ *   null     — tells us nothing (connection refused, 5xx, a timeout, a bare 404).
+ *
+ * Match the CODE, not the message text. The earlier version also matched a set
+ * of message regexes and treated a bare 404 as a weaker tier of evidence; both
+ * are gone. A bare 404 is what a renamed route or a proxy mid-deploy answers
+ * with, identically for every txid, and a tier that lets it move money is a
+ * tier that empties every open credit during a deploy. `TX_NOT_FOUND` is a
+ * published contract now, gated on the feature flag, so the guesswork is
+ * unnecessary.
+ */
+function _classifyLookupFailure(err, strongCodeSupported) {
+  if (!strongCodeSupported) return null;
+  return String((err && err.code) || '') === 'TX_NOT_FOUND' ? 'strong' : null;
+}
+
+/**
+ * Is this node's view of the chain trustworthy enough to take money on?
+ *
+ * A node behind the tip returns "transaction not found" for a transaction that
+ * really landed. Node-down is a safe 5xx; node-lag is a 404 that debits a buyer
+ * who genuinely paid — so the verdict is only admissible from a node that says
+ * it is caught up.
+ *
+ * Every clause earns its place:
+ *   - `longestChain > 0` — Komodo-lineage daemons report 0 before peer heights
+ *     are polled, and `anyHeight >= 0` is trivially true. The backend restarts
+ *     daily, so this state is reached routinely, and without this clause an
+ *     arbitrarily-behind node reads as perfectly synced.
+ *   - `connections > 0` — an isolated node's `longestChain` is just its own
+ *     stale tip agreeing with itself.
+ *   - `testnet` match — a node pointed at the wrong chain, or with a corrupt
+ *     txindex, is "synced" by every height test and still answers TX_NOT_FOUND
+ *     for every genuinely-landed txid.
+ *
+ * What it does NOT catch: an eclipsed node whose peers are all stale. There is
+ * no tip timestamp in the response, so tip age cannot be computed client-side;
+ * backend-attested sync would close it and is the right long-term answer.
+ */
+function _syncedView(ci, network) {
+  if (!ci) return false;
+  const h = Number(ci.blockHeight);
+  const lc = Number(ci.longestChain);
+  if (!Number.isFinite(h) || !Number.isFinite(lc) || h <= 0 || lc <= 0) return false;
+  if (!(Number(ci.connections) > 0)) return false;
+  if (h < lc) return false;
+  if (typeof ci.testnet === 'boolean' && ci.testnet !== (network !== 'verus')) return false;
+  return true;
+}
+
+async function _chainInfo(client) {
+  try {
+    const ci = await client.getChainInfo();
+    return ci && ci.data ? ci.data : ci;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Mark any open `reversed` ledger entry for this txid as settled, because some
+ * OTHER path just credited it.
+ *
+ * A reversed txid is deliberately removed from the dedup ledger so a buyer whose
+ * payment did confirm can re-report it. The orphaned ledger entry would then
+ * still look restorable, and _recheckReversals would credit it a second time.
+ */
+function _settleReversedForTxid(deposits, txid, reason) {
+  let touched = false;
+  for (const r of deposits.reversed || []) {
+    if (r && r.txid === txid && !r.restoredAt) {
+      r.restoredAt = new Date().toISOString();
+      r.resolvedBy = reason;
+      touched = true;
+    }
+  }
+  return touched;
+}
+
+/** Clear a miss run's stamps. Every one of them, every time — see below. */
+function _clearMissRun(rec) {
+  // `firstMissHeight` MUST be cleared everywhere `firstMissAtMs` is. The stamp
+  // idiom is `if (!rec.firstMissHeight)`, so a stale value left behind by a
+  // flapping index makes the next run's "30 blocks have passed" test true
+  // immediately, and the block grace silently degrades to nothing.
+  delete rec.misses;
+  delete rec.firstMissAtMs;
+  delete rec.firstMissHeight;
+}
+
+/**
+ * Adopt 0-conf credits minted before this code existed.
+ *
+ * They carry `confirmations: 0` but no `unconfirmed` flag, so the reconciler's
+ * filter cannot see them and they would never be reconciled at all. Bounded to
+ * recent ones on purpose; the older tail is reported rather than silently
+ * written off, because "we decided not to" and "we never noticed" prescribe
+ * different actions.
+ */
+function _backfillPrePortZeroConf(agentId, deposits, now) {
+  let opened = 0;
+  let tooOld = 0;
+  for (const rec of deposits.processed) {
+    if (!rec || rec.unconfirmed || rec.crediting || rec.confirmations !== 0) continue;
+    if (rec.reconcileBackfillSkipped) continue;
+    const at = Date.parse(rec.creditedAt || '');
+    if (!Number.isFinite(at)) { rec.reconcileBackfillSkipped = true; tooOld++; continue; }
+    if (now - at > RECONCILE_BACKFILL_MAX_AGE_MS) { rec.reconcileBackfillSkipped = true; tooOld++; continue; }
+    rec.unconfirmed = true;
+    rec.creditedAtMs = at;
+    rec.misses = 0;
+    opened++;
+  }
+  if (opened || tooOld) {
+    saveDeposits(agentId, deposits);
+    if (tooOld) {
+      console.warn(`[Deposits] ${agentId}: ${tooOld} pre-existing 0-conf credit(s) are older than the ` +
+        'backfill window and will NOT be reconciled — they predate the reconciler and are past any ' +
+        'plausible mempool lifetime. Audit them by hand if the balances look wrong.');
+    }
+    if (opened) {
+      console.log(`[Deposits] ${agentId}: adopted ${opened} pre-existing 0-conf credit(s) for reconciliation`);
+    }
+  }
+  return { opened, tooOld };
+}
+
+/**
+ * Reconcile every open 0-conf credit for one agent.
+ *
+ * @returns {{confirmed:number, reversed:number, waiting:number, restored:number, state:string}}
+ */
+async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
+  const network = loadDispatcherConfig().platform.network;
+
+  const seed = loadDeposits(agentId);
+  _backfillPrePortZeroConf(agentId, seed, now);
+  const deposits = loadDeposits(agentId);
+  const open = deposits.processed.filter((d) => d && d.unconfirmed);
+  if (open.length === 0) {
+    // No OPEN credits, but a reversal may still be waiting to be undone — and a
+    // reversal is precisely the state in which nothing is open any more.
+    const restoredOnly = await _recheckReversals(agentId, client, now);
+    return { confirmed: 0, reversed: 0, waiting: 0, restored: restoredOnly, state: 'idle' };
+  }
+
+  const strongCodeSupported = await _strongCodeSupported();
+
+  // ── Gate: is this node's word worth acting on? ───────────────────────────
+  // Taken after the early-return so idle agents cost nothing.
+  const ciBefore = await _chainInfo(client);
+  if (!_syncedView(ciBefore, network)) {
+    // A lagging, unreachable, isolated or wrong-chain node produces ZERO
+    // evidence. No miss increments, no persistence — an outage cannot
+    // accumulate its way to a reversal one pass at a time.
+    const restoredOnly = await _recheckReversals(agentId, client, now);
+    return { confirmed: 0, reversed: 0, waiting: open.length, restored: restoredOnly, state: 'inert-unsynced' };
+  }
+
+  let confirmed = 0, reversed = 0, waiting = 0;
+
+  // ── Phase 1: LOOK UP EVERYTHING, decide nothing ──────────────────────────
+  // The systemic check compares each record against the whole pass, so the whole
+  // pass must exist before any record is judged. Doing both in one loop makes
+  // the guard true only for the LAST record of each pass, which is not a guard.
+  const lookups = [];
+  for (const rec of open) {
+    let seen = null;
+    let strength = null;
+    let transient = false;
+    try {
+      const st = await client.getTxStatus(rec.txid);
+      seen = st && Number.isFinite(st.confirmations) ? st.confirmations : null;
+      // The call RESOLVED but we could not read a confirmation count out of it —
+      // an empty body, `{}`, a stringified count, a re-wrapped `{data:{…}}`.
+      // A backend response-shape change must not claw back every open credit.
+      if (seen === null) transient = true;
+    } catch (e) {
+      strength = _classifyLookupFailure(e, strongCodeSupported);
+      if (!strength) transient = true;
+    }
+    lookups.push({ rec, seen, strength, transient });
+  }
+
+  // ── Phase 2: is this about the transactions, or about the backend? ───────
+  // A backend fault answers identically for EVERY txid; a genuinely dropped
+  // transaction is isolated among its peers. A txindex wipe or rebuild returns
+  // a tx-specific TX_NOT_FOUND for everything while the node sits happily at
+  // its peers' tip, so this is judged over the STRONG class — the class that
+  // can actually move money.
+  const strongMisses = lookups.filter((l) => l.strength === 'strong').length;
+  if (lookups.length > 1 && strongMisses === lookups.length) {
+    console.error(`[Deposits] ${agentId}: all ${lookups.length} open 0-conf lookups returned TX_NOT_FOUND ` +
+      'identically — treating as a backend-side fault, not as evidence about any transaction. Nothing counted.');
+    const restoredOnly = await _recheckReversals(agentId, client, now);
+    return { confirmed: 0, reversed: 0, waiting: lookups.length, restored: restoredOnly, state: 'systemic' };
+  }
+
+  // Second half of the bracket. The gate is a self-report sampled at one instant;
+  // the lookups happened after it. Re-sampling detects a node that restarted,
+  // fell behind, or was swapped mid-pass, for the price of one public GET.
+  const ciAfter = await _chainInfo(client);
+  const stillSynced = _syncedView(ciAfter, network)
+    && Number(ciAfter.blockHeight) >= Number(ciBefore.blockHeight);
+  // The most conservative height available across the whole pass.
+  const passHeight = stillSynced
+    ? Math.min(Number(ciBefore.blockHeight), Number(ciAfter.blockHeight))
+    : null;
+
+  // ── Phase 3: act, one record at a time ───────────────────────────────────
+  for (const { rec, seen, strength, transient } of lookups) {
+    if (transient) {
+      waiting++;
+      continue;
+    }
+
+    // Re-load per record: crediting/reversing is a write, and other paths write
+    // `processed` too.
+    const fresh = loadDeposits(agentId);
+    const live = fresh.processed.find((d) => d && d.txid === rec.txid && d.unconfirmed);
+    if (!live) continue; // someone else resolved it while we were awaiting
+
+    if (seen !== null && seen >= 1) {
+      if (live.reversal === 'debited') {
+        // We know the meter was debited and the tx has now confirmed, so the
+        // debit was wrong — the buyer funded it after all. Clear the flag and
+        // persist FIRST: a lost re-credit leaves the buyer short by a recorded
+        // amount an operator can see, whereas a repeated re-credit silently
+        // mints money on every subsequent pass.
+        live.reversal = 'recredited';
+        saveDeposits(agentId, fresh);
+        creditDeposit(agentId, live.buyerVerusId, live.amount, live.txid);
+        console.warn(`[Deposits] ${agentId}: ${rec.txid.substring(0, 12)}… confirmed AFTER a completed reversal — ` +
+          `re-credited ${live.amount} VRSC to ${live.buyerVerusId}.`);
+        delete live.reversal;
+      } else if (live.reversal) {
+        // 'debiting' (crashed between the intent stamp and the debit) or
+        // 'recredited' (crashed between the flag write and the credit). We
+        // cannot tell whether the money moved, and this is a confirmed,
+        // genuinely funded deposit — so do NOT guess. Stop and ask a human.
+        live.needsOperator = `reversal state '${live.reversal}' when the tx confirmed — balance may be off by ${live.amount}`;
+        delete live.reversal;
+        console.error(`[Deposits] ${agentId}: ⚠️  ${rec.txid.substring(0, 12)}… confirmed while a reversal was ` +
+          `mid-flight. We CANNOT tell whether ${live.amount} VRSC was debited from ${live.buyerVerusId}. ` +
+          'No money moved. Check the meter against the chain and correct it by hand.');
+      }
+      delete live.unconfirmed;
+      _clearMissRun(live);
+      live.confirmations = seen;
+      saveDeposits(agentId, fresh);
+      confirmed++;
+      console.log(`[Deposits] ${agentId}: 0-conf credit ${rec.txid.substring(0, 12)}… confirmed at ${seen} block(s)`);
+      continue;
+    }
+
+    if (seen === 0) {
+      // Still in the mempool. It exists; keep waiting and reset the miss run.
+      if (live.misses || live.firstMissAtMs || live.firstMissHeight) {
+        _clearMissRun(live);
+        live.misses = 0;
+        saveDeposits(agentId, fresh);
+      }
+      waiting++;
+      continue;
+    }
+
+    // strength === 'strong': the platform says the chain does not know this txid.
+    //
+    // A `reversing` stamp from a previous pass means we may already have debited
+    // the meter and died before clearing the record. 'debited' is proof;
+    // 'debiting' only proves we INTENDED to — the stamp is written before the
+    // debit precisely so a crash is recoverable, which means it cannot also
+    // stand as evidence that the debit ran. Treat the ambiguous case as already
+    // debited: forgiving ≤2 VRSC beats debiting a buyer twice.
+    const alreadyDebited = live.reversal === 'debited' || live.reversal === 'debiting';
+    live.misses = (live.misses || 0) + 1;
+    if (!live.firstMissAtMs) live.firstMissAtMs = now;
+    if (!live.firstMissHeight) live.firstMissHeight = passHeight || Number(ciBefore.blockHeight);
+
+    const missRunLongEnough = live.misses >= RECONCILE_MIN_MISSES
+      && now - live.firstMissAtMs >= RECONCILE_MISS_SPAN_MS;
+    // The substance of the gate: this node ingested ≥30 blocks, stayed at its
+    // peers' tip at BOTH ends of the pass, and still says the txid does not
+    // exist. A frozen node satisfies the wall clock and never satisfies this.
+    const blocksAdvanced = passHeight !== null && Number.isFinite(live.firstMissHeight)
+      ? passHeight - live.firstMissHeight
+      : -1;
+    const pastBlockGrace = blocksAdvanced >= RECONCILE_MIN_ADVANCE_BLOCKS;
+
+    if (!alreadyDebited && !(stillSynced && missRunLongEnough && pastBlockGrace)) {
+      saveDeposits(agentId, fresh);
+      waiting++;
+      continue;
+    }
+
+    if (!alreadyDebited && !_reversalBudgetAvailable(now)) {
+      // More reversals in the last hour than any plausible organic rate. Stop
+      // and say so rather than working through the fleet one buyer at a time.
+      live.needsOperator = 'reversal withheld: fleet reversal budget exhausted — ' +
+        'suspected backend-side fault, check before clearing';
+      saveDeposits(agentId, fresh);
+      waiting++;
+      console.error(`[Deposits] ${agentId}: ⛔ reversal budget exhausted (${REVERSAL_BUDGET_MAX} in the last hour). ` +
+        `Withholding the reversal of ${live.amount} VRSC for ${live.buyerVerusId} and flagging for review. ` +
+        'This usually means the backend is wrong, not that every buyer stopped paying at once.');
+      continue;
+    }
+
+    let debitCertain = false;
+    if (!alreadyDebited) {
+      // Persist the intent BEFORE the irreversible debit, so a crash in between
+      // is recoverable rather than a guess.
+      live.reversal = 'debiting';
+      saveDeposits(agentId, fresh);
+      reverseDeposit(agentId, live.buyerVerusId, live.amount, live.txid);
+      live.reversal = 'debited';
+      saveDeposits(agentId, fresh);
+      debitCertain = true;
+      _recentReversals.push(now);
+    } else {
+      console.warn(`[Deposits] ${agentId}: ${live.txid.substring(0, 12)}… was mid-reversal at the last crash — ` +
+        'completing the bookkeeping without debiting again.');
+    }
+
+    fresh.processed = fresh.processed.filter((d) => d.txid !== live.txid);
+    // Out of the dedup ledger too, and release the in-process claim: the credit
+    // is gone, so a buyer whose payment DID confirm must be able to re-report
+    // it. _recordCreditIntent settles the ledger entry when they do, and
+    // _recheckReversals re-adds the txid if it restores automatically — so
+    // exactly one of the two paths can ever credit it.
+    fresh.creditedTxids = fresh.creditedTxids.filter((t) => t !== live.txid);
+    releaseTxid(agentId, live.txid);
+    fresh.reversed = fresh.reversed || [];
+    fresh.reversed.push({
+      txid: live.txid,
+      buyerVerusId: live.buyerVerusId,
+      amount: live.amount,
+      creditedAt: live.creditedAt,
+      reversedAt: new Date().toISOString(),
+      reason: 'funding transaction never confirmed and is unknown to the chain',
+      // Did the meter ACTUALLY move? Only `true` licenses an automatic restore.
+      // The forgiveness branch above reaches here having deliberately NOT
+      // debited, so a ledger entry exists for a buyer who was never charged;
+      // restoring that on a later confirmation credits them a second time.
+      debited: debitCertain,
+    });
+    if (fresh.reversed.length > 1000) {
+      const open2 = fresh.reversed.filter((r) => r && (!r.restoredAt || r.needsOperator));
+      const settled = fresh.reversed.filter((r) => !(r && (!r.restoredAt || r.needsOperator)));
+      fresh.reversed = [...open2, ...settled.slice(-Math.max(0, 1000 - open2.length))];
+    }
+    saveDeposits(agentId, fresh);
+    reversed++;
+    console.error(`[Deposits] ${agentId}: ⛔ REVERSED ${live.amount} VRSC of credit for ${live.buyerVerusId} — ` +
+      `funding tx ${live.txid.substring(0, 12)}… never confirmed and the chain does not know it. ` +
+      'If the buyer disputes this, check the txid on-chain before re-crediting.');
+  }
+
+  // ── Phase 4: was a reversal wrong? ───────────────────────────────────────
+  const restored = await _recheckReversals(agentId, client, now);
+
+  if (confirmed || reversed || restored) {
+    console.log(`[Deposits] ${agentId}: reconciled 0-conf credits — ${confirmed} confirmed, ${reversed} reversed, ` +
+      `${restored} restored, ${waiting} still open`);
+  }
+  return {
+    confirmed, reversed, waiting, restored,
+    state: strongCodeSupported ? (stillSynced ? 'armed' : 'inert-unsynced') : 'inert-no-flag',
+  };
+}
+
+/**
+ * Restore a reversed credit whose transaction later confirmed.
+ *
+ * Bounded by REVERSAL_RECHECK_WINDOW_MS and idempotent via `restoredAt`. Only
+ * ever acts on a POSITIVE confirmation, which is trustworthy from any node — so
+ * unlike the reversal path this needs no sync gate. An unknown or unreachable
+ * lookup leaves the reversal standing.
+ */
+async function _recheckReversals(agentId, client, now = Date.now()) {
+  const d = loadDeposits(agentId);
+
+  // A `restoring` stamp that survived a restart means we crashed between the
+  // intent and the credit. Whether the buyer got their money back is unknowable
+  // from here, and the entry is excluded from the candidate filter below — so
+  // without this it would be terminal and invisible, which is the exact failure
+  // the intent stamp was introduced to prevent.
+  let flagged = false;
+  for (const r of d.reversed) {
+    if (r && r.restoring && !r.needsOperator) {
+      r.needsOperator = `restore was interrupted (stamped ${r.restoringAt}) — ` +
+        `check whether ${r.buyerVerusId} received ${r.amount} back`;
+      flagged = true;
+      console.error(`[Deposits] ${agentId}: ⚠️  restore of ${String(r.txid).substring(0, 12)}… was interrupted. ` +
+        `Cannot tell whether ${r.amount} VRSC went back to ${r.buyerVerusId}. Check the meter by hand.`);
+    }
+  }
+  if (flagged) saveDeposits(agentId, d);
+
+  const candidates = (d.reversed || []).filter((r) => {
+    if (!r || r.restoredAt || r.restoring || !r.txid) return false;
+    const at = Date.parse(r.reversedAt || '');
+    return Number.isFinite(at) && now - at <= REVERSAL_RECHECK_WINDOW_MS;
+  });
+  if (candidates.length === 0) return 0;
+
+  let restored = 0;
+  for (const cand of candidates) {
+    // Only an entry we KNOW debited may be restored automatically. `debited:
+    // false` means the reversal forgave an ambiguous crash and never charged
+    // the buyer; crediting it back would hand them the deposit twice.
+    // `undefined` is an entry written before this field existed — same
+    // treatment, because we cannot tell.
+    if (cand.debited !== true) {
+      const fresh0 = loadDeposits(agentId);
+      const e0 = (fresh0.reversed || []).find((r) => r && r.txid === cand.txid && !r.restoredAt);
+      if (e0 && !e0.needsOperator) {
+        e0.needsOperator = 'reversed without a certain debit, and the tx later confirmed — ' +
+          `check whether ${e0.buyerVerusId} is owed ${e0.amount}`;
+        saveDeposits(agentId, fresh0);
+        console.error(`[Deposits] ${agentId}: ⚠️  reversed tx ${String(cand.txid).substring(0, 12)}… has confirmed, ` +
+          'but we cannot prove the reversal ever debited. No money moved. Check the meter by hand.');
+      }
+      continue;
+    }
+    let confs = null;
+    try {
+      const st = await client.getTxStatus(cand.txid);
+      confs = st && Number.isFinite(st.confirmations) ? st.confirmations : null;
+    } catch {
+      continue; // no news is not good news, and not bad news either
+    }
+    if (confs === null || confs < 1) continue;
+
+    const fresh = loadDeposits(agentId);
+    const live = (fresh.reversed || []).find((r) => r && r.txid === cand.txid && !r.restoredAt && !r.restoring);
+    if (!live) continue;
+
+    // Intent, money, settle — the same three-step the credit path uses.
+    // Stamping `restoredAt` before crediting and calling it done was the old
+    // shape, and a crash in between excluded the entry from every future pass:
+    // the buyer's money gone, no flag, no reader, while the ledger asserted
+    // they had been made whole. `restoring` is distinguishable from finished.
+    live.restoring = true;
+    live.restoringAt = new Date(now).toISOString();
+    saveDeposits(agentId, fresh);
+
+    creditDeposit(agentId, live.buyerVerusId, live.amount, live.txid);
+
+    const settle = loadDeposits(agentId);
+    const entry = (settle.reversed || []).find((r) => r && r.txid === cand.txid && r.restoring);
+    if (entry) {
+      delete entry.restoring;
+      delete entry.restoringAt;
+      entry.restoredAt = new Date(now).toISOString();
+      entry.resolvedBy = 'automatic restore — the funding tx confirmed after all';
+    }
+    // Back into the dedup ledger. The reversal took it out so the buyer could
+    // re-report; now that we have credited it ourselves, a re-report must not
+    // credit it a second time. Without this the sequence reverse → auto-restore
+    // → buyer re-reports the same confirmed txid credits twice.
+    if (!settle.processed.some((r) => r && r.txid === cand.txid)) {
+      settle.processed.push({
+        txid: cand.txid,
+        buyerVerusId: live.buyerVerusId,
+        amount: live.amount,
+        confirmations: confs,
+        creditedAt: new Date(now).toISOString(),
+        restoredFromReversal: true,
+      });
+    }
+    _rememberCreditedTxid(settle, cand.txid);
+    _trimProcessed(settle);
+    saveDeposits(agentId, settle);
+
+    restored++;
+    console.warn(`[Deposits] ${agentId}: ↩️  RESTORED ${live.amount} VRSC to ${live.buyerVerusId} — ` +
+      `reversed tx ${String(live.txid).substring(0, 12)}… has confirmed (${confs} block(s)) after all. ` +
+      'The reversal was wrong; the credit is back.');
+  }
+  return restored;
+}
+
 /**
  * Poll pending deposits and credit any that have reached required confirmations.
  * Called periodically by the dispatcher's polling loop.
@@ -500,6 +1075,16 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
  * @param client - Authenticated J41Client
  */
 async function pollPendingDeposits(agentId, client) {
+  // Reconcile first. This is the only caller, so a 0-conf credit that never
+  // lands is only ever clawed back from here — and unlike the pending sweep it
+  // must run even when `pending` is empty, because a 0-conf credit is not
+  // pending, it is already credited.
+  try {
+    await reconcileUnconfirmedDeposits(agentId, client);
+  } catch (e) {
+    console.warn(`[Deposits] ${agentId}: reconcile pass failed (${e.message}) — credits left standing`);
+  }
+
   const deposits = loadDeposits(agentId);
   if (deposits.pending.length === 0) return;
 
@@ -722,4 +1307,4 @@ async function notifyJ41CreditLow(sellerWif, sellerVerusId, buyerVerusId, balanc
   }
 }
 
-module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
+module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, _recheckReversals, _settleReversedForTxid, _classifyLookupFailure, _syncedView, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_MIN_ADVANCE_BLOCKS, REVERSAL_RECHECK_WINDOW_MS, REVERSAL_BUDGET_MAX, PROCESSED_AUDIT_CAP, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
