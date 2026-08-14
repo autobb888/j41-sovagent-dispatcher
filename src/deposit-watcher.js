@@ -131,6 +131,114 @@ function depositsPath(agentId) {
   return path.join(AGENTS_DIR, agentId, 'deposits.json');
 }
 
+// ── The dedup ledger is not the audit log ───────────────────────────────────
+// `processed` serves two masters: it is the human-readable record of what was
+// credited, and it is the ONLY thing stopping a txid being credited twice.
+// Trimming it for size silently trimmed the dedup, so a deposit older than
+// PROCESSED_AUDIT_CAP could be re-reported and credited again.
+//
+// `creditedTxids` is the dedup ledger proper: txid strings only, so it holds an
+// order of magnitude more history for a fraction of the bytes, and it is what
+// claimTxid consults. Records may age out of the audit log; the txid does not
+// age out of the dedup ledger with it.
+const PROCESSED_AUDIT_CAP = 1000;
+const CREDITED_TXID_CAP = 10000;
+
+/**
+ * Fill in structure a caller can rely on, and migrate older files in place.
+ *
+ * A deposits.json written before `creditedTxids` existed has its ledger seeded
+ * from whatever `processed` still holds — the best reconstruction available.
+ * Anything the old trim already discarded is unrecoverable and stays that way;
+ * this stops the bleeding rather than pretending to undo it.
+ */
+function _normalizeDeposits(d) {
+  const out = d && typeof d === 'object' ? d : {};
+  if (!Array.isArray(out.processed)) out.processed = [];
+  if (!Array.isArray(out.pending)) out.pending = [];
+  if (!Array.isArray(out.creditedTxids)) {
+    out.creditedTxids = out.processed.map((r) => r && r.txid).filter(Boolean);
+  }
+  return out;
+}
+
+/** True if this txid has ever been credited (or is mid-credit) on this agent. */
+function _hasCreditedTxid(deposits, txid) {
+  if (!deposits) return false;
+  if (Array.isArray(deposits.creditedTxids) && deposits.creditedTxids.includes(txid)) return true;
+  return Array.isArray(deposits.processed) && deposits.processed.some((d) => d && d.txid === txid);
+}
+
+function _rememberCreditedTxid(deposits, txid) {
+  if (!deposits.creditedTxids.includes(txid)) deposits.creditedTxids.push(txid);
+  if (deposits.creditedTxids.length > CREDITED_TXID_CAP) {
+    const dropped = deposits.creditedTxids.splice(0, deposits.creditedTxids.length - CREDITED_TXID_CAP);
+    // Loud on purpose. Past this horizon a re-reported deposit CAN be credited
+    // twice, and a silent cap would make that look like it never happened.
+    console.warn(`[Deposits] dedup ledger full — ${dropped.length} oldest txid(s) evicted; ` +
+      'a deposit older than that horizon could be re-reported and credited again');
+  }
+}
+
+/**
+ * Trim the audit log, never the unresolved.
+ *
+ * A record still marked `crediting` is an open money question — it means the
+ * meter may or may not have moved — so it is exempt from the cap. Dropping one
+ * would erase the only evidence that a human needs to look.
+ */
+function _trimProcessed(deposits) {
+  if (deposits.processed.length <= PROCESSED_AUDIT_CAP) return;
+  const open = deposits.processed.filter((r) => r && r.crediting);
+  const settled = deposits.processed.filter((r) => !(r && r.crediting));
+  const keep = Math.max(0, PROCESSED_AUDIT_CAP - open.length);
+  deposits.processed = [...open, ...settled.slice(-keep)];
+}
+
+/**
+ * Phase 1 of a credit: durably claim the txid before any money moves.
+ *
+ * Throws if the write fails, and that is the point — no record, no credit.
+ *
+ * @param deposits - a FRESHLY loaded snapshot (never one that predates an await)
+ */
+function _recordCreditIntent(agentId, deposits, { txid, buyerVerusId, amount, confirmations }) {
+  deposits.processed.push({
+    txid,
+    buyerVerusId,
+    amount,
+    confirmations,
+    crediting: true,
+    intentAt: new Date().toISOString(),
+  });
+  deposits.pending = deposits.pending.filter((d) => d.txid !== txid);
+  _rememberCreditedTxid(deposits, txid);
+  _trimProcessed(deposits);
+  saveDeposits(agentId, deposits);
+}
+
+/**
+ * Phase 3: the money moved, so settle the record.
+ *
+ * Best-effort by design. If this save fails the record stays `crediting`, which
+ * reads as "a human must check" — wrong in the harmless direction, since the
+ * txid is already in the dedup ledger and cannot be credited again.
+ */
+function _finalizeCredit(agentId, txid) {
+  try {
+    const d = loadDeposits(agentId);
+    const rec = d.processed.find((r) => r && r.txid === txid && r.crediting);
+    if (!rec) return;
+    delete rec.crediting;
+    delete rec.intentAt;
+    rec.creditedAt = new Date().toISOString();
+    saveDeposits(agentId, d);
+  } catch (e) {
+    console.error(`[Deposits] ${agentId}: credited tx ${String(txid).substring(0, 12)}… but could not ` +
+      `finalize its record (${e.message}). It stays flagged mid-credit; the credit itself did land.`);
+  }
+}
+
 // ── Audit M4: per-(agent,txid) atomic credit claim ──────────────────────────
 // The per-report nonce only dedups IDENTICAL reports. Two differently-nonced
 // reports for the SAME txid — or a report racing the poller — both load
@@ -156,7 +264,19 @@ function _claimKey(agentId, txid) { return `${String(agentId).length}:${agentId}
 function claimTxid(agentId, txid, deposits) {
   const k = _claimKey(agentId, txid);
   if (_claimsInProgress.has(k)) return false;
-  if (deposits && deposits.processed && deposits.processed.some((d) => d.txid === txid)) return false;
+  if (_hasCreditedTxid(deposits, txid)) {
+    // A record left in `crediting` is a crash between the intent and its
+    // finalization: the meter may or may not have moved. Refusing is the safe
+    // half (never credit twice); saying so is the other half, because the only
+    // way to settle it is for a human to compare the meter against the chain.
+    const open = deposits.processed.find((d) => d && d.txid === txid && d.crediting);
+    if (open) {
+      console.error(`[Deposits] ${agentId}: tx ${String(txid).substring(0, 12)}… is stuck mid-credit ` +
+        `(intent recorded ${open.intentAt}, never finalized). Refusing to credit again. ` +
+        'Check the buyer\'s meter against the chain — the credit may or may not have landed.');
+    }
+    return false;
+  }
   _claimsInProgress.add(k);
   return true;
 }
@@ -168,9 +288,9 @@ function releaseTxid(agentId, txid) {
 function loadDeposits(agentId) {
   const p = depositsPath(agentId);
   try {
-    if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (fs.existsSync(p)) return _normalizeDeposits(JSON.parse(fs.readFileSync(p, 'utf8')));
   } catch {}
-  return { processed: [], pending: [] };
+  return { processed: [], pending: [], creditedTxids: [] };
 }
 
 function saveDeposits(agentId, data) {
@@ -282,16 +402,24 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
     const txStatus = await client.getTxStatus(txid);
     const required = requiredConfirmations(expectedAmount);
     if (txStatus.confirmations < required) {
-      // Add to pending — will be credited when confirmed
-      if (!deposits.pending.some(d => d.txid === txid)) {
-        deposits.pending.push({
+      // Add to pending — will be credited when confirmed.
+      //
+      // RE-LOAD fresh, for the same reason the credit path below does: the
+      // `deposits` snapshot predates verifyPayment/getTxStatus, and a commit
+      // that landed during those awaits would be erased by saving the stale
+      // copy — taking that txid's dedup entry with it, and, if the clobbered
+      // write was a reversal, resurrecting a record the reconciler would then
+      // reverse a second time.
+      const freshPending = loadDeposits(agentId);
+      if (!freshPending.pending.some(d => d.txid === txid)) {
+        freshPending.pending.push({
           txid,
           buyerVerusId,
           amount: expectedAmount,
           requiredConfirmations: required,
           reportedAt: new Date().toISOString(),
         });
-        saveDeposits(agentId, deposits);
+        saveDeposits(agentId, freshPending);
       }
       return { credited: false, message: `Waiting for ${required - txStatus.confirmations} more confirmation(s) (${txStatus.confirmations}/${required})` };
     }
@@ -303,7 +431,7 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
     // guarantees no concurrent path is crediting THIS txid, and we re-check the
     // persisted `processed` one last time as belt-and-suspenders.
     const fresh = loadDeposits(agentId);
-    if (fresh.processed.some(d => d.txid === txid)) {
+    if (_hasCreditedTxid(fresh, txid)) {
       // Persisted by someone else after we claimed (e.g. a crash-recovery edge).
       return { credited: false, message: 'Deposit already processed' };
     }
@@ -311,28 +439,48 @@ async function reportDeposit(agentId, client, report, payAddress, network = 'ver
     if (credited < expectedAmount) {
       console.warn(`[deposit] credited ${credited} < reported ${expectedAmount} (confirmedAmount=${verification.confirmedAmount}) for tx ${txid}`);
     }
-    const result = creditDeposit(agentId, buyerVerusId, credited, txid);
 
-    // Notify J41 platform (non-blocking, non-fatal) — uses per-agent context
+    // ── Record the intent BEFORE the money moves ──────────────────────────
+    // Crediting first and persisting second means a crash in between leaves a
+    // credited meter with no record of it, and the next attempt credits again
+    // — unbounded by the confirmation tier, so this is the >10 VRSC path too.
+    // Writing the intent first inverts the failure: the worst case becomes a
+    // deposit that is recorded but possibly not credited, which a human can
+    // settle, instead of one that is silently credited twice, which nobody
+    // sees. Same two-phase shape the reversal path uses (`debiting`/`debited`).
+    _recordCreditIntent(agentId, fresh, {
+      txid, buyerVerusId, amount: credited, confirmations: txStatus.confirmations,
+    });
+    committed = true; // the txid is durably claimed from here on
+
+    let result;
+    try {
+      result = creditDeposit(agentId, buyerVerusId, credited, txid);
+    } catch (e) {
+      // The intent is durable but the money did not move. Say exactly that:
+      // the generic "Verification failed" this used to fall through to would
+      // send the operator hunting a verification problem that does not exist,
+      // while a buyer sits under-credited behind a dedup entry that stops any
+      // automatic retry. Deliberate — an under-credit a human can fix beats a
+      // double-credit nobody sees — but only if the message is honest.
+      console.error(`[Deposits] ${agentId}: intent recorded for tx ${String(txid).substring(0, 12)}… ` +
+        `but the meter write FAILED (${e.message}). Flagged mid-credit; it will NOT be retried ` +
+        'automatically. Credit the buyer by hand or clear the flag.');
+      return {
+        credited: false,
+        code: 'CREDIT_WRITE_FAILED',
+        message: 'Deposit recorded but the credit could not be applied; flagged for operator review',
+      };
+    }
+    _finalizeCredit(agentId, txid);
+
+    // Notify J41 platform (non-blocking, non-fatal) — uses per-agent context.
+    // After the credit, not before: notifying about money that did not move
+    // leaves our ledger and the platform's disagreeing.
     const ctx = _notifyContexts.get(agentId);
     if (ctx) {
       notifyJ41DepositConfirmed(ctx.sellerWif, ctx.sellerVerusId, buyerVerusId, credited, txid, ctx.network).catch(() => {});
     }
-
-    // Mark as processed (on the fresh snapshot)
-    fresh.processed.push({
-      txid,
-      buyerVerusId,
-      amount: credited,
-      confirmations: txStatus.confirmations,
-      creditedAt: new Date().toISOString(),
-    });
-    // Remove from pending if it was there
-    fresh.pending = fresh.pending.filter(d => d.txid !== txid);
-    // Keep only last 1000 processed (prevent unbounded growth)
-    if (fresh.processed.length > 1000) fresh.processed = fresh.processed.slice(-1000);
-    saveDeposits(agentId, fresh);
-    committed = true; // durably persisted — the persisted check now covers this txid
 
     return { credited: true, message: 'Deposit confirmed and credited', balance: result.newBalance };
   } catch (e) {
@@ -375,19 +523,21 @@ async function pollPendingDeposits(agentId, client) {
         // before crediting/persisting so we never double-credit or clobber a
         // concurrent writer's state (audit M4).
         const fresh = loadDeposits(agentId);
-        if (fresh.processed.some(d => d.txid === dep.txid)) {
+        if (_hasCreditedTxid(fresh, dep.txid)) {
           continue; // already credited by another path
         }
-        creditDeposit(agentId, dep.buyerVerusId, dep.amount, dep.txid);
-        fresh.processed.push({
-          ...dep,
+        // Intent first, then the money — see _recordCreditIntent. Crediting
+        // before the record meant a failed save left the deposit in `pending`
+        // with a credited meter, and the very next poll tick credited it again.
+        _recordCreditIntent(agentId, fresh, {
+          txid: dep.txid,
+          buyerVerusId: dep.buyerVerusId,
+          amount: dep.amount,
           confirmations: txStatus.confirmations,
-          creditedAt: new Date().toISOString(),
         });
-        fresh.pending = fresh.pending.filter(d => d.txid !== dep.txid);
-        if (fresh.processed.length > 1000) fresh.processed = fresh.processed.slice(-1000);
-        saveDeposits(agentId, fresh);
         committed = true;
+        creditDeposit(agentId, dep.buyerVerusId, dep.amount, dep.txid);
+        _finalizeCredit(agentId, dep.txid);
         credited++;
         console.log(`[Deposits] ${agentId}: credited ${dep.amount} VRSC from ${dep.buyerVerusId} (${dep.txid.substring(0, 12)}...)`);
         // Notify J41 — uses per-agent context
