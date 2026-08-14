@@ -6626,8 +6626,14 @@ function acquireSendLock(jobId) {
         // long it has been held; the gate is held for microseconds, so a live
         // holder means a peer is genuinely mid-steal.
         let owner = null;
-        try { owner = parseInt(String(fs.readFileSync(gatePath, 'utf8')).split('.')[0], 10); }
-        catch { return false; } // unreadable or vanished — a peer is active; stand down
+        // Keep the RAW bytes, not just the parsed pid. They are the identity of
+        // the specific orphan we judged dead, and the rename below has to prove
+        // it moved that exact file and not something a peer created since.
+        let orphanRaw = null;
+        try {
+          orphanRaw = String(fs.readFileSync(gatePath, 'utf8'));
+          owner = parseInt(orphanRaw.split('.')[0], 10);
+        } catch { return false; } // unreadable or vanished — a peer is active; stand down
         if (Number.isInteger(owner) && owner > 0) {
           let alive = true;
           try { process.kill(owner, 0); } catch (err) { alive = (err.code === 'EPERM'); }
@@ -6647,12 +6653,42 @@ function acquireSendLock(jobId) {
         // given source, the rest get ENOENT — and the acquire has to be O_EXCL
         // create, which lets a third contender that legitimately grabbed the
         // freed path win instead, with us standing down.
+        const deadName = `${gatePath}.dead.${gateTag}`;
         try {
-          fs.renameSync(gatePath, `${gatePath}.dead.${gateTag}`);
+          fs.renameSync(gatePath, deadName);
         } catch {
           return false; // another contender claimed the reclaim
         }
-        try { fs.unlinkSync(`${gatePath}.dead.${gateTag}`); } catch { /* already gone */ }
+        // PROVE WE MOVED THE ORPHAN WE JUDGED, NOT A LIVE PEER'S FRESH GATE.
+        //
+        // rename() is atomic on a PATH, not on the file we inspected. Between the
+        // liveness check above and this rename, a peer can finish its own reclaim
+        // and create a brand-new, live gate at the same path — and this rename
+        // then succeeds against THAT. The result was two processes inside the
+        // "exclusive" section at once; the second one's unlink further down then
+        // deleted the first's freshly created lock, and both returned true.
+        //
+        // This is the same "check one file, act on a different one" flaw the
+        // comments above condemn for the lock — reproduced one layer up, in the
+        // gate's own reclaim. It surfaced as `test/send-lock-race.test.js`
+        // failing in 3 of 24 full-suite runs (it needs suite-level CPU
+        // contention; the file alone would not reproduce it in 110+ rounds).
+        //
+        // The lock guards outbound refund sends, so a breach means two processes
+        // pass the de-dup check microseconds apart and can double-broadcast a
+        // refund. Preconditions are narrow — a prior crash must leave both a
+        // stale lock and an orphaned gate, and the daemon's drain tick must race
+        // an out-of-band `refunds approve` — but that pairing is the documented
+        // operator workflow, not an exotic one.
+        let movedRaw = null;
+        try { movedRaw = String(fs.readFileSync(deadName, 'utf8')); } catch { movedRaw = null; }
+        if (movedRaw !== orphanRaw) {
+          // We just moved a live peer's gate. Put it back and stand down; the
+          // peer is mid-steal and is entitled to finish.
+          try { fs.renameSync(deadName, gatePath); } catch { /* peer already recreated it */ }
+          return false;
+        }
+        try { fs.unlinkSync(deadName); } catch { /* already gone */ }
         try {
           gate = fs.openSync(gatePath, 'wx');
           fs.writeSync(gate, gateTag);
