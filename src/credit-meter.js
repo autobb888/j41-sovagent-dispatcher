@@ -56,62 +56,49 @@ function saveMeters(agentId, data) {
 // already been served. A lost update is a rare bounded error; a broken settle
 // path is a continuous one. It says so loudly when it happens.
 const METER_LOCK_SPIN_MS = 250;
+const METER_LOCK_STALE_MS = 100;
 
 function meterLockPath(agentId) {
   return path.join(AGENTS_DIR, agentId, 'credit-meters.lock');
 }
 
-function _meterHolderGone(raw) {
-  if (typeof raw !== 'string' || !raw) return false; // mid-write, not abandoned
-  const pid = parseInt(raw.split(':')[0], 10);
-  if (!Number.isInteger(pid) || pid <= 0) return true;
-  try { process.kill(pid, 0); return false; } catch (e) { return e.code !== 'EPERM'; }
-}
-
 /**
  * Run a synchronous meter mutation with the file lock held.
+ *
+ * Delegates to file-lock.js rather than re-implementing the discipline. The
+ * first version of this function stole a dead holder's lock by unlinking it and
+ * retrying, which is exactly the pattern acquireSendLock's comment condemns —
+ * two contenders judge the same dead lock, the second's unlink deletes the
+ * first's freshly published live one, and both end up inside the section. It
+ * was written three commits after file-lock.js wrote that invariant down.
+ *
  * @param {string} agentId
  * @param {Function} fn
+ * @param {{failClosed?: boolean}} [opts]
  */
-function withMeterLock(agentId, fn) {
+function withMeterLock(agentId, fn, opts = {}) {
+  const { acquireFileLockSync, releaseFileLock } = require('./file-lock.js');
   const lockPath = meterLockPath(agentId);
-  const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
-  const deadline = Date.now() + METER_LOCK_SPIN_MS;
-  let held = false;
 
-  while (Date.now() < deadline) {
-    try {
-      fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
-      // link() from a fully-written temp file, not open(wx)+write: the latter
-      // leaves an EMPTY file visible at the path between the two calls, and an
-      // empty lock reads as abandoned to anyone inspecting it.
-      const tmp = `${lockPath}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 8)}`;
-      fs.writeFileSync(tmp, token, { mode: 0o600 });
-      try {
-        fs.linkSync(tmp, lockPath);
-        held = true;
-      } catch (e) {
-        if (e.code !== 'EEXIST') throw e;
-      } finally {
-        try { fs.unlinkSync(tmp); } catch {}
-      }
-      if (held) break;
-    } catch {
-      break; // filesystem refused us entirely — do not block the request path
-    }
-
-    let raw = null;
-    try { raw = String(fs.readFileSync(lockPath, 'utf8')); } catch { raw = null; }
-    if (raw !== null && _meterHolderGone(raw)) {
-      // Liveness, not age: a live holder is never robbed however slow it is.
-      try { fs.unlinkSync(lockPath); } catch {}
-      continue;
-    }
-    const until = Date.now() + 2;
-    while (Date.now() < until) { /* the section is microseconds; spin briefly */ }
+  let token = null;
+  try {
+    token = acquireFileLockSync(lockPath, { timeoutMs: METER_LOCK_SPIN_MS, staleMs: METER_LOCK_STALE_MS });
+  } catch (e) {
+    // A filesystem that refuses us entirely must not take the request path down.
+    console.error(`[Meter] ${agentId}: lock unavailable (${e.message})`);
   }
 
-  if (!held) {
+  if (!token) {
+    // Fail-open is right for the PROXY settle path — refusing to settle a
+    // request the buyer has already been served would either drop the charge or
+    // break a response. It is wrong for a deposit adjudication, which can
+    // simply be retried, so those callers pass failClosed and get an error
+    // instead of a silent lost update.
+    if (opts.failClosed) {
+      const e = new Error(`could not acquire the credit-meter lock for ${agentId}`);
+      e.code = 'METER_LOCK_BUSY';
+      throw e;
+    }
     console.error(`[Meter] ${agentId}: balance lock not acquired in ${METER_LOCK_SPIN_MS}ms — ` +
       'applying the change UNSERIALIZED. A concurrent writer could drop it; ' +
       'compare totalDeposited against the deposit ledger if a balance looks wrong.');
@@ -119,11 +106,7 @@ function withMeterLock(agentId, fn) {
   try {
     return fn();
   } finally {
-    if (held) {
-      try {
-        if (String(fs.readFileSync(lockPath, 'utf8')) === token) fs.unlinkSync(lockPath);
-      } catch {}
-    }
+    if (token) releaseFileLock(lockPath, token);
   }
 }
 
@@ -235,6 +218,10 @@ function refundReservation(agentId, buyerVerusId, reservedCost) {
  * Credit a deposit (buyer sends VRSC to seller).
  */
 function creditDeposit(agentId, buyerVerusId, amount, txid) {
+  // failClosed: a deposit adjudication can simply be retried, unlike a proxy
+  // settle for a request the buyer has already been served. Without this the
+  // most carefully-guarded paths in the system inherit the hot path's
+  // fail-open policy purely because they share a lock wrapper.
   return withMeterLock(agentId, () => {
   const data = loadMeters(agentId);
   const buyer = ensureBuyer(data, buyerVerusId);
@@ -247,7 +234,7 @@ function creditDeposit(agentId, buyerVerusId, amount, txid) {
   delete buyer.lowNotifiedAt;
   saveMeters(agentId, data);
   return { newBalance: buyer.balance };
-  });
+  }, { failClosed: true });
 }
 
 /**
@@ -268,6 +255,10 @@ function creditDeposit(agentId, buyerVerusId, amount, txid) {
  * @returns {{newBalance: number}}
  */
 function reverseDeposit(agentId, buyerVerusId, amount, txid) {
+  // failClosed: a deposit adjudication can simply be retried, unlike a proxy
+  // settle for a request the buyer has already been served. Without this the
+  // most carefully-guarded paths in the system inherit the hot path's
+  // fail-open policy purely because they share a lock wrapper.
   return withMeterLock(agentId, () => {
   const data = loadMeters(agentId);
   const buyer = ensureBuyer(data, buyerVerusId);
@@ -277,7 +268,7 @@ function reverseDeposit(agentId, buyerVerusId, amount, txid) {
   if (txid) buyer.lastReversedTxid = txid;
   saveMeters(agentId, data);
   return { newBalance: buyer.balance };
-  });
+  }, { failClosed: true });
 }
 
 /**

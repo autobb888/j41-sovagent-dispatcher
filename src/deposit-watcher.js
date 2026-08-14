@@ -565,16 +565,37 @@ const RECONCILE_BACKFILL_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 // credit on the fleet at once. The systemic guard catches that within a single
 // agent's pass; this catches it across agents and across passes.
 const REVERSAL_BUDGET_WINDOW_MS = 60 * 60 * 1000;
-const REVERSAL_BUDGET_MAX = 10;
+const REVERSAL_BUDGET_MAX_DEFAULT = 10;
+
+/** Operator-settable; see the doctrine comment in config-loader.js. */
+function _reversalBudgetMax() {
+  try {
+    const n = loadDispatcherConfig().deposit.reversal_budget_max;
+    return Number.isFinite(n) && n >= 0 ? n : REVERSAL_BUDGET_MAX_DEFAULT;
+  } catch { return REVERSAL_BUDGET_MAX_DEFAULT; }
+}
 
 const _recentReversals = []; // epoch ms, module-wide (i.e. fleet-wide)
 const _lastReconcileState = new Map(); // agentId -> last logged reconciler state
+
+/**
+ * Is the fleet-wide financial kill switch set?
+ *
+ * Read from disk rather than importing cli.js, which would be circular. Same
+ * path cli.js writes (FINANCIAL_SUSPENDED_PATH); an operator with a dead daemon
+ * clears it with rm, and that must work for this subsystem too.
+ */
+function _financiallySuspended() {
+  try {
+    return fs.existsSync(path.join(os.homedir(), ".j41", "dispatcher", "financial-suspended"));
+  } catch { return false; }
+}
 
 function _reversalBudgetAvailable(now) {
   while (_recentReversals.length && now - _recentReversals[0] > REVERSAL_BUDGET_WINDOW_MS) {
     _recentReversals.shift();
   }
-  return _recentReversals.length < REVERSAL_BUDGET_MAX;
+  return _recentReversals.length < _reversalBudgetMax();
 }
 
 /**
@@ -698,8 +719,6 @@ function _settleReversedForTxid(deposits, txid, reason) {
  */
 function _findAnomaly(deposits, txid) {
   const p = deposits.processed.find((r) => r && r.txid === txid && _isUnresolvedAnomaly(r));
-  // eslint-disable-next-line no-unused-expressions
-  void 0;
   if (p) return { entry: p, where: 'processed' };
   const r = deposits.reversed.find((x) => x && x.txid === txid && _isUnresolvedAnomaly(x));
   if (r) return { entry: r, where: 'reversed' };
@@ -904,6 +923,14 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now(), e
 }
 
 async function _reconcileLocked(agentId, client, now, emit) {
+  let reconcileEnabled = true;
+  try { reconcileEnabled = loadDispatcherConfig().deposit.reconcile_enabled !== false; } catch {}
+  if (!reconcileEnabled) {
+    // Deliberately off. Credits stand; nothing is clawed back. Reported rather
+    // than silent, because an operator who forgot they disabled it would
+    // otherwise see open credits climb with no explanation.
+    return { confirmed: 0, reversed: 0, waiting: 0, restored: 0, state: 'disabled' };
+  }
   const network = loadDispatcherConfig().platform.network;
 
   const seed = loadDeposits(agentId);
@@ -1098,6 +1125,18 @@ async function _reconcileLocked(agentId, client, now, emit) {
       continue;
     }
 
+    if (!alreadyDebited && _financiallySuspended()) {
+      // The operator (or the outage sweep) has declared the platform untrusted
+      // for money decisions. Refunds already freeze on this flag; a reversal
+      // debits a buyer on the SAME platform answers, with no approval queue in
+      // front of it, so it has to honour the flag too — otherwise the operator
+      // mental model ("that file means no money moves") is false for the one
+      // subsystem that moves money unattended. Restores and confirms keep
+      // running: they only ever move money toward the buyer, on positive evidence.
+      waiting++;
+      continue;
+    }
+
     if (!alreadyDebited && !_reversalBudgetAvailable(now)) {
       // More reversals in the last hour than any plausible organic rate. Stop
       // and say so rather than working through the fleet one buyer at a time.
@@ -1110,7 +1149,7 @@ async function _reconcileLocked(agentId, client, now, emit) {
       live.withheldReversal = true;
       saveDeposits(agentId, fresh);
       waiting++;
-      console.error(`[Deposits] ${agentId}: ⛔ reversal budget exhausted (${REVERSAL_BUDGET_MAX} in the last hour). ` +
+      console.error(`[Deposits] ${agentId}: ⛔ reversal budget exhausted (${_reversalBudgetMax()} in the last hour). ` +
         `Withholding the reversal of ${live.amount} VRSC for ${live.buyerVerusId} and flagging for review. ` +
         'This usually means the backend is wrong, not that every buyer stopped paying at once.');
       _emit(emit, 'deposit.needs_operator', { agentId, txid: live.txid, buyerVerusId: live.buyerVerusId, amount: live.amount, where: 'processed', reason: live.needsOperator });
@@ -1788,4 +1827,4 @@ async function notifyJ41CreditLow(sellerWif, sellerVerusId, buyerVerusId, balanc
   }
 }
 
-module.exports = { STUCK_CREDITING_MS, reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, listDepositAnomalies, listDepositAnomaliesForAgent, creditDepositAnomaly, dismissDepositAnomaly, reconcileMeterAgainstLedger, withDepositLock, _recheckReversals, _settleReversedForTxid, _classifyLookupFailure, _syncedView, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_MIN_ADVANCE_BLOCKS, REVERSAL_RECHECK_WINDOW_MS, REVERSAL_BUDGET_MAX, PROCESSED_AUDIT_CAP, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
+module.exports = { STUCK_CREDITING_MS, reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, listDepositAnomalies, listDepositAnomaliesForAgent, creditDepositAnomaly, dismissDepositAnomaly, reconcileMeterAgainstLedger, withDepositLock, _recheckReversals, _settleReversedForTxid, _classifyLookupFailure, _syncedView, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_MIN_ADVANCE_BLOCKS, REVERSAL_RECHECK_WINDOW_MS, REVERSAL_BUDGET_MAX_DEFAULT, PROCESSED_AUDIT_CAP, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };

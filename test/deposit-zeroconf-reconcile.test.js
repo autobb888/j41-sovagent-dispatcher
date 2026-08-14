@@ -32,7 +32,7 @@ os.homedir = () => TEST_HOME;
 const {
   reconcileUnconfirmedDeposits,
   RECONCILE_MIN_ADVANCE_BLOCKS,
-  REVERSAL_BUDGET_MAX,
+  REVERSAL_BUDGET_MAX_DEFAULT: REVERSAL_BUDGET_MAX,
 } = require('../src/deposit-watcher.js');
 const { creditDeposit, getBalance } = require('../src/credit-meter.js');
 

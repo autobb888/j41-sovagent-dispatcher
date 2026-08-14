@@ -180,6 +180,53 @@ function _stealStale(lockPath, token, staleMs, now) {
 }
 
 /**
+ * Acquire an exclusive lock SYNCHRONOUSLY, or return null.
+ *
+ * Same core as the async version — same atomic publish, same liveness test, same
+ * gated steal — differing only in that it spins rather than awaiting between
+ * retries. That matters for callers whose critical section is itself
+ * synchronous: making them async to borrow a lock would push `await` up through
+ * a hot request path for no benefit.
+ *
+ * This exists because the alternative was a FOURTH hand-copy of the discipline,
+ * and the third copy (in credit-meter.js) shipped without the steal gate —
+ * stealing by unlink-then-retry, which is the pattern acquireSendLock's own
+ * comment condemns with measurements: two contenders judge the same dead lock,
+ * the second's unlink deletes the first's freshly published live one, and both
+ * proceed. Copying a discipline by hand is how a step goes missing.
+ *
+ * @returns {string|null} the token to pass to `releaseFileLock`, or null on timeout.
+ */
+function acquireFileLockSync(lockPath, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const staleMs = opts.staleMs ?? DEFAULT_STALE_MS;
+  if (staleMs >= timeoutMs) {
+    throw new Error(`file-lock: staleMs (${staleMs}) must be below timeoutMs (${timeoutMs}), ` +
+      'or a stale lock can never be reclaimed and every contender falls through unserialised');
+  }
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+
+  const token = `${process.pid}:${Date.now()}:${crypto.randomBytes(8).toString('hex')}`;
+  const deadline = Date.now() + timeoutMs;
+
+  for (;;) {
+    if (_publishExclusive(lockPath, token)) return token;
+
+    let raw = null;
+    try { raw = String(fs.readFileSync(lockPath, 'utf8')); } catch { raw = null; }
+    if (_isStale(raw, staleMs, Date.now()) && _stealStale(lockPath, token, staleMs, Date.now())) {
+      return token;
+    }
+
+    if (Date.now() >= deadline) return null;
+    // Spin, do not sleep: the caller's critical section is synchronous and
+    // measured in microseconds, so yielding the loop would cost more than it saves.
+    const until = Date.now() + 2;
+    while (Date.now() < until) { /* brief */ }
+  }
+}
+
+/**
  * Acquire an exclusive lock at `lockPath`, or return null.
  *
  * @returns {string|null} the token to pass to `releaseFileLock`, or null on timeout.
@@ -230,4 +277,4 @@ function releaseFileLock(lockPath, token) {
   return true;
 }
 
-module.exports = { acquireFileLock, releaseFileLock, DEFAULT_STALE_MS, DEFAULT_TIMEOUT_MS };
+module.exports = { acquireFileLock, acquireFileLockSync, releaseFileLock, DEFAULT_STALE_MS, DEFAULT_TIMEOUT_MS };

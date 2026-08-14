@@ -83,6 +83,16 @@ suggested_topup_vrsc = 10       # X-J41-Credit-SuggestedTopup header default
 
 [deposit]
 poll_interval_ms = 60000        # how often to scan for new VRSC deposits
+# The 0-conf reconciler claws back credits whose funding tx never landed. It
+# debits buyer balances unattended, so it is operator-controllable — same
+# doctrine as refund_limits. The EVIDENCE thresholds (misses, time span, block
+# advance) are deliberately NOT configurable: a tunable standard of proof is a
+# standard that gets lowered at 3am.
+reconcile_enabled = true        # false = credits stand, nothing is clawed back (J41_DEPOSIT_RECONCILE)
+reversal_budget_max = 10        # max reversals per hour FLEET-WIDE; excess is flagged for a
+                                # human instead. Lower it if you suspect the backend is
+                                # answering wrongly; 0 halts reversals entirely.
+                                # (J41_DEPOSIT_REVERSAL_BUDGET)
 
 [health]
 poll_interval_ms = 60000        # how often upstream-health pings each agent's upstream

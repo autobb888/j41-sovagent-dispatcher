@@ -66,7 +66,12 @@ const DEFAULTS = Object.freeze({
   // path, and `start` SIGTERMs the PID in dispatcher.pid — so an operator following
   // the docs took their own fleet down.
   poll: { interval_ms: 0 },
-  deposit: { poll_interval_ms: 60000 },
+  // reconcile_enabled / reversal_budget_max are configurable for the same reason
+  // refund_limits are: the reconciler debits buyer balances unattended, and a
+  // limit an operator cannot raise is a limit they disable by other means. The
+  // EVIDENCE thresholds (misses, span, block advance) stay constants on purpose
+  // — making the standard of proof tunable invites weakening it at 3am.
+  deposit: { poll_interval_ms: 60000, reconcile_enabled: true, reversal_budget_max: 10 },
   // M3 — the outbound-money rate limit the README has always promised. These were
   // hardcoded constants attached to two functions with ZERO callers, so none of it
   // existed. Configurable because an operator draining a large approved backlog
@@ -139,6 +144,10 @@ const ENV_OVERRIDES = [
   ['J41_PROXY_CIRCUIT_OPEN_MS',        'proxy.circuit_open_ms',        'int'],
   ['J41_POLL_INTERVAL_MS',      'poll.interval_ms',         'int'],
   ['J41_DEPOSIT_POLL_INTERVAL', 'deposit.poll_interval_ms', 'int'],
+  // 'bool', not 'bool1': the reconciler is DEFAULT-ON, so J41_DEPOSIT_RECONCILE=true
+  // must not silently disable it — the same trap documented for J41_FEE_SWEEP.
+  ['J41_DEPOSIT_RECONCILE', 'deposit.reconcile_enabled', 'bool'],
+  ['J41_DEPOSIT_REVERSAL_BUDGET', 'deposit.reversal_budget_max', 'int'],
   ['J41_REFUND_MAX_SENDS_PER_JOB',  'refund_limits.max_sends_per_job',   'int'],
   ['J41_REFUND_MAX_VALUE_MULT',     'refund_limits.max_value_multiplier','float'],
   ['J41_REFUND_MAX_SENDS_PER_HOUR', 'refund_limits.max_sends_per_hour',  'int'],

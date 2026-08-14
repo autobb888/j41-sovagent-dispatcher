@@ -1657,14 +1657,60 @@ async function configureServicesScreen(inquirer) {
         }
         console.log('');
       }
-      const recent = deposits.processed.slice(-10);
+      // Anomalies FIRST, and through the shared read model rather than this
+      // screen's own reading of the file.
+      //
+      // This screen used to print every `processed` record under "Recent
+      // confirmed" — including records still mid-credit, still unconfirmed at
+      // 0-conf, or flagged for an operator — and it never looked at `reversed`
+      // at all, so a buyer debit was invisible here. An operator standing in
+      // front of the TUI was told "confirmed" about deposits the ledger
+      // considered unresolved, which is the same "a flag nobody can see"
+      // failure the reconciler's whole surface layer exists to prevent.
+      try {
+        const { listDepositAnomaliesForAgent } = require('./deposit-watcher.js');
+        const surface = listDepositAnomaliesForAgent(agentId);
+
+        if (surface.needsOperator.length > 0) {
+          console.log(`  ⚠️  ${surface.needsOperator.length} NEED AN OPERATOR DECISION:`);
+          for (const n of surface.needsOperator) {
+            console.log(`    ${String(n.txid).substring(0, 16)}...  ${n.amount} VRSC  ${n.buyerVerusId}`);
+            console.log(`      ${n.reason}`);
+          }
+          console.log(`    Resolve with: j41-dispatcher deposits credit|dismiss ${agentId} <txid>`);
+          console.log('');
+        }
+        if (surface.open.length > 0) {
+          console.log(`  Still open (${surface.open.length}) — credited but not yet settled:`);
+          for (const o of surface.open) {
+            console.log(`    ${String(o.txid).substring(0, 16)}...  ${o.amount} VRSC  ${o.buyerVerusId}  [${o.state}]`);
+          }
+          console.log('');
+        }
+        const standing = surface.reversed.filter((r) => !r.restoredAt);
+        if (standing.length > 0) {
+          console.log(`  Reversed — credit taken back (${standing.length}):`);
+          for (const r of standing) {
+            console.log(`    ${String(r.txid).substring(0, 16)}...  ${r.amount} VRSC  ${r.buyerVerusId}` +
+              `${r.debited ? '' : '  [debit NOT certain]'}`);
+          }
+          console.log('');
+        }
+      } catch (e) {
+        console.log(`  (could not read the deposit ledger: ${e.message})`);
+      }
+
+      // Settled history only — anything unresolved is shown above, so this
+      // section can honestly call itself confirmed.
+      const settled = deposits.processed.filter(d => d && !d.crediting && !d.unconfirmed && !d.needsOperator);
+      const recent = settled.slice(-10);
       if (recent.length > 0) {
-        console.log(`  Recent confirmed (${deposits.processed.length} total, showing last 10):`);
+        console.log(`  Recent confirmed (${settled.length} settled, showing last 10):`);
         for (const d of recent) {
           console.log(`    ${d.txid.substring(0, 16)}...  ${d.amount} VRSC  from ${d.buyerVerusId}  at ${d.creditedAt}`);
         }
       } else {
-        console.log('  No deposits recorded yet.');
+        console.log('  No settled deposits yet.');
       }
       console.log('');
       await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);

@@ -35,8 +35,9 @@ billing: a real `completion_tokens: 0` no longer bills a flat estimate, errors b
 nothing on both paths, and the three settle sites now share one policy), and a static
 scope checker.
 
-**Deferred deliberately: M4**, the 0-conf deposit reconciler, on
-`feature/m4-deposit-reconcile`. See "Why M4 was cut" below.
+**M4 SHIPPED 2026-08-14** — the 0-conf deposit reconciler is on `main`, no longer
+deferred. See "M4: why it was cut, and what changed before it landed" below, and
+`docs/testing/2026-08-14-m4-deposit-runbook.md` for how to validate it.
 
 ## What is proven versus merely tested
 
@@ -62,7 +63,23 @@ first-run half remains untested since the four first-run highs were fixed in 2.2
 Until someone walks it on a clean machine, "a new operator can run this" is an
 assertion.
 
-## Why M4 was cut, and what it needs before it lands
+## M4: why it was cut, and what changed before it landed
+
+> **Status: SHIPPED to `main` 2026-08-14** (commits `64612a1`, `f896dfa`, `4885eb1`,
+> `4741942`, `7ca53e8`, `407969a`, `54f1fee`). The account below of why it was cut
+> in 2.29.0 is preserved because it explains what the re-land had to fix.
+>
+> **What was done before it landed:** the design was rewritten after three
+> adversarial review passes (`f231169`), which found four money defects beyond the
+> original six and showed the sync gate was bypassable in three node states. It
+> re-landed in four reviewed chunks, then three further audits found six more
+> defects — including a two-holder bug in its own new lock — all fixed. It carries
+> 60+ dedicated tests and was mutation-tested at every stage.
+>
+> **What is still NOT proven:** it has never run against real data. No agent on
+> this fleet has a `deposits.json` or an api-endpoint service, so the reconciler
+> does not execute at all today. Steps 3 and 4 of the runbook (a real 0-conf
+> deposit, and a real reversal) remain undone.
 
 M4 was a third of the release's source diff and produced roughly a quarter of every
 defect found across five adversarial review rounds: an uninterpretable-response

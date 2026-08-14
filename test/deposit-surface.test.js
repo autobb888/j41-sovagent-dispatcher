@@ -182,3 +182,37 @@ test('ctl deposits and the builder return the same document', async () => {
     'one builder, every transport — or `ctl deposits` and /v1/deposits drift');
   assert.equal(viaSocket.summary.deposits_needs_operator, 1);
 });
+
+// ── operability: the knobs an operator needs at 3am ────────────────────────
+
+test('the reconciler can be switched off without stopping the daemon', async () => {
+  // Every other autonomous money-mover here is operator-controllable — the fee
+  // sweep has --no-fee-sweep, refunds have configurable limits, and
+  // config-loader's own doctrine says "a limit you cannot raise is a limit
+  // operators disable". The reconciler debits buyer balances unattended and
+  // had no off switch at all.
+  const { reconcileUnconfirmedDeposits } = require('../src/deposit-watcher.js');
+  writeDeposits('agent-offswitch', {
+    processed: [{ ...OPEN_CREDIT, txid: 'tx_offswitch' }],
+    pending: [], reversed: [], creditedTxids: ['tx_offswitch'],
+  });
+
+  // Config is cached with a TTL, so flipping the env var is not enough — the
+  // cache has to be invalidated, which is exactly what a daemon restart does.
+  // Worth knowing operationally: this switch takes effect on restart (or within
+  // the config TTL), not instantly.
+  const { invalidateConfigCache } = require('../src/config-loader.js');
+  process.env.J41_DEPOSIT_RECONCILE = 'false';
+  invalidateConfigCache();
+  try {
+    const res = await reconcileUnconfirmedDeposits('agent-offswitch', {
+      async getChainInfo() { throw new Error('must not be called'); },
+      async getTxStatus() { throw new Error('must not be called'); },
+    }, Date.now());
+    assert.equal(res.state, 'disabled', 'and it must SAY it is off, not just be quiet');
+    assert.equal(res.reversed, 0);
+  } finally {
+    delete process.env.J41_DEPOSIT_RECONCILE;
+    invalidateConfigCache();
+  }
+});

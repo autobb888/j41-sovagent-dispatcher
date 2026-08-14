@@ -40,6 +40,9 @@ j41-dispatcher post-bounty agent-1 --title "Fix API" --amount 5 --description ".
 | `src/fee-tank.js` | **Fee-tank sweep.** Job payments land at the agent's **i-address**; identity-update fees are payable only from its **R-address**, so the R-address only ever drains and the agent silently stops being able to write on-chain. `planFeeSweep()` (pure) decides when to sweep; `executeFeeSweep()` broadcasts i→R. **Self-funding by construction** — it pays its own fee out of the swept inputs, so it works at a zero R-balance, which is exactly when it's needed. Refuses R-address inputs. Wired as `checkFeeTanks()` in cli.js on its own 30-min timer. |
 | `src/wallet.js` | **Fleet wallet decisions.** Operator-side counterpart of `fee-tank.js`, behind the `wallet` CLI command. `parseVrscAmount` (decimal-string → satoshis with BigInt — **never** `parseFloat(x) * 1e8`), `formatVrsc`, `buildWalletRow`/`summarizeFleet` (fleet table), `planManualSweep` (no floor gate — the operator asked; keeps the pending + dust gates), `planFleetSend` (reserve floor, self-send, pending), `executeSend` (R→R; refuses every input that is not the source R-address, address-less included — the mirror of `executeFeeSweep`'s refusal of R-inputs). Pure, no fs/network/SDK/clock; nothing throws. |
 | `src/config.js` | Runtime detection, config persistence. |
+| `src/deposit-watcher.js` | **Deposits + the 0-conf reconciler.** Buyer-signed deposit reports, on-chain verification, the credit/reversal/restore state machine, and the `listDepositAnomalies` read model. Credits under 2 VRSC land from the mempool, so this file also claws them back when a funding tx never confirms — behind a caught-up-node gate and a block-denominated grace. |
+| `src/credit-meter.js` | Per-buyer prepaid VRSC balances for api-endpoint access. All mutations run under a synchronous cross-process lock; deposit-side writers fail closed, the proxy settle path fails open. |
+| `src/file-lock.js` | Shared inter-process lock discipline (liveness-not-age staleness, gated steal, atomic `link()` publication, token-verified release). Consumed by deposits and the credit meter. Deliberately NOT wired into `acquireSendLock`. |
 | `src/control.js` | IPC control socket for `j41-dispatcher ctl status/jobs/agents`, plus the open `/health` + `/metrics` HTTP server on `:9842`. Exports the shared **read-model builders** (`buildStatus`/`buildJobs`/`buildJob`/`buildAgents`/`buildEarnings`/`buildHealthDocument`) consumed by both the socket and the control API. |
 | `src/control-api.js` | **Headless control API (WP-D1/D2).** Token-gated HTTP surface on `:9843` (`GET /v1/status\|agents\|jobs\|jobs/:id\|earnings\|events`). Bearer token at `~/.j41/dispatcher/control.token` (0600, auto-created). File-backed event ring buffer (`events.jsonl`, monotonic `seq`, survives restart). `state.emitEvent(type, data)` is wired in cli.js at job/container/extension/agent lifecycle points. |
 | `src/webhook-server.js` | HTTP webhook receiver for event-driven mode. |
@@ -213,6 +216,9 @@ j41-dispatcher update-profile agent-1 --display-name "Test" --dry-run  # Preview
   agents/<id>/SOUL.md             # Agent personality
   agents/<id>/agent-config.json   # Per-agent executor config (0600)
   agents/<id>/finalize-state.json # Onboarding progress
+  agents/<id>/deposits.json       # Deposit ledger: processed, pending, reversed, creditedTxids
+  agents/<id>/deposits.lock       # Per-agent deposit lock (see file-lock.js)
+  agents/<id>/credit-meters.json  # Per-buyer prepaid balances (0600)
   config.json                     # Runtime config
   dispatcher.pid                  # PID file
   financial-allowlist.json        # Deny-all default

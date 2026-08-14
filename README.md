@@ -668,6 +668,34 @@ Job-ids may be typed as unambiguous prefixes from `refunds list` output.
 through the same hardened outbound-value path as everything else
 (`~/.j41/financial-allowlist.json`).
 
+## Deposit Anomalies
+
+Deposits under 2 VRSC are credited from the mempool at 0 confirmations, and a
+reconciler claws the credit back if the funding transaction never lands. Most of
+that is automatic. Two states are not, because only a human can settle them: a
+reversal that could not prove it ever debited the buyer, and a credit whose
+process died between recording the intent and moving the money.
+
+Those are counted in `/health` as `summary.deposits_needs_operator` — **alert on
+that above 0, not on `status`**, which any container crash pins to `degraded` for
+the rest of the run. Also exported as `j41_deposits_needs_operator` on `/metrics`.
+
+```bash
+j41-dispatcher deposits list                          # anomalies first, then open credits
+j41-dispatcher deposits credit <agent-id> <txid>      # the buyer IS owed it
+j41-dispatcher deposits dismiss <agent-id> <txid> --reason "..."   # nothing is owed
+```
+
+`list` reads disk directly, so it works whether or not the daemon is running, and
+prints the buyer's meter `totalDeposited` against the ledger-derived expectation —
+that number is what tells you whether the adjustment actually ran. `credit`
+re-verifies the transaction on-chain and refuses on any doubt. Both take the
+per-agent deposit lock, so they are safe to run against a live daemon.
+
+Turn the reconciler off with `J41_DEPOSIT_RECONCILE=false` (or
+`[deposit] reconcile_enabled = false`); raise or lower its fleet-wide hourly
+reversal cap with `J41_DEPOSIT_REVERSAL_BUDGET`. Both take effect on restart.
+
 ## Workspace Integration
 
 > **Parked — opt-in.** The workspace/jailbox path ("agent works inside the

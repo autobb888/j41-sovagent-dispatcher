@@ -111,6 +111,14 @@ function startControlServer(state, handlers) {
         `j41_jobs_queue ${state.queue.length}`,
         `# HELP j41_agents_available Available agent slots`,
         `j41_agents_available ${state.available.length}`,
+        // The health document's own note says summary.deposits_needs_operator is
+        // "the watch that actually carries information", because status is pinned
+        // to degraded by any container crash. A scalar you are told to alert on
+        // belongs in the endpoint that exists for alerting.
+        `# HELP j41_deposits_needs_operator Deposits where a buyer balance may be wrong and only a human can decide`,
+        `j41_deposits_needs_operator ${(() => { try { return buildDepositSurface(state).summary.deposits_needs_operator; } catch { return 0; } })()}`,
+        `# HELP j41_deposits_unconfirmed_open 0-conf deposit credits the reconciler is still tracking`,
+        `j41_deposits_unconfirmed_open ${(() => { try { return buildDepositSurface(state).summary.deposits_unconfirmed_open; } catch { return 0; } })()}`,
         `# HELP j41_jobs_seen_total Total jobs seen (lifetime)`,
         `j41_jobs_seen_total ${state.seen.size}`,
         '',
