@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.30.0 — 2026-08-14
 
 ### The path from install to earning actually exists now
 
@@ -87,8 +87,8 @@ resolves at all — the event loop drains and the process **exits 0 with the
 promise pending**. So a piped stdin auto-answered every TUI prompt, and every
 headless money command reported success having done nothing.
 
-- **Nine TUI confirms that commit money or an on-chain write now default to
-  no**: identity registration (both call sites), `Proceed with setup?`, bounty
+- **Eight TUI confirm call sites that commit money or an on-chain write now
+  default to no**: identity registration (both call sites), `Proceed with setup?`, bounty
   posting, bounty winner selection, batch activate/deactivate, profile update,
   review submission. Wizard steps that commit nothing keep their yes default,
   and the exemptions are enumerated with reasons in the test rather than left to
@@ -128,7 +128,37 @@ mangles honest input trains operators to ignore it.
 
 Both defect classes were invisible to a 1149-test suite because nothing had ever
 asserted on non-TTY behaviour or on rendered screen content. `grep -rln isTTY
-test/` returned nothing. 23 tests now cover it.
+test/` returned nothing.
+
+### Post-fix audit corrections
+
+Three audits against a written spec found the first pass of the above was
+incomplete in ways an enumerated fix list could not catch:
+
+- **Sanitisation missed four surfaces**, including `deposits list` — the screen
+  the new TUI Deposits entry routes operators to — and a buyer name rendered
+  *inside* an inquirer confirm question. Now enforced by a class assertion over
+  both files.
+- **The buyer-text label was trailing**, so an injected instruction was read
+  before the label qualifying it. It is now a leading fence, and the Unicode tag
+  block (U+E0000–E007F) — the channel for smuggling instructions past a human
+  and into a model — is stripped along with variation selectors, word joiner and
+  soft hyphen. Truncation is code-point-safe. The helper moved to
+  `src/untrusted.js` because both the CLI and the TUI render buyer text.
+- **The currency fix had missed the TUI entirely** (every service-pricing and
+  API-rate prompt hardcoded `VRSCTEST` — the mainnet mirror of the bug) plus a
+  `|| 'VRSC'` fallback cluster. A class assertion over both files found ~20
+  offenders; the original scan looked only at lines containing "fund", in
+  `cli.js` only.
+- **`start`'s image preflight made the start-action harness host-dependent** — 18
+  scenarios passed only because this machine has the live fleet's image. Gated on
+  the file's existing `NODE_ENV === 'test'` seam.
+- **The container-creation call still hardcoded the image name** while the build
+  command and preflight honoured `J41_JOB_IMAGE`/`J41_JOB_TAG`, so a custom tag
+  built and preflighted one image and ran another.
+- The dashboard's TTY refusal now exits **2**, matching the money guards.
+
+1198 tests pass.
 
 ### 0-conf deposits are reconciled, and their anomalies are visible
 

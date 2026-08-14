@@ -90,17 +90,30 @@ test('printFundingInstructions tolerates a missing address', () => {
   assert.ok(!out.includes('null'));
 });
 
-test('CLASS: no user-facing funding message hardcodes a currency', () => {
-  // The original defect was two messages disagreeing. Assert no funding-shaped
-  // string carries a literal coin name, so a third cannot drift back in.
+test('CLASS: no user-facing output or default hardcodes a currency', () => {
+  // The first version of this scanned only lines containing "fund", in cli.js
+  // only — and both surviving defect clusters (deposit screens, dashboard
+  // service pricing) sat exactly where it could not see. Scan every printed
+  // line and every prompt default, in BOTH files.
   const offenders = [];
-  CLI.split('\n').forEach((line, i) => {
-    if (!/console\.(log|error)/.test(line)) return;
-    if (!/\bfund|\bFund/.test(line)) return;
-    if (/VRSCTEST|'VRSC'|\bVRSC\b/.test(line)) offenders.push(`cli.js:${i + 1}: ${line.trim()}`);
-  });
+  for (const [name, text] of [['cli.js', CLI], ['dashboard.js', DASH]]) {
+    text.split('\n').forEach((line, i) => {
+      const isOutput = /console\.(log|error)|message:|default:/.test(line);
+      if (!isOutput) return;
+      if (/^\s*(\/\/|\*)/.test(line)) return;              // comments
+      if (/networkCurrency|NATIVE_COIN/.test(line)) return;   // derived: fine
+      // The testnet warning must NAME the mainnet coin — that is its whole job.
+      if (/is NOT VRSC|sending real VRSC/.test(line)) return;
+      // The USD price feed is genuinely denominated in mainnet VRSC even on
+      // testnet; relabelling it VRSCTEST/USD would be the actual falsehood.
+      if (/VRSC\/USD|platform VRSC rate/.test(line)) return;
+      if (/VRSCTEST|'VRSC'|`VRSC`|\bVRSC\b/.test(line)) {
+        offenders.push(`${name}:${i + 1}: ${line.trim()}`);
+      }
+    });
+  }
   assert.deepEqual(offenders, [],
-    'funding messages must derive their currency from the network');
+    'user-facing currency must derive from the configured network');
 });
 
 test('CLASS: service-currency defaults derive from the network', () => {
@@ -109,7 +122,10 @@ test('CLASS: service-currency defaults derive from the network', () => {
   assert.ok(!/'Service currency', 'VRSC'/.test(CLI),
     "no --service-currency option may default to the literal 'VRSC'");
   assert.match(CLI, /'Service currency', NATIVE_COIN/);
-  assert.equal(NATIVE_COIN, 'VRSCTEST', 'this checkout is configured for testnet');
+  // Do NOT assert a specific coin: that couples the suite to whatever network
+  // the runner's config happens to name, so correct code fails on a
+  // mainnet-configured machine. Assert the shape instead.
+  assert.ok(['VRSC', 'VRSCTEST'].includes(NATIVE_COIN), `unexpected coin ${NATIVE_COIN}`);
 });
 
 test('setup pauses for funding before it spends, and refuses headless rather than guessing', () => {
@@ -222,8 +238,20 @@ test('the TUI money screens shell out to the CLI instead of copying money logic'
   assert.ok(start > 0);
   const body = DASH.slice(start, start + 900);
   assert.match(body, /runCommandAsync\(process\.execPath, \[process\.argv\[1\]/);
-  for (const verb of ['approve', 'reject', 'sweep', 'send', 'credit', 'dismiss']) {
-    assert.ok(!new RegExp(`'${verb}'\\s*\\]`).test(body),
-      `moneyScreen must not invoke the mutating verb ${verb}`);
+});
+
+test('every TUI money CALL SITE passes a read-only verb', () => {
+  // The earlier version of this test grepped moneyScreen's own body, where a
+  // mutating verb could never appear — it would have passed while a call site
+  // said `['refunds','approve','--all','--yes']`. Assert on the arguments that
+  // are actually handed over.
+  const calls = [...DASH.matchAll(/moneyScreen\(inquirer,[^,]+,\s*(\[[^\]]*\])/g)].map(m => m[1]);
+  assert.ok(calls.length >= 3, `expected at least 3 money screens, found ${calls.length}`);
+  const MUTATING = ['approve', 'reject', 'sweep', 'send', 'credit', 'dismiss', 'unblock', '--yes', '--all'];
+  for (const call of calls) {
+    for (const verb of MUTATING) {
+      assert.ok(!call.includes(`'${verb}'`),
+        `a money screen passes the mutating verb ${verb}: ${call}`);
+    }
   }
 });

@@ -8,7 +8,8 @@ Multi-agent orchestration for the Junction41 sovereign AI agent marketplace. Man
 
 ```bash
 yarn global add @junction41/dispatcher
-j41-dispatcher dashboard          # Interactive TUI (18-item menu)
+j41-dispatcher dashboard          # Interactive TUI (21-item menu)
+j41-dispatcher build-image        # Build the job-agent image (required once before `start`)
 j41-dispatcher setup agent-1 myname --template code-review
 j41-dispatcher start              # Listen for jobs
 j41-dispatcher inspect agent-1    # Full agent state dump
@@ -166,7 +167,7 @@ Why it "stopped working" on 2026-08-04: the action-3 payload writes `MULTIMAPREM
 
 ### Dashboard Menu Structure
 
-18 numbered items plus an unlabelled "⚡ Live Jobs" entry and a Quit option (verified against `src/dashboard.js` `choices` array):
+21 numbered items plus an unlabelled "⚡ Live Jobs" entry and a Quit option (verified against `src/dashboard.js` `choices` array 2026-08-14):
 
 ```
 [1]  View Agents                 [10] Status & Health
@@ -179,8 +180,21 @@ Why it "stopped working" on 2026-08-04: the action-3 payload writes `MULTIMAPREM
 ⚡    Live Jobs (auto-refresh)    [17] Bounties
 [7]  Start Dispatcher            [18] API Endpoint Setup
 [8]  Stop Dispatcher                  (resell your LLM, metered)
-[9]  View Logs
+[9]  View Logs                     ── Money ──
+                                  [19] Wallet & Fee Tanks
+                                  [20] Refunds Queue
+                                  [21] Deposits
 ```
+
+[20] and [21] show a count when something is waiting on a human, and those
+counts also print above the menu — refunds are held until approved and deposit
+anomalies until settled, so both sit silently owed otherwise.
+
+**The job image is a hard prerequisite.** `start` refuses without it rather than
+failing after a buyer has paid. Build with `j41-dispatcher build-image`, which
+resolves the bundled script from the module's own location — never tell a
+globally-installed user to run `./scripts/build-image.sh`, they have no such
+path.
 
 ### Key Patterns
 

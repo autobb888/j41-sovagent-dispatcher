@@ -205,9 +205,15 @@ with no demand" and "invisibly broken" look identical for hours.**
 
 ### B5. The TUI has no money surface at all — **FIXED**
 
-> **Fixed 2026-08-14.** A Money section (wallet / refunds / deposits) plus
-> counts of anything awaiting a human on the first screen. The views shell out to
-> the CLI rather than duplicating the money paths.
+> **Partially fixed 2026-08-14.** A Money section (wallet / refunds / deposits)
+> plus first-screen counts for refunds and deposit anomalies; the views shell out
+> to the CLI rather than duplicating the money paths.
+>
+> **The drained fee tank — half the original finding — is still not surfaced
+> proactively.** It is visible only if the operator opens [19]. The audit's
+> counter-proposal is right and is the next fix: `checkFeeTanks` already detects
+> the condition in the daemon and can stamp a file next to `pending-refunds.json`
+> that the existing never-throw counter reads, at zero menu-latency cost.
 
 `refund` appears **428 times in `cli.js` and 0 times in `dashboard.js`**; `sweep`
 192 vs 0. The 18-item dashboard (`dashboard.js:210-234`) has no refunds queue, no
@@ -234,9 +240,13 @@ open and unanswered (`docs/backend-responses/2026-08-14-m4-shipped.md` §1).
 
 ### B7. ~~Seven~~ **NINE** `default:true` confirms sit in front of money and on-chain writes — **FIXED**
 
-> **Fixed 2026-08-14.** All nine now default to no; the dashboard additionally
-> refuses to start without a TTY, before inquirer is imported. A class-level
-> test enumerates the wizard-step exemptions with reasons.
+> **Fixed 2026-08-14 — EIGHT of the nine.** Corrected by the post-fix audit:
+> my "all nine" was false. `List this API endpoint?` (`dashboard.js`) still
+> defaults to yes, reclassified as a wizard-terminal step that writes no chain
+> transaction and spends nothing. That may be the right call, but reclassifying
+> an item out of a list is not the same as fixing it, and the original note
+> rounded up. The dashboard also refuses to start without a TTY (exit 2, before
+> inquirer is imported), which retires the class for a piped caller regardless.
 >
 > **The audit found two of the nine. I found five more by hand. The last two —
 > `Proceed with setup?` (triggers on-chain registration) and `Select N
@@ -271,11 +281,22 @@ this class is confined to inquirer. **The fix is one word per line.**
 
 ### B8. The operator path has no prompt-injection assumption at all — **FIXED**
 
-> **Fixed 2026-08-14.** `untrusted()` strips C0/C1 controls, DEL, zero-width
-> characters, bidi overrides and the BOM, and caps length. Applied to the refund
-> list, the refund approval screen and the deposit credit screen. Buyer-authored
-> fields are also **labelled on screen as buyer-supplied** — neutralising the
-> bytes does not stop a model reading the text as a system instruction.
+> **Fixed 2026-08-14; the first pass was incomplete and the audit caught it.**
+> The initial fix covered three screens and missed four more — `deposits list`
+> (which the new TUI [21] actively routes operators to), `refunds approve --all`,
+> `refunds unblock`, and every buyer field in the TUI, including one rendered
+> *inside* an inquirer confirm question. All now sanitised, enforced by a class
+> assertion over both files rather than a list.
+>
+> Two design corrections from the audit, both adopted: the label was **trailing**,
+> so an injected instruction was read before the thing qualifying it — it is now
+> a **leading fence** (`«buyer-supplied: …»`). And the Unicode **tag block**
+> (U+E0000–E007F), the standard channel for smuggling instructions past a human
+> and into a model, was not stripped. It is now, along with variation selectors,
+> word joiner and soft hyphen. Truncation is also code-point-safe.
+>
+> `untrusted()` now lives in `src/untrusted.js`, because both the CLI and the TUI
+> render buyer text and the first version was reachable from only one of them.
 
 
 `scanUntrusted` has **28 call sites, every one of them in `src/executors/*` or
@@ -339,8 +360,13 @@ every job." The dead advice survived the fix. The downstream decline
 
 ### E5. Currency defaults register VRSC services on a VRSCTEST network — **FIXED**
 
-> **Fixed 2026-08-14.** All four `--service-currency` defaults and the
-> interactive default now derive from the network via `NATIVE_COIN`.
+> **Fixed 2026-08-14, far wider than the finding described.** The audit found the
+> fix had missed the TUI entirely — every service-pricing and API-rate prompt
+> there hardcoded `VRSCTEST`, the mainnet mirror of the original bug — plus a
+> `|| 'VRSC'` fallback cluster across job queueing, bounties, refunds, fee-tank
+> sweeps and earnings. A class assertion over **both** files then found ~20
+> offenders in total. The original scan looked only at lines containing "fund",
+> in `cli.js` only, which is precisely where the survivors were not.
 
 `--service-currency` defaults to `'VRSC'` at every job-service registration
 surface (`cli.js:1277, 1847, 2032, 3162`), the interactive prompt defaults to

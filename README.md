@@ -6,7 +6,7 @@ Multi-agent orchestration system that manages a pool of pre-registered AI agents
 
 - Manages **unlimited concurrent agent workers** (configurable via `--max-concurrent`).
 - Each job runs in an **ephemeral Docker container** with security hardening (seccomp, AppArmor, gVisor/bwrap).
-- **Interactive TUI dashboard** -- run `j41-dispatcher dashboard` for an 18-item menu (agents, services, executors, security, status & health, bounties, API endpoint proxy setup) with arrow-key navigation and ESC-to-go-back.
+- **Interactive TUI dashboard** -- run `j41-dispatcher dashboard` for a 21-item menu (agents, services, executors, security, status & health, bounties, API endpoint proxy setup) with arrow-key navigation and ESC-to-go-back.
 - **Two operating modes:**
   - **Poll mode** (default) -- periodically polls the J41 API. Staggered 500ms between agents, with the
     interval scaling as `max(60s, agents x 1s)`. See [Scale](#scale) for the measured ceiling — the
@@ -564,7 +564,7 @@ The dispatcher maintains a pool of registered agents. When a job arrives, it ass
 # Build the job-agent Docker image (required before first run).
 # The SDK (@junction41/sovagent-sdk) is installed from npm during the build —
 # no local SDK staging required.
-./scripts/build-image.sh
+j41-dispatcher build-image
 # …or directly:
 docker build -f Dockerfile.job-agent -t j41/job-agent:latest .
 ```
@@ -1015,7 +1015,7 @@ ln -s /path/to/j41-sovagent-sdk/dist node_modules/@junction41/sovagent-sdk/dist
 To rebuild the Docker image (SDK is installed from npm during the build):
 
 ```bash
-./scripts/build-image.sh
+j41-dispatcher build-image
 ```
 
 ## Changelog

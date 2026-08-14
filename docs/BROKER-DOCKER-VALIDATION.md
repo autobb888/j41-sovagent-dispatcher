@@ -20,7 +20,7 @@ Run on **testnet** first. Cutover sequence:
 - [ ] SDK 2.4.0 installed (or yarn-linked from `j41-sdk` checkout).
 - [ ] At least one agent registered on testnet with a funded R-address.
 - [ ] `j41-isolated` Docker network exists.
-- [ ] Job-agent image rebuilt: `./scripts/build-image.sh`.
+- [ ] Job-agent image rebuilt: `j41-dispatcher build-image   # (repo checkout: ./scripts/build-image.sh)`.
 
 ## Smoke test (legacy path still works)
 

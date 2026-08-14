@@ -15,6 +15,11 @@ const AGENTS_DIR = path.join(DISPATCHER_DIR, 'agents');
 const CONFIG_FILE = path.join(DISPATCHER_DIR, 'config.json');
 
 const { loadDispatcherConfig, saveDispatcherConfig } = require('./config-loader.js');
+const { networkCurrency } = require('./deposit-watcher.js');
+const { untrusted, untrustedField } = require('./untrusted.js');
+// The chain's native coin, derived once — the TUI hardcoded 'VRSCTEST' on every
+// service-pricing surface, which is the mainnet mirror of the bug the CLI had.
+const NATIVE_COIN = networkCurrency(loadDispatcherConfig().platform.network);
 const { writeKeysFile, readKeysFile } = require('./keys-file.js');
 const { sendCommand } = require('./control.js');
 const { renderActiveJobs, runLiveScreen } = require('./tui/live-screen.js');
@@ -927,11 +932,11 @@ async function statusScreen(inquirer) {
           const sp = buyers.reduce((n, b) => n + (b.totalSpent || 0), 0);
           totalDeposited += dep;
           totalSpent += sp;
-          console.log(`    Buyers:    ${buyers.length}  (deposited ${dep.toFixed(4)} VRSC, spent ${sp.toFixed(4)})`);
+          console.log(`    Buyers:    ${buyers.length}  (deposited ${dep.toFixed(4)} ${NATIVE_COIN}, spent ${sp.toFixed(4)})`);
         }
       } catch {}
     }
-    console.log(`  Total:    ${totalActiveKeys} active key(s), deposited ${totalDeposited.toFixed(4)}, spent ${totalSpent.toFixed(4)} VRSC`);
+    console.log(`  Total:    ${totalActiveKeys} active key(s), deposited ${totalDeposited.toFixed(4)}, spent ${totalSpent.toFixed(4)} ${NATIVE_COIN}`);
   }
 
   // ── Section 6: Webhook / tunnel ──
@@ -1071,7 +1076,7 @@ async function createCustomTemplate(inquirer, tplDir) {
   const { svcName } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcName', message: 'Service name:', default: profileName }]);
   const { svcDesc } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcDesc', message: 'Service description:', default: profileDesc }]);
   const { svcPrice } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcPrice', message: 'Price:', default: '0.5' }]);
-  const { svcCurrency } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcCurrency', message: 'Currency:', default: 'VRSCTEST' }]);
+  const { svcCurrency } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcCurrency', message: 'Currency:', default: NATIVE_COIN }]);
   const svcCategory = await pickCategory(inquirer, profileCategory);
   const { svcTurnaround } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcTurnaround', message: 'Turnaround:', default: '15 minutes' }]);
   const { svcPayment } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'svcPayment', message: 'Payment terms:', choices: ['prepay', 'postpay', 'split'], default: 'prepay' }]);
@@ -1349,7 +1354,7 @@ async function configureServicesScreen(inquirer) {
       const { svcName } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcName', message: 'Service name:', default: 'Code Review' }]);
       const { svcDesc } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcDesc', message: 'Description:' }]);
       const { svcPrice } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcPrice', message: 'Price:', default: '0.5' }]);
-      const { svcCurrency } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcCurrency', message: 'Currency:', default: 'VRSCTEST' }]);
+      const { svcCurrency } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcCurrency', message: 'Currency:', default: NATIVE_COIN }]);
       const svcCategory = await pickCategory(inquirer, 'development');
       const { svcTurnaround } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcTurnaround', message: 'Turnaround:', default: '15 minutes' }]);
       const { svcSovguard } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'svcSovguard', message: 'Enable SovGuard?', default: true }]);
@@ -1396,8 +1401,8 @@ async function configureServicesScreen(inquirer) {
       while (addModel) {
         const { model } = await promptWithEsc(inquirer, [{ type: 'input', name: 'model', message: '  Model name (e.g. gpt-4.1, llama-3.3-70b):' }]);
         if (!model) break;
-        const { inputRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'inputRate', message: `  Input token rate (VRSCTEST per 1M tokens):`, default: '2' }]);
-        const { outputRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'outputRate', message: `  Output token rate (VRSCTEST per 1M tokens):`, default: '8' }]);
+        const { inputRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'inputRate', message: `  Input token rate (${NATIVE_COIN} per 1M tokens):`, default: '2' }]);
+        const { outputRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'outputRate', message: `  Output token rate (${NATIVE_COIN} per 1M tokens):`, default: '8' }]);
 
         modelPricing.push({
           model,
@@ -1445,7 +1450,7 @@ async function configureServicesScreen(inquirer) {
             description: apiDesc,
             category: apiCategory,
             price: 0, // pay-per-token, not flat price
-            currency: 'VRSCTEST',
+            currency: NATIVE_COIN,
             turnaround: 'real-time',
             paymentTerms: 'postpay',
             sovguard: false,
@@ -1521,8 +1526,8 @@ async function configureServicesScreen(inquirer) {
             const existing = (svc.modelPricing || []).find(p => p.model === m);
             const defaultIn = existing ? String(existing.inputTokenRate * 1000000) : '2';
             const defaultOut = existing ? String(existing.outputTokenRate * 1000000) : '8';
-            const { inRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'inRate', message: `  ${m} input rate (VRSCTEST per 1M tokens):`, default: defaultIn }]);
-            const { outRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'outRate', message: `  ${m} output rate (VRSCTEST per 1M tokens):`, default: defaultOut }]);
+            const { inRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'inRate', message: `  ${m} input rate (${NATIVE_COIN} per 1M tokens):`, default: defaultIn }]);
+            const { outRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'outRate', message: `  ${m} output rate (${NATIVE_COIN} per 1M tokens):`, default: defaultOut }]);
             newPricing.push({
               model: m,
               inputTokenRate: parseFloat(inRate) / 1000000,
@@ -1591,7 +1596,7 @@ async function configureServicesScreen(inquirer) {
       } else {
         for (const k of activeKeys) {
           const masked = k.key.substring(0, 10) + '...' + k.key.slice(-4);
-          console.log(`  ${masked}  buyer: ${k.buyerVerusId}`);
+          console.log(`  ${masked}  buyer: ${untrustedField(k.buyerVerusId, 60)}`);
           console.log(`    Created: ${k.createdAt}  Expires: ${k.expiresAt}`);
           console.log(`    Usage: ${k.usage.requests} req, ${k.usage.inputTokens} in, ${k.usage.outputTokens} out\n`);
         }
@@ -1611,9 +1616,9 @@ async function configureServicesScreen(inquirer) {
         for (const buyerId of buyerIds) {
           const b = buyers[buyerId];
           console.log(`  ${buyerId}`);
-          console.log(`    Balance: ${b.balance.toFixed(4)} VRSC  |  Deposited: ${b.totalDeposited.toFixed(4)}  |  Spent: ${b.totalSpent.toFixed(4)}`);
+          console.log(`    Balance: ${b.balance.toFixed(4)} ${NATIVE_COIN}  |  Deposited: ${b.totalDeposited.toFixed(4)}  |  Spent: ${b.totalSpent.toFixed(4)}`);
           for (const [model, u] of Object.entries(b.usage || {})) {
-            console.log(`    ${model}: ${u.requests} req, ${u.inputTokens} in, ${u.outputTokens} out, ${u.cost.toFixed(6)} VRSC`);
+            console.log(`    ${model}: ${u.requests} req, ${u.inputTokens} in, ${u.outputTokens} out, ${u.cost.toFixed(6)} ${NATIVE_COIN}`);
           }
           console.log('');
         }
@@ -1632,10 +1637,10 @@ async function configureServicesScreen(inquirer) {
       }
       const { keyIdx } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 10, name: 'keyIdx', message: 'Select key to revoke:', choices: activeKeys.map((k, i) => {
         const masked = k.key.substring(0, 10) + '...' + k.key.slice(-4);
-        return { name: `  ${masked}  (${k.buyerVerusId})`, value: i };
+        return { name: `  ${masked}  (${untrusted(k.buyerVerusId, 60)})`, value: i };
       })}]);
       const keyToRevoke = activeKeys[keyIdx];
-      const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Revoke key for ${keyToRevoke.buyerVerusId}?`, default: false }]);
+      const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Revoke key for ${untrusted(keyToRevoke.buyerVerusId, 60)}?`, default: false }]);
       if (confirm) {
         revokeApiKey(agentId, keyToRevoke.key);
         console.log('\n  ✅ Key revoked.\n');
@@ -1663,7 +1668,7 @@ async function configureServicesScreen(inquirer) {
       const requestCount = Object.values(b.usage || {}).reduce((n, u) => n + (u.requests || 0), 0);
       const { rating } = await promptWithEsc(inquirer, [{ type: 'list', name: 'rating', message: 'Rating:', choices: [{ name: '5 — excellent', value: 5 }, { name: '4 — good', value: 4 }, { name: '3 — neutral', value: 3 }, { name: '2 — poor', value: 2 }, { name: '1 — avoid', value: 1 }] }]);
       const { message } = await promptWithEsc(inquirer, [{ type: 'input', name: 'message', message: 'Review comment (optional):' }]);
-      const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Submit ${rating}-star review for ${buyerVerusId}?`, default: false }]);
+      const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Submit ${rating}-star review for ${untrusted(buyerVerusId, 60)}?`, default: false }]);
       if (!confirm) continue;
 
       try {
@@ -1710,7 +1715,7 @@ async function configureServicesScreen(inquirer) {
       if (deposits.pending.length > 0) {
         console.log(`  Pending (${deposits.pending.length}):`);
         for (const d of deposits.pending) {
-          console.log(`    ${d.txid.substring(0, 16)}...  ${d.amount} VRSC  from ${d.buyerVerusId}  (needs ${d.requiredConfirmations} conf)`);
+          console.log(`    ${d.txid.substring(0, 16)}...  ${d.amount} ${NATIVE_COIN}  from ${untrustedField(d.buyerVerusId, 60)}  (needs ${d.requiredConfirmations} conf)`);
         }
         console.log('');
       }
@@ -1731,7 +1736,7 @@ async function configureServicesScreen(inquirer) {
         if (surface.needsOperator.length > 0) {
           console.log(`  ⚠️  ${surface.needsOperator.length} NEED AN OPERATOR DECISION:`);
           for (const n of surface.needsOperator) {
-            console.log(`    ${String(n.txid).substring(0, 16)}...  ${n.amount} VRSC  ${n.buyerVerusId}`);
+            console.log(`    ${String(n.txid).substring(0, 16)}...  ${n.amount} ${NATIVE_COIN}  ${untrustedField(n.buyerVerusId, 60)}`);
             console.log(`      ${n.reason}`);
           }
           console.log(`    Resolve with: j41-dispatcher deposits credit|dismiss ${agentId} <txid>`);
@@ -1740,7 +1745,7 @@ async function configureServicesScreen(inquirer) {
         if (surface.open.length > 0) {
           console.log(`  Still open (${surface.open.length}) — credited but not yet settled:`);
           for (const o of surface.open) {
-            console.log(`    ${String(o.txid).substring(0, 16)}...  ${o.amount} VRSC  ${o.buyerVerusId}  [${o.state}]`);
+            console.log(`    ${String(o.txid).substring(0, 16)}...  ${o.amount} ${NATIVE_COIN}  ${untrustedField(o.buyerVerusId, 60)}  [${o.state}]`);
           }
           console.log('');
         }
@@ -1748,7 +1753,7 @@ async function configureServicesScreen(inquirer) {
         if (standing.length > 0) {
           console.log(`  Reversed — credit taken back (${standing.length}):`);
           for (const r of standing) {
-            console.log(`    ${String(r.txid).substring(0, 16)}...  ${r.amount} VRSC  ${r.buyerVerusId}` +
+            console.log(`    ${String(r.txid).substring(0, 16)}...  ${r.amount} ${NATIVE_COIN}  ${untrustedField(r.buyerVerusId, 60)}` +
               `${r.debited ? '' : '  [debit NOT certain]'}`);
           }
           console.log('');
@@ -1764,7 +1769,7 @@ async function configureServicesScreen(inquirer) {
       if (recent.length > 0) {
         console.log(`  Recent confirmed (${settled.length} settled, showing last 10):`);
         for (const d of recent) {
-          console.log(`    ${d.txid.substring(0, 16)}...  ${d.amount} VRSC  from ${d.buyerVerusId}  at ${d.creditedAt}`);
+          console.log(`    ${d.txid.substring(0, 16)}...  ${d.amount} ${NATIVE_COIN}  from ${untrustedField(d.buyerVerusId, 60)}  at ${d.creditedAt}`);
         }
       } else {
         console.log('  No settled deposits yet.');
@@ -2513,7 +2518,7 @@ async function postBountyScreen(inquirer) {
 
   const { description } = await promptWithEsc(inquirer, [{ type: 'input', name: 'description', message: 'What do you need done?' }]);
   const { amount } = await promptWithEsc(inquirer, [{ type: 'input', name: 'amount', message: 'Bounty amount:', default: '1' }]);
-  const { currency } = await promptWithEsc(inquirer, [{ type: 'input', name: 'currency', message: 'Currency:', default: 'VRSCTEST' }]);
+  const { currency } = await promptWithEsc(inquirer, [{ type: 'input', name: 'currency', message: 'Currency:', default: NATIVE_COIN }]);
   const category = await pickCategory(inquirer, 'development');
   const { maxClaimants } = await promptWithEsc(inquirer, [{ type: 'input', name: 'maxClaimants', message: 'Max winners (how many people can claim this):', default: '1' }]);
   const { deadline } = await promptWithEsc(inquirer, [{ type: 'input', name: 'deadline', message: 'Application deadline (YYYY-MM-DD or leave blank):' }]);
@@ -2640,7 +2645,7 @@ async function bountyDetailScreen(inquirer, bountyId, agentKeys) {
   }
 
   console.log(`  Title:       ${bounty.title || '(none)'}`);
-  console.log(`  Amount:      ${bounty.amount} ${bounty.currency || 'VRSC'}`);
+  console.log(`  Amount:      ${bounty.amount} ${bounty.currency || NATIVE_COIN}`);
   console.log(`  Status:      ${bounty.status}`);
   console.log(`  Category:    ${bounty.category || '(none)'}`);
   console.log(`  Posted by:   ${bounty.poster_verus_id || bounty.posterVerusId || '?'}`);
@@ -2841,8 +2846,8 @@ async function apiEndpointSetupScreen(inquirer) {
 
   const modelPricing = [];
   for (const model of selectedModels) {
-    const { inputRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'inputRate', message: `  ${model} — input rate (VRSCTEST per 1M tokens):`, default: '2' }]);
-    const { outputRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'outputRate', message: `  ${model} — output rate (VRSCTEST per 1M tokens):`, default: '8' }]);
+    const { inputRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'inputRate', message: `  ${model} — input rate (${NATIVE_COIN} per 1M tokens):`, default: '2' }]);
+    const { outputRate } = await promptWithEsc(inquirer, [{ type: 'input', name: 'outputRate', message: `  ${model} — output rate (${NATIVE_COIN} per 1M tokens):`, default: '8' }]);
     modelPricing.push({
       model,
       inputTokenRate: parseFloat(inputRate) / 1000000,
@@ -2951,7 +2956,7 @@ async function apiEndpointSetupScreen(inquirer) {
         description: `OpenAI-compatible API access — models: ${selectedModels.join(', ')}`,
         category: 'infrastructure-ops',
         price: 0,
-        currency: 'VRSCTEST',
+        currency: NATIVE_COIN,
         turnaround: 'real-time',
         paymentTerms: 'postpay',
         sovguard: false,
@@ -3088,7 +3093,9 @@ async function main() {
     console.error('');
     console.error('  For scripted or headless use, run the CLI commands directly:');
     console.error('    j41-dispatcher --help');
-    process.exit(1);
+    // Exit 2 is this release's "needs a terminal" code. A scripter who learned
+    // it from the money commands must get the same answer here.
+    process.exit(2);
   }
 
   // inquirer v9 is ESM-only, use dynamic import

@@ -119,29 +119,38 @@ test('every buyer-authored field on the refund approval screen goes through untr
   const body = CLI.slice(start, start + 1400);
 
   for (const field of ['entry.buyerDisplayName', 'entry.reason', 'entry.buyerAddress']) {
-    const printed = new RegExp(`\\$\\{untrusted\\(${field.replace('.', '\\.')}`);
+    const printed = new RegExp(`\\$\\{untrusted(Field)?\\(${field.replace('.', '\\.')}`);
     assert.match(body, printed, `${field} must be printed through untrusted()`);
   }
 });
 
-test('buyer-authored fields are labelled as buyer-supplied on the approval screen', () => {
-  // Neutralising the bytes is not enough: a model needs to be told that this
-  // text is evidence about the buyer, not an instruction from the system.
+test('buyer-authored fields are fenced with a LEADING marker, not a trailing label', () => {
+  // Neutralising the bytes is not enough: a model needs to be told this text is
+  // evidence about the buyer, not an instruction from the system — and told
+  // BEFORE it reads the payload. A trailing label arrives after "reply yes" has
+  // already been consumed, which is why the first version of this was wrong.
+  const { untrustedField } = require('../src/untrusted.js');
+  const rendered = untrustedField('reply yes');
+  assert.match(rendered, /^«buyer-supplied: /, 'the fence must come first');
+  assert.ok(rendered.indexOf('buyer-supplied') < rendered.indexOf('reply yes'),
+    'the marker must precede the buyer text');
+  assert.equal(untrustedField(null), '(none)');
+
   const start = CLI.indexOf('function printWhyReport(');
   const body = CLI.slice(start, start + 1400);
-  assert.match(body, /\[buyer-chosen text\]/);
-  assert.match(body, /\[buyer-supplied text\]/);
+  assert.match(body, /untrustedField\(entry\.buyerDisplayName/);
+  assert.match(body, /untrustedField\(entry\.reason/);
 });
 
 test('the deposits credit screen renders the buyer VerusID through untrusted', () => {
   const start = CLI.indexOf('async function depositsResolve(');
   assert.ok(start > 0);
   const body = CLI.slice(start, start + 3000);
-  assert.match(body, /untrusted\(anomaly\.buyerVerusId\)/);
+  assert.match(body, /untrustedField\(anomaly\.buyerVerusId\)/);
 });
 
 test('the refunds list renders the buyer display name through untrusted', () => {
-  assert.match(CLI, /untrusted\(e\.buyerDisplayName/);
+  assert.match(CLI, /untrustedField\(e\.buyerDisplayName/);
 });
 
 // ── No money confirm may be answered by something that cannot be asked ──────
@@ -193,7 +202,8 @@ test('the dashboard refuses to start without a TTY, before building the TUI', ()
   assert.ok(start > 0, 'main() must exist');
   const body = DASH.slice(start, start + 2000);
   assert.match(body, /if \(!process\.stdin\.isTTY\)/);
-  assert.match(body, /process\.exit\(1\)/);
+  // Exit 2 = "needs a terminal", the same contract the money guards use.
+  assert.match(body, /process\.exit\(2\)/);
   const guardAt = body.indexOf('process.stdin.isTTY');
   const importAt = body.indexOf("await import('inquirer')");
   assert.ok(guardAt > 0 && importAt > 0 && guardAt < importAt,
@@ -258,4 +268,87 @@ test('promptWithEsc records the default-false convention for money confirms', ()
   const idx = DASH.indexOf('function promptWithEsc(');
   const doc = DASH.slice(Math.max(0, idx - 900), idx);
   assert.match(doc, /default: false/);
+});
+
+// ── Behaviour, not source text ──────────────────────────────────────────────
+
+const { execFileSync, spawnSync } = require('child_process');
+const os = require('os');
+
+const SCRATCH = path.join(os.tmpdir(), 'j41-hygiene-test');
+
+/** Run node with piped (non-TTY) stdin under a throwaway HOME. */
+function runHeadless(args, code) {
+  fs.mkdirSync(SCRATCH, { recursive: true });
+  return spawnSync(process.execPath, args, {
+    input: '\n',
+    encoding: 'utf8',
+    env: { ...process.env, HOME: SCRATCH, NODE_ENV: code ? 'test' : process.env.NODE_ENV },
+    timeout: 30000,
+  });
+}
+
+test('BEHAVIOUR: requireInteractiveConfirm really exits 2 on a piped stdin', () => {
+  // Every other assertion about this guard reads source. This one runs it: a
+  // child process with stdin piped must terminate with code 2, not hang and not
+  // exit 0. The whole defect class was "reports success having done nothing".
+  const r = runHeadless(['-e', `
+    process.env.NODE_ENV = 'test';
+    const { requireInteractiveConfirm } = require('${path.join(SRC, 'cli.js').replace(/\\/g, '\\\\')}');
+    requireInteractiveConfirm('unit test');
+    console.log('REACHED_PAST_GUARD');
+  `], true);
+
+  assert.equal(r.status, 2, `expected exit 2, got ${r.status}; stderr: ${r.stderr}`);
+  assert.ok(!String(r.stdout).includes('REACHED_PAST_GUARD'),
+    'execution must not continue past the guard');
+  assert.match(String(r.stderr), /not a TTY/);
+  assert.match(String(r.stderr), /Nothing was done/);
+});
+
+test('BEHAVIOUR: the dashboard really refuses a piped stdin with exit 2', () => {
+  const r = runHeadless([path.join(SRC, 'dashboard.js')], false);
+  assert.equal(r.status, 2, `expected exit 2, got ${r.status}; stderr: ${r.stderr}`);
+  assert.match(String(r.stderr), /requires a terminal/);
+});
+
+// ── CLASS: a new money confirm cannot join silently ─────────────────────────
+
+test('CLASS: every readline confirm on a money path is guarded', () => {
+  // The enumerated list above pins the sites we know about; it cannot catch the
+  // next one. This finds every readline prompt in cli.js whose question text
+  // implies a spend, and requires a guard within the preceding lines.
+  const lines = CLI.split('\n');
+  const MONEY_PROMPT = /rl\.question\(|question\(`/;
+  const SPENDY = /refund|credit|dismiss|send|sweep|unblock|approve|deactivate|register|bounty|Retype the exact amount/i;
+  const offenders = [];
+
+  lines.forEach((line, i) => {
+    if (!MONEY_PROMPT.test(line) || !SPENDY.test(line)) return;
+    // Look back for a guard in the enclosing region.
+    const before = lines.slice(Math.max(0, i - 40), i).join('\n');
+    if (/requireInteractiveConfirm|process\.stdin\.isTTY/.test(before)) return;
+    offenders.push(`cli.js:${i + 1}: ${line.trim().slice(0, 110)}`);
+  });
+
+  assert.deepEqual(offenders, [],
+    'these money prompts can be reached by a caller that cannot answer them');
+});
+
+test('CLASS: no buyer-controlled field is printed raw on an operator screen', () => {
+  // The audits found four surfaces the first pass missed, all by enumeration.
+  // Assert over the class instead: any interpolation of a buyer-authored field
+  // into console output must pass through the sanitiser.
+  const BUYER_FIELDS = /\$\{[^}]*\b(buyerVerusId|buyerDisplayName|buyerAddress)\b/;
+  const offenders = [];
+  for (const [name, text] of [['cli.js', CLI], ['dashboard.js', DASH]]) {
+    text.split('\n').forEach((line, i) => {
+      if (!/console\.(log|error)|message: `/.test(line)) return;
+      if (!BUYER_FIELDS.test(line)) return;
+      if (/untrusted/.test(line)) return;
+      offenders.push(`${name}:${i + 1}: ${line.trim().slice(0, 110)}`);
+    });
+  }
+  assert.deepEqual(offenders, [],
+    'buyer-authored text must be rendered through untrusted()/untrustedField()');
 });
