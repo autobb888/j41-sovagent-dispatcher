@@ -685,3 +685,66 @@ test('a restore emits even when the pass also has open credits to work through',
   assert.ok(ev, `phase 4 must emit too; got ${JSON.stringify(events.map((e) => e.type))}`);
   assert.equal(ev.data.txid, txid);
 });
+
+// ── the exploit this feature exists to close ────────────────────────────────
+
+test('a reversal drives a SPENT balance negative — clamping at zero makes the exploit free', async () => {
+  // The test above this one is titled "...the balance goes negative if it was
+  // spent" and never spends anything, so it asserts 0 either way. That made
+  // `buyer.balance = Math.max(0, buyer.balance - amount)` a mutation the whole
+  // suite would accept — and that mutation IS the exploit: deposit at 0-conf,
+  // spend it, let the tx evaporate, owe nothing, repeat with a fresh txid.
+  const T0 = epoch();
+  setBackendFeatures(FLAG_ON);
+  const { agentId, buyer, amount } = seedOpenCredit({ amount: 1.5 });
+  const { reserveCredit } = require('../src/credit-meter.js');
+  const PRICING = [{ model: 'm', inputTokenRate: 0.001, outputTokenRate: 0 }];
+
+  // Burn 1.0 of the 1.5 through the proxy meter before the tx is judged.
+  const spend = reserveCredit(agentId, buyer, 'm', 1000, 0, PRICING);
+  assert.equal(spend.allowed, true);
+  assert.equal(getBalance(agentId, buyer), 0.5);
+
+  const state = { chain: syncedChain(), tx: {} };
+  const res = await fullMissRun(agentId, makeClient(state), state, { t0: T0 });
+  assert.equal(res.reversed, 1);
+
+  const after = getBalance(agentId, buyer);
+  assert.equal(after, -1, `balance must go to ${0.5 - amount}, not be forgiven to 0; got ${after}`);
+  const blocked = reserveCredit(agentId, buyer, 'm', 100, 0, PRICING);
+  assert.equal(blocked.allowed, false, 'a negative balance must block further spending until topped up');
+});
+
+test('a withheld reversal stops being an operator question once the tx confirms', async () => {
+  // The budget flags the record and leaves the credit standing. If the tx then
+  // confirms, the credit was correct all along and nothing is owed — but the
+  // flag used to survive, pinning /health degraded and printing a credit
+  // command beside an entry that was never reversed.
+  const T0 = epoch();
+  setBackendFeatures(FLAG_ON);
+  const { agentId, txid, buyer, amount } = seedOpenCredit({ amount: 1 });
+  const state = { chain: syncedChain(), tx: {} };
+  const client = makeClient(state);
+
+  // Exhaust the fleet budget with throwaway agents at this same hour.
+  for (let i = 0; i < REVERSAL_BUDGET_MAX; i++) {
+    const s = seedOpenCredit({ buyer: `drain-${i}@`, amount: 1 });
+    const st = { chain: syncedChain(), tx: {} };
+    await fullMissRun(s.agentId, makeClient(st), st, { t0: T0 });
+  }
+  await fullMissRun(agentId, client, state, { t0: T0 });
+
+  const withheld = readDeposits(agentId).processed[0];
+  assert.ok(withheld.needsOperator, 'precondition: the reversal was withheld and flagged');
+  assert.equal(getBalance(agentId, buyer), amount, 'and no money moved');
+
+  // The transaction confirms after all.
+  state.tx[txid] = { confirmations: 2 };
+  await reconcileUnconfirmedDeposits(agentId, client, T0 + 60 * MINUTE);
+
+  const settled = readDeposits(agentId).processed[0];
+  assert.equal(settled.needsOperator, undefined,
+    'a confirmed tx answers the question the flag asked — leaving it walks an operator into crediting an unreversed deposit');
+  assert.ok(settled.resolvedAt);
+  assert.equal(getBalance(agentId, buyer), amount, 'and still nothing moved');
+});

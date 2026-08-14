@@ -41,11 +41,19 @@ function raceRound({ racers, seedLock }) {
   const startAt = Date.now() + 1200; // children spin to this instant
   const kids = Array.from({ length: racers }, () =>
     spawn(process.execPath, [RACER, JOB, String(startAt)],
-      { env: { ...process.env, HOME: home }, stdio: ['ignore', 'pipe', 'ignore'] }));
+      // stderr was 'ignore', which threw away the only evidence that
+      // distinguishes the two ways this test can fail. withSendHistoryLock has a
+      // DELIBERATE fallback: past a 5s acquire deadline it runs the write
+      // UNSERIALIZED rather than dropping a send record, and announces that on
+      // stderr. So "7 records from 8 writers" means either the lock is broken or
+      // the documented fallback fired under load — and without stderr the two are
+      // indistinguishable. Observed 2/18 under full-suite CPU contention.
+      { env: { ...process.env, HOME: home }, stdio: ['ignore', 'pipe', 'pipe'] }));
 
   return new Promise((resolve) => {
     let exited = 0;
     const outs = new Array(kids.length).fill('');
+    const errs = new Array(kids.length).fill('');
     const finish = () => {
       let recorded = 0;
       try {
@@ -53,35 +61,39 @@ function raceRound({ racers, seedLock }) {
         recorded = (H.perJob && Array.isArray(H.perJob[JOB])) ? H.perJob[JOB].length : 0;
       } catch { recorded = 0; }
       const reported = outs.filter((o) => o.includes('RECORDED')).length;
+      const unserialized = errs.filter((e) => e.includes('UNSERIALIZED')).length;
       fs.rmSync(home, { recursive: true, force: true });
-      resolve({ recorded, reported });
+      resolve({ recorded, reported, unserialized, errs });
     };
     kids.forEach((c, i) => {
       c.stdout.on('data', (d) => { outs[i] += String(d); });
+      c.stderr.on('data', (d) => { errs[i] += String(d); });
       c.on('exit', () => { if (++exited === kids.length) finish(); });
     });
   });
 }
 
 test('concurrent recorders do not lose a send record (clean lock)', async () => {
-  const { recorded, reported } = await raceRound({ racers: 8 });
+  const { recorded, reported, unserialized, errs } = await raceRound({ racers: 8 });
   assert.equal(reported, 8, 'every child should have completed its record call');
   assert.equal(recorded, 8,
     `expected 8 records on disk, found ${recorded} — a lost read-modify-write ` +
-    'under-counts the per-job cap and grants an extra refund send');
+    `under-counts the per-job cap and grants an extra refund send. ` +
+    `${unserialized} writer(s) fell back to UNSERIALIZED; stderr: ${JSON.stringify(errs)}`);
 });
 
 test('concurrent recorders do not lose a send record when a DEAD holder must be stolen', async () => {
   // The steal path: a crashed process left its lock behind. Every contender
   // judges it dead at the same instant and races to reclaim it — which is where
   // unlink-then-create let two of them into the critical section at once.
-  const { recorded, reported } = await raceRound({
+  const { recorded, reported, unserialized, errs } = await raceRound({
     racers: 8,
     seedLock: `${DEAD_PID}:${Date.now() - 60_000}:1`,
   });
   assert.equal(reported, 8);
   assert.equal(recorded, 8,
-    `expected 8 records on disk, found ${recorded} — the steal path lost a write`);
+    `expected 8 records on disk, found ${recorded} — the steal path lost a write. ` +
+    `${unserialized} writer(s) fell back to UNSERIALIZED; stderr: ${JSON.stringify(errs)}`);
 });
 
 test('a stale lock with unparseable content is still reclaimed by age', async () => {
@@ -92,9 +104,9 @@ test('a stale lock with unparseable content is still reclaimed by age', async ()
   // acquire deadline, so the reclaim could never fire — every contender spun out
   // and wrote UNSERIALIZED, and 4 recorders left 3 records. The window is now
   // shorter than the deadline so the path is actually reachable.
-  const { recorded, reported } = await raceRound({ racers: 4, seedLock: 'garbage-no-pid' });
+  const { recorded, reported, unserialized, errs } = await raceRound({ racers: 4, seedLock: 'garbage-no-pid' });
   assert.equal(reported, 4);
-  assert.equal(recorded, 4, `expected 4 records, found ${recorded}`);
+  assert.equal(recorded, 4, `expected 4 records, found ${recorded}; ${unserialized} UNSERIALIZED; stderr: ${JSON.stringify(errs)}`);
 });
 
 test('a lock held by a LIVE process is never stolen', async () => {

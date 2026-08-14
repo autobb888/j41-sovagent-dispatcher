@@ -568,6 +568,7 @@ const REVERSAL_BUDGET_WINDOW_MS = 60 * 60 * 1000;
 const REVERSAL_BUDGET_MAX = 10;
 
 const _recentReversals = []; // epoch ms, module-wide (i.e. fleet-wide)
+const _lastReconcileState = new Map(); // agentId -> last logged reconciler state
 
 function _reversalBudgetAvailable(now) {
   while (_recentReversals.length && now - _recentReversals[0] > REVERSAL_BUDGET_WINDOW_MS) {
@@ -583,7 +584,8 @@ function _reversalBudgetAvailable(now) {
  * classify nothing as strong evidence and never reverse. That is the correct
  * money direction, but it is also SILENT — an inert reconciler looks exactly
  * like a working one, and reproduces the very leak this exists to close. The
- * caller logs the state; `reconcilerState()` exposes it.
+ * caller is responsible for surfacing it — see the `state` field on the
+ * reconcile result, which pollPendingDeposits logs when it is not `armed`.
  *
  * Uses the SDK's cached helper (5-minute TTL) rather than a bare fetch: this
  * runs per-agent per-poll, and an uncached /v1/version GET on each pass would
@@ -696,6 +698,8 @@ function _settleReversedForTxid(deposits, txid, reason) {
  */
 function _findAnomaly(deposits, txid) {
   const p = deposits.processed.find((r) => r && r.txid === txid && _isUnresolvedAnomaly(r));
+  // eslint-disable-next-line no-unused-expressions
+  void 0;
   if (p) return { entry: p, where: 'processed' };
   const r = deposits.reversed.find((x) => x && x.txid === txid && _isUnresolvedAnomaly(x));
   if (r) return { entry: r, where: 'reversed' };
@@ -739,8 +743,30 @@ async function creditDepositAnomaly(agentId, txid, { client, resolvedBy = 'opera
     const amount = entry.amount;
     const buyerVerusId = entry.buyerVerusId;
 
+    if (entry.resolving) {
+      // A previous run of this verb died between the meter write and the record
+      // write. Retrying blind is how a human turns one credit into two — and a
+      // human who just watched the command die is exactly who retries.
+      return {
+        ok: false,
+        code: 'RESOLVE_INTERRUPTED',
+        message: `A previous credit of ${amount} VRSC to ${buyerVerusId} was interrupted ` +
+          `(started ${entry.resolvingAt}). The meter may already hold it. Compare ` +
+          'totalDeposited against the ledger before retrying, then dismiss it if it landed.',
+      };
+    }
+
+    // Intent first, money second — the protocol every other credit path in this
+    // file follows. A crash between them leaves `resolving`, which refuses
+    // above instead of paying twice.
+    entry.resolving = true;
+    entry.resolvingAt = new Date().toISOString();
+    saveDeposits(agentId, d);
+
     creditDeposit(agentId, buyerVerusId, amount, txid);
 
+    delete entry.resolving;
+    delete entry.resolvingAt;
     entry.resolvedAt = new Date().toISOString();
     entry.resolvedBy = resolvedBy;
     entry.resolution = `credited ${amount} VRSC by operator (tx confirmed at ${confs} block(s))`;
@@ -992,6 +1018,16 @@ async function _reconcileLocked(agentId, client, now, emit) {
           'No money moved. Check the meter against the chain and correct it by hand.');
         _emit(emit, 'deposit.needs_operator', { agentId, txid: live.txid, buyerVerusId: live.buyerVerusId, amount: live.amount, where: 'processed', reason: live.needsOperator });
       }
+      if (live.withheldReversal) {
+        // The reversal we declined to make turned out to be the right call: the
+        // transaction confirmed, so the credit standing on the meter is correct
+        // and nothing is owed. Retire the flag, or it pins /health to degraded
+        // forever and walks an operator into crediting an unreversed deposit.
+        delete live.withheldReversal;
+        delete live.needsOperator;
+        live.resolvedAt = new Date().toISOString();
+        live.resolution = 'tx confirmed — the withheld reversal was correctly withheld';
+      }
       delete live.unconfirmed;
       _clearMissRun(live);
       live.confirmations = seen;
@@ -1046,6 +1082,11 @@ async function _reconcileLocked(agentId, client, now, emit) {
       // and say so rather than working through the fleet one buyer at a time.
       live.needsOperator = 'reversal withheld: fleet reversal budget exhausted — ' +
         'suspected backend-side fault, check before clearing';
+      // Tagged so the confirmed branch can retire it. Without the tag the flag
+      // outlives the question it asked: the tx confirms, the credit was never
+      // reversed, nothing is owed — and the operator surface still lists the
+      // entry with a credit command beside it.
+      live.withheldReversal = true;
       saveDeposits(agentId, fresh);
       waiting++;
       console.error(`[Deposits] ${agentId}: ⛔ reversal budget exhausted (${REVERSAL_BUDGET_MAX} in the last hour). ` +
@@ -1327,9 +1368,36 @@ function _emit(emit, type, data) {
   try { emit(type, data); } catch {}
 }
 
+// A `crediting` record older than this is not "in flight", it is wreckage: the
+// process died between the intent and the money, and only a human can say
+// whether the meter moved. Generous enough that a slow credit is never mistaken
+// for a crashed one.
+const STUCK_CREDITING_MS = 5 * 60 * 1000;
+
+/**
+ * A crash between the credit intent and the credit itself.
+ *
+ * This is the state chunk 1 deliberately creates, described at the time as
+ * reading "a human must check" — but nothing read it. It was counted only among
+ * open 0-conf credits, which deliberately do not degrade health, so the ONE
+ * state that is not bounded by the 2 VRSC tier (it applies to the 6-confirmation
+ * >10 VRSC path too) was the least visible thing in the file.
+ */
+function _isStuckCrediting(r, now = Date.now()) {
+  if (!r || !r.crediting || r.resolvedAt) return false;
+  const at = Date.parse(r.intentAt || '');
+  return !Number.isFinite(at) || (now - at) >= STUCK_CREDITING_MS;
+}
+
+function _stuckCreditingReason(r) {
+  return `credit intent recorded ${r.intentAt} but never finalized — ${r.amount} VRSC ` +
+    `for ${r.buyerVerusId} may or may not have reached the meter`;
+}
+
 /** Unresolved means a human still has to decide. Resolving stamps `resolvedAt`. */
-function _isUnresolvedAnomaly(r) {
-  return !!(r && r.needsOperator && !r.resolvedAt);
+function _isUnresolvedAnomaly(r, now = Date.now()) {
+  if (!r || r.resolvedAt) return false;
+  return !!r.needsOperator || _isStuckCrediting(r, now);
 }
 
 // /health is polled continuously and a deposits file can hold a thousand records
@@ -1367,14 +1435,14 @@ function listDepositAnomaliesForAgent(agentId) {
     }));
 
   const needsOperator = [
-    ...d.processed.filter(_isUnresolvedAnomaly).map((r) => ({
+    ...d.processed.filter((r) => _isUnresolvedAnomaly(r)).map((r) => ({
       txid: r.txid,
       buyerVerusId: r.buyerVerusId || null,
       amount: r.amount ?? null,
       where: 'processed',
-      reason: r.needsOperator,
+      reason: r.needsOperator || _stuckCreditingReason(r),
     })),
-    ...d.reversed.filter(_isUnresolvedAnomaly).map((r) => ({
+    ...d.reversed.filter((r) => _isUnresolvedAnomaly(r)).map((r) => ({
       txid: r.txid,
       buyerVerusId: r.buyerVerusId || null,
       amount: r.amount ?? null,
@@ -1433,7 +1501,24 @@ async function pollPendingDeposits(agentId, client, emit) {
   // lock is not reentrant, so nesting them would deadlock the agent for the
   // full acquire timeout on every single poll.
   try {
-    await reconcileUnconfirmedDeposits(agentId, client, Date.now(), emit);
+    const r = await reconcileUnconfirmedDeposits(agentId, client, Date.now(), emit);
+    // The commit that added this claimed it "reports inert-no-flag rather than
+    // doing so silently". It did not: the state was returned and discarded, so
+    // an inert reconciler looked exactly like a working one — the precise
+    // failure the fail-closed design is supposed to avoid. Log it, once per
+    // transition, so a reconciler that has quietly stopped being able to act is
+    // visible without reading the source.
+    if (r && r.state && r.state !== "armed" && r.state !== "idle") {
+      if (_lastReconcileState.get(agentId) !== r.state) {
+        _lastReconcileState.set(agentId, r.state);
+        console.warn(`[Deposits] ${agentId}: reconciler is ${r.state} — ` +
+          (r.state === "inert-no-flag"
+            ? "the backend does not advertise tx.status-notfound-code, so 0-conf credits will NOT be reconciled."
+            : "the platform node is not reporting a trustworthy view; credits left standing."));
+      }
+    } else if (r && r.state) {
+      _lastReconcileState.set(agentId, r.state);
+    }
   } catch (e) {
     console.warn(`[Deposits] ${agentId}: reconcile pass failed (${e.message}) — credits left standing`);
   }
@@ -1670,4 +1755,4 @@ async function notifyJ41CreditLow(sellerWif, sellerVerusId, buyerVerusId, balanc
   }
 }
 
-module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, listDepositAnomalies, listDepositAnomaliesForAgent, creditDepositAnomaly, dismissDepositAnomaly, reconcileMeterAgainstLedger, withDepositLock, _recheckReversals, _settleReversedForTxid, _classifyLookupFailure, _syncedView, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_MIN_ADVANCE_BLOCKS, REVERSAL_RECHECK_WINDOW_MS, REVERSAL_BUDGET_MAX, PROCESSED_AUDIT_CAP, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
+module.exports = { STUCK_CREDITING_MS, reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, listDepositAnomalies, listDepositAnomaliesForAgent, creditDepositAnomaly, dismissDepositAnomaly, reconcileMeterAgainstLedger, withDepositLock, _recheckReversals, _settleReversedForTxid, _classifyLookupFailure, _syncedView, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_MIN_ADVANCE_BLOCKS, REVERSAL_RECHECK_WINDOW_MS, REVERSAL_BUDGET_MAX, PROCESSED_AUDIT_CAP, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };

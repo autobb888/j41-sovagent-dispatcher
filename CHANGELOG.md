@@ -26,11 +26,25 @@ way, which is strictly worse than a dead-lettered inbox item. Monitor on
 already pinned to `degraded` for the rest of any run containing one container crash,
 so it carries much less information than it appears to.
 
-Also new: `ctl deposits`, `GET /v1/deposits`, `j41-dispatcher deposits list`, and
-`deposit.reversed` / `deposit.restored` / `deposit.needs_operator` control-API
-events. `deposits credit` and `deposits dismiss` are deliberately not implemented
-yet — they move money out-of-band against a running daemon and need an
-inter-process lock first.
+Also new: `ctl deposits`, `GET /v1/deposits`, `deposit.reversed` /
+`deposit.restored` / `deposit.needs_operator` control-API events, and a
+`j41-dispatcher deposits` command with three verbs:
+
+- `deposits list` — anomalies first, each printed with the buyer's meter
+  `totalDeposited` against the ledger-derived expectation, so "did the
+  adjustment run?" is arithmetic rather than a judgement call.
+- `deposits credit <agent-id> <txid>` — the buyer is owed this; re-verifies the
+  transaction on-chain and fails closed on any doubt.
+- `deposits dismiss <agent-id> <txid> --reason <text>` — nothing is owed; moves
+  no money, records why.
+
+The verbs run out-of-band against a live daemon, so all deposit-ledger
+read-modify-writes now go through a per-agent inter-process lock
+(`src/file-lock.js`). Note the limit: `credit-meters.json` is still written
+without a lock by the proxy metering path on every request, so a `deposits
+credit` issued while that agent is actively serving traffic can still lose
+either write. Prefer resolving anomalies on a quiet agent until that path is
+serialised too.
 
 ### The `start` action can now be executed by a test
 

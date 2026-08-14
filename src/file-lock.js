@@ -137,13 +137,42 @@ function _stealStale(lockPath, token, staleMs, now) {
     // Inside the gate: re-read the real lock. A peer may already have replaced it.
     let currentRaw = null;
     try { currentRaw = String(fs.readFileSync(lockPath, 'utf8')); } catch { currentRaw = null; }
-    if (currentRaw !== null && !_isStale(currentRaw, staleMs, Date.now())) return false;
 
-    // Replace via rename: atomic, and the replacement carries its content from
-    // the start, so no contender can observe an empty lock at this path.
+    if (currentRaw === null) {
+      // The path is FREE, not stale — the previous holder released while we were
+      // getting into the gate. Nothing here is ours to take, and a plain
+      // acquirer may be link()ing into that path this instant.
+      //
+      // This is where the first version put two processes inside the critical
+      // section: the staleness guard below reads `currentRaw !== null && ...`,
+      // which short-circuits to false when the file is absent, so an absent
+      // lock fell through to a rename() install. rename() cannot fail, so it
+      // silently overwrote the live lock a contender had just acquired
+      // legitimately, and both returned a token.
+      //
+      // Compete for it honestly instead. Losing means a peer got there first,
+      // which is the correct outcome — not a reason to overwrite them.
+      return _publishExclusive(lockPath, token);
+    }
+
+    if (!_isStale(currentRaw, staleMs, Date.now())) return false;
+
+    // Replacing a still-PRESENT stale file is safe to do by rename: only a
+    // live token-holder ever unlinks, and this one's holder is dead, so nobody
+    // can pull the file out from under us. The replacement carries its content
+    // from the start, so no contender observes an empty lock at this path.
     const tmp = `${lockPath}.new.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
     fs.writeFileSync(tmp, token, { mode: 0o600 });
     fs.renameSync(tmp, lockPath);
+
+    // Proof of ownership, mirroring acquireSendLock's read-back. The gate makes
+    // a second stealer unlikely, not impossible: the gate-reclaim path briefly
+    // renames the gate away before renaming it back, and a third contender can
+    // publish a gate in that window. If two of us reach this line, exactly one
+    // must lose, and the read-back is what decides it.
+    let back = null;
+    try { back = String(fs.readFileSync(lockPath, 'utf8')); } catch { back = null; }
+    if (back !== token) return false;
     return true;
   } finally {
     try { fs.unlinkSync(gatePath); } catch {}

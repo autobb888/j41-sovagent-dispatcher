@@ -201,3 +201,70 @@ test('reconciliation reports a missing meter rather than inventing a zero', asyn
   assert.equal(m.actualTotalDeposited, null, '"never looked" and "looked and it is zero" prescribe opposite actions');
   assert.equal(m.delta, null);
 });
+
+// ── the state a crash leaves, and whether anyone can see or settle it ───────
+
+test('a record stuck mid-credit becomes an operator question, and is resolvable', async () => {
+  // chunk 1 creates this state on a crash and described it as reading "a human
+  // must check". Nothing read it: it was counted only among open 0-conf credits
+  // (which deliberately do not degrade health), never listed as needing an
+  // operator, and both verbs returned NOT_FOUND for it. It is also the ONE state
+  // not bounded by the 2 VRSC tier — this is the 6-confirmation >10 VRSC path.
+  const { STUCK_CREDITING_MS } = require('../src/deposit-watcher.js');
+  const agentId = 'agent-stuck';
+  const txid = 'tx_stuck_big';
+  writeDeposits(agentId, {
+    processed: [{
+      txid, buyerVerusId: 'whale@', amount: 25, confirmations: 6,
+      crediting: true, intentAt: new Date(Date.now() - STUCK_CREDITING_MS - 60_000).toISOString(),
+    }],
+    pending: [], reversed: [], creditedTxids: [txid],
+  });
+
+  const listed = listDepositAnomaliesForAgent(agentId).needsOperator;
+  assert.equal(listed.length, 1, 'a 25 VRSC deposit stuck mid-credit must be visible to a human');
+  assert.match(listed[0].reason, /never finalized/);
+
+  const res = await creditDepositAnomaly(agentId, txid, { client: client(6) });
+  assert.equal(res.ok, true, 'and settleable — otherwise the fix is hand-editing JSON');
+  assert.equal(getBalance(agentId, 'whale@'), 25);
+  assert.equal(listDepositAnomaliesForAgent(agentId).needsOperator.length, 0);
+});
+
+test('a credit intent still in flight is NOT reported as stuck', async () => {
+  const agentId = 'agent-inflight';
+  writeDeposits(agentId, {
+    processed: [{
+      txid: 'tx_inflight', buyerVerusId: 'b@', amount: 1,
+      crediting: true, intentAt: new Date().toISOString(),
+    }],
+    pending: [], reversed: [], creditedTxids: ['tx_inflight'],
+  });
+  assert.equal(listDepositAnomaliesForAgent(agentId).needsOperator.length, 0,
+    'a slow credit must not be mistaken for a crashed one');
+});
+
+test('an interrupted operator credit refuses to run again blind', async () => {
+  // The verb a human retries is the one that most needs an intent protocol: a
+  // crash between the meter write and the record write leaves the anomaly open
+  // and un-deduped, and the natural response to a command that died is to run
+  // it again.
+  const { agentId, txid, buyer, amount } = seedReversedAnomaly();
+  const realRename = fs.renameSync;
+  fs.renameSync = (from, to, ...rest) => {
+    if (String(to).endsWith('credit-meters.json')) throw new Error('EIO: killed mid-credit');
+    return realRename(from, to, ...rest);
+  };
+  try {
+    await creditDepositAnomaly(agentId, txid, { client: client(3) }).catch(() => {});
+  } finally {
+    fs.renameSync = realRename;
+  }
+
+  const retry = await creditDepositAnomaly(agentId, txid, { client: client(3) });
+  assert.equal(retry.ok, false);
+  assert.equal(retry.code, 'RESOLVE_INTERRUPTED',
+    `a blind retry is how one credit becomes two; got ${JSON.stringify(retry)}`);
+  assert.match(retry.message, /totalDeposited/, 'and it must say how to decide');
+  assert.equal(getBalance(agentId, buyer), 0, `nothing landed; amount was ${amount}`);
+});

@@ -22,7 +22,20 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
+
+/**
+ * A pid that is provably not running: spawn a child, wait for it to exit, use
+ * its pid. Hard-coding one (999997) assumes it is unallocated, and this host's
+ * pid_max is 4194304 — squarely inside normal allocation range. A live process
+ * there makes the lock un-stealable, all contenders burn their timeouts, and the
+ * test fails for a reason nothing in the message would reveal. That is a
+ * plausible cause of the one unexplained failure seen in ~68 rounds.
+ */
+function deadPid() {
+  const r = spawnSync(process.execPath, ['-e', '0']);
+  return r.pid;
+}
 
 const RACER = path.join(__dirname, 'fixtures', 'deposit-racer.js');
 const AGENT = 'agent-lock-race';
@@ -76,7 +89,7 @@ test('a lock left behind by a dead process is reclaimed, not deadlocked on', asy
   // Without a reclaim path a single crash jams that agent's deposits forever.
   const { recorded, ok, outs } = await raceRound({
     racers: 6,
-    seedLock: `999997:${Date.now() - 60_000}:deadbeef`,
+    seedLock: `${deadPid()}:${Date.now() - 60_000}:deadbeef`,
   });
   assert.equal(ok, 6, `children said ${JSON.stringify(outs)}`);
   assert.equal(recorded, 6, `expected 6 records, found ${recorded}; children said ${JSON.stringify(outs)}`);
