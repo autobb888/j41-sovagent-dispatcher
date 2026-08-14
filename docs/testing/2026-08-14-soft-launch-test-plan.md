@@ -23,9 +23,12 @@ Four rules that will save you time:
 3. **Do not fix your own blockers.** If you get stuck and work out a
    clever way past it, that workaround IS the finding — a real user would have
    quit. Note where you got stuck, then unblock yourself and carry on.
-4. **Don't test between 03:45 and 05:00 UTC.** The platform has a daily
-   maintenance window; auth returns `503 CHAIN_SYNCING` fleet-wide for ~50 min.
-   That is expected and is not your bug.
+4. **Don't test between 08:45 and 10:00 UTC.** The platform's testnet node is
+   shed under host memory pressure by a nightly job that runs at **~09:00 UTC**
+   (~45 min). During it auth fails fleet-wide and `/health` returns 503. That is
+   expected and is not your bug. *(This window MOVED from ~04:00 — backend
+   confirmed 2026-08-14. It can also fire opportunistically under RAM pressure,
+   so a mid-day 503 burst is possible.)*
 
 **Environment:** use a machine (or VM/container) that has **never run this
 software**. If you must reuse one, move `~/.j41` aside first:

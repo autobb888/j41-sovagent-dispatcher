@@ -28,6 +28,13 @@ const AGENTS_DIR = path.join(os.homedir(), '.j41', 'dispatcher', 'agents');
 // Deposit reports must be signed within this window (replay/freshness bound).
 const DEPOSIT_REPORT_MAX_AGE_MS = 5 * 60 * 1000;
 
+// Deposit-notify retry. The platform 503s while it cannot see the funding tx on
+// its own node — a routine propagation race, plus a daily ~09:00 UTC window of
+// ~45 min. Bounded so a permanently unreachable platform does not spin forever.
+const NOTIFY_MAX_ATTEMPTS = 8;
+const NOTIFY_BACKOFF_BASE_MS = 60 * 1000;
+const NOTIFY_BACKOFF_MAX_MS = 15 * 60 * 1000;
+
 /** Currency symbol for a network (deposits are in the chain's native coin). */
 function networkCurrency(network) {
   return network === 'verus' ? 'VRSC' : 'VRSCTEST';
@@ -515,7 +522,10 @@ async function _reportVerifiedDeposit(agentId, client, report, payAddress, netwo
     // leaves our ledger and the platform's disagreeing.
     const ctx = _notifyContexts.get(agentId);
     if (ctx) {
-      notifyJ41DepositConfirmed(ctx.sellerWif, ctx.sellerVerusId, buyerVerusId, credited, txid, ctx.network).catch(() => {});
+      _markNotifyOwed(agentId, txid);
+      notifyJ41DepositConfirmed(ctx.sellerWif, ctx.sellerVerusId, buyerVerusId, credited, txid, ctx.network)
+        .then((r) => { if (r === 'ok') _clearNotifyOwed(agentId, txid); })
+        .catch(() => {});
     }
 
     return { credited: true, message: 'Deposit confirmed and credited', balance: result.newBalance };
@@ -1567,6 +1577,14 @@ function listDepositAnomalies(agentIds) {
  * @param client - Authenticated J41Client
  */
 async function pollPendingDeposits(agentId, client, emit) {
+  // Re-fire any notification the platform could not accept last time. Cheap
+  // (usually zero rows) and it is the only thing that closes their ~09:00 UTC
+  // window and the routine mempool-propagation race.
+  try {
+    const ctx = _notifyContexts.get(agentId);
+    if (ctx) await retryPendingNotifies(agentId, ctx);
+  } catch { /* never let a retry break the poll */ }
+
   // Reconcile first. This is the only caller, so a 0-conf credit that never
   // lands is only ever clawed back from here — and unlike the pending sweep it
   // must run even when `pending` is empty, because a 0-conf credit is not
@@ -1650,7 +1668,10 @@ async function _pollPendingSweep(agentId, client) {
         // Notify J41 — uses per-agent context
         const pollCtx = _notifyContexts.get(agentId);
         if (pollCtx) {
-          notifyJ41DepositConfirmed(pollCtx.sellerWif, pollCtx.sellerVerusId, dep.buyerVerusId, dep.amount, dep.txid, pollCtx.network).catch(() => {});
+          _markNotifyOwed(agentId, dep.txid);
+          notifyJ41DepositConfirmed(pollCtx.sellerWif, pollCtx.sellerVerusId, dep.buyerVerusId, dep.amount, dep.txid, pollCtx.network)
+            .then((r) => { if (r === 'ok') _clearNotifyOwed(agentId, dep.txid); })
+            .catch(() => {});
         }
       } else {
         stillPendingCount++;
@@ -1734,10 +1755,20 @@ async function notifyJ41DepositConfirmed(sellerWif, sellerVerusId, buyerVerusId,
       confirmedAt,
       nonce,
     };
-    const canonical = canonicalize(payload);
-    const signature = signMessage(sellerWif, canonical, network);
-
-    const body = JSON.stringify({ ...payload, signature });
+    let body;
+    try {
+      const canonical = canonicalize(payload);
+      const signature = signMessage(sellerWif, canonical, network);
+      body = JSON.stringify({ ...payload, signature });
+    } catch (e) {
+      // Local failure — a bad WIF, a broken canonicaliser. It will fail the same
+      // way forever, so it must not consume the retry budget and must not look
+      // like the platform being busy. Matching on the message text would be
+      // fragile ("Non-base58 character" matches no obvious keyword); the
+      // position in the flow is what actually distinguishes the two.
+      console.error(`[Deposits] J41 notification FAILED LOCALLY (not a platform problem): ${e.message}`);
+      return 'permanent';
+    }
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10000);
@@ -1752,12 +1783,106 @@ async function notifyJ41DepositConfirmed(sellerWif, sellerVerusId, buyerVerusId,
 
     if (res.ok) {
       console.log(`[Deposits] J41 notified: deposit ${txid.substring(0, 12)}... confirmed for ${buyerVerusId}`);
-    } else {
-      console.warn(`[Deposits] J41 notification failed: ${res.status} ${await res.text().catch(() => '')}`);
+      return 'ok';
     }
+    const errBody = await res.text().catch(() => '');
+    // The platform verifies the funding tx is visible on ITS node before
+    // routing, and 503s when it is not. That is not an error condition — it is
+    // a propagation race we lose routinely, because we credit from OUR mempool
+    // view and notify immediately. It also covers their daily ~09:00 UTC window
+    // when the node is shed under memory pressure (~45 min).
+    //
+    // No money is at stake either way: the platform holds no reversible balance
+    // for a deposit, so the only casualty of giving up is a LOST NOTIFICATION —
+    // an inbox card the buyer never sees. Retryable statuses get re-fired by the
+    // poller instead of being dropped with a warning nobody reads.
+    const retryable = res.status === 503 || res.status === 429 || res.status === 408 || res.status >= 500;
+    console.warn(`[Deposits] J41 notification ${retryable ? 'deferred' : 'failed'}: ${res.status} ${errBody.slice(0, 200)}`);
+    return retryable ? 'retry' : 'permanent';
   } catch (e) {
-    console.warn(`[Deposits] J41 notification failed (non-fatal): ${e.message}`);
+    // Distinguish "we could not build/sign the request" from "the platform is
+    // busy". A bad WIF or a broken canonicaliser will fail identically on every
+    // retry, and letting it consume the retry budget hides a local defect
+    // behind what looks like a platform outage — exactly the confusion that
+    // made the earlier `canonicalize is not a function` bug invisible.
+    // Only the fetch can reach here now — signing failures returned above.
+    console.warn(`[Deposits] J41 notification deferred (network): ${e.message}`);
+    return 'retry';
   }
+}
+
+/** Flag a credited deposit as owing a platform notification. Never throws. */
+function _markNotifyOwed(agentId, txid) {
+  try {
+    const d = loadDeposits(agentId);
+    const rec = (d.processed || []).find((r) => r && r.txid === txid);
+    if (!rec || rec.notifyGaveUp) return;
+    rec.notifyPending = true;
+    saveDeposits(agentId, d);
+  } catch { /* the notify is best-effort; never break a credit over it */ }
+}
+
+/** Clear the flag once the platform has accepted the notification. */
+function _clearNotifyOwed(agentId, txid) {
+  try {
+    const d = loadDeposits(agentId);
+    const rec = (d.processed || []).find((r) => r && r.txid === txid);
+    if (!rec || !rec.notifyPending) return;
+    delete rec.notifyPending; delete rec.notifyAttempts; delete rec.notifyNextAt;
+    saveDeposits(agentId, d);
+  } catch { /* best effort */ }
+}
+
+/** Deposits whose notify is owed, oldest first. Never throws. */
+function _pendingNotifies(deposits) {
+  try {
+    return (deposits.processed || []).filter((r) => r && r.notifyPending && !r.notifyGaveUp);
+  } catch { return []; }
+}
+
+/**
+ * Re-fire notifications the platform could not accept yet.
+ *
+ * Bounded: NOTIFY_MAX_ATTEMPTS tries, then the record is marked `notifyGaveUp`
+ * and left in the ledger for a human to see. Unbounded retry against a node
+ * that is down for 45 minutes would just spin; giving up silently is what we
+ * are fixing.
+ */
+async function retryPendingNotifies(agentId, ctx, now = Date.now()) {
+  if (!ctx || !ctx.sellerWif) return { attempted: 0, ok: 0 };
+  let deposits;
+  try { deposits = loadDeposits(agentId); } catch { return { attempted: 0, ok: 0 }; }
+  const owed = _pendingNotifies(deposits);
+  if (!owed.length) return { attempted: 0, ok: 0 };
+
+  let attempted = 0; let ok = 0; let changed = false;
+  for (const r of owed) {
+    if (r.notifyNextAt && now < r.notifyNextAt) continue;
+    attempted += 1;
+    // eslint-disable-next-line no-await-in-loop
+    const result = await notifyJ41DepositConfirmed(
+      ctx.sellerWif, ctx.sellerVerusId, r.buyerVerusId, r.amount, r.txid, ctx.network,
+    );
+    changed = true;
+    if (result === 'ok') {
+      delete r.notifyPending; delete r.notifyAttempts; delete r.notifyNextAt;
+      ok += 1;
+    } else if (result === 'permanent') {
+      r.notifyPending = false; r.notifyGaveUp = 'rejected';
+    } else {
+      r.notifyAttempts = (r.notifyAttempts || 0) + 1;
+      if (r.notifyAttempts >= NOTIFY_MAX_ATTEMPTS) {
+        r.notifyPending = false;
+        r.notifyGaveUp = 'exhausted';
+        console.error(`[Deposits] ⚠️  Gave up notifying J41 about ${String(r.txid).substring(0, 12)}… after ${r.notifyAttempts} tries. The buyer's balance is correct locally; the platform has no record of this deposit.`);
+      } else {
+        // Exponential, capped — their outage window is ~45 min.
+        r.notifyNextAt = now + Math.min(NOTIFY_BACKOFF_BASE_MS * (2 ** r.notifyAttempts), NOTIFY_BACKOFF_MAX_MS);
+      }
+    }
+  }
+  if (changed) { try { saveDeposits(agentId, deposits); } catch { /* best effort */ } }
+  return { attempted, ok };
 }
 
 /**
@@ -1830,4 +1955,4 @@ async function notifyJ41CreditLow(sellerWif, sellerVerusId, buyerVerusId, balanc
   }
 }
 
-module.exports = { networkCurrency, STUCK_CREDITING_MS, reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, listDepositAnomalies, listDepositAnomaliesForAgent, creditDepositAnomaly, dismissDepositAnomaly, reconcileMeterAgainstLedger, withDepositLock, _recheckReversals, _settleReversedForTxid, _classifyLookupFailure, _syncedView, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_MIN_ADVANCE_BLOCKS, REVERSAL_RECHECK_WINDOW_MS, REVERSAL_BUDGET_MAX_DEFAULT, PROCESSED_AUDIT_CAP, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
+module.exports = { networkCurrency, retryPendingNotifies, _pendingNotifies, NOTIFY_MAX_ATTEMPTS, STUCK_CREDITING_MS, reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, listDepositAnomalies, listDepositAnomaliesForAgent, creditDepositAnomaly, dismissDepositAnomaly, reconcileMeterAgainstLedger, withDepositLock, _recheckReversals, _settleReversedForTxid, _classifyLookupFailure, _syncedView, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_MIN_ADVANCE_BLOCKS, REVERSAL_RECHECK_WINDOW_MS, REVERSAL_BUDGET_MAX_DEFAULT, PROCESSED_AUDIT_CAP, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };

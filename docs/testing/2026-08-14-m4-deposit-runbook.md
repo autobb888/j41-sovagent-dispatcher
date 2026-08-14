@@ -16,7 +16,7 @@ That makes the restart into this code near-zero-risk on the deposit side — the
 is nothing to migrate and nothing to reconcile — and it also means steps 3 and 4
 cannot happen until an agent actually sells an endpoint.
 
-**Do not run this near 04:00 UTC.** Seller auth dies fleet-wide for ~50 minutes
+**Do not run this near 09:00 UTC** (window moved from 04:00; backend confirmed 2026-08-14).** Seller auth dies fleet-wide for ~50 minutes
 during scheduled backend maintenance.
 
 **A restart deactivates the fleet.** `start` does not reactivate; run

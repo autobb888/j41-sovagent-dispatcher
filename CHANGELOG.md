@@ -1,5 +1,35 @@
 # Changelog
 
+## 2.30.1 — 2026-08-14
+
+### Deposit notifications survive the platform's new visibility gate
+
+The platform now verifies a deposit's funding transaction is visible on **its
+own node** before routing our `deposit-confirmed`, returning `503
+DEPOSIT_TX_NOT_VISIBLE` when it is not, or `503 VERIFICATION_UNAVAILABLE` when
+its RPC is down.
+
+Both are routine rather than exceptional: we credit from OUR mempool view and
+notify immediately, so losing the propagation race is the normal case — and
+their testnet node is shed under memory pressure daily around **09:00 UTC** for
+~45 minutes (the window moved from ~04:00; their confirmation, 2026-08-14).
+
+Our notify was fire-and-forget — a 503 produced a warning and the notification
+was gone. No money was ever at risk (the platform holds no reversible balance
+for a deposit) but the buyer silently never got their inbox card. Credited
+deposits now carry a `notifyPending` flag, and the existing deposit poller
+re-fires owed notifications with exponential backoff, bounded to 8 attempts
+before giving up **loudly** and leaving the record visible in the ledger.
+
+A local signing or serialisation failure is classified as permanent rather than
+retryable — by its position in the flow, not by matching the error text. It
+fails identically on every retry, and letting it consume the retry budget is how
+the earlier `canonicalize is not a function` bug stayed invisible.
+
+### Maintenance window corrected everywhere
+
+Test plan and deposit runbook now say **~09:00 UTC**, not 04:00.
+
 ## 2.30.0 — 2026-08-14
 
 ### The path from install to earning actually exists now

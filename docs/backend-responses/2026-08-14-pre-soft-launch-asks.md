@@ -146,3 +146,70 @@ side, now closed and published:
 
 **A1 decided** — it is the only thing standing between us and a clean run.
 Then A2 and A3. Everything in section C can be a one-line yes/no.
+
+
+---
+
+# ANSWERED — backend reply 2026-08-14, and what we did with it
+
+Their reply resolved or closed **every** item. Recording the deltas that
+changed our code, so this file is the whole exchange.
+
+## What we changed in response (shipped in 2.30.1)
+
+**A1 — they solved it a third way, and it created work for us.** Rather than
+deferring the notify or specing a reversal webhook, they now verify the funding
+tx is visible on *their* node before routing, and **503** when it is not
+(`DEPOSIT_TX_NOT_VISIBLE` / `VERIFICATION_UNAVAILABLE`).
+
+Their premise is right — their handler holds no reversible balance, so a
+reversed 0-conf deposit cannot corrupt their ledger. **But their 503 is not
+rare.** We credit from OUR mempool view and notify immediately, so losing the
+propagation race is the *normal* case, not just their 09:00 window. Our notify
+was fire-and-forget: one warning and the notification was gone forever.
+
+Fixed: credited deposits carry `notifyPending`; the deposit poller re-fires with
+exponential backoff, bounded to 8 attempts, then gives up loudly with the record
+left visible. Local signing failures are classified permanent by position in the
+flow, so they cannot burn the retry budget.
+
+**C7 — the window moved and we were testing against the wrong hour.** ~04:00 →
+**~09:00 UTC**, memory-pressure driven, ~45 min. Corrected in the tester run
+book and the deposit runbook. This alone would have cost a tester a morning.
+
+## What we accept as closed with no action
+
+- **A2** — the core fix shipped 08-09 and we never knew; A2-R now defers the
+  60-min auto-complete while a top-up is mid-flight, grace-bounded.
+- **A3** — penalty-only on every path, no escrow, so "can it move funds under
+  `defaultAction: rework`" is moot. **Correction accepted:** `agent-6` never
+  published consent; the on-chain consenters are `vari1`/`vari2`. Our note named
+  the wrong agent.
+- **B1 — our bug, not theirs.** `getAgentPaymentAddress` is a dispatcher symbol;
+  they advertise the i-address and settle the whole set. Verified our side: the
+  deposit path already uses `iAddress || address` (`cli.js:4585`, `:4462`), so
+  the advertised and verified addresses already agree. **No change needed** —
+  the audit finding overstated it.
+- **C1–C4** confirmed live. **D1/D2** acknowledged.
+
+## Deferred deliberately (not needed for the test run)
+
+They shipped two things at our request that we have **not yet adopted**:
+
+- **`GET /v1/pricing/confirmation-tiers`** + `tx.confirmation-tiers-v1`. We still
+  hardcode the tiers. They match today, so there is no divergence to fix — but
+  the silent-retier risk is only closed once we read the endpoint. **Next.**
+- **`nodeSynced` on `/v1/tx/status/:txid`** + `tx.status-sync-attested`. Our
+  reconciler still double-samples chain info to detect a lagging node. That
+  workaround is correct and passing; switching to `nodeSynced` is a
+  simplification, not a fix. **Next.**
+
+Adopting either mid-test-run would change reconciler behaviour under the tester's
+feet, which is why both wait.
+
+## Still owed to them
+
+- If we want dispute resolution exercised during the test run, a test agent must
+  publish `config.disputeresolution="platform"` on-chain. **Owner's call** —
+  nothing happens for our fleet until then, and the resolver correctly holds
+  non-consenting sellers' disputes for review.
