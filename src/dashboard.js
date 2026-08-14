@@ -133,12 +133,23 @@ async function createAgent(keys) {
  * screens are authoritative.
  */
 function readMoneyAttention(agents) {
-  const out = { pendingRefunds: 0, depositsNeedOperator: 0 };
+  const out = { pendingRefunds: 0, depositsNeedOperator: 0, feeTanksNeedingFunding: 0, feeTankCheckedAt: 0 };
   try {
     const raw = fs.readFileSync(path.join(DISPATCHER_DIR, 'pending-refunds.json'), 'utf8');
     const ledger = JSON.parse(raw);
     out.pendingRefunds = Object.values(ledger)
       .filter((e) => e && e.status === 'pending_approval').length;
+  } catch { /* absent or unreadable — report nothing */ }
+  try {
+    // Written by the daemon's fee-tank sweep. A tank that has drained means the
+    // agent has gone SILENT on-chain — no reviews, no attestations — while it
+    // may still hold unswept earnings. It is advisory and possibly stale (the
+    // daemon may not be running); the screen says so rather than pretending.
+    const raw = fs.readFileSync(path.join(DISPATCHER_DIR, 'fee-tank-status.json'), 'utf8');
+    const doc = JSON.parse(raw);
+    const rows = Array.isArray(doc.agents) ? doc.agents : [];
+    out.feeTanksNeedingFunding = rows.filter((r) => r && r.needsFunding).length;
+    out.feeTankCheckedAt = Number(doc.at) || 0;
   } catch { /* absent or unreadable — report nothing */ }
   try {
     const { listDepositAnomaliesForAgent } = require('./deposit-watcher.js');
@@ -258,6 +269,12 @@ async function mainMenu(inquirer) {
   if (money.depositsNeedOperator) {
     console.log(`  \x1b[33m⚠ ${money.depositsNeedOperator} deposit(s) need a decision ([21])\x1b[0m`);
   }
+  if (money.feeTanksNeedingFunding) {
+    const age = money.feeTankCheckedAt
+      ? ` as of ${Math.round((Date.now() - money.feeTankCheckedAt) / 60000)}m ago`
+      : '';
+    console.log(`  \x1b[31m⚠ ${money.feeTanksNeedingFunding} agent(s) have an EMPTY fee tank${age} — they cannot write on-chain ([19])\x1b[0m`);
+  }
   console.log('');
 
   const { choice } = await promptWithEsc(inquirer, [{
@@ -289,7 +306,7 @@ async function mainMenu(inquirer) {
       { name: '[17] Bounties', value: 'bounties' },
       { name: '[18] API Endpoint Setup (resell your LLM, metered)', value: 'api_setup' },
       new inquirer.Separator('  ── Money ──'),
-      { name: '[19] Wallet & Fee Tanks', value: 'wallet' },
+      { name: `[19] Wallet & Fee Tanks${money.feeTanksNeedingFunding ? ` \x1b[31m(${money.feeTanksNeedingFunding} empty)\x1b[0m` : ''}`, value: 'wallet' },
       { name: `[20] Refunds Queue${money.pendingRefunds ? ` \x1b[33m(${money.pendingRefunds} awaiting you)\x1b[0m` : ''}`, value: 'refunds' },
       { name: `[21] Deposits${money.depositsNeedOperator ? ` \x1b[33m(${money.depositsNeedOperator} need a decision)\x1b[0m` : ''}`, value: 'deposits' },
       new inquirer.Separator(),
@@ -1438,7 +1455,7 @@ async function configureServicesScreen(inquirer) {
       }
       console.log('');
 
-      const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'List this API endpoint?', default: true }]);
+      const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'List this API endpoint?', default: false }]);
       if (!confirm) continue;
 
       try {

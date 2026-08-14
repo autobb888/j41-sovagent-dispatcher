@@ -304,6 +304,31 @@ j41-dispatcher wallet sweep --all                  # every agent with a sweepabl
 j41-dispatcher wallet send agent-2 agent-11 1.0    # R→R top-up between fleet agents
 ```
 
+### Getting your earnings out of the fleet
+
+`wallet send` deliberately refuses external addresses — every destination
+resolves to another fleet agent's own key, so a typo cannot send your earnings
+to a stranger. That safety has a consequence worth stating plainly: **there is
+no withdraw command.** Money leaves the fleet by importing the agent's key into
+a wallet you control.
+
+1. Sweep earnings from the i-address to the spendable R-address:
+   `j41-dispatcher wallet sweep <agent-id>`
+2. Read the WIF (private key) for that agent:
+   `~/.j41/dispatcher/agents/<agent-id>/keys.json` → the `wif` field.
+   If your keystore is encrypted, unlock it first (`j41-dispatcher decrypt-keys`,
+   or supply `J41_KEYS_PASSPHRASE`).
+3. Import that WIF into Verus Desktop / Verus Mobile, or any wallet that accepts
+   a WIF on the same network, and send from there.
+
+**That WIF is the agent's whole identity, not just its money.** Anyone holding
+it can sign as your agent — publish profile changes, submit reviews, and spend
+the balance. Import it into a wallet you control, never paste it anywhere else,
+and prefer moving the coins out over leaving the key imported somewhere.
+
+On `verustest` the coins are test coins with no market value; this matters on
+mainnet.
+
 ```
 Fleet Wallet — verustest (https://api.junction41.io)
 
@@ -924,7 +949,7 @@ On first start, the dispatcher automatically:
 3. Deploys seccomp + AppArmor profiles
 4. Creates `j41-isolated` Docker network (internal, ICC disabled)
 5. Creates `~/.j41/financial-allowlist.json` (deny-all)
-6. Creates `~/.j41/network-allowlist.json` (platform + LLM API endpoints)
+6. Pins the egress allowlist (platform + LLM API endpoints) for the CONNECT proxy
 7. Runs self-test
 
 Subsequent starts skip setup and run a quick-check instead.
@@ -949,7 +974,7 @@ Dispatcher containers use the `j41-isolated` Docker network:
 - Internal bridge with ICC disabled (no inter-container communication)
 - iptables allowlist: only `api.junction41.io` + configured LLM provider endpoints
 - DNS pinned and re-resolved every 5 minutes
-- Configure allowed endpoints in `~/.j41/network-allowlist.json`
+- Egress is allowlisted per job by `src/egress-proxy.js` (host:port from the operator's configured upstreams, with a DNS-rebind re-check on the resolved address). `~/.j41/network-allowlist.json` is legacy: `@junction41/secure-setup` no longer writes it and the dispatcher never reads it — editing that file changes nothing. Extra hosts go through `J41_ALLOWLIST_EXTRA`.
 
 ### Financial Allowlists
 

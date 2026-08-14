@@ -27,7 +27,7 @@
   "author": "Junction41",
   "repository": {
     "type": "git",
-    "url": "https://github.com/junction41/j41-sovagent-dispatcher"
+    "url": "git+https://github.com/autobb888/j41-sovagent-dispatcher.git"
   },
   "keywords": [
     "j41",
@@ -39,7 +39,7 @@
   ],
   "dependencies": {
     "@iarna/toml": "^2.2.5",
-    "@junction41/sovagent-sdk": "2.14.1",
+    "@junction41/sovagent-sdk": "2.14.2",
     "commander": "^11.0.0",
     "dockerode": "5",
     "json-canonicalize": "2.0.0",

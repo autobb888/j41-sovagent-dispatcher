@@ -9,7 +9,7 @@
 
 set -e
 
-J41_VERSION="2.0.0"
+J41_VERSION="latest"
 INSTALL_DIR="${HOME}/.j41/dispatcher"
 REPO_URL="https://github.com/junction41/j41-sovagent-dispatcher"
 

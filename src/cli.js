@@ -134,6 +134,9 @@ const QUEUE_DIR = path.join(DISPATCHER_DIR, 'queue');
 const JOBS_DIR = path.join(DISPATCHER_DIR, 'jobs');
 const SEEN_JOBS_PATH = path.join(DISPATCHER_DIR, 'seen-jobs.json');
 const PENDING_REFUNDS_PATH = path.join(DISPATCHER_DIR, 'pending-refunds.json');
+// Written by the fee-tank sweep so a SEPARATE process (the TUI) can see a
+// draining tank. Advisory only — nothing gates on it.
+const FEE_TANK_STATUS_PATH = path.join(DISPATCHER_DIR, 'fee-tank-status.json');
 const REFUNDED_JOBS_PATH = path.join(DISPATCHER_DIR, 'refunded-jobs.json');
 const REFUND_LOCKS_DIR = path.join(DISPATCHER_DIR, 'refund-locks');
 const FINALIZE_STATE_FILENAME = 'finalize-state.json';
@@ -1766,7 +1769,15 @@ program
     let apiKey = '';
     if (provider !== 'ollama' && provider !== 'lmstudio' && provider !== 'vllm') {
       apiKey = await ask(`API key for ${provider}`, '');
-      if (!apiKey) console.log('  (You can set it later via environment variable)');
+      if (!apiKey) {
+        // NOT an environment variable — host env vars are deliberately never
+        // read for provider keys; they are forwarded per-job into containers
+        // from config.toml. The old advice here told users to do the one thing
+        // that does not work, and the comment below records the result: a fleet
+        // that declined every job.
+        console.log('  (Add it later under [provider_keys] in ~/.j41/dispatcher/config.toml,');
+        console.log('   or re-run: j41-dispatcher quickstart — an agent with no key declines every job.)');
+      }
     }
 
     // 5. Runtime
@@ -3509,7 +3520,13 @@ program
     console.log('║     LLM Providers & Executors            ║');
     console.log('╚══════════════════════════════════════════╝\n');
 
-    console.log('LLM Providers (set J41_LLM_PROVIDER):\n');
+    console.log('LLM Providers\n');
+    console.log('  Set the provider and its key in ~/.j41/dispatcher/config.toml:');
+    console.log('    [llm]           provider = "<name from the list below>"');
+    console.log('    [provider_keys] <name>   = "<your api key>"');
+    console.log('  or run: j41-dispatcher quickstart');
+    console.log('  The env-var column below is the UPSTREAM vendor\'s own convention — the');
+    console.log('  dispatcher does NOT read provider keys from its own environment.\n');
     for (const [name, preset] of Object.entries(LLM_PRESETS)) {
       if (name === 'custom') continue;
       const current = LLM_CONFIG.provider === name ? ' ← current' : '';
@@ -8025,7 +8042,18 @@ async function handleExtensionRequest(state, jobId, extensionId, agentInfo) {
   const cfg = loadConfig();
 
   if (cfg.extensionAutoApprove === false) {
-    console.log(`[Extension] Auto-approve disabled — ignoring ${extensionId.substring(0, 8)}`);
+    // Previously a silent `return`: the buyer waited forever on a job whose
+    // deadline we own, and no CLI or TUI verb existed to answer by hand. An
+    // explicit rejection is a worse answer than "yes" and a far better one than
+    // no answer — the buyer can re-request, pay, or walk away.
+    console.log(`[Extension] Auto-approve disabled — REJECTING ${extensionId.substring(0, 8)} (set extension_auto_approve = true to accept)`);
+    try {
+      const agent = await getAgentSession(state, agentInfo);
+      await agent.client.rejectExtension(jobId, extensionId);
+    } catch (e) {
+      console.error(`[Extension] Could not deliver the rejection for ${extensionId.substring(0, 8)}: ${e.message}`);
+      console.error('           The buyer may still be waiting — answer it from the platform UI.');
+    }
     return;
   }
 
@@ -9255,6 +9283,27 @@ async function checkFeeTanks(state) {
         console.error(`[FeeTank] ${agentInfo.id}: ${e.message}`);
       }
     }
+    // Persist the snapshot the TUI reads. `_feeTankLast` is in-memory, so the
+    // dashboard — a SEPARATE process — could never see it, which is why a
+    // draining tank was invisible to the one surface a human operator lives in
+    // while `refund` appeared 428 times in the CLI and zero times there. An
+    // agent whose R-address empties goes silent on-chain: no reviews, no
+    // attestations, no job records, and nothing says so.
+    try {
+      const rows = [];
+      for (const [agentId, snap] of state._feeTankLast.entries()) {
+        rows.push({
+          agentId,
+          writes: snap.writes,
+          reason: snap.reason,
+          needsFunding: snap.reason === 'needs-external-funding',
+          at: snap.at,
+        });
+      }
+      const tmp = `${FEE_TANK_STATUS_PATH}.tmp.${process.pid}`;
+      fs.writeFileSync(tmp, JSON.stringify({ at: Date.now(), agents: rows }, null, 2), { mode: 0o600 });
+      fs.renameSync(tmp, FEE_TANK_STATUS_PATH);
+    } catch { /* a status file we could not write must never break the sweep */ }
   } finally {
     state._feeSweepRunning = false;
   }
@@ -9730,7 +9779,9 @@ async function reportSpawnAttachFailed(state, agentInfo, job, reason, deps = {})
 async function startJobContainer(state, job, agentInfo) {
   if (!isValidJobId(job.id)) { console.error(`[security] Refusing job with invalid id: ${String(job.id).slice(0,40)}`); return; }
   if (!docker) {
-    throw new Error('Docker not available. Switch to local mode: j41-dispatcher config --runtime local');
+    throw new Error('Docker not available. Start it (`systemctl start docker`) or check your user can reach it (`docker ps`). '
+        + 'Local mode exists but is dev-only: it gives containers ZERO isolation, is refused without --dev-unsafe, '
+        + 'and cannot serve public jobs.');
   }
   const jobDir = path.join(JOBS_DIR, job.id);
   fs.mkdirSync(jobDir, { recursive: true });
@@ -10850,7 +10901,8 @@ program
   .command('ctl <command>')
   .description('Send command to running dispatcher: status, jobs, agents, resources, earnings, history, providers, inbox, inbox-redrive, deposits, shutdown, canary')
   .option('--agent <id>', 'Agent ID (for canary command)')
-  .option('--item <id>', 'Inbox item ID (for inbox-redrive; omit to redrive ALL dead letters)')
+  .option('--item <id>', 'Inbox item ID (for inbox-redrive)')
+  .option('--all', 'inbox-redrive: redrive EVERY dead letter (destructive — hands fresh budgets to poisoned items)')
   .option('--json', 'Raw JSON output')
   .action(async (command, options) => {
     const { sendCommand } = require('./control');
@@ -10862,6 +10914,19 @@ program
       // allows excess args) and redrives EVERY dead letter — an operator would
       // hand fresh budgets to genuinely poisoned items believing they targeted one.
       if (options.item) cmd.itemId = options.item;
+      // `wallet list` doctrine: the bare form must be the safe one. This was the
+      // single place where omitting an argument was the DESTRUCTIVE choice —
+      // a bare `ctl inbox-redrive` redrove every dead letter, handing fresh
+      // budgets to genuinely poisoned items, and probing `ctl` verbs to see
+      // what they print would fire it.
+      if (command === 'inbox-redrive' && !options.item && !options.all) {
+        console.error('❌ `ctl inbox-redrive` needs a target.');
+        console.error('   One item:      j41-dispatcher ctl inbox-redrive --item <id>');
+        console.error('   Every item:    j41-dispatcher ctl inbox-redrive --all');
+        console.error('   `--all` hands a fresh retry budget to items that may be poisoned.');
+        console.error('   See what is stuck first:  j41-dispatcher ctl inbox');
+        process.exit(1);
+      }
 
       const result = await sendCommand(cmd);
 
@@ -11298,10 +11363,11 @@ program
   .requiredOption('--title <title>', 'Bounty title')
   .requiredOption('--description <text>', 'Bounty description')
   .requiredOption('--amount <number>', 'Bounty amount')
-  .option('--currency <currency>', 'Currency', 'VRSCTEST')
+  .option('--currency <currency>', 'Currency', NATIVE_COIN)
   .option('--category <category>', 'Category')
   .option('--max-claimants <n>', 'Max number of winners', '1')
   .option('--deadline <date>', 'Application deadline (YYYY-MM-DD)')
+  .option('--yes', 'Skip the confirmation')
   .action(async (agentId, options) => {
     await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
@@ -11309,6 +11375,27 @@ program
     if (!keys || !keys.identity) {
       console.error(`❌ Agent ${agentId} not found or not registered.`);
       process.exit(1);
+    }
+
+    // This commits funds and was the only money verb in the CLI with no
+    // confirmation at all — the TUI equivalent has always asked. It is also the
+    // one place a headless caller could spend without meeting the exit-2
+    // contract every other money command now follows.
+    if (!options.yes) {
+      console.log(`\n  Posting a bounty from ${agentId} (${keys.identity})`);
+      console.log(`    Title:  ${untrusted(options.title, 80)}`);
+      console.log(`    Amount: ${options.amount} ${options.currency}`);
+      console.log(`    Winners: up to ${options.maxClaimants}`);
+      requireInteractiveConfirm('post-bounty');
+      const readline = require('readline');
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      const answer = await new Promise((resolve) => rl.question('\n  Post this bounty? (y/N) ', resolve));
+      rl.close();
+      const a = answer.trim().toLowerCase();
+      if (a !== 'y' && a !== 'yes') {
+        console.log('  Cancelled — no bounty posted.');
+        return;
+      }
     }
 
     const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');

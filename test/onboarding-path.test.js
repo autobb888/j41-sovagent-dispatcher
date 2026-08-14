@@ -221,14 +221,57 @@ test('money owed to buyers is surfaced on the FIRST screen, not buried', () => {
   assert.match(body, /buyers are owed until you act/);
 });
 
-test('readMoneyAttention degrades to zero rather than blocking the TUI', () => {
-  // It runs on the way to drawing a menu; a corrupt ledger must not lock the
-  // operator out of the only interface they have.
-  const start = DASH.indexOf('function readMoneyAttention(');
-  const body = DASH.slice(start, start + 1400);
-  assert.equal((body.match(/catch/g) || []).length >= 3, true,
-    'every read must be individually guarded');
-  assert.match(body, /out\.pendingRefunds = 0|pendingRefunds: 0/);
+test('BEHAVIOUR: readMoneyAttention counts correctly and degrades to zero', () => {
+  // Counting `catch` keywords in source (the first version of this test) proves
+  // nothing about behaviour. Extract the real function and run it: it draws the
+  // menu, so a corrupt ledger must not lock the operator out of the only
+  // interface they have.
+  const os = require('os');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-money-'));
+  const dir = path.join(home, '.j41', 'dispatcher');
+  fs.mkdirSync(dir, { recursive: true });
+
+  const src = DASH.slice(DASH.indexOf('function readMoneyAttention('),
+                         DASH.indexOf('// ── ESC-to-back'));
+  // eslint-disable-next-line no-new-func
+  const make = new Function('fs', 'path', 'DISPATCHER_DIR', 'require',
+    `${src}; return readMoneyAttention;`);
+  const readMoneyAttention = make(fs, path, dir, require);
+
+  fs.writeFileSync(path.join(dir, 'pending-refunds.json'), JSON.stringify({
+    a: { status: 'pending_approval' },
+    b: { status: 'sent' },
+    c: { status: 'pending_approval' },
+  }));
+  fs.writeFileSync(path.join(dir, 'fee-tank-status.json'), JSON.stringify({
+    at: Date.now(), agents: [{ agentId: 'x', needsFunding: true }, { agentId: 'y', needsFunding: false }],
+  }));
+  let r = readMoneyAttention([]);
+  assert.equal(r.pendingRefunds, 2, 'only pending_approval counts');
+  assert.equal(r.feeTanksNeedingFunding, 1, 'only empty tanks count');
+
+  // Corrupt both ledgers: must degrade, not throw.
+  fs.writeFileSync(path.join(dir, 'pending-refunds.json'), '{ not json');
+  fs.writeFileSync(path.join(dir, 'fee-tank-status.json'), 'garbage');
+  assert.doesNotThrow(() => { r = readMoneyAttention([]); });
+  assert.equal(r.pendingRefunds, 0);
+  assert.equal(r.feeTanksNeedingFunding, 0);
+
+  // Missing files and a null agent list.
+  fs.rmSync(path.join(dir, 'pending-refunds.json'));
+  fs.rmSync(path.join(dir, 'fee-tank-status.json'));
+  assert.doesNotThrow(() => { r = readMoneyAttention(null); });
+  assert.deepEqual({ p: r.pendingRefunds, f: r.feeTanksNeedingFunding }, { p: 0, f: 0 });
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('a drained fee tank is surfaced on the first screen, not only inside [19]', () => {
+  // Half of B5's original finding. An agent whose R-address empties goes silent
+  // on-chain — no reviews, no attestations — while the menu said nothing.
+  assert.match(DASH, /feeTanksNeedingFunding/);
+  assert.match(DASH, /EMPTY fee tank/);
+  assert.match(CLI, /FEE_TANK_STATUS_PATH/,
+    'the daemon must persist the status for the separate TUI process to read');
 });
 
 test('the TUI money screens shell out to the CLI instead of copying money logic', () => {

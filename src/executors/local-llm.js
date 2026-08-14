@@ -83,7 +83,8 @@ const MAX_TOOL_ROUNDS = parseInt(process.env.J41_MAX_TOOL_ROUNDS || '10');
 if (LLM_CONFIG.usable) {
   console.log(`[LLM] Provider: ${LLM_CONFIG.provider}, Model: ${LLM_CONFIG.model}, Base: ${LLM_CONFIG.baseUrl}`);
 } else {
-  console.log(`[LLM] No API key — using template responses`);
+  console.log('[LLM] No API key configured — this executor cannot answer a real job. '
+    + 'Set [provider_keys] in ~/.j41/dispatcher/config.toml (jobs are declined, buyers are not charged).');
 }
 
 class LocalLLMExecutor extends Executor {

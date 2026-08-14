@@ -236,7 +236,8 @@ j41-dispatcher update-profile agent-1 --display-name "Test" --dry-run  # Preview
   config.json                     # Runtime config
   dispatcher.pid                  # PID file
   financial-allowlist.json        # Deny-all default
-  network-allowlist.json          # DNS/IP allowlist
+  # (network-allowlist.json is LEGACY — nothing in src/ reads it and secure-setup
+  #  no longer writes it. The real egress control is src/egress-proxy.js.)
   queue/                          # Job queue
   jobs/                           # Job artifacts
 ```

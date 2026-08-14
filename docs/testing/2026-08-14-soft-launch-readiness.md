@@ -209,11 +209,12 @@ with no demand" and "invisibly broken" look identical for hours.**
 > plus first-screen counts for refunds and deposit anomalies; the views shell out
 > to the CLI rather than duplicating the money paths.
 >
-> **The drained fee tank — half the original finding — is still not surfaced
-> proactively.** It is visible only if the operator opens [19]. The audit's
-> counter-proposal is right and is the next fix: `checkFeeTanks` already detects
-> the condition in the daemon and can stamp a file next to `pending-refunds.json`
-> that the existing never-throw counter reads, at zero menu-latency cost.
+> **FULLY CLOSED 2026-08-14** — the audit's counter-proposal was right and is now
+> built. `checkFeeTanks` persists `fee-tank-status.json` after each cycle (atomic
+> tmp→rename), and the TUI's never-throw counter reads it, so an empty tank shows
+> on the first screen with its age and as a badge on [19]. The daemon computed
+> this all along in memory; the dashboard is a separate process and could never
+> see it.
 
 `refund` appears **428 times in `cli.js` and 0 times in `dashboard.js`**; `sweep`
 192 vs 0. The 18-item dashboard (`dashboard.js:210-234`) has no refunds queue, no
@@ -332,7 +333,11 @@ CLI-only (B5). Neither direction is documented.
 Neither surface is complete, and they are missing different things. This lands
 directly on the two machine operator classes.
 
-### E2. Extension requests become a silent black hole when auto-approve is off
+### E2. Extension requests become a silent black hole when auto-approve is off — **FIXED**
+
+> **Fixed 2026-08-14.** The request is now REJECTED rather than dropped. An
+> explicit no is worse than yes and far better than silence: the buyer can
+> re-request, pay, or walk away instead of waiting out a deadline we own.
 
 `cli.js:7828-7831`: logs `ignoring` and returns. No rejection is ever sent to the
 buyer, and no `extensions` verb exists in CLI or TUI to handle one by hand. The
@@ -340,7 +345,11 @@ flag is advertised in `config --help` (`cli.js:1570`) and README:166 with no
 warning. A seller who reasonably declines blanket auto-approval leaves buyers
 waiting forever on jobs with seller-owned deadlines.
 
-### E3. Bare `ctl inbox-redrive` redrives every dead letter, unconfirmed
+### E3. Bare `ctl inbox-redrive` redrives every dead letter, unconfirmed — **FIXED**
+
+> **Fixed 2026-08-14.** The bare form now refuses and asks for `--item <id>` or
+> an explicit `--all`, restoring the `wallet list` doctrine to the one place that
+> inverted it.
 
 `cli.js:10650` — `--item <id>` … "omit to redrive ALL dead letters". The one
 place in the surface where the argument-less form is the destructive one, the
@@ -348,7 +357,14 @@ exact inversion of the `wallet list` doctrine. The comment at `cli.js:10657-1065
 shows the danger is already understood ("hand fresh budgets to genuinely
 poisoned items").
 
-### E4. The product's own tooling teaches the config method its own comments call a fleet-killer
+### E4. The product's own tooling teaches the config method its own comments call a fleet-killer — **FIXED**
+
+> **Fixed 2026-08-14.** `providers` now shows the `config.toml` shape and states
+> that the env column is the upstream vendor's convention, not ours. Quickstart's
+> "set it later via environment variable" is replaced with the `[provider_keys]`
+> instruction and a warning that a keyless agent declines every job. The
+> executor's alarming "using template responses" now says it cannot answer a real
+> job and that buyers are not charged.
 
 `providers` prints `LLM Providers (set J41_LLM_PROVIDER):` with an env-var column
 (`cli.js:3425`), and `quickstart` tells a user who skips the key "(You can set it
@@ -375,7 +391,14 @@ api-endpoint path hardcodes `'VRSCTEST'` (`:3529`). This produced our own
 still-unresolved signed-`J41-JOB` label inconsistency; we fixed the listings by
 hand and left the defaults. Mirror hazard at mainnet cutover.
 
-### E6. No cash-out story
+### E6. No cash-out story — **DOCUMENTED**
+
+> **2026-08-14.** README now has "Getting your earnings out of the fleet": sweep
+> to the R-address, read the WIF, import into a wallet you control — with the
+> warning that the WIF is the agent's whole identity, not just its money. No
+> withdraw COMMAND was added: `wallet send` refusing external addresses is a
+> deliberate safety property, and the honest fix is to say so rather than punch
+> a hole in it.
 
 `wallet send` refuses external addresses by design (README:294-297). No command
 and no sentence anywhere explains how earnings leave the fleet. The actual answer
@@ -383,7 +406,11 @@ and no sentence anywhere explains how earnings leave the fleet. The actual answe
 wallet — is constructible only from key-file knowledge. **The product's promise
 is "earn crypto" and the final step of earning is undocumented and untooled.**
 
-### E7. Docker-missing advice at job time is a dead end
+### E7. Docker-missing advice at job time is a dead end — **FIXED**
+
+> **Fixed 2026-08-14.** It now says how to start Docker and states plainly that
+> local mode is dev-only, refused without `--dev-unsafe`, and cannot serve public
+> jobs — instead of pointing at a door that is locked two gates later.
 
 `cli.js:9534` advises `config --runtime local`; local mode is then refused
 without `--dev-unsafe` (`cli.js:10049-10063`) and cannot serve public jobs
@@ -403,7 +430,11 @@ Backend never answered the 2026-08-05 ask. We engineered around it (fee-tank
 sweep, `wallet`); a stranger reading the advertised field mis-models where their
 money is.
 
-### E10. `post-bounty` commits funds with no confirmation
+### E10. `post-bounty` commits funds with no confirmation — **FIXED**
+
+> **Fixed 2026-08-14.** Shows what it is about to commit, requires y/N, honours
+> `--yes`, and refuses a non-TTY with exit 2 — bringing the last money verb into
+> both conventions this release established.
 
 `cli.js:11091-11129` goes straight from flags to `agent.postBounty(...)`. The TUI
 equivalent confirms (`dashboard.js:2483`) — but with `default:true`, unlike the
