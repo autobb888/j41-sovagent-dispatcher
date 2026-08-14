@@ -115,6 +115,38 @@ async function createAgent(keys) {
   }
 }
 
+// ── Money waiting on a human ────────────────────────────────────────────────
+
+/**
+ * Count the things only a person can clear: refunds held for approval, and
+ * deposit anomalies awaiting a credit-or-dismiss decision.
+ *
+ * Reads the on-disk ledgers directly and never throws — this runs on the way to
+ * drawing a menu, so a corrupt or missing file must degrade to "nothing to
+ * report" rather than block the operator out of the TUI entirely. Undercounting
+ * is the safe failure here: the counts are a prompt to look, and the [20]/[21]
+ * screens are authoritative.
+ */
+function readMoneyAttention(agents) {
+  const out = { pendingRefunds: 0, depositsNeedOperator: 0 };
+  try {
+    const raw = fs.readFileSync(path.join(DISPATCHER_DIR, 'pending-refunds.json'), 'utf8');
+    const ledger = JSON.parse(raw);
+    out.pendingRefunds = Object.values(ledger)
+      .filter((e) => e && e.status === 'pending_approval').length;
+  } catch { /* absent or unreadable — report nothing */ }
+  try {
+    const { listDepositAnomaliesForAgent } = require('./deposit-watcher.js');
+    for (const a of agents || []) {
+      try {
+        const r = listDepositAnomaliesForAgent(a.id);
+        out.depositsNeedOperator += (r && r.needsOperator ? r.needsOperator.length : 0);
+      } catch { /* per-agent failure must not hide the others */ }
+    }
+  } catch { /* module unavailable — report nothing */ }
+  return out;
+}
+
 // ── ESC-to-back support ──
 
 const BACK = Symbol('BACK');
@@ -209,6 +241,18 @@ async function mainMenu(inquirer) {
   console.log(`  Runtime: ${config.runtime || 'docker'}`);
   console.log(`  Global LLM: ${cfg.llm.provider || '(not configured)'}`);
   console.log(`  Executor: ${cfg.executor.type || 'local-llm'} (global default — per-agent overrides via [3])`);
+
+  // Money that is waiting on a human belongs on the FIRST screen, not three
+  // levels down. Refunds are held until approved and deposit anomalies until
+  // settled, so both sit silently owed until somebody looks — and this menu is
+  // where a human operator actually lives.
+  const money = readMoneyAttention(agents);
+  if (money.pendingRefunds) {
+    console.log(`  \x1b[33m⚠ ${money.pendingRefunds} refund(s) awaiting your approval — buyers are owed until you act ([20])\x1b[0m`);
+  }
+  if (money.depositsNeedOperator) {
+    console.log(`  \x1b[33m⚠ ${money.depositsNeedOperator} deposit(s) need a decision ([21])\x1b[0m`);
+  }
   console.log('');
 
   const { choice } = await promptWithEsc(inquirer, [{
@@ -239,6 +283,10 @@ async function mainMenu(inquirer) {
       new inquirer.Separator('  ── Marketplace ──'),
       { name: '[17] Bounties', value: 'bounties' },
       { name: '[18] API Endpoint Setup (resell your LLM, metered)', value: 'api_setup' },
+      new inquirer.Separator('  ── Money ──'),
+      { name: '[19] Wallet & Fee Tanks', value: 'wallet' },
+      { name: `[20] Refunds Queue${money.pendingRefunds ? ` \x1b[33m(${money.pendingRefunds} awaiting you)\x1b[0m` : ''}`, value: 'refunds' },
+      { name: `[21] Deposits${money.depositsNeedOperator ? ` \x1b[33m(${money.depositsNeedOperator} need a decision)\x1b[0m` : ''}`, value: 'deposits' },
       new inquirer.Separator(),
       { name: '     Quit', value: 'quit' },
     ],
@@ -3000,6 +3048,25 @@ WantedBy=multi-user.target
 
 // ── Main Loop ──
 
+/**
+ * Show a read-only money view by running the CLI's own list command.
+ *
+ * Deliberately read-only: the mutating verbs have confirmations, allowlists and
+ * value ceilings that belong in one place, and the footer names them so the
+ * operator can run them directly. The gap this closes is that the TUI showed
+ * refunds and fee tanks NOWHERE — a dashboard user could not learn that buyers
+ * were owed money or that an agent's fee tank had run dry.
+ */
+async function moneyScreen(inquirer, title, cliArgs, footer) {
+  console.clear();
+  console.log(`\n  ═══ ${title} ═══\n`);
+  await runCommandAsync(process.execPath, [process.argv[1], ...cliArgs]);
+  console.log('');
+  if (footer) console.log(`  ${footer}`);
+  console.log('');
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
 async function main() {
   // The TUI's confirmations are its ONLY safety layer, and they are not a
   // control when nothing can answer them. Measured against this repo's own
@@ -3224,6 +3291,15 @@ async function main() {
         console.log('');
         await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
       }); break;
+      // These shell out to the CLI rather than reimplementing the money paths.
+      // Those paths carry allowlists, value ceilings, rate limits and in-flight
+      // markers; a second copy in the TUI would be a second thing to get wrong.
+      case 'wallet': await withBack(() => moneyScreen(inquirer, 'Wallet & Fee Tanks', ['wallet'],
+        'Move funds:  j41-dispatcher wallet sweep <agent> | wallet send <from> <to> <amount>')); break;
+      case 'refunds': await withBack(() => moneyScreen(inquirer, 'Refunds Queue', ['refunds', 'list'],
+        'Approve or reject:  j41-dispatcher refunds approve <job-id> | refunds reject <job-id>')); break;
+      case 'deposits': await withBack(() => moneyScreen(inquirer, 'Deposits', ['deposits', 'list'],
+        'Settle:  j41-dispatcher deposits credit <agent> <txid> | deposits dismiss <agent> <txid>')); break;
       case 'activate_all': await withBack(() => batchActivateScreen(inquirer, true)); break;
       case 'deactivate_all': await withBack(() => batchActivateScreen(inquirer, false)); break;
       case 'bounties': await withBack(() => bountiesMenuScreen(inquirer)); break;

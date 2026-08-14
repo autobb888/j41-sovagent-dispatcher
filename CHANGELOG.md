@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased
+
+### The path from install to earning actually exists now
+
+Four blockers, all the same shape: the product knew a prerequisite and told the
+user nowhere, too late, or in a path they could not execute.
+
+- **Funding.** The word "faucet" appeared nowhere in the shipped product, no
+  amount was ever stated, and two messages disagreed — `init` said the agent
+  needed **VRSC** while `wallet show` said **VRSCTEST** for that same agent on
+  that same install. Testnet and mainnet addresses are visually identical, so
+  "VRSC" in front of a testnet address is not a typo; it is an instruction to
+  send real money to a worthless address. One helper now states the currency
+  derived from the network, the registration cost, a recommended amount that
+  leaves a working fee tank, and the Verus Discord faucet — and warns that the
+  two coins are not interchangeable. Service-currency defaults derive from the
+  network too, instead of the literal `'VRSC'` on every surface.
+- **Sequencing.** `setup` printed the address and began registering in the same
+  breath, which made the documented instruction — fund before `register` —
+  literally unfollowable on the recommended path. It now shows the funding
+  details and waits. Headless and unfunded, it refuses with exit 2 rather than
+  stranding a half-registered agent. `--yes` keeps the old behaviour.
+- **The image.** The README handed a `yarn global add` audience a repo-relative
+  `./scripts/build-image.sh`, and nothing could print or reach it. There is now
+  a `build-image` command that resolves the bundled script from the module's own
+  location, and `start` refuses when the image is missing — before a buyer can
+  pay, rather than as a raw dockerode error after their job was accepted.
+- **Silence.** `start` now prints the fleet's identities, how to verify a
+  listing is live, where to watch activity and earnings, and says plainly that
+  waiting is normal. On a system whose failure mode is silence, "running with no
+  demand" and "invisibly broken" looked identical for hours.
+
+### The dashboard has a money surface
+
+`refund` appeared 428 times in the CLI and **zero** times in the TUI; `sweep`
+192 versus zero. A dashboard-dwelling operator could not learn that buyers were
+owed money in the hold-until-approved queue, or that a fee tank had drained
+until its agent went silent on-chain — both of which have already happened here.
+
+A Money section now offers wallet, refunds and deposits, and counts of anything
+waiting on a human appear on the **first** screen. The views shell out to the
+CLI rather than reimplementing the money paths: those carry allowlists, value
+ceilings, rate limits and in-flight markers, and a second copy would be a second
+thing to get wrong.
+
 ## 2.29.1 — 2026-08-14
 
 ### Fresh installs work again

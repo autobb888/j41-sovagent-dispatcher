@@ -34,12 +34,17 @@ yarn global add @junction41/dispatcher
 
 ### Before you begin
 
-1. **Docker installed** — all job containers run inside Docker. Verify with `docker --version`.
-2. **Build the job-agent image** — required before the first `setup` or `start`; the dispatcher will hang mid-registration if it is missing:
+1. **Node 20 or newer, and Docker installed** — every job runs in a fresh Docker container, so there is no mode that works without it. Verify with `node --version` and `docker --version`.
+2. **Build the job-agent image** — one command, a few minutes, once. `start` refuses to run without it rather than failing after a buyer has already paid:
    ```bash
-   ./scripts/build-image.sh
+   j41-dispatcher build-image
    ```
-3. **Fund a testnet address** — agent registration writes to the Verus blockchain (verustest network) and costs a small on-chain fee. After `init` or `setup` generates your keys, fund the displayed address from a verustest faucet before the `register` step can complete.
+3. **Fund your agent address** — registration writes to the Verus blockchain and costs an on-chain fee.
+   - On the default network (`verustest`) you need **VRSCTEST**, which is free: ask in the [Verus Discord](https://discord.gg/veruscoin) faucet channel.
+   - Registration itself costs about **0.0001**. Send **1 VRSCTEST** so the agent can keep writing reviews and attestations afterwards — an agent whose fee tank empties goes silent on-chain.
+   - **VRSCTEST is not VRSC.** Testnet and mainnet addresses look identical, so real VRSC sent to a testnet-purposed address is lost.
+
+   `setup` prints the address and waits for you to fund it before it registers. `j41-dispatcher wallet` lists every agent's address and balance.
 
 A fresh install requires **no** `J41_*` environment variables. Every security default is already the strict one — broker signing, sandboxed containers, sender-verified deposits, local signature verification. Environment variables exist only to opt into stricter behavior or for one-shot ops overrides; none of them are needed to run.
 
@@ -92,8 +97,15 @@ Running `j41-dispatcher dashboard` launches the interactive TUI:
     ── Marketplace ──
   [17] Bounties
   [18] API Endpoint Setup (resell your LLM, metered)
+    ── Money ──
+  [19] Wallet & Fee Tanks
+  [20] Refunds Queue
+  [21] Deposits
        Quit
 ```
+
+Refunds and deposits show a count in the menu when they are waiting on you — both
+are held until a human decides, so they sit silently owed otherwise.
 
 Arrow keys to navigate, Enter to select, **ESC to go back** from any screen.
 
@@ -143,11 +155,23 @@ Available from: Create Custom Template, or View Agents → SOUL.md → Edit.
 
 ## CLI Commands
 
-All commands are also available directly for scripted/headless use:
+Most commands are available directly for scripted or headless use, with these
+exceptions — the TUI is the only way to do them today:
+
+- **awarding a bounty** (selecting winners); posting and listing have CLI verbs
+- **editing or deleting a service** after it is registered
+- **configuring an executor or the global LLM default**
+
+Conversely `wallet`, `refunds`, `deposits` and `respond-dispute` are CLI-only,
+though the TUI now links to read-only views of the first three.
+
+Commands that confirm before spending refuse a non-interactive stdin and exit
+**2** rather than proceeding or hanging, so a script can tell "needs a terminal"
+from an ordinary failure.
 
 | Command | Description |
 |---|---|
-| *(no args)* | **Interactive TUI menu** — run agents, setup, system settings |
+| *(no args)* | **Interactive TUI menu** — the 21-item dashboard shown above |
 | `dashboard` | Launch the interactive TUI (same as no args, explicit alias) |
 | `init -n N` | Generate N agent identities (keys + SOUL.md); default N is 9 |
 | `register <agent-id> <name>` | Register agent on-chain and create platform profile (interactive if no `--profile-name`) |
@@ -164,6 +188,11 @@ All commands are also available directly for scripted/headless use:
 | `status` | Show the dispatcher pool status (active workers, queued jobs) |
 | `logs [job-id]` | View job logs; use `-f` for follow/tail mode |
 | `config` | View/change dispatcher settings (max-concurrent, timeouts, extension thresholds) |
+| `build-image` | Build the pre-baked job-agent Docker image (required once, before `start`); `--force` rebuilds |
+| `update-profile <agent-id>` | Edit on-chain VDXF profile fields in one transaction; `--dry-run` previews |
+| `post-bounty <agent-id>` | Post a bounty (awarding a winner is TUI-only) |
+| `list-bounties` / `my-bounties <agent-id>` | Browse open bounties / your own; both support `--json` |
+| `deposits [action] [agent] [txid]` | 0-conf deposit anomalies: `list` (default), `credit`, `dismiss`. Only a human can settle these — see [Deposits](#deposits) |
 | `wallet` | Fleet fee-tank table — balances, writes affordable, sweepable earnings |
 | `wallet show <agent-id>` | One agent: both addresses and its per-UTXO breakdown |
 | `wallet sweep <agent-id>\|--all` | Force an i-address → R-address sweep now (self-funding; no floor) |

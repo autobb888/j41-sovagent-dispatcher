@@ -146,7 +146,14 @@ what a stranger gets. Three independent audits hit this from different angles.
 **Remedy is publishing, not code.** npm has been held deliberately pending live
 testing; this is the cost of continuing to hold it.
 
-### B2. There is no path to money
+### B2. There is no path to money — **FIXED**
+
+> **Fixed 2026-08-14.** One `printFundingInstructions` helper: currency derived
+> from the network, registration cost, a recommended amount that leaves a working
+> fee tank, the Verus Discord faucet, and an explicit VRSCTEST-is-not-VRSC
+> warning. `setup` now pauses for funding and refuses headless-unfunded with exit
+> 2. A class-level test forbids any funding message from hardcoding a currency —
+> **it immediately caught a third divergent message the audit had missed.**
 
 - The word "faucet" appears in the shipped product **nowhere**. The only
   occurrence in the repo is an internal plan that says "link the standard
@@ -167,7 +174,11 @@ without spending real funds; there is no local funds check before the platform
 call (`cli.js:3253`). **That a newcomer cannot determine it either is the
 finding.**
 
-### B3. The install path cannot reach the image build
+### B3. The install path cannot reach the image build — **FIXED**
+
+> **Fixed 2026-08-14.** A `build-image` command resolves the bundled script from
+> `__dirname`, and `start` refuses when the image is absent — before a buyer can
+> pay, rather than as a raw dockerode error afterwards.
 
 README:39-41 tells a `yarn global add` audience to run `./scripts/build-image.sh`
 — a repo-relative path they do not have. The tarball ships `scripts/`
@@ -181,7 +192,10 @@ dockerode message>` (`cli.js:9901`), which never mentions the build script.
 line 12) and referenced nowhere. Also unstated anywhere: Node >= 20
 (`package.json:56`).
 
-### B4. No feedback loop between `start` and the first job
+### B4. No feedback loop between `start` and the first job — **FIXED**
+
+> **Fixed 2026-08-14.** `start` prints the live fleet, how to verify a listing,
+> where to watch activity and earnings, and states that silence is normal.
 
 After `→ Starting job listener…`, silence. Nothing prints a marketplace listing
 URL, confirms the agent is discoverable, gives a time-to-first-job expectation,
@@ -189,7 +203,11 @@ or offers a self-test job (`scripts/pay-jobs.js` exists for exactly this and is
 undocumented). **On a system whose signature failure mode is silence, "working
 with no demand" and "invisibly broken" look identical for hours.**
 
-### B5. The TUI has no money surface at all
+### B5. The TUI has no money surface at all — **FIXED**
+
+> **Fixed 2026-08-14.** A Money section (wallet / refunds / deposits) plus
+> counts of anything awaiting a human on the first screen. The views shell out to
+> the CLI rather than duplicating the money paths.
 
 `refund` appears **428 times in `cli.js` and 0 times in `dashboard.js`**; `sweep`
 192 vs 0. The 18-item dashboard (`dashboard.js:210-234`) has no refunds queue, no
@@ -319,7 +337,10 @@ for provider keys — the fix comment eighteen lines below that very message
 every job." The dead advice survived the fix. The downstream decline
 (`cli.js:7989`) then states what happened but never why.
 
-### E5. Currency defaults register VRSC services on a VRSCTEST network
+### E5. Currency defaults register VRSC services on a VRSCTEST network — **FIXED**
+
+> **Fixed 2026-08-14.** All four `--service-currency` defaults and the
+> interactive default now derive from the network via `NATIVE_COIN`.
 
 `--service-currency` defaults to `'VRSC'` at every job-service registration
 surface (`cli.js:1277, 1847, 2032, 3162`), the interactive prompt defaults to

@@ -141,6 +141,11 @@ const FINALIZE_STATE_FILENAME = 'finalize-state.json';
 const J41_API_URL = cfg.platform.api_url;
 const J41_NETWORK = cfg.platform.network;
 const IS_MAINNET = resolveIsMainnet(fileConfiguredNetwork(), J41_NETWORK);
+// The chain's native coin, derived once. Service registration used to default
+// to the literal 'VRSC' on every surface regardless of network, so a testnet
+// fleet listed VRSC-priced services — which is how our own signed J41-JOB
+// payloads ended up with inconsistent currency labels.
+const NATIVE_COIN = require('./deposit-watcher.js').networkCurrency(J41_NETWORK);
 const _cfg = loadConfig();
 const { computeMaxAgents, capacityLine, resolveCapacity, DEFAULTS: SIZING_DEFAULTS } = require('./hardware-sizing.js');
 
@@ -157,6 +162,47 @@ const MAX_RETRIES = 2;
 const SEEN_JOBS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 // Job statuses that are permanently done — never re-run (H1: terminal-status check on retry).
 const TERMINAL_STATUSES = ['delivered', 'completed', 'cancelled', 'resolved', 'resolved_rejected'];
+
+// ── Telling someone how to fund an agent ────────────────────────────────────
+
+/**
+ * One on-chain write costs 0.0001. Registration is a couple of writes, but an
+ * agent that can only just register goes silent on its first review or
+ * attestation, so the recommendation covers a working fee tank rather than the
+ * bare minimum. The sweep's default floor is 100 writes (0.01); 1 coin leaves
+ * real headroom and testnet coins are free.
+ */
+const REGISTRATION_COST = '0.0001';
+const RECOMMENDED_FUNDING = '1';
+
+/**
+ * Print how to fund an address, in the currency that address actually uses.
+ *
+ * This exists because the answer was previously split across messages that
+ * disagreed: `init` said "they need VRSC" while `wallet show` said VRSCTEST for
+ * the very same agent, and nothing anywhere named an amount or a source.
+ * Mainnet and testnet R-addresses are visually identical, so "VRSC" in front of
+ * a testnet address is not a typo — it is an instruction to send real money to
+ * a worthless address.
+ */
+function printFundingInstructions(address, network, { indent = '  ' } = {}) {
+  const { networkCurrency } = require('./deposit-watcher.js');
+  const coin = networkCurrency(network);
+  const isTestnet = network !== 'verus';
+  const i = indent;
+
+  console.log(`${i}Fund this address with ${coin}${isTestnet ? ' (testnet coins — not real money)' : ''}:`);
+  if (address) console.log(`${i}  ${address}`);
+  console.log(`${i}Registration costs about ${REGISTRATION_COST} ${coin}. Send ${RECOMMENDED_FUNDING} ${coin} so the`);
+  console.log(`${i}agent can keep writing reviews and attestations afterwards.`);
+  if (isTestnet) {
+    console.log(`${i}Free ${coin} from the Verus Discord faucet: https://discord.gg/veruscoin`);
+    console.log(`${i}⚠️  ${coin} is NOT VRSC. Testnet and mainnet addresses look identical —`);
+    console.log(`${i}   sending real VRSC here would lose it.`);
+  } else {
+    console.log(`${i}⚠️  MAINNET — this is real money.`);
+  }
+}
 
 // ── Rendering buyer-authored text on an operator's screen ───────────────────
 
@@ -1139,7 +1185,7 @@ async function interactiveProfileSetup(keys, soulContent) {
     const svcName = await ask('    Service name (e.g. "Code Review", "Write Blog Post")');
     if (!svcName) break;
     const svcDesc = await ask('    What does the buyer get?', description);
-    const svcPrice = parseFloat(await ask('    Price in VRSCTEST', '0.5')) || 0.5;
+    const svcPrice = parseFloat(await ask(`    Price in ${NATIVE_COIN}`, '0.5')) || 0.5;
     const svcTurnaround = await ask('    How long does it take? (e.g. "15 min", "1 hour")', '15 min');
 
     services.push({
@@ -1154,7 +1200,7 @@ async function interactiveProfileSetup(keys, soulContent) {
       resolutionWindow: 72,
       refundPolicy: { policy: 'fixed', percent: 100 },
     });
-    console.log(`    ✓ "${svcName}" — ${svcPrice} VRSCTEST\n`);
+    console.log(`    ✓ "${svcName}" — ${svcPrice} ${NATIVE_COIN}\n`);
 
     addService = await yesNo('  Add another service?', 'N');
   }
@@ -1312,7 +1358,7 @@ function addServiceOptions(cmd) {
     .option('--service-name <name>', 'Service name for marketplace')
     .option('--service-description <desc>', 'Service description')
     .option('--service-price <price>', 'Service price')
-    .option('--service-currency <currency>', 'Service currency', 'VRSC')
+    .option('--service-currency <currency>', 'Service currency', NATIVE_COIN)
     .option('--service-category <cat>', 'Service category')
     .option('--service-turnaround <time>', 'Service turnaround time', '1h')
     .option('--service-payment-terms <terms>', 'Payment terms (prepay|postpay|split)', 'prepay')
@@ -1364,7 +1410,7 @@ async function interactiveOnboarding(identityName) {
   const serviceName = await ask('Service name');
   const serviceDescription = await ask('Service description', profileDescription);
   const servicePrice = await ask('Primary price', '0.5');
-  const serviceCurrency = await ask('Primary currency', 'VRSC');
+  const serviceCurrency = await ask('Primary currency', NATIVE_COIN);
   const serviceCategory = await ask('Service category', 'development');
   const serviceTurnaround = await ask('Turnaround time', '5 minutes');
   const servicePaymentTerms = await ask('Payment terms (prepay|postpay|split)', 'prepay');
@@ -1520,7 +1566,7 @@ function createFinalizeHooks(agentId, identityName, profile, services = [], disp
         // Throwing is what stops the state machine advancing on a step that did not
         // happen.
         console.log('   ⚠️  No UTXOs available — identity needs funds for tx fee');
-        console.log(`   ↳ Send at least 0.0001 VRSCTEST to ${keys.address}`);
+        printFundingInstructions(keys.address, J41_NETWORK, { indent: '   ↳ ' });
         console.log(`   ↳ VDXF plan saved to: ${planPath}`);
         console.log('   ↳ Then re-run this step; nothing was published on-chain.');
         throw new Error(
@@ -1860,10 +1906,13 @@ program
     
     console.log(`\n✅ ${count} agents initialized`);
     console.log('\nNext steps:');
-    console.log('  1. Fund the agent addresses (they need VRSC for registration)');
+    console.log('  1. Fund each agent address — registration cannot complete without it:');
+    printFundingInstructions(null, J41_NETWORK, { indent: '     ' });
+    console.log('     Addresses are listed above, and by: j41-dispatcher wallet');
     console.log('  2. Register each: j41-dispatcher register agent-1 <name>');
     console.log('  3. Finalize each: j41-dispatcher finalize agent-1');
-    console.log('  4. Start dispatcher: j41-dispatcher start');
+    console.log('  4. Build the job image (once): j41-dispatcher build-image');
+    console.log('  5. Start dispatcher: j41-dispatcher start');
   });
 
 // Register command — register an agent identity on-chain
@@ -1882,7 +1931,7 @@ program
   .option('--service-name <name>', 'Service name for marketplace listing')
   .option('--service-description <desc>', 'Service description')
   .option('--service-price <price>', 'Service price')
-  .option('--service-currency <currency>', 'Service currency', 'VRSC')
+  .option('--service-currency <currency>', 'Service currency', NATIVE_COIN)
   .option('--service-category <cat>', 'Service category')
   .option('--service-turnaround <time>', 'Service turnaround time', '1h')
   .option('--service-payment-terms <terms>', 'Payment terms (prepay|postpay)', 'prepay')
@@ -2067,7 +2116,7 @@ program
   .option('--service-name <name>', 'Service name for marketplace listing')
   .option('--service-description <desc>', 'Service description')
   .option('--service-price <price>', 'Service price')
-  .option('--service-currency <currency>', 'Service currency', 'VRSC')
+  .option('--service-currency <currency>', 'Service currency', NATIVE_COIN)
   .option('--service-category <cat>', 'Service category')
   .option('--service-turnaround <time>', 'Service turnaround time', '1h')
   .option('--service-payment-terms <terms>', 'Payment terms (prepay|postpay)', 'prepay')
@@ -3182,7 +3231,8 @@ program
 program
   .command('setup <agent-id> <identity-name>')
   .description('One-command setup: init keys + register on-chain + finalize with profile & service')
-  .option('--template <name>', 'Use a template (code-review, general-assistant, data-analyst)')
+  .option('--template <name>', 'Use a template (code-review, general-assistant, data-analyst, character-roleplay, workspace-reviewer)')
+  .option('--yes', 'Skip the funding pause and register immediately (the address must already hold funds)')
   .option('--profile-name <name>', 'Profile display name')
   .option('--profile-type <type>', 'Profile type (autonomous|assisted|hybrid|tool)', 'autonomous')
   .option('--profile-description <desc>', 'Profile description')
@@ -3198,7 +3248,7 @@ program
   .option('--service-name <name>', 'Service name for marketplace')
   .option('--service-description <desc>', 'Service description')
   .option('--service-price <price>', 'Service price')
-  .option('--service-currency <currency>', 'Service currency', 'VRSC')
+  .option('--service-currency <currency>', 'Service currency', NATIVE_COIN)
   .option('--service-category <cat>', 'Service category')
   .option('--service-turnaround <time>', 'Service turnaround time', '1h')
   .option('--service-payment-terms <terms>', 'Payment terms (prepay|postpay)', 'prepay')
@@ -3300,6 +3350,39 @@ program
     // ── Step 2: Register on-chain ──
     console.log('\nStep 2/4: Register identity on-chain');
     const { J41Agent, finalizeOnboarding, RegistrationTimeoutError } = require('@junction41/sovagent-sdk/dist/index.js');
+
+    // The address was printed one line ago and the next step needs it funded.
+    // Previously this ran straight on, so the documented instruction — "fund the
+    // displayed address before the register step can complete" — was literally
+    // unfollowable on the recommended path: you learned the address the same
+    // second registration started. Say what is needed and let the operator go
+    // get it. `--yes` keeps the old straight-through behaviour for anyone who
+    // funded ahead of time or is scripting.
+    if (!keys.identity && !options.yes) {
+      console.log('');
+      printFundingInstructions(keys.address, J41_NETWORK, { indent: '  ' });
+      console.log('');
+      if (process.stdin.isTTY) {
+        const readline = require('readline');
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        const answer = await new Promise((resolve) => rl.question('  Funded and ready to register? (y/N) ', resolve));
+        rl.close();
+        const a = answer.trim().toLowerCase();
+        if (a !== 'y' && a !== 'yes') {
+          console.log('\n  Stopped before registering. Nothing was spent.');
+          console.log(`  Check the balance with: j41-dispatcher wallet show ${agentId}`);
+          console.log(`  Then run the same command again, or: j41-dispatcher register ${agentId} ${identityName}`);
+          return;
+        }
+      } else {
+        // Non-interactive and unfunded is the setup most likely to strand a
+        // half-registered agent. Refuse rather than guess.
+        console.error('\n❌ setup needs a terminal to confirm funding before it registers on-chain.');
+        console.error('   Nothing was spent. Fund the address above, then re-run with --yes,');
+        console.error(`   or run: j41-dispatcher register ${agentId} ${identityName}`);
+        process.exit(2);
+      }
+    }
 
     if (keys.identity && keys.iAddress && keys.registrationStatus !== 'timeout') {
       console.log(`  ✓ Already registered: ${keys.identity}`);
@@ -3591,6 +3674,72 @@ program
   .description('Launch the interactive TUI menu')
   .action(() => { require('./dashboard.js'); });
 
+// ── The job-agent image ─────────────────────────────────────────────────────
+
+const JOB_IMAGE = `${process.env.J41_JOB_IMAGE || 'j41/job-agent'}:${process.env.J41_JOB_TAG || 'latest'}`;
+
+/** True if the pre-baked job image is present locally. Never throws. */
+function jobImageExists() {
+  try {
+    require('child_process').execSync(
+      `docker image inspect ${JOB_IMAGE}`,
+      { stdio: 'ignore', timeout: 15000 },
+    );
+    return true;
+  } catch { return false; }
+}
+
+/**
+ * Absolute path to the bundled build script.
+ *
+ * The README told a `yarn global add` audience to run `./scripts/build-image.sh`
+ * — a repo-relative path they do not have. The script ships in the tarball
+ * (package.json `files`), but at the global install dir, which nothing printed
+ * and no command could reach. This resolves it from our own location instead.
+ */
+function buildImageScriptPath() {
+  return path.join(__dirname, '..', 'scripts', 'build-image.sh');
+}
+
+program
+  .command('build-image')
+  .description('Build the pre-baked job-agent Docker image (required before running jobs)')
+  .option('--force', 'Rebuild even if the image already exists')
+  .action(async (options) => {
+    const script = buildImageScriptPath();
+    if (!fs.existsSync(script)) {
+      console.error(`❌ Build script not found at ${script}`);
+      console.error('   This install looks incomplete — try reinstalling the package.');
+      process.exit(1);
+    }
+    if (!options.force && jobImageExists()) {
+      console.log(`✓ ${JOB_IMAGE} already exists. Nothing to do.`);
+      console.log('  Rebuild it with: j41-dispatcher build-image --force');
+      return;
+    }
+    console.log(`Building ${JOB_IMAGE} — this takes a few minutes on first run.\n`);
+    const code = await new Promise((resolve) => {
+      const child = require('child_process').spawn('bash', [script], {
+        cwd: path.dirname(path.dirname(script)),
+        stdio: 'inherit',
+      });
+      const onSigint = () => { child.kill('SIGTERM'); };
+      process.on('SIGINT', onSigint);
+      child.on('close', (c) => { process.removeListener('SIGINT', onSigint); resolve(c); });
+      child.on('error', (e) => {
+        process.removeListener('SIGINT', onSigint);
+        console.error(`\n❌ Could not run the build script: ${e.message}`);
+        resolve(1);
+      });
+    });
+    if (code !== 0) {
+      console.error(`\n❌ Image build failed (exit ${code}).`);
+      console.error('   Docker must be installed and running, and your user able to reach it.');
+      process.exit(1);
+    }
+    console.log(`\n✅ ${JOB_IMAGE} is ready. Next: j41-dispatcher start`);
+  });
+
 // Start command — run the dispatcher (listen for jobs)
 program
   .command('start')
@@ -3734,6 +3883,23 @@ program
       console.error('');
       console.error('   Local mode was most likely selected automatically by the installer because');
       console.error('   Docker was not found on this machine.');
+      process.exit(1);
+    }
+
+    // The job image is as load-bearing as Docker itself, and its absence used
+    // to surface only when the first container was created — i.e. AFTER a
+    // buyer's job had been accepted — as a raw dockerode error that never named
+    // the build script. Same ordering argument as the local-mode gate above:
+    // find out before anyone pays.
+    if (RUNTIME !== 'local' && !jobImageExists()) {
+      console.error(`\n❌ Refusing to start: the job image ${JOB_IMAGE} is not built.`);
+      console.error('   Nothing was accepted and no buyer can pay into this fleet.');
+      console.error('');
+      console.error('   Build it (a few minutes, once):');
+      console.error('     j41-dispatcher build-image');
+      console.error('');
+      console.error('   Every job runs in a fresh container from this image, so there is no');
+      console.error('   partial mode that works without it.');
       process.exit(1);
     }
 
@@ -3972,8 +4138,28 @@ program
     console.log(`Ready agents: ${readyAgents.length}\n`);
     
     // Start job polling loop
+    // What a newcomer needs between "started" and their first job: proof the
+    // fleet is actually listed, the name a buyer would search for, and an
+    // honest expectation. Without this, "running with no demand" and "silently
+    // broken" look identical for hours on a system whose failure mode IS
+    // silence.
+    console.log('\n─── Your fleet is live ───\n');
+    for (const a of readyAgents.slice(0, 10)) {
+      console.log(`  ${(a.id || '').padEnd(10)} ${a.identity || '(no identity)'}`);
+    }
+    if (readyAgents.length > 10) console.log(`  … and ${readyAgents.length - 10} more`);
+    console.log('');
+    console.log(`  Buyers find these on the J41 marketplace by name or service.`);
+    console.log(`  Check a listing is live:  j41-dispatcher inspect ${readyAgents[0]?.id || '<agent-id>'}`);
+    console.log(`  Watch what is happening:  j41-dispatcher ctl status   (or the ⚡ Live Jobs screen)`);
+    console.log(`  Earnings so far:          j41-dispatcher ctl earnings`);
+    console.log('');
+    console.log('  Jobs arrive when a buyer hires you — that can take hours or days, and');
+    console.log('  silence here is normal. This process must keep running to receive them.');
+    console.log('');
+
     console.log('→ Starting job listener...\n');
-    
+
     const state = {
       agents: [...readyAgents], // all registered agents (never modified)
       active: new Map(), // jobId -> { agentId, container, startedAt, retries }
@@ -11085,7 +11271,8 @@ async function mainMenu() {
     writeKeysFile(path.join(agentDir, 'keys.json'), keys);
     fs.writeFileSync(path.join(agentDir, 'SOUL.md'), `# ${id}\n\nA helpful AI assistant on the J41 platform.`);
     console.log(`\n  Created ${id} (${keys.address})`);
-    console.log(`  Fund this address with VRSCTEST, then register the identity.\n`);
+    printFundingInstructions(keys.address, J41_NETWORK, { indent: '  ' });
+    console.log('');
   }
 
   async function showSystemSettings() {
@@ -12650,7 +12837,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState, untrusted,
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState, untrusted, printFundingInstructions, jobImageExists, JOB_IMAGE, NATIVE_COIN,
     // Execution-harness seam: `program` so a test can drive the REAL `start`
     // action through commander, and `__getState` so it can then assert on what
     // that action actually did. See test/helpers/dispatcher-harness.js.
