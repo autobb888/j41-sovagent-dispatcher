@@ -12323,6 +12323,102 @@ program
     process.exit(1);
   });
 
+/**
+ * `deposits credit|dismiss` — settle one anomaly a human has adjudicated.
+ *
+ * Runs out-of-band against a LIVE daemon, so every mutation goes through the
+ * per-agent deposit lock in deposit-watcher.js. Without it this is an unlocked
+ * read-modify-write racing the 60s poller and every proxied request's meter
+ * update, which is the same lost-update bug the refund path met twice.
+ *
+ * @returns {Promise<number>} process exit code
+ */
+async function depositsResolve(action, agentId, txid, options) {
+  // Inlined rather than shared: `refunds approve` does the same, and lifting a
+  // prompt helper out of a hardened money path to reuse it here is exactly the
+  // kind of incidental refactor that has caused regressions in this repo.
+  const confirmYesNo = async (question) => {
+    const readline = require('readline');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await new Promise((resolve) => rl.question(`\n  ${question} (y/N) `, resolve));
+    rl.close();
+    const a = answer.trim().toLowerCase();
+    return a === 'y' || a === 'yes';
+  };
+
+  if (!agentId || !txid) {
+    console.error(`Usage: j41-dispatcher deposits ${action} <agent-id> <txid>` +
+      (action === 'dismiss' ? ' --reason "<why nothing is owed>"' : ''));
+    return 1;
+  }
+  const known = listRegisteredAgents();
+  if (!known.includes(agentId)) {
+    console.error(`Unknown agent '${agentId}'. Registered: ${known.join(', ') || '(none)'}`);
+    return 1;
+  }
+
+  const {
+    listDepositAnomaliesForAgent, creditDepositAnomaly, dismissDepositAnomaly, reconcileMeterAgainstLedger,
+  } = require('./deposit-watcher.js');
+
+  const anomaly = listDepositAnomaliesForAgent(agentId).needsOperator.find((n) => n.txid === txid);
+  if (!anomaly) {
+    console.error(`No unresolved anomaly for ${txid} on ${agentId}.`);
+    console.error('Run: j41-dispatcher deposits list — to see what is outstanding.');
+    return 1;
+  }
+
+  console.log(`\n${agentId}  ${txid}`);
+  console.log(`  buyer:  ${anomaly.buyerVerusId}`);
+  console.log(`  amount: ${anomaly.amount} VRSC`);
+  console.log(`  reason: ${anomaly.reason}`);
+  try {
+    const m = reconcileMeterAgainstLedger(agentId, anomaly.buyerVerusId);
+    console.log(`  meter:  balance ${m.balance ?? '—'}, totalDeposited ${m.actualTotalDeposited ?? '—'} ` +
+      `vs ledger ${m.expectedTotalDeposited} (delta ${m.delta ?? '—'})`);
+  } catch { /* advisory only */ }
+
+  if (action === 'dismiss') {
+    if (!options.reason) {
+      console.error('\n--reason is required: a dismissal has to record why nothing is owed.');
+      return 1;
+    }
+    if (!options.yes && !(await confirmYesNo(`Dismiss this anomaly for ${anomaly.buyerVerusId}? No money moves.`))) {
+      console.log('Aborted.');
+      return 1;
+    }
+    const res = await dismissDepositAnomaly(agentId, txid, { reason: options.reason });
+    if (!res.ok) { console.error(`Failed: ${res.message}`); return 1; }
+    console.log(`✅ Dismissed. No money moved. Recorded: ${options.reason}`);
+    return 0;
+  }
+
+  // credit — moves money, so it re-verifies on-chain and fails closed.
+  if (!options.yes && !(await confirmYesNo(
+    `CREDIT ${anomaly.amount} VRSC to ${anomaly.buyerVerusId}? This changes a real balance.`))) {
+    console.log('Aborted.');
+    return 1;
+  }
+
+  const state = buildRefundsState();
+  const agent = state.agents.find((a) => a.id === agentId);
+  if (!agent) { console.error(`${agentId} has no usable keys.`); return 1; }
+  let client;
+  try {
+    const session = await getAgentSession(state, agent);
+    client = session._client || session.client;
+  } catch (e) {
+    console.error(`Could not authenticate ${agentId}: ${e.message}`);
+    console.error('Crediting re-verifies the transaction on-chain first, so this cannot proceed offline.');
+    return 1;
+  }
+
+  const res = await creditDepositAnomaly(agentId, txid, { client });
+  if (!res.ok) { console.error(`Failed: ${res.message}`); return 1; }
+  console.log(`✅ Credited ${res.credited} VRSC to ${res.buyerVerusId} (tx confirmed at ${res.confirmations} block(s)).`);
+  return 0;
+}
+
 // ── deposits ───────────────────────────────────────────────────────────────
 // Read-only view of the 0-conf deposit ledger. Reads DISK directly rather than
 // the control socket, so it works out-of-band while the daemon runs and still
@@ -12332,17 +12428,23 @@ program
 // pattern applies here too: one `deposits [action]` rather than separate
 // registrations that would collide.
 program
-  .command('deposits [action]')
-  .description('0-conf deposit ledger — actions: list (default)')
-  .option('--all', 'include settled reversals, not just the last few')
-  .option('--json', 'raw JSON output')
-  .action(async (action, options) => {
+  .command('deposits [action] [agent-id] [txid]')
+  .description('0-conf deposit ledger — actions: list (default) | credit <agent-id> <txid> | dismiss <agent-id> <txid> --reason <text>')
+  .option('--all', 'list: include settled reversals, not just the last few')
+  .option('--json', 'list: raw JSON output')
+  .option('--yes', 'credit/dismiss: skip the interactive confirmation')
+  .option('--reason <text>', 'dismiss: why nothing is owed (required)')
+  .action(async (action, agentIdArg, txidArg, options) => {
     ensureDirs();
     action = (action || 'list').toLowerCase();
+
+    if (action === 'credit' || action === 'dismiss') {
+      await ensureKeystoreUnlockedIfEncrypted();
+      process.exitCode = await depositsResolve(action, agentIdArg, txidArg, options);
+      return;
+    }
     if (action !== 'list') {
-      console.error(`Unknown action '${action}'. Available: list`);
-      console.error("(`deposits credit` and `deposits dismiss` are not implemented yet — " +
-        'they move money and need the inter-process lock that is still to come.)');
+      console.error(`Unknown action '${action}'. Available: list | credit | dismiss`);
       process.exitCode = 1;
       return;
     }
@@ -12365,8 +12467,25 @@ program
         for (const n of a.needsOperator) {
           console.log(`  ${a.agentId}  ${String(n.txid).substring(0, 16)}…  ${n.amount} VRSC  ${n.buyerVerusId}`);
           console.log(`    ${n.reason}`);
-          console.log(`    check: is tx ${String(n.txid).substring(0, 16)}… on-chain, and does ${n.buyerVerusId}'s`);
-          console.log('           meter balance reflect that amount? The ledger cannot tell you.\n');
+          // The flags say "check the meter against the chain". The chain half is
+          // answerable from the txid; the meter half is not, because the meter
+          // keeps no journal and its balance moves with every proxied request.
+          // totalDeposited is the one figure only deposits and reversals touch,
+          // so reconstructing it from the ledger turns this from a judgement
+          // call into arithmetic.
+          try {
+            const { reconcileMeterAgainstLedger } = require('./deposit-watcher.js');
+            const m = reconcileMeterAgainstLedger(a.agentId, n.buyerVerusId);
+            const deltaStr = m.delta === null ? 'meter not found' :
+              (m.delta === 0 ? 'matches the ledger — the adjustment did NOT run'
+                             : `off by ${m.delta > 0 ? '+' : ''}${m.delta} VRSC`);
+            console.log(`    meter: balance ${m.balance ?? '—'}, totalDeposited ${m.actualTotalDeposited ?? '—'} ` +
+              `vs ledger ${m.expectedTotalDeposited} → ${deltaStr}`);
+          } catch (e) {
+            console.log(`    meter: could not reconcile (${e.message})`);
+          }
+          console.log(`    resolve: j41-dispatcher deposits credit ${a.agentId} ${n.txid}`);
+          console.log(`         or: j41-dispatcher deposits dismiss ${a.agentId} ${n.txid} --reason "..."\n`);
         }
       }
     } else {

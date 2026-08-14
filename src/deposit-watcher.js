@@ -333,12 +333,29 @@ function saveDeposits(agentId, data) {
  */
 async function reportDeposit(agentId, client, report, payAddress, network = 'verustest') {
   // ── Authenticate the report before doing anything else ──
+  //
+  // Deliberately OUTSIDE the deposit lock. This call is reachable by anyone who
+  // can POST to the webhook, and holding a per-agent lock across an
+  // unauthenticated network round-trip would let junk reports stall the poller.
   const auth = await verifyDepositReport(client, report, network);
   if (!auth.ok) {
     console.warn(`[Deposit] Rejected report for ${agentId}: ${auth.code} — ${auth.message}`);
     return { credited: false, message: auth.message, code: auth.code };
   }
 
+  try {
+    return await withDepositLock(agentId,
+      () => _reportVerifiedDeposit(agentId, client, report, payAddress, network));
+  } catch (e) {
+    if (e && e.code === 'DEPOSIT_LOCK_BUSY') {
+      return { credited: false, code: 'BUSY', message: 'Deposit ledger is busy; please retry in a moment' };
+    }
+    throw e;
+  }
+}
+
+/** The serialised half of reportDeposit. Runs under the per-agent deposit lock. */
+async function _reportVerifiedDeposit(agentId, client, report, payAddress, network) {
   const { buyerVerusId, txid } = report;
   const expectedAmount = Number(report.amount);
 
@@ -657,10 +674,150 @@ function _settleReversedForTxid(deposits, txid, reason) {
     if (r && r.txid === txid && !r.restoredAt) {
       r.restoredAt = new Date().toISOString();
       r.resolvedBy = reason;
+      // Clear the flag too. Left standing, a settled entry keeps showing up as
+      // actionable, `deposits list` prints the resolution command next to it,
+      // and an operator following the tool's own instruction credits a buyer
+      // who has already been made whole.
+      if (r.needsOperator && !r.resolvedAt) {
+        r.resolvedAt = r.restoredAt;
+        r.resolution = 'settled automatically — another path credited this txid';
+        delete r.needsOperator;
+      }
       touched = true;
     }
   }
   return touched;
+}
+
+/**
+ * Find the one unresolved anomaly for a txid, wherever it lives.
+ *
+ * @returns {{entry: object, where: 'processed'|'reversed'}|null}
+ */
+function _findAnomaly(deposits, txid) {
+  const p = deposits.processed.find((r) => r && r.txid === txid && _isUnresolvedAnomaly(r));
+  if (p) return { entry: p, where: 'processed' };
+  const r = deposits.reversed.find((x) => x && x.txid === txid && _isUnresolvedAnomaly(x));
+  if (r) return { entry: r, where: 'reversed' };
+  return null;
+}
+
+/**
+ * Operator decision: the buyer IS owed this amount. Apply it and close the entry.
+ *
+ * Fails closed on any doubt about the transaction. The anomalies this resolves
+ * all have the same shape — "the tx confirmed but we cannot prove which way the
+ * meter moved" — so a correction in the buyer's favour is only defensible if the
+ * transaction really is on-chain.
+ */
+async function creditDepositAnomaly(agentId, txid, { client, resolvedBy = 'operator' } = {}) {
+  // Verify BEFORE taking the lock (it is a network call), then re-check the
+  // ledger inside the lock — the entry may have been settled while we waited.
+  let confs = null;
+  try {
+    const st = await client.getTxStatus(txid);
+    confs = st && Number.isFinite(st.confirmations) ? st.confirmations : null;
+  } catch (e) {
+    return { ok: false, code: 'VERIFY_FAILED', message: `Could not check ${txid} on-chain: ${e.message}` };
+  }
+  if (confs === null || confs < 1) {
+    return {
+      ok: false,
+      code: 'NOT_CONFIRMED',
+      message: `Refusing: ${txid} has ${confs === null ? 'an unreadable confirmation count' : `${confs} confirmation(s)`}. ` +
+        'Only a transaction that is genuinely on-chain justifies crediting the buyer.',
+    };
+  }
+
+  return withDepositLock(agentId, () => {
+    const d = loadDeposits(agentId);
+    const found = _findAnomaly(d, txid);
+    if (!found) {
+      return { ok: false, code: 'NOT_FOUND', message: `No unresolved anomaly for ${txid} on ${agentId} (already settled?)` };
+    }
+    const { entry, where } = found;
+    const amount = entry.amount;
+    const buyerVerusId = entry.buyerVerusId;
+
+    creditDeposit(agentId, buyerVerusId, amount, txid);
+
+    entry.resolvedAt = new Date().toISOString();
+    entry.resolvedBy = resolvedBy;
+    entry.resolution = `credited ${amount} VRSC by operator (tx confirmed at ${confs} block(s))`;
+    delete entry.needsOperator;
+    if (where === 'reversed') entry.restoredAt = entry.restoredAt || entry.resolvedAt;
+
+    // Back into the dedup ledger. A reversal takes the txid OUT so the buyer can
+    // re-report; now that we have credited it by hand, a re-report must not
+    // credit it a second time — the same coupling _recheckReversals maintains.
+    if (!d.processed.some((r) => r && r.txid === txid)) {
+      d.processed.push({
+        txid, buyerVerusId, amount, confirmations: confs,
+        creditedAt: entry.resolvedAt,
+        resolvedByOperator: true,
+      });
+    }
+    _rememberCreditedTxid(d, txid);
+    _trimProcessed(d);
+    saveDeposits(agentId, d);
+
+    return { ok: true, credited: amount, buyerVerusId, confirmations: confs };
+  });
+}
+
+/**
+ * Operator decision: nothing is owed. Close the entry, move no money.
+ */
+async function dismissDepositAnomaly(agentId, txid, { reason, resolvedBy = 'operator' } = {}) {
+  if (!reason) return { ok: false, code: 'REASON_REQUIRED', message: 'A dismissal must record why' };
+  return withDepositLock(agentId, () => {
+    const d = loadDeposits(agentId);
+    const found = _findAnomaly(d, txid);
+    if (!found) {
+      return { ok: false, code: 'NOT_FOUND', message: `No unresolved anomaly for ${txid} on ${agentId} (already settled?)` };
+    }
+    const { entry } = found;
+    entry.resolvedAt = new Date().toISOString();
+    entry.resolvedBy = resolvedBy;
+    entry.resolution = `dismissed by operator: ${reason}`;
+    delete entry.needsOperator;
+    saveDeposits(agentId, d);
+    return { ok: true, dismissed: true, buyerVerusId: entry.buyerVerusId, amount: entry.amount };
+  });
+}
+
+/**
+ * What an operator needs to answer "did the debit actually run?".
+ *
+ * The flags say "check the meter against the chain", and the chain half is easy.
+ * The meter half is not: credit-meters.json keeps no journal, and `balance`
+ * moves with every proxied request, so no arithmetic on the balance alone can
+ * isolate one historical adjustment. What CAN be reconstructed is
+ * `totalDeposited`, which only deposits and reversals touch — comparing it to
+ * the sum of this buyer's settled ledger records turns the decision from a
+ * judgement call into arithmetic.
+ */
+function reconcileMeterAgainstLedger(agentId, buyerVerusId) {
+  const { getMeter } = require('./credit-meter.js');
+  const d = loadDeposits(agentId);
+  const meter = getMeter(agentId, buyerVerusId) || null;
+
+  const credited = d.processed
+    .filter((r) => r && r.buyerVerusId === buyerVerusId && !r.crediting)
+    .reduce((n, r) => n + (Number(r.amount) || 0), 0);
+  const debited = d.reversed
+    .filter((r) => r && r.buyerVerusId === buyerVerusId && r.debited === true && !r.restoredAt)
+    .reduce((n, r) => n + (Number(r.amount) || 0), 0);
+
+  const expected = credited - debited;
+  const actual = meter && Number.isFinite(meter.totalDeposited) ? meter.totalDeposited : null;
+  return {
+    buyerVerusId,
+    expectedTotalDeposited: Number(expected.toFixed(8)),
+    actualTotalDeposited: actual,
+    delta: actual === null ? null : Number((actual - expected).toFixed(8)),
+    balance: meter && Number.isFinite(meter.balance) ? meter.balance : null,
+  };
 }
 
 /** Clear a miss run's stamps. Every one of them, every time — see below. */
@@ -717,6 +874,10 @@ function _backfillPrePortZeroConf(agentId, deposits, now) {
  * @returns {{confirmed:number, reversed:number, waiting:number, restored:number, state:string}}
  */
 async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now(), emit) {
+  return withDepositLock(agentId, () => _reconcileLocked(agentId, client, now, emit));
+}
+
+async function _reconcileLocked(agentId, client, now, emit) {
   const network = loadDispatcherConfig().platform.network;
 
   const seed = loadDeposits(agentId);
@@ -1073,6 +1234,74 @@ async function _recheckReversals(agentId, client, now = Date.now(), emit) {
   return restored;
 }
 
+// ── Cross-process serialisation ─────────────────────────────────────────────
+//
+// `deposits.json` and `credit-meters.json` are read-modify-written by the
+// daemon continuously — the poller every 60s, the meter on every proxied
+// request — and now also by a SECOND process, because `deposits credit` runs
+// out-of-band while the daemon is up. That is the documented operator workflow,
+// not an edge case.
+//
+// Atomic tmp→rename protects against a TORN file. It does nothing about a lost
+// update: two processes load the same snapshot, both save, and whichever lands
+// second silently erases the other. If the erased write was a dedup entry, that
+// txid can be credited again; if it was a reversal, the reconciler runs the
+// whole miss cycle a second time and debits the buyer twice.
+//
+// This is the third time this codebase has met this bug (refund sends, send
+// history, now deposits), so it uses the same discipline rather than a new one.
+// Its own lock namespace, deliberately: a deposits bug must not be able to
+// reach into the hardened refund path.
+const DEPOSIT_LOCK_TIMEOUT_MS = 15000; // holds span network calls; be patient
+const DEPOSIT_LOCK_STALE_MS = 2000;    // below the timeout — see file-lock.js
+
+function depositLockPath(agentId) {
+  return path.join(AGENTS_DIR, agentId, 'deposits.lock');
+}
+
+// In-process serialisation, because the file lock alone is not enough: one
+// process can have the webhook's reportDeposit and the poller in flight at the
+// same time, and O_EXCL says nothing about two async tasks in the SAME process.
+// A queue rather than a reentrancy counter on purpose — a counter would let a
+// second concurrent task see "already held" and sail straight through.
+const _agentQueues = new Map(); // agentId -> tail promise
+
+function _withAgentQueue(agentId, fn) {
+  const prev = _agentQueues.get(agentId) || Promise.resolve();
+  const run = prev.then(fn, fn); // a rejected predecessor must not block the queue
+  // Keep the chain alive but never let it accumulate unhandled rejections.
+  _agentQueues.set(agentId, run.then(() => {}, () => {}));
+  return run;
+}
+
+/**
+ * Run `fn` with exclusive access to this agent's deposit state.
+ *
+ * Fails CLOSED: if the lock cannot be taken, the work does NOT happen. A poller
+ * pass skipped is retried in 60 seconds; a report refused is retried by the
+ * buyer. Proceeding unserialised is the one option that silently loses money.
+ */
+async function withDepositLock(agentId, fn) {
+  const { acquireFileLock, releaseFileLock } = require('./file-lock.js');
+  return _withAgentQueue(agentId, async () => {
+    const lockPath = depositLockPath(agentId);
+    const token = await acquireFileLock(lockPath, {
+      timeoutMs: DEPOSIT_LOCK_TIMEOUT_MS,
+      staleMs: DEPOSIT_LOCK_STALE_MS,
+    });
+    if (!token) {
+      const e = new Error(`could not acquire the deposit lock for ${agentId} — another process holds it`);
+      e.code = 'DEPOSIT_LOCK_BUSY';
+      throw e;
+    }
+    try {
+      return await fn();
+    } finally {
+      releaseFileLock(lockPath, token);
+    }
+  });
+}
+
 // ── Read model ──────────────────────────────────────────────────────────────
 //
 // Every `needsOperator` state this file writes was, until now, write-only: four
@@ -1199,12 +1428,25 @@ async function pollPendingDeposits(agentId, client, emit) {
   // lands is only ever clawed back from here — and unlike the pending sweep it
   // must run even when `pending` is empty, because a 0-conf credit is not
   // pending, it is already credited.
+  //
+  // The two halves take the lock SEPARATELY rather than sharing one hold. The
+  // lock is not reentrant, so nesting them would deadlock the agent for the
+  // full acquire timeout on every single poll.
   try {
     await reconcileUnconfirmedDeposits(agentId, client, Date.now(), emit);
   } catch (e) {
     console.warn(`[Deposits] ${agentId}: reconcile pass failed (${e.message}) — credits left standing`);
   }
 
+  try {
+    return await withDepositLock(agentId, () => _pollPendingSweep(agentId, client));
+  } catch (e) {
+    if (e && e.code === 'DEPOSIT_LOCK_BUSY') return; // retried on the next tick
+    throw e;
+  }
+}
+
+async function _pollPendingSweep(agentId, client) {
   const deposits = loadDeposits(agentId);
   if (deposits.pending.length === 0) return;
 
@@ -1428,4 +1670,4 @@ async function notifyJ41CreditLow(sellerWif, sellerVerusId, buyerVerusId, balanc
   }
 }
 
-module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, listDepositAnomalies, listDepositAnomaliesForAgent, _recheckReversals, _settleReversedForTxid, _classifyLookupFailure, _syncedView, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_MIN_ADVANCE_BLOCKS, REVERSAL_RECHECK_WINDOW_MS, REVERSAL_BUDGET_MAX, PROCESSED_AUDIT_CAP, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
+module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, listDepositAnomalies, listDepositAnomaliesForAgent, creditDepositAnomaly, dismissDepositAnomaly, reconcileMeterAgainstLedger, withDepositLock, _recheckReversals, _settleReversedForTxid, _classifyLookupFailure, _syncedView, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_MIN_ADVANCE_BLOCKS, REVERSAL_RECHECK_WINDOW_MS, REVERSAL_BUDGET_MAX, PROCESSED_AUDIT_CAP, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
