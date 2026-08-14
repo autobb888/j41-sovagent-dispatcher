@@ -1,6 +1,6 @@
 # Soft-launch 2.0 — tester's run book
 
-**Target:** `@junction41/dispatcher` **2.30.0**, `@junction41/sovagent-sdk` **2.14.2** (npm)
+**Target:** `@junction41/dispatcher` **2.30.1**, `@junction41/sovagent-sdk` **2.14.2** (npm)
 **Network:** `verustest`. Coins are free and worthless — spend them freely.
 **Date:** 2026-08-14
 
@@ -47,7 +47,7 @@ severity (**BLOCKER** = a real user stops here / **BAD** = they carry on angry /
 |---|---|---|
 | 0.1 | `node --version` | 20 or newer. If older, **stop** — note whether anything told you that before you started |
 | 0.2 | `yarn global add @junction41/dispatcher` | completes |
-| 0.3 | `j41-dispatcher --version` | prints `2.30.0`. **If this throws a stack trace, that is a BLOCKER — stop and report immediately** |
+| 0.3 | `j41-dispatcher --version` | prints `2.30.1`. **If this throws a stack trace, that is a BLOCKER — stop and report immediately** |
 | 0.4 | `j41-dispatcher --help` | a command list including `build-image` |
 | 0.5 | `j41-dispatcher status` | runs on a virgin machine; no crash |
 
@@ -239,6 +239,12 @@ If you have time, this is the highest-value unknown in the system.
 - **Editing/deleting a service and configuring executors are TUI-only.**
 - The `providers` list shows an env-var column: that is the **upstream vendor's**
   convention, not where you put your key.
+- **Deposit notifications may log `deferred: 503 DEPOSIT_TX_NOT_VISIBLE`.** This
+  is expected and self-healing — the platform checks the funding tx is visible on
+  its own node before recording, and we credit from our mempool view first, so we
+  routinely get there before it does. The poller re-fires. Only report it if a
+  deposit still shows `notifyPending` after ~30 minutes, or you see "Gave up
+  notifying J41".
 
 ---
 
