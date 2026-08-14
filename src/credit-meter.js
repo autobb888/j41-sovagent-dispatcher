@@ -35,6 +35,98 @@ function saveMeters(agentId, data) {
   fs.renameSync(tmp, p);
 }
 
+// ── Cross-process serialisation of the balance file ─────────────────────────
+//
+// Every mutation here is a synchronous load → mutate → save, which Node's single
+// thread already serialises WITHIN a process. That was sufficient while the
+// daemon was the only writer. It stopped being sufficient when `deposits credit`
+// shipped: an operator resolving an anomaly out-of-band is a second process
+// writing this file, and the proxy path writes it two or three times per served
+// request. Atomic tmp→rename makes each write whole; it does nothing about a
+// lost update, and the loser here is either a buyer's balance or a settled
+// charge.
+//
+// SYNCHRONOUS on purpose. The critical section contains no awaits, so the lock
+// is held for microseconds, and making it async would turn every call site —
+// including the proxy hot path — into an async signature for no benefit.
+//
+// Fails OPEN after a short deadline, and this is the one place in the deposit
+// work where that is the right call: refusing to settle a completed LLM request
+// would either drop the charge (free compute) or fail a request the buyer has
+// already been served. A lost update is a rare bounded error; a broken settle
+// path is a continuous one. It says so loudly when it happens.
+const METER_LOCK_SPIN_MS = 250;
+
+function meterLockPath(agentId) {
+  return path.join(AGENTS_DIR, agentId, 'credit-meters.lock');
+}
+
+function _meterHolderGone(raw) {
+  if (typeof raw !== 'string' || !raw) return false; // mid-write, not abandoned
+  const pid = parseInt(raw.split(':')[0], 10);
+  if (!Number.isInteger(pid) || pid <= 0) return true;
+  try { process.kill(pid, 0); return false; } catch (e) { return e.code !== 'EPERM'; }
+}
+
+/**
+ * Run a synchronous meter mutation with the file lock held.
+ * @param {string} agentId
+ * @param {Function} fn
+ */
+function withMeterLock(agentId, fn) {
+  const lockPath = meterLockPath(agentId);
+  const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
+  const deadline = Date.now() + METER_LOCK_SPIN_MS;
+  let held = false;
+
+  while (Date.now() < deadline) {
+    try {
+      fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+      // link() from a fully-written temp file, not open(wx)+write: the latter
+      // leaves an EMPTY file visible at the path between the two calls, and an
+      // empty lock reads as abandoned to anyone inspecting it.
+      const tmp = `${lockPath}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 8)}`;
+      fs.writeFileSync(tmp, token, { mode: 0o600 });
+      try {
+        fs.linkSync(tmp, lockPath);
+        held = true;
+      } catch (e) {
+        if (e.code !== 'EEXIST') throw e;
+      } finally {
+        try { fs.unlinkSync(tmp); } catch {}
+      }
+      if (held) break;
+    } catch {
+      break; // filesystem refused us entirely — do not block the request path
+    }
+
+    let raw = null;
+    try { raw = String(fs.readFileSync(lockPath, 'utf8')); } catch { raw = null; }
+    if (raw !== null && _meterHolderGone(raw)) {
+      // Liveness, not age: a live holder is never robbed however slow it is.
+      try { fs.unlinkSync(lockPath); } catch {}
+      continue;
+    }
+    const until = Date.now() + 2;
+    while (Date.now() < until) { /* the section is microseconds; spin briefly */ }
+  }
+
+  if (!held) {
+    console.error(`[Meter] ${agentId}: balance lock not acquired in ${METER_LOCK_SPIN_MS}ms — ` +
+      'applying the change UNSERIALIZED. A concurrent writer could drop it; ' +
+      'compare totalDeposited against the deposit ledger if a balance looks wrong.');
+  }
+  try {
+    return fn();
+  } finally {
+    if (held) {
+      try {
+        if (String(fs.readFileSync(lockPath, 'utf8')) === token) fs.unlinkSync(lockPath);
+      } catch {}
+    }
+  }
+}
+
 function ensureBuyer(data, buyerVerusId) {
   if (!data.buyers[buyerVerusId]) {
     data.buyers[buyerVerusId] = {
@@ -74,6 +166,7 @@ function calculateCost(modelPricing, model, inputTokens, outputTokens) {
  * After the request completes, call adjustCredit to correct the estimate.
  */
 function reserveCredit(agentId, buyerVerusId, model, estimatedInputTokens, estimatedOutputTokens, modelPricing) {
+  return withMeterLock(agentId, () => {
   const data = loadMeters(agentId);
   const buyer = ensureBuyer(data, buyerVerusId);
   const estimatedCost = calculateCost(modelPricing, model, estimatedInputTokens, estimatedOutputTokens);
@@ -88,6 +181,7 @@ function reserveCredit(agentId, buyerVerusId, model, estimatedInputTokens, estim
   saveMeters(agentId, data);
 
   return { allowed: true, reserved: estimatedCost, balance: buyer.balance };
+  });
 }
 
 /**
@@ -96,6 +190,7 @@ function reserveCredit(agentId, buyerVerusId, model, estimatedInputTokens, estim
  * Also records per-model usage stats.
  */
 function adjustCredit(agentId, buyerVerusId, model, inputTokens, outputTokens, reservedCost, modelPricing) {
+  return withMeterLock(agentId, () => {
   const data = loadMeters(agentId);
   const buyer = ensureBuyer(data, buyerVerusId);
   const actualCost = calculateCost(modelPricing, model, inputTokens, outputTokens);
@@ -121,22 +216,26 @@ function adjustCredit(agentId, buyerVerusId, model, inputTokens, outputTokens, r
 
   saveMeters(agentId, data);
   return { remaining: buyer.balance, cost: actualCost };
+  });
 }
 
 /**
  * Refund a reservation (e.g., upstream failed, request never completed).
  */
 function refundReservation(agentId, buyerVerusId, reservedCost) {
+  return withMeterLock(agentId, () => {
   const data = loadMeters(agentId);
   const buyer = ensureBuyer(data, buyerVerusId);
   buyer.balance += reservedCost;
   saveMeters(agentId, data);
+  });
 }
 
 /**
  * Credit a deposit (buyer sends VRSC to seller).
  */
 function creditDeposit(agentId, buyerVerusId, amount, txid) {
+  return withMeterLock(agentId, () => {
   const data = loadMeters(agentId);
   const buyer = ensureBuyer(data, buyerVerusId);
   buyer.balance += amount;
@@ -148,6 +247,7 @@ function creditDeposit(agentId, buyerVerusId, amount, txid) {
   delete buyer.lowNotifiedAt;
   saveMeters(agentId, data);
   return { newBalance: buyer.balance };
+  });
 }
 
 /**
@@ -168,6 +268,7 @@ function creditDeposit(agentId, buyerVerusId, amount, txid) {
  * @returns {{newBalance: number}}
  */
 function reverseDeposit(agentId, buyerVerusId, amount, txid) {
+  return withMeterLock(agentId, () => {
   const data = loadMeters(agentId);
   const buyer = ensureBuyer(data, buyerVerusId);
   buyer.balance -= amount;
@@ -176,6 +277,7 @@ function reverseDeposit(agentId, buyerVerusId, amount, txid) {
   if (txid) buyer.lastReversedTxid = txid;
   saveMeters(agentId, data);
   return { newBalance: buyer.balance };
+  });
 }
 
 /**

@@ -748,3 +748,80 @@ test('a withheld reversal stops being an operator question once the tx confirms'
   assert.ok(settled.resolvedAt);
   assert.equal(getBalance(agentId, buyer), amount, 'and still nothing moved');
 });
+
+// ── crash residues: the ways a half-finished write becomes double money ─────
+
+test('a record stuck mid-credit is never auto-debited — we cannot prove the credit landed', async () => {
+  // A `crediting` record carries `unconfirmed: true`, so the reconciler sees it,
+  // and `alreadyDebited` consults only `reversal` — which it has none of. So a
+  // crash between the intent and the money, followed by the tx evaporating,
+  // debited a buyer who was never credited: their meter goes negative for a
+  // deposit they neither got credit for nor (the tx being gone) paid.
+  const T0 = epoch();
+  setBackendFeatures(FLAG_ON);
+  const { agentId, buyer } = seedOpenCredit({
+    amount: 1, extra: { crediting: true, intentAt: new Date(T0).toISOString() },
+  });
+  // The meter was never credited — that is the whole point of a stuck intent.
+  const { reverseDeposit } = require('../src/credit-meter.js');
+  reverseDeposit(agentId, buyer, 1, 'undo-seed'); // back to 0
+  assert.equal(getBalance(agentId, buyer), 0);
+
+  const state = { chain: syncedChain(), tx: {} };
+  await fullMissRun(agentId, makeClient(state), state, { t0: T0, passes: 6 });
+
+  assert.equal(getBalance(agentId, buyer), 0,
+    'debiting here charges a buyer for a deposit they never received credit for');
+  const rec = readDeposits(agentId).processed[0];
+  assert.ok(rec.needsOperator, 'and the ambiguity must be handed to a human');
+});
+
+test('a forgiven reversal keeps its dedup entry — the credit may still be standing', async () => {
+  // When a crash makes the debit unprovable the reconciler deliberately does NOT
+  // charge the buyer. Removing the txid from the dedup ledger anyway let them
+  // re-report the same deposit and be credited a second time, on top of a credit
+  // that was never reversed.
+  const T0 = epoch();
+  setBackendFeatures(FLAG_ON);
+  const { agentId, txid, buyer, amount } = seedOpenCredit({
+    amount: 1.5, extra: { reversal: 'debiting' }, // crashed mid-reversal
+  });
+  const state = { chain: syncedChain(), tx: {} };
+  await fullMissRun(agentId, makeClient(state), state, { t0: T0 });
+
+  const d = readDeposits(agentId);
+  const entry = d.reversed.find((r) => r.txid === txid);
+  assert.ok(entry, 'the reversal completed its bookkeeping');
+  assert.equal(entry.debited, false, 'without charging the buyer');
+  assert.equal(getBalance(agentId, buyer), amount, 'so the credit is still standing');
+  assert.ok(d.creditedTxids.includes(txid),
+    're-reporting this txid would credit it a second time on top of a credit that was never reversed');
+});
+
+test('an interrupted restore leaves the dedup armed, so a re-report cannot credit again', async () => {
+  const T0 = epoch();
+  setBackendFeatures(FLAG_ON);
+  const { agentId, txid, buyer } = seedOpenCredit({ amount: 1.5 });
+  const state = { chain: syncedChain(), tx: {} };
+  const client = makeClient(state);
+  await fullMissRun(agentId, client, state, { t0: T0 });
+  assert.equal(getBalance(agentId, buyer), 0, 'reversed, debit certain');
+
+  // Crash between the restore intent and the credit.
+  state.tx[txid] = { confirmations: 4 };
+  const realRename = fs.renameSync;
+  fs.renameSync = (from, to, ...rest) => {
+    if (String(to).endsWith('credit-meters.json')) throw new Error('EIO');
+    return realRename(from, to, ...rest);
+  };
+  try {
+    await reconcileUnconfirmedDeposits(agentId, client, T0 + 40 * MINUTE).catch(() => {});
+  } finally {
+    fs.renameSync = realRename;
+  }
+
+  const d = readDeposits(agentId);
+  assert.ok(d.creditedTxids.includes(txid),
+    'the dedup must be armed in the same write as the intent — otherwise a buyer ' +
+    'whose restore died mid-flight can re-report and be credited twice');
+});

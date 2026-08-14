@@ -1056,6 +1056,27 @@ async function _reconcileLocked(agentId, client, now, emit) {
     // debit precisely so a crash is recoverable, which means it cannot also
     // stand as evidence that the debit ran. Treat the ambiguous case as already
     // debited: forgiving ≤2 VRSC beats debiting a buyer twice.
+    if (live.crediting) {
+      // We cannot prove the credit ever reached the meter, so we cannot know
+      // whether there is anything to take back. claimTxid already treats this
+      // record as "the meter may or may not have moved" — the reversal path must
+      // agree with it rather than guessing in the direction that charges a buyer.
+      if (!live.needsOperator) {
+        live.needsOperator = 'credit intent never finalized and the funding tx is unknown to the chain — ' +
+          `cannot tell whether ${live.amount} VRSC ever reached ${live.buyerVerusId}`;
+        saveDeposits(agentId, fresh);
+        console.error(`[Deposits] ${agentId}: ⚠️  ${rec.txid.substring(0, 12)}… is both stuck mid-credit ` +
+          'and unknown to the chain. Refusing to debit a buyer whose credit we cannot prove landed. ' +
+          'Check the meter against the ledger.');
+        _emit(emit, 'deposit.needs_operator', {
+          agentId, txid: live.txid, buyerVerusId: live.buyerVerusId,
+          amount: live.amount, where: 'processed', reason: live.needsOperator,
+        });
+      }
+      waiting++;
+      continue;
+    }
+
     const alreadyDebited = live.reversal === 'debited' || live.reversal === 'debiting';
     live.misses = (live.misses || 0) + 1;
     if (!live.firstMissAtMs) live.firstMissAtMs = now;
@@ -1118,8 +1139,18 @@ async function _reconcileLocked(agentId, client, now, emit) {
     // it. _recordCreditIntent settles the ledger entry when they do, and
     // _recheckReversals re-adds the txid if it restores automatically — so
     // exactly one of the two paths can ever credit it.
-    fresh.creditedTxids = fresh.creditedTxids.filter((t) => t !== live.txid);
-    releaseTxid(agentId, live.txid);
+    if (debitCertain) {
+      // The credit is genuinely gone, so the buyer must be able to re-report the
+      // txid if it turns out to have confirmed after all.
+      fresh.creditedTxids = fresh.creditedTxids.filter((t) => t !== live.txid);
+      releaseTxid(agentId, live.txid);
+    }
+    // When the debit was NOT certain we deliberately did not charge the buyer —
+    // so their original credit may still be standing. Releasing the txid then
+    // lets them re-report the same deposit and be credited a SECOND time on top
+    // of a credit that was never reversed. Keep the dedup entry; the reversed
+    // ledger row still records what happened, and _recheckReversals already
+    // refuses to auto-restore a `debited !== true` entry for the same reason.
     fresh.reversed = fresh.reversed || [];
     fresh.reversed.push({
       txid: live.txid,
@@ -1236,6 +1267,22 @@ async function _recheckReversals(agentId, client, now = Date.now(), emit) {
     // they had been made whole. `restoring` is distinguishable from finished.
     live.restoring = true;
     live.restoringAt = new Date(now).toISOString();
+    // Re-arm the dedup in the SAME save as the intent, not after the credit.
+    // Doing it afterwards left a window where the buyer had been credited and
+    // the txid was not in the ledger, so a re-report credited them again — the
+    // third path through a rule that is supposed to admit exactly two.
+    if (!fresh.processed.some((r) => r && r.txid === cand.txid)) {
+      fresh.processed.push({
+        txid: cand.txid,
+        buyerVerusId: live.buyerVerusId,
+        amount: live.amount,
+        confirmations: confs,
+        creditedAt: new Date(now).toISOString(),
+        restoredFromReversal: true,
+      });
+    }
+    _rememberCreditedTxid(fresh, cand.txid);
+    _trimProcessed(fresh);
     saveDeposits(agentId, fresh);
 
     creditDeposit(agentId, live.buyerVerusId, live.amount, live.txid);
@@ -1248,22 +1295,8 @@ async function _recheckReversals(agentId, client, now = Date.now(), emit) {
       entry.restoredAt = new Date(now).toISOString();
       entry.resolvedBy = 'automatic restore — the funding tx confirmed after all';
     }
-    // Back into the dedup ledger. The reversal took it out so the buyer could
-    // re-report; now that we have credited it ourselves, a re-report must not
-    // credit it a second time. Without this the sequence reverse → auto-restore
-    // → buyer re-reports the same confirmed txid credits twice.
-    if (!settle.processed.some((r) => r && r.txid === cand.txid)) {
-      settle.processed.push({
-        txid: cand.txid,
-        buyerVerusId: live.buyerVerusId,
-        amount: live.amount,
-        confirmations: confs,
-        creditedAt: new Date(now).toISOString(),
-        restoredFromReversal: true,
-      });
-    }
-    _rememberCreditedTxid(settle, cand.txid);
-    _trimProcessed(settle);
+    // The dedup entry was already written with the intent above; this save only
+    // settles the ledger row.
     saveDeposits(agentId, settle);
 
     restored++;

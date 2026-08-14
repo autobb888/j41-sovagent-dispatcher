@@ -38,13 +38,13 @@ Also new: `ctl deposits`, `GET /v1/deposits`, `deposit.reversed` /
 - `deposits dismiss <agent-id> <txid> --reason <text>` — nothing is owed; moves
   no money, records why.
 
-The verbs run out-of-band against a live daemon, so all deposit-ledger
-read-modify-writes now go through a per-agent inter-process lock
-(`src/file-lock.js`). Note the limit: `credit-meters.json` is still written
-without a lock by the proxy metering path on every request, so a `deposits
-credit` issued while that agent is actively serving traffic can still lose
-either write. Prefer resolving anomalies on a quiet agent until that path is
-serialised too.
+The verbs run out-of-band against a live daemon, so both files are now
+serialised across processes: `deposits.json` through an async per-agent lock
+(`src/file-lock.js`), and `credit-meters.json` through a synchronous one held
+across its load-mutate-save. The meter lock fails OPEN after 250ms and says so
+loudly — refusing to settle a request the buyer has already been served would
+either drop the charge or break the proxy, and a rare bounded lost update beats
+a continuously broken settle path.
 
 ### The `start` action can now be executed by a test
 
