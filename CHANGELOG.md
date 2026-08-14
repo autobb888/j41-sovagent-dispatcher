@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.29.1 — 2026-08-14
+
+### Fresh installs work again
+
+**Every clean install of this package was dead**, including 2.28.2, and had been
+since `json-canonicalize@2.0.1` was published. That release declares
+`main: ./bundles/index.umd.js` but ships no `bundles/` directory, so requiring it
+throws `MODULE_NOT_FOUND`. The SDK depends on it as `^2.0.0`, so any fresh
+resolve picked the broken 2.0.1 and **every command crashed before printing
+anything** — `--version` included.
+
+Development checkouts were immune, which is why this survived so long: their
+lockfiles pin the working 2.0.0, and the maintainer's own fleet has never been a
+fresh install. It took a clean-machine install to see it — the test
+`docs/RELEASE-READINESS.md` records as never having been run.
+
+Pinned to `2.0.0` three ways: a direct dependency (the one that actually works
+for a global install, where a nested package's own `overrides` are ignored),
+plus `resolutions` and `overrides` for the clone-and-run case.
+
+The durable fix belongs upstream in `@junction41/sovagent-sdk`, which should pin
+`json-canonicalize` to `2.0.0` exactly rather than `^2.0.0`. Until it does, every
+other consumer of the SDK is still broken.
+
 ## 2.29.0 — 2026-08-14
 
 Held back from npm since 2.28.2 while the deposit work was validated. Everything
