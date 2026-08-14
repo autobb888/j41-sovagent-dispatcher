@@ -307,32 +307,118 @@ function saveSendHistory(h) {
 // counter, so a crashed holder must never wedge refunds permanently.
 const SEND_HISTORY_LOCK = () => `${SEND_HISTORY_PATH}.lock`;
 
+/**
+ * Age window for the LAST-RESORT reclaim, used only when the lock's content
+ * carries no usable pid.
+ *
+ * It was 10s against a 5s acquire deadline, which made the path unreachable: the
+ * deadline always expired first, so a lock with legacy or torn content could never
+ * be reclaimed and every caller fell through to an UNSERIALIZED write. Proved by
+ * `test/send-history-lock-race.test.js` — 4 concurrent recorders left 3 records.
+ *
+ * 2s is safe here because this branch is only reached when no pid can be parsed,
+ * and a healthy holder always writes `pid:ts:seq` in a single small `writeSync`.
+ * Unparseable content is therefore debris, not a live peer; the window exists only
+ * to avoid racing a writer caught mid-write.
+ */
+const SEND_HISTORY_LOCK_STALE_MS = 2000;
+/** Distinguishes two acquisitions by the same pid in the same millisecond. */
+let _sendHistoryLockSeq = 0;
+
+/**
+ * Serialize the read-modify-write of the send-history file across processes.
+ *
+ * This guards the LIFETIME "max 3 sends per job" cap and the hourly global cap, so
+ * a lost update here is not a cosmetic counter glitch — it under-counts sends and
+ * grants an extra refund broadcast.
+ *
+ * Rewritten to the same discipline as `acquireSendLock`, because it had the same
+ * three flaws that lock's own comments condemn:
+ *
+ *  1. It judged the holder by AGE. Age flips over time and misjudges a peer that is
+ *     merely slow; "the holder is dead" is stable, because a dead pid stays dead.
+ *  2. It stole with unlink-then-create — two contenders could both stat the same
+ *     stale lock, and the second's `unlink` then deleted the FIRST's freshly created
+ *     live lock, putting both inside the "exclusive" section.
+ *  3. On release it unlinked `lockPath` unconditionally. If our own lock had since
+ *     been stolen (we outlived the stale window), that deleted the new holder's lock.
+ *
+ * The steal is now an atomic rename plus a content check proving we moved the exact
+ * file we judged — rename() is atomic on a PATH, not on the file you inspected — and
+ * the release only removes a lock that is still ours.
+ */
 function withSendHistoryLock(fn) {
   const lockPath = SEND_HISTORY_LOCK();
   const deadline = Date.now() + 5000;
+  const token = `${process.pid}:${Date.now()}:${++_sendHistoryLockSeq}`;
   let held = false;
   while (Date.now() < deadline) {
     try {
       fs.mkdirSync(path.dirname(lockPath), { recursive: true });
       const fd = fs.openSync(lockPath, 'wx');
-      fs.writeSync(fd, `${process.pid}:${Date.now()}`);
+      fs.writeSync(fd, token);
       fs.closeSync(fd);
       held = true;
       break;
     } catch {
-      try {
-        const age = Date.now() - fs.statSync(lockPath).mtimeMs;
-        if (age > 10000) { fs.unlinkSync(lockPath); continue; }
-      } catch { /* vanished — retry the create */ }
+      // Read the holder's bytes: they identify the specific lock we are judging,
+      // and the steal below has to prove it moved that one.
+      let holderRaw = null;
+      try { holderRaw = String(fs.readFileSync(lockPath, 'utf8')); }
+      catch { continue; } // vanished — retry the create immediately
+
+      let stealable = false;
+      const holderPid = parseInt(holderRaw.split(':')[0], 10);
+      if (Number.isInteger(holderPid) && holderPid > 0) {
+        let alive = true;
+        try { process.kill(holderPid, 0); } catch (e) { alive = (e.code === 'EPERM'); }
+        stealable = !alive;
+      } else {
+        // No usable pid (legacy or torn content). Age is all we have left.
+        try { stealable = (Date.now() - fs.statSync(lockPath).mtimeMs) > SEND_HISTORY_LOCK_STALE_MS; }
+        catch { continue; }
+      }
+
+      if (stealable) {
+        const stolen = `${lockPath}.stale.${process.pid}.${++_sendHistoryLockSeq}`;
+        try { fs.renameSync(lockPath, stolen); }
+        catch { continue; } // a peer claimed the reclaim first
+        let movedRaw = null;
+        try { movedRaw = String(fs.readFileSync(stolen, 'utf8')); } catch { movedRaw = null; }
+        if (movedRaw !== holderRaw) {
+          // A peer recreated the lock between our judgement and the rename, and we
+          // just moved THEIR live lock. Put it back and stand down.
+          try { fs.renameSync(stolen, lockPath); } catch { /* peer recreated it already */ }
+          continue;
+        }
+        try { fs.unlinkSync(stolen); } catch { /* already gone */ }
+        continue;
+      }
+
       // Spin briefly. This is a sub-millisecond critical section in practice.
       const until = Date.now() + 25;
       while (Date.now() < until) { /* busy-wait */ }
     }
   }
+  if (!held) {
+    // We still run `fn`, and that is deliberate: it RECORDS a send that has already
+    // been broadcast, so dropping it would under-count the cap in exactly the
+    // direction that permits an extra refund. But an unserialized read-modify-write
+    // on a money cap must never be silent — a concurrent writer can still lose this
+    // record, and the operator needs to know a cap reading may be low.
+    console.error('[refund] send-history lock not acquired within 5s — recording UNSERIALIZED. ' +
+      'A concurrent write could drop this record and under-count the per-job send cap.');
+  }
   try {
     return fn();
   } finally {
-    if (held) { try { fs.unlinkSync(lockPath); } catch { /* already gone */ } }
+    if (held) {
+      // Only remove a lock that is still OURS. Not atomic, but the failure mode
+      // inverts from "delete a live peer's lock" to "leave a lock that ages out".
+      let cur = null;
+      try { cur = String(fs.readFileSync(lockPath, 'utf8')); } catch { cur = null; }
+      if (cur === token) { try { fs.unlinkSync(lockPath); } catch { /* already gone */ } }
+    }
   }
 }
 
