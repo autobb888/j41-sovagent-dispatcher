@@ -108,15 +108,15 @@
   resolved "https://registry.yarnpkg.com/@junction41/secure-setup/-/secure-setup-0.3.0.tgz#3c7ddd9601ae3ec4a7c032b75ff6421ca0c613c1"
   integrity sha512-M3bX0lxx5gg0PIsVYUH98cK8sdQcfbqzXm8kgEs8t+Z/st7glNbRqfVtiXEGDvurUGkgiJEs3x9its+JIG1syQ==
 
-"@junction41/sovagent-sdk@2.14.1":
-  version "2.14.1"
-  resolved "https://registry.yarnpkg.com/@junction41/sovagent-sdk/-/sovagent-sdk-2.14.1.tgz#f80ab7818f4805428888fe3cb2b6103ef3f9b335"
-  integrity sha512-bcMsByOBOHLXbzNxhGlh/PxflMoxq+n5xwYtmWWnyEjTes+mNQwR32HomQloV2aQcePBrthrPnsnL6hgqbVfBg==
+"@junction41/sovagent-sdk@2.14.2":
+  version "2.14.2"
+  resolved "https://registry.yarnpkg.com/@junction41/sovagent-sdk/-/sovagent-sdk-2.14.2.tgz#418daa8b801032b554f0963dd8083e5812de3aef"
+  integrity sha512-vB5TV7penIfpJh9rqPM3/hRleWIO/sDtHgXD89wJ3xcOFpwT36CvJ5JtJjhQTf3Lap3lrr2QyreY47izsQBU1A==
   dependencies:
     "@bitgo/utxo-lib" "github:VerusCoin/BitGoJS#5e82f4fda2975ca1af7f2b01590093b4a1439dc9"
     bn.js "^5.2.0"
     bs58check "2.0.0"
-    json-canonicalize "^2.0.0"
+    json-canonicalize "2.0.0"
     socket.io-client "^4.8.3"
     verus-typescript-primitives "github:VerusCoin/verus-typescript-primitives#27e6c076def4416c20a568e31e4c406b10612807"
 
@@ -832,7 +832,7 @@ isarray@~1.0.0:
   resolved "https://registry.yarnpkg.com/isarray/-/isarray-1.0.0.tgz#bb935d48582cba168c06834957a54a3e07124f11"
   integrity sha512-VLghIWNM6ELQzo7zwmcg0NmTVyWKYjvIeM83yjp0wRDTmUnrM678fQbcKBo6n2CJEF0szoG//ytg+TKla89ALQ==
 
-json-canonicalize@2.0.0, json-canonicalize@^2.0.0:
+json-canonicalize@2.0.0:
   version "2.0.0"
   resolved "https://registry.yarnpkg.com/json-canonicalize/-/json-canonicalize-2.0.0.tgz#920b1f7ad1954c9470cbb5bfd460cba5a97b33a7"
   integrity sha512-yyrnK/mEm6Na3ChbJUWueXdapueW0p380RUyTW87XGb1ww8l8hU0pRrGC3vSWHe9CxrbPHX2fGUOZpNiHR0IIg==
