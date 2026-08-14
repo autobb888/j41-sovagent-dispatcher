@@ -33,6 +33,60 @@ nowhere, too late, or in a path they cannot execute.*
 
 ---
 
+## Verified on a real clean install (2026-08-14, dispatcher 2.29.1)
+
+The four audits read source. The one empirical test — `npm i` into an empty
+directory with a scratch `HOME` — found a defect worse than all of them (B0
+below) and corrected three findings the paper audits got wrong. **Do this every
+release.** Walk stopped short of `register`, which spends.
+
+### B0. Every fresh install was dead — **FIXED**
+
+`json-canonicalize@2.0.1` declares `main: ./bundles/index.umd.js` and ships no
+`bundles/`. The SDK depended on it as `^2.0.0`, so a clean resolve took 2.0.1 and
+**every command threw `MODULE_NOT_FOUND` before printing anything**, `--version`
+included. **2.28.2 failed identically** — a pre-existing outage, not a
+regression. Dev checkouts were immune because their lockfiles pin the working
+2.0.0, which is why it survived: nobody had done a clean install.
+
+Fixed in dispatcher **2.29.1** (direct pin — a nested package's own
+`overrides`/`resolutions` are ignored on a global install) and durably in SDK
+**2.14.2** (`json-canonicalize` pinned to `2.0.0` exactly). Both published and
+verified by clean install.
+
+**Every newcomer blocker below was moot while this stood. Nobody got that far.**
+
+### Confirmed live
+
+- **The currency contradiction, in two adjacent commands on one virgin install.**
+  `init` prints *"Fund the agent addresses (they need **VRSC** for
+  registration)"*; `wallet show agent-1` on that same agent prints *"Fee tank: —
+  **VRSCTEST**"*. Still no faucet URL and no amount anywhere. Mainnet and testnet
+  R-addresses are visually identical. This is B2, proven rather than inferred.
+- **`setup --help` advertises 3 templates; 5 ship.** `character-roleplay` and
+  `workspace-reviewer` are invisible to anyone reading help.
+- **`providers` teaches the config method the codebase rejects** — an
+  `OPENAI_API_KEY`-style env column and "set J41_LLM_PROVIDER", neither read for
+  provider keys — and prints `[LLM] No API key — using template responses` as a
+  side effect of merely loading. Alarming phrasing on a money product.
+- **`status` on a virgin machine gives no next step**, and reports `Active jobs:
+  0/7` where the README claims the default is unlimited. (`init`, by contrast,
+  does print numbered next steps.)
+
+### Corrected — these audit findings do NOT hold
+
+- **Exit codes are sound.** `ctl status`/`ctl jobs` return **1** with no daemon;
+  `inspect`/`activate` on an unknown agent return **1**; the read verbs return 0.
+  Earlier readings of "exit 0" were an artefact of piping to `head` — `$?` gives
+  the pipe's last command. Use `${PIPESTATUS[0]}`.
+- **`quickstart` fails loudly without a TTY** — RC=1, "Name required". It is not
+  in the silent exit-0 class; the onboarding prompts were never the problem.
+- **The money verbs all work on a virgin install** with sane empty states, and
+  `wallet show` on an unregistered agent is genuinely well written: it says
+  *"never queried"* rather than `0`, and names the exact address to fund.
+
+---
+
 ## Controls that are real for a human and absent for a machine
 
 The headline deliverable of audit 4. Nobody had written this down for this system.
