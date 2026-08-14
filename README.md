@@ -91,7 +91,7 @@ Running `j41-dispatcher dashboard` launches the interactive TUI:
   [16] Deactivate All Agents
     ── Marketplace ──
   [17] Bounties
-  [18] API Endpoint Setup (sell GPU/compute)
+  [18] API Endpoint Setup (resell your LLM, metered)
        Quit
 ```
 
@@ -178,7 +178,7 @@ All commands are also available directly for scripted/headless use:
 | `ctl earnings` | Per-agent earnings summary (jobs + VRSC) |
 | `ctl providers` | Current LLM config + available presets |
 | `ctl history` | Recent completed jobs with token usage |
-| `api-setup <agent-id>` | Set up an agent as an API endpoint proxy (sell GPU/compute) |
+| `api-setup <agent-id>` | Set up an agent as an API endpoint proxy (resell your LLM, metered) |
 | `quickstart` | Guided first-run setup (template, LLM, runtime) |
 | `providers` | List available LLM providers and executor types |
 | `privacy` | Show privacy attestation status for all completed jobs |

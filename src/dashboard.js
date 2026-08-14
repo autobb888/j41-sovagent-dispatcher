@@ -119,7 +119,16 @@ async function createAgent(keys) {
 
 const BACK = Symbol('BACK');
 
-/** Wrap inquirer.prompt to support ESC key → throws BACK */
+/**
+ * Wrap inquirer.prompt to support ESC key → throws BACK.
+ *
+ * CONVENTION: any `confirm` that commits money or an on-chain write MUST use
+ * `default: false`. inquirer resolves a confirm to its default on a bare
+ * newline, so a `default: true` in front of a spend means Enter — or a stray
+ * keystroke — pays. Wizard-shaped confirms that commit nothing irreversible
+ * (e.g. "List this API endpoint?" at the end of a wizard the operator just
+ * walked through) may keep `default: true`.
+ */
 function promptWithEsc(inquirer, questions) {
   return new Promise((resolve, reject) => {
     // Listen for ESC on raw stdin
@@ -507,7 +516,7 @@ async function updateProfileScreen(inquirer, agentId, keys) {
   console.log('  Two transactions required: remove old values → wait for block → write new values.');
   console.log('  This typically takes 1-3 minutes.\n');
 
-  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Proceed?', default: true }]);
+  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Proceed?', default: false }]);
   if (!confirm) return;
 
   // Build CLI flags
@@ -1154,7 +1163,7 @@ async function addAgentScreen(inquirer) {
   console.log(`  Identity: ${name}.agentplatform@`);
   console.log(`  Template: ${template}\n`);
 
-  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Proceed with setup?', default: true }]);
+  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Proceed with setup?', default: false }]);
   if (!confirm) return;
 
   // Run the setup command (async — registration can take 20+ minutes for block confirmations)
@@ -1606,7 +1615,7 @@ async function configureServicesScreen(inquirer) {
       const requestCount = Object.values(b.usage || {}).reduce((n, u) => n + (u.requests || 0), 0);
       const { rating } = await promptWithEsc(inquirer, [{ type: 'list', name: 'rating', message: 'Rating:', choices: [{ name: '5 — excellent', value: 5 }, { name: '4 — good', value: 4 }, { name: '3 — neutral', value: 3 }, { name: '2 — poor', value: 2 }, { name: '1 — avoid', value: 1 }] }]);
       const { message } = await promptWithEsc(inquirer, [{ type: 'input', name: 'message', message: 'Review comment (optional):' }]);
-      const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Submit ${rating}-star review for ${buyerVerusId}?`, default: true }]);
+      const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Submit ${rating}-star review for ${buyerVerusId}?`, default: false }]);
       if (!confirm) continue;
 
       try {
@@ -2041,7 +2050,7 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
     if (!name) { console.log('\n  ❌ Name required.\n'); return; }
     identityName = name;
 
-    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${identityName}.agentplatform@ on-chain?`, default: true }]);
+    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${identityName}.agentplatform@ on-chain?`, default: false }]);
     if (!confirm) return;
 
     keysData.pendingName = identityName;
@@ -2077,7 +2086,7 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
     keysData.pendingName = identityName;
     writeKeysFile(keysPath, keysData);
 
-    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${identityName}.agentplatform@ on-chain?`, default: true }]);
+    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${identityName}.agentplatform@ on-chain?`, default: false }]);
     if (!confirm) return;
 
     console.log('');
@@ -2302,7 +2311,7 @@ async function batchActivateScreen(inquirer, activate) {
     { name: '  Platform only — faster, skip blockchain tx', value: false },
   ]}]);
 
-  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `${action} ${selectedIds.length} agent(s)?`, default: true }]);
+  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `${action} ${selectedIds.length} agent(s)?`, default: false }]);
   if (!confirm) return;
 
   // Run activate/deactivate per agent via CLI
@@ -2480,7 +2489,7 @@ async function postBountyScreen(inquirer) {
   if (description) console.log(`  Description: ${description.substring(0, 80)}`);
   console.log('');
 
-  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Post this bounty?', default: true }]);
+  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Post this bounty?', default: false }]);
   if (!confirm) return;
 
   try {
@@ -2643,7 +2652,7 @@ async function bountyDetailScreen(inquirer, bountyId, agentKeys) {
       return;
     }
 
-    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Select ${selectedIds.length} winner(s)? This creates jobs for each.`, default: true }]);
+    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Select ${selectedIds.length} winner(s)? This creates jobs for each.`, default: false }]);
     if (!confirm) return;
 
     try {
@@ -2992,6 +3001,29 @@ WantedBy=multi-user.target
 // ── Main Loop ──
 
 async function main() {
+  // The TUI's confirmations are its ONLY safety layer, and they are not a
+  // control when nothing can answer them. Measured against this repo's own
+  // inquirer 9.3.8 on Node 20.20.1: `confirm` resolves to its DEFAULT on a bare
+  // newline, so a piped stdin auto-answers every prompt — including the ones
+  // that spend money and write on-chain. At EOF it is worse: the awaited
+  // promise never settles, the event loop drains, and the process exits 0
+  // having silently done nothing, which an orchestrator reads as success.
+  //
+  // A machine driving this fleet belongs on the CLI, which has real
+  // non-interactive gates (`--yes` with principled refusals, allowlists, value
+  // ceilings) instead of prompts. Refuse the TUI outright rather than pretend
+  // its prompts are protecting anyone.
+  if (!process.stdin.isTTY) {
+    console.error('The dashboard is interactive and requires a terminal.');
+    console.error('');
+    console.error('  stdin is not a TTY, so its confirmations cannot be answered. A piped or');
+    console.error('  redirected stdin auto-answers prompts — including ones that spend funds.');
+    console.error('');
+    console.error('  For scripted or headless use, run the CLI commands directly:');
+    console.error('    j41-dispatcher --help');
+    process.exit(1);
+  }
+
   // inquirer v9 is ESM-only, use dynamic import
   const mod = await import('inquirer');
   const inquirer = mod.default || mod;

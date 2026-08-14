@@ -178,7 +178,7 @@ Why it "stopped working" on 2026-08-04: the action-3 payload writes `MULTIMAPREM
   ── Dispatcher ──               [16] Deactivate All Agents
 ⚡    Live Jobs (auto-refresh)    [17] Bounties
 [7]  Start Dispatcher            [18] API Endpoint Setup
-[8]  Stop Dispatcher                  (sell GPU/compute)
+[8]  Stop Dispatcher                  (resell your LLM, metered)
 [9]  View Logs
 ```
 
