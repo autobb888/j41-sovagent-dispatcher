@@ -380,18 +380,82 @@ function withSendHistoryLock(fn) {
       }
 
       if (stealable) {
-        const stolen = `${lockPath}.stale.${process.pid}.${++_sendHistoryLockSeq}`;
-        try { fs.renameSync(lockPath, stolen); }
-        catch { continue; } // a peer claimed the reclaim first
-        let movedRaw = null;
-        try { movedRaw = String(fs.readFileSync(stolen, 'utf8')); } catch { movedRaw = null; }
-        if (movedRaw !== holderRaw) {
-          // A peer recreated the lock between our judgement and the rename, and we
-          // just moved THEIR live lock. Put it back and stand down.
-          try { fs.renameSync(stolen, lockPath); } catch { /* peer recreated it already */ }
+        // Serialise the steal behind an O_EXCL gate, and re-check INSIDE it.
+        //
+        // The previous version renamed the lock away, compared the bytes, and
+        // renamed it back if it had grabbed the wrong file. Between that
+        // rename-away and rename-back the lock PATH IS EMPTY, so a third
+        // contender's `openSync(lockPath, 'wx')` succeeds there — and then the
+        // rename-back drops the old bytes on top of that contender's live lock.
+        // Two processes end up inside the critical section and one send record
+        // is lost, which under-counts the per-job cap and grants an extra refund.
+        //
+        // Measured, not theorised: 3 failures in 33 full-suite runs under CPU
+        // contention, every one of them this test. The diagnostic that settled
+        // it was the children's stderr — all 8 reported success, none took the
+        // deliberate unserialized fallback, and 7 records reached disk. It never
+        // reproduced standalone at 16 contenders over 30 rounds: the window is
+        // two syscalls wide and needs real preemption to land in.
+        //
+        // `acquireSendLock` has had this gate since 1306478; this sibling never
+        // got it. Same discipline, same reasons.
+        const gatePath = `${lockPath}.steal`;
+        const gateTag = `${process.pid}.${crypto.randomBytes(6).toString('hex')}`;
+        let gate = null;
+        try {
+          gate = fs.openSync(gatePath, 'wx');
+          fs.writeSync(gate, gateTag);
+        } catch (ge) {
+          if (ge.code !== 'EEXIST') { continue; }
+          // A peer is mid-steal, or crashed inside the gate. The gate is held
+          // for microseconds, so age is a sound test HERE (unlike for the lock,
+          // whose holder may legitimately be slow).
+          let gateAge = Infinity;
+          try { gateAge = Date.now() - fs.statSync(gatePath).mtimeMs; } catch { continue; }
+          if (gateAge > SEND_HISTORY_LOCK_STALE_MS) { try { fs.unlinkSync(gatePath); } catch {} }
           continue;
         }
-        try { fs.unlinkSync(stolen); } catch { /* already gone */ }
+        try {
+          // Re-read the real lock now that we are alone. A peer may have
+          // completed its steal while we were getting in here.
+          let curRaw = null;
+          try { curRaw = String(fs.readFileSync(lockPath, 'utf8')); } catch { curRaw = null; }
+
+          if (curRaw === null) {
+            // The path is FREE, not stale — nothing here is ours to reclaim, and
+            // a plain acquirer may be creating a lock at it right now. Compete
+            // honestly on the next loop instead of installing over them.
+            continue;
+          }
+
+          const curPid = parseInt(curRaw.split(':')[0], 10);
+          let curStale;
+          if (Number.isInteger(curPid) && curPid > 0) {
+            let alive = true;
+            try { process.kill(curPid, 0); } catch (e) { alive = (e.code === 'EPERM'); }
+            curStale = !alive;
+          } else {
+            try { curStale = (Date.now() - fs.statSync(lockPath).mtimeMs) > SEND_HISTORY_LOCK_STALE_MS; }
+            catch { curStale = false; }
+          }
+          if (!curStale) continue; // a live holder arrived; stand down
+
+          // Replace by rename, never unlink-then-create: rename is atomic and
+          // leaves no window in which the path is empty. Safe because the file
+          // we are replacing belongs to a DEAD holder, so nobody live can pull
+          // it out from under us.
+          const tmp = `${lockPath}.new.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
+          fs.writeFileSync(tmp, token, { mode: 0o600 });
+          fs.renameSync(tmp, lockPath);
+          // Prove we own what is actually at the path before claiming the lock.
+          let back = null;
+          try { back = String(fs.readFileSync(lockPath, 'utf8')); } catch { back = null; }
+          if (back === token) { held = true; }
+        } finally {
+          try { fs.closeSync(gate); } catch {}
+          try { fs.unlinkSync(gatePath); } catch {}
+        }
+        if (held) break;
         continue;
       }
 
