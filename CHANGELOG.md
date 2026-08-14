@@ -2,6 +2,130 @@
 
 ## Unreleased
 
+### The `start` action can now be executed by a test
+
+`start` is a ~1700-line closure inside `program.command('start').action()`. Nothing
+could call it, so every test that claimed to cover it was a source-text grep — and a
+grep for an identifier passes against `if (false)`. That is not a hypothetical: across
+the five review rounds on 2.29.0, the defects that survived all of them lived in this
+code, and they fell in a single pass to a reviewer who built a throwaway harness and
+ran the real thing.
+
+`test/helpers/dispatcher-harness.js` runs the real action — real commander parse, real
+activation loop, real marker handling, real control plane, real health document —
+against a stubbed process edge. Time and the chain are modelled, so a nine-agent
+upgrade restart including its three-minute confirmation wait completes in ~100 ms.
+
+- `test/helpers/virtual-clock.js` — fake timers and `Date`, with an auto-advance pump.
+- `test/helpers/fake-chain.js` — the two status axes, and the rule that actually bites:
+  one unconfirmed identity write at a time, second one is a bare `-25`. Scenarios
+  therefore *reproduce* the double-spend rather than describe it.
+- `test/helpers/sdk-stub.js` — SDK stub over the fake chain, keeping every real export
+  (VDXF helpers, message builders) and replacing only the network-facing classes.
+  Every call is audited, so a test asserts "exactly one `setOnChainStatus` per agent"
+  instead of grepping for the identifier. Unmodelled methods return `null` and are
+  reported, so the stub grows from observed behaviour rather than from guesswork.
+- `test/start-action.test.js` — 16 executing scenarios: the zero-transaction routine
+  restart, the 2.28.x upgrade restart, a chain-stranded agent with and without a
+  shutdown marker, a repair that returns no txid, a repair that fails and lands on the
+  next start, both sides of the 90s pending-write gate, an unresolvable confirmation
+  wait, the offline-fleet exit advice, and both fail-closed `/v1/version` paths. Every
+  one of them also asserts zero rejected chain writes.
+
+Three seams were added to make this possible: `program` and a `__getState()` accessor
+are exported under `NODE_ENV=test`, and the control-plane handles are kept on `state`.
+
+An adversarial review of the harness then found two mutations it did NOT catch, both
+in the defect class the harness exists to prevent, and both now covered:
+
+- **The chain repair's txid was not being asserted as recorded.** Deleting the
+  `_inboxLastWrite.set(...)` after a successful repair passed the whole suite. In
+  production that makes the repair invisible to the inbox sweep at +60s, which then
+  builds its batched write from the last *confirmed* prevOutput and double-spends it —
+  and the repair is the write most likely to still be unconfirmed after an upgrade,
+  because downtime is exactly when reviews and attestations pile up.
+- **No scenario made an activate's on-chain half fail.** Neutering the
+  `!(result && result.onChainTxid)` guard passed the whole suite. That is the guard
+  whose absence once reported nine consecutive rejected writes as a tick.
+
+The same review found the harness was **not hermetic**: `src/egress-proxy.js` requires
+`node:child_process`, which the module interception did not match, so every scenario
+shelled out to the real `docker` daemon and the egress proxy bound on the host's actual
+bridge (172.18.0.1) rather than the stub's loopback. The suite silently depended on a
+live daemon. Both spellings are matched now.
+
+`started()` is stricter as a result: a run that called `process.exit`, never set
+`startupComplete`, or had a timer callback throw is now a failure rather than a pass.
+
+**Verified by mutation — eight, each killed with an accurate message:** deleting the
+deactivate-confirmation wait fails 3 scenarios; forcing `repairChain: false` fails the
+upgrade scenario; keeping the unmatchable txid fails the unresolvable-wait scenario;
+replacing the pending-write gate with `if (false)` fails the deferring scenario while
+its companion correctly still passes; and always clearing the per-agent error instead
+of honouring `_errorRecordedThisPass` fails two scenarios.
+
+Five of the defects found while building this were in the HARNESS, not the dispatcher,
+which is the argument for auditing test infrastructure at least as hard as production
+code — a broken harness does not fail loudly, it manufactures confidence. The two worth
+recording, because both are general traps:
+
+- **Substring matching in the audit helpers.** `'deactivate'.includes('activate')` is
+  true, so "exactly one activate per agent" could be satisfied by a deactivate with the
+  activate missing entirely. Matching is exact now, with a self-test pinning it.
+- **A teardown that only ran on the success path.** One scenario tore down manually
+  after its assertions; a failing assertion skipped it and left the virtual clock
+  installed and PAUSED, so every later test hung on a clock that never advanced and the
+  run had to be SIGKILLed. `teardown()` is idempotent now and registered before the
+  assertions. One mutation pass went from a 100s hang reporting nothing to 0.76s with
+  two clean failures.
+
+### Fixed
+
+- **Agent status leaked from one agent to the next at startup** (pre-existing, found by
+  review of the above, reproduced and pinned by the new harness). The per-agent axis
+  variables were cleared only after `readyAgents.push(...)`, and three paths `continue`
+  before reaching it. A skipped agent left its axes loaded, so the next agent whose
+  `authenticate()` threw — the daily ~04:00 UTC backend maintenance window is the
+  routine cause — took the fail-open "including" path and was recorded carrying the
+  *skipped* agent's status. Both directions do harm: an inherited `chain=inactive`
+  makes `planAgentActivation` broadcast an on-chain identity write for an agent on the
+  strength of another agent's data (a fee, and prevOutput contention); an inherited
+  `platform=active` yields "already active — no write needed", so the platform POST
+  never happens and the agent is silently unhireable with `/health` green. Reset now
+  happens at the top of the loop body.
+- **The new axis-naming skip line could fabricate a platform reading.** It read
+  `_lastSeenPlatformStatus`, which carries a deliberate `|| _eff` fallback for older
+  backends — so against a backend that serves no platform axis it printed
+  `platform=inactive`, asserting a value the backend never sent. It now reads the
+  profile directly and says `platform=unavailable (backend does not report it)`. It
+  also treats `chain=disabled` as a named blocking axis; testing only for `inactive`
+  left that shape unexplained, which is the same confusion the line exists to remove.
+- **"WebSocket: N agent(s) connected" became a lie** — a regression created by the
+  `chat.connect()` fix immediately below. The counter increments synchronously before
+  the connection resolves; that was harmless only while a rejected connect killed the
+  process. A fleet started inside the 503 window would print "9 agent(s) connected"
+  directly above nine failures. It now counts attempts and says "connecting", and the
+  failure line states that a step-1 (token-fetch) failure leaves that agent poll-only
+  until restart, because no socket exists for socket.io to reconnect.
+- **The health server's EADDRINUSE retry could resurrect a closed server**, re-binding
+  the port up to 3s after `stopControlServer()`. Guarded with a `_closing` flag.
+- **`chat.connect()` was a floating promise.** The surrounding `try/catch` only sees
+  synchronous throws, so when the platform is unreachable at startup the rejection was
+  unhandled — and Node's default `--unhandled-rejections=throw` terminates the process.
+  A dispatcher starting during a platform outage could die instead of falling back to
+  poll-only. Found by the harness on its first scenario.
+- **`stopControlServer()` left the health server listening** — a handle with no owner.
+  All three call sites currently exit the process straight afterwards, so the OS
+  reclaims it and the production impact is nil; it bites anything that stops the
+  control plane without exiting, which is what leaked a bound port per harness
+  scenario. Cleanup that works only because the process dies next is not a contract
+  worth keeping.
+- **The startup skip line named the wrong axis.** `⏸ <agent>: inactive on platform` was
+  printed using the ANDed value, so an agent whose platform axis reads `active` and
+  whose *chain* axis is the blocker — exactly what an older dispatcher leaves behind —
+  sent the operator to check `platformStatus`, see `active`, and conclude the
+  dispatcher was confused. It now names the blocking axis.
+
 ## 2.29.0
 
 **LIVE-PROVEN 2026-08-12.** The upgrade restart was executed on the 9-agent fleet:

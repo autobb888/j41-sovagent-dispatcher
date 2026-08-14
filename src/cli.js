@@ -68,6 +68,19 @@ const {
  * is fixed.
  */
 const FEE_TANK_ERROR_PREFIX = 'FEE TANK EMPTY';
+
+/**
+ * The live `state` object of a running `start`, for the execution harness.
+ *
+ * `start` is an ~1700-line closure inside `program.command('start').action()`;
+ * its state was unreachable, so every test of it was a source-text grep — and a
+ * grep for an identifier passes against `if (false)`. This one reference is what
+ * lets test/helpers/dispatcher-harness.js run the real action and then assert on
+ * what it actually did. Written unconditionally (assigning a reference costs
+ * nothing) but only READABLE through the NODE_ENV=test export block below, so
+ * there is no production surface here.
+ */
+let _liveState = null;
 const log = require('./logger');
 const { loadDispatcherConfig, fileConfiguredNetwork } = require('./config-loader.js');
 const { SignChannelHost } = require('./sign-channel-host.js');
@@ -3590,6 +3603,25 @@ program
     let _lastSeenPlatformStatus = null;
     let _lastSeenChainStatus = null;
     for (const agentId of agents) {
+      // RESET PER ITERATION, at the top.
+      //
+      // These were cleared only after `readyAgents.push(...)` at the bottom, and
+      // three paths `continue` before reaching it (unregistered, finalize-not-ready,
+      // and the `skipThisAgent` exit). So a skipped agent left its axes loaded, and
+      // the NEXT agent whose `authenticate()` threw — the daily 04:00 UTC 503 window
+      // is the routine cause — took the fail-open "including" path and was pushed
+      // carrying the SKIPPED agent's status instead of `unknown`.
+      //
+      // Not cosmetic. `planAgentActivation` reads `chainStatus`, so an inherited
+      // `inactive` broadcasts an on-chain identity write for an agent on the
+      // strength of a DIFFERENT agent's data — the "write on a guess" its own
+      // comment forbids, costing a fee and risking prevOutput contention. The
+      // inverse is quieter and worse: inheriting `platform=active` yields "already
+      // active — no write needed", so the platform POST never happens and the agent
+      // is silently unhireable with /health green.
+      _lastSeenPlatformStatus = null;
+      _lastSeenChainStatus = null;
+
       const keys = loadAgentKeys(agentId);
       if (!keys?.identity) {
         console.log(`⚠️  ${agentId}: not registered on platform`);
@@ -3648,7 +3680,33 @@ program
                 console.log(`↻  ${agentId} (${keys.identity}): deactivated by our last shutdown — restoring`);
                 _reactivatedOnStart.push(agentId);
               } else {
-                console.log(`⏸  ${agentId} (${keys.identity}): ${_eff} on platform — skipping` +
+                // NAME THE AXIS. `_eff` is the AND of two independent axes, so
+                // "inactive on platform" was printed for an agent whose platform
+                // axis reads `active` and whose CHAIN axis is the blocker — which
+                // is exactly the state an older dispatcher leaves behind. The
+                // operator then checks `platformStatus`, sees `active`, and
+                // concludes the dispatcher is confused rather than that the agent
+                // needs an on-chain write.
+                // Read the axes STRAIGHT FROM THE PROFILE, not from
+                // `_lastSeenPlatformStatus`. That variable carries a deliberate
+                // `|| _eff` fallback for older backends, so on a backend that
+                // serves no platform axis it holds the ANDed value — and printing
+                // that as `platform=inactive` asserts a reading the backend never
+                // gave us. Fabricating the field is the mirror image of the
+                // confusion this line exists to fix.
+                const _pAxis = platformAgentStatus(profile);
+                const _cAxis = _normStatus(chainAgentStatus(profile));
+                const _why = [
+                  _pAxis === null
+                    ? 'platform=unavailable (backend does not report it)'
+                    : (_normStatus(_pAxis) !== 'active' ? `platform=${_normStatus(_pAxis)}` : null),
+                  // `disabled` counts too. Testing only for `inactive` left the
+                  // blocking axis unnamed for a chain-disabled agent, landing the
+                  // operator back on `platformStatus: active` and the same "the
+                  // dispatcher is confused" conclusion this line exists to prevent.
+                  (_cAxis === 'inactive' || _cAxis === 'disabled') ? `chain=${_cAxis}` : null,
+                ].filter(Boolean).join(', ') || `status=${_eff}`;
+                console.log(`⏸  ${agentId} (${keys.identity}): ${_eff} — skipping (${_why})` +
                   (_eff === 'inactive' ? ` (bring it back with: j41-dispatcher activate ${agentId})` : ''));
                 skipThisAgent = true;
               }
@@ -3673,8 +3731,7 @@ program
         platformStatus: _lastSeenPlatformStatus || 'unknown',
         chainStatus: _lastSeenChainStatus || 'unknown',
       });
-      _lastSeenPlatformStatus = null;
-      _lastSeenChainStatus = null;
+      // (reset moved to the top of the loop body — see the note there)
     }
     
     // Clear the marker only once every agent in it has been dealt with, so a start
@@ -3789,6 +3846,9 @@ program
           || 30 * 60000),
       },
     };
+
+    // Publish the live state to the execution harness (see `_liveState` above).
+    _liveState = state;
 
     // ── Startup sweep: remove stale _live/*.log for jobs not in active state ──
     // Guards against dispatcher crash leaving orphaned live-log files.
@@ -4285,6 +4345,16 @@ program
       console.log(`Mode: POLL (60s interval)\n`);
 
       // WebSocket listeners for instant notification (supplement to polling)
+      //
+      // ATTEMPTED, not connected. `connect()` is async and we deliberately do not
+      // await it, so this counter can only ever mean "we started N connections".
+      // The summary line said "N agent(s) connected", which was accidentally true
+      // only while a rejected connect killed the process. Now that failures are
+      // survivable, a fleet started inside the daily 04:00 UTC 503 window would
+      // print "9 agent(s) connected" directly above nine connect failures.
+      // Attaching the catch fixed a crash and created a lie; both halves belong to
+      // that change.
+      let wsAttempted = 0;
       let wsConnected = 0;
       for (const agentInfo of readyAgents) {
         try {
@@ -4315,14 +4385,32 @@ program
                 console.error(`[WS] ${agentInfo.id}: re-auth failed: ${reAuthErr.message}`);
               }
             };
-            chat.connect();
-            wsConnected++;
+            // ATTACH A HANDLER. This was a bare `chat.connect();` — a floating
+            // promise. The surrounding try/catch only sees synchronous throws, so
+            // when the platform is unreachable at startup (its 503 window, or a
+            // DNS blip) the rejection was unhandled, and Node's default
+            // --unhandled-rejections=throw terminates the process. The WebSocket
+            // is a supplement to polling; failing to open one must degrade to
+            // poll-only, never take the dispatcher down.
+            chat.connect().then(() => {
+              wsConnected++;
+            }).catch((e) => {
+              // A step-1 failure (the REST session-token fetch) means NO socket was
+              // ever created, so socket.io's reconnection never engages and this
+              // agent stays poll-only until the dispatcher restarts. Say so, rather
+              // than leaving one line that reads like a transient blip.
+              console.log(`[WS] ${agentInfo.id}: connect failed (${e && e.message}) — ` +
+                'poll mode still active; this agent stays poll-only until restart');
+            });
+            wsAttempted++;
           }
         } catch (e) {
           console.log(`[WS] ${agentInfo.id}: skipped (${e.message})`);
         }
       }
-      if (wsConnected > 0) console.log(`WebSocket: ${wsConnected} agent(s) connected`);
+      if (wsAttempted > 0) {
+        console.log(`WebSocket: ${wsAttempted} agent(s) connecting (failures reported above/below; polling is unaffected)`);
+      }
 
       // Poll interval scales with agent count — 60s base, +500ms per agent stagger
       // 5 agents:  60s cycle (2.5s stagger total)
@@ -4498,6 +4586,10 @@ program
       onShutdown: (source) => requestShutdown(`control-plane (${source})`),
       getAgentSession,
     });
+    // Keep the handles reachable. They were locals, so nothing but the graceful
+    // shutdown path could close them — which is also why a harnessed run left a
+    // listening health port behind after every scenario.
+    state._controlServer = controlServer;
 
     // ── Start headless control API (WP-D1/D2) ──
     // Versioned, token-gated HTTP surface on its own port. The event bus is
@@ -4511,6 +4603,7 @@ program
         port: cfg.runtime.control_api_port,
       });
       state.emitEvent = (type, data) => controlApi.bus.emit(type, data);
+      state._controlApi = controlApi;
     } catch (e) {
       console.error(`[ControlAPI] Failed to start (continuing without it): ${e.message}`);
       state.emitEvent = () => {};
@@ -12111,7 +12204,11 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState };
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState,
+    // Execution-harness seam: `program` so a test can drive the REAL `start`
+    // action through commander, and `__getState` so it can then assert on what
+    // that action actually did. See test/helpers/dispatcher-harness.js.
+    program, __getState: () => _liveState };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');

@@ -132,7 +132,14 @@ function startControlServer(state, handlers) {
   healthServer.on('error', (err) => {
     if (err && err.code === 'EADDRINUSE' && _healthBindAttempts < 10) {
       _healthBindAttempts++;
-      setTimeout(() => { try { healthServer.listen(healthPort, '127.0.0.1'); } catch {} }, 3000).unref?.();
+      setTimeout(() => {
+        // Do not resurrect a server we have since been asked to close: the retry
+        // would re-bind the port up to 3s AFTER stopControlServer(), which in any
+        // process that stops the control plane without exiting leaves the port held
+        // by a dispatcher that has stopped serving.
+        if (healthServer._closing) return;
+        try { healthServer.listen(healthPort, '127.0.0.1'); } catch {}
+      }, 3000).unref?.();
       if (_healthBindAttempts === 1) console.warn(`[Health] port ${healthPort} busy — retrying`);
       return;
     }
@@ -141,6 +148,17 @@ function startControlServer(state, handlers) {
         'running WITHOUT /health. Monitoring will see this dispatcher as down.');
     }
   });
+
+  // The health server was a local, so `stopControlServer()` closed the control
+  // socket and left the health port listening — a handle with no owner.
+  //
+  // Today all three call sites are immediately followed by process exit, so the
+  // OS reclaims it and the production impact is nil. It matters for anything
+  // that stops the control plane WITHOUT exiting: the execution harness does
+  // exactly that between scenarios, and every one of them leaked a bound port.
+  // "Cleanup that only works because the process dies next" is a fragile
+  // contract to keep relying on.
+  server._healthServer = healthServer;
 
   return server;
 }
@@ -743,6 +761,12 @@ function sendCommand(cmd) {
 function stopControlServer(server) {
   if (server) {
     server.close();
+    if (server._healthServer) {
+      // Set BEFORE close(): the EADDRINUSE retry timer checks this flag, and a
+      // pending retry would otherwise re-listen seconds after we closed.
+      server._healthServer._closing = true;
+      try { server._healthServer.close(); } catch { /* never bound */ }
+    }
   }
   try { if (fs.existsSync(SOCKET_PATH)) fs.unlinkSync(SOCKET_PATH); } catch {}
 }
