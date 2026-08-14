@@ -414,20 +414,23 @@ async function _reportVerifiedDeposit(agentId, client, report, payAddress, netwo
       return { credited: false, code: 'SENDER_MISMATCH', message: 'Funding transaction sender does not match the claiming buyer' };
     }
     if (verification.senderVerified === undefined) {
-      // Audit M-DISPATCHER-funds-1: hard-fail unless operator opts in to the
-      // legacy signature-only credit path (it's the H-equivalent of the
-      // "trust the platform" findings — without sender verification, anyone
-      // who observes a public funding tx can claim its credit). Default
-      // refuses; J41_DEPOSIT_ALLOW_AUTH_ONLY=1 restores the old behavior.
-      const allowAuthOnly = process.env.J41_DEPOSIT_ALLOW_AUTH_ONLY === '1';
-      if (!allowAuthOnly) {
-        return {
-          credited: false,
-          code: 'SENDER_VERIFICATION_REQUIRED',
-          message: 'Platform did not return sender verification for this deposit; refusing to credit on signature-only auth. Set J41_DEPOSIT_ALLOW_AUTH_ONLY=1 to opt in to the legacy behavior.',
-        };
-      }
-      console.warn(`[Deposit] Platform did not return sender verification for ${txid.substring(0, 12)}… — crediting on signature auth only via J41_DEPOSIT_ALLOW_AUTH_ONLY opt-in (audit M-DISPATCHER-funds-1)`);
+      // Audit M-DISPATCHER-funds-1: without sender verification, anyone who
+      // observes a public funding transaction can claim its credit. Signing the
+      // report proves you control the buyer identity; it does NOT prove that
+      // identity funded the transaction.
+      //
+      // There used to be a J41_DEPOSIT_ALLOW_AUTH_ONLY=1 escape hatch here for
+      // platforms that could not return `senderVerified`. Removed 2026-08-14:
+      // the backend has advertised `tx.sender-verification` for months, so the
+      // legacy case it existed for no longer has a user — and an env var that
+      // switches OFF a verification check is the exact pattern this project
+      // decided not to ship. Opt in to stricter, never opt out of safe.
+      return {
+        credited: false,
+        code: 'SENDER_VERIFICATION_REQUIRED',
+        message: 'Platform did not return sender verification for this deposit; refusing to credit on ' +
+          'signature-only auth. Signing a report proves control of the buyer identity, not that it funded the transaction.',
+      };
     }
 
     // Check confirmations

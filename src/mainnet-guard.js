@@ -37,7 +37,6 @@ function findMainnetSecurityViolations(env, opts) {
   // session" impossible to carry into a mainnet deployment by accident.
   //
   // Money:
-  if (e.J41_DEPOSIT_ALLOW_AUTH_ONLY === '1') v.push('J41_DEPOSIT_ALLOW_AUTH_ONLY=1 — credits deposits on signature auth alone when the platform omits sender verification; re-opens the self-credit risk closed by the 2026-06 audit (M-funds-1), where anyone observing a public funding tx could claim its credit');
   if (e.J41_ALLOW_UNPRICED_JOBS === '1') v.push('J41_ALLOW_UNPRICED_JOBS=1 — admits jobs with no payment record at all; the agent does the work and may never be paid');
 
   // Prompt-injection / untrusted input:

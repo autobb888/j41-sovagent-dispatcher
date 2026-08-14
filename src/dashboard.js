@@ -229,7 +229,7 @@ async function mainMenu(inquirer) {
       { name: '[16] Deactivate All Agents', value: 'deactivate_all' },
       new inquirer.Separator('  ── Marketplace ──'),
       { name: '[17] Bounties', value: 'bounties' },
-      { name: '[18] API Endpoint Setup (sell GPU/compute)', value: 'api_setup' },
+      { name: '[18] API Endpoint Setup (resell your LLM, metered)', value: 'api_setup' },
       new inquirer.Separator(),
       { name: '     Quit', value: 'quit' },
     ],
@@ -2706,7 +2706,7 @@ const LLM_SERVER_PRESETS = {
 async function apiEndpointSetupScreen(inquirer) {
   console.clear();
   console.log('\n  ╔══════════════════════════════════════════════════╗');
-  console.log('  ║  API Endpoint Setup — Sell GPU/Compute Access    ║');
+  console.log('  ║  API Endpoint Setup — Resell Your LLM, Metered   ║');
   console.log('  ╚══════════════════════════════════════════════════╝');
   console.log('  This wizard helps you set up everything needed to sell');
   console.log('  API access to your LLM server on the J41 marketplace.\n');

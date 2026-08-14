@@ -79,7 +79,6 @@ test('resolveIsMainnet: effective=verus (env upgrade) → true', () => {
 // ---------------------------------------------------------------------------
 
 const NEW_BYPASSES = [
-  ['J41_DEPOSIT_ALLOW_AUTH_ONLY', '1', '0', /self-credit|DEPOSIT_ALLOW_AUTH_ONLY/],
   ['J41_ALLOW_UNPRICED_JOBS',     '1', '0', /no payment record|UNPRICED/],
   ['J41_SCAN_BUYER_CHAT',         '0', '1', /SovGuard scanning|SCAN_BUYER_CHAT/],
   ['J41_ALLOW_INSECURE',          '1', '0', /plaintext HTTP|ALLOW_INSECURE/],
@@ -116,11 +115,11 @@ test('every violation names its flag, so the operator can act on the message alo
   const all = {
     J41_SIGNING_BROKER: '0', J41_DISABLE_BWRAP: '1', J41_ALLOW_LOCAL_UPSTREAM: '1',
     J41_SKIP_STATUS_CHECK: '1', J41_ALLOW_LEGACY_REVOKE: '1', J41_WITNESS_VERIFY: 'off',
-    J41_DEPOSIT_ALLOW_AUTH_ONLY: '1', J41_ALLOW_UNPRICED_JOBS: '1', J41_SCAN_BUYER_CHAT: '0',
+    J41_ALLOW_UNPRICED_JOBS: '1', J41_SCAN_BUYER_CHAT: '0',
     J41_ALLOW_INSECURE: '1', J41_LOCAL_SIGNER_TEST_MODE: '1', J41_TRUST_PLATFORM_RESOLUTION: '1',
   };
   const v = findMainnetSecurityViolations(all, { devUnsafe: true });
-  assert.equal(v.length, 13, '12 env flags + --dev-unsafe');
+  assert.equal(v.length, 12, '11 env flags + --dev-unsafe');
   for (const msg of v) {
     assert.match(msg, /^(J41_[A-Z_]+=|--dev-unsafe)/, `violation must start with the flag: ${msg}`);
     assert.match(msg, / — /, `violation must explain itself: ${msg}`);
