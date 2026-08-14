@@ -571,3 +571,117 @@ test('0-conf credits minted before the reconciler existed are adopted, and the o
 // matter what the trim did — a mutation removing `unconfirmed` from the
 // exemption survived it. Trimming happens when a NEW deposit is credited, so the
 // test has to drive `reportDeposit`, which is where that file's machinery is.
+
+// ── events ──────────────────────────────────────────────────────────────────
+
+test('[MUT-5] money-moving outcomes emit control-API events', async () => {
+  // The emit parameter defaults to a no-op, so "never wire it up" is a mutation
+  // that changes nothing observable unless something asserts the events. Which
+  // is exactly how an event stream ends up permanently silent in production.
+  const T0 = epoch();
+  setBackendFeatures(FLAG_ON);
+  const { agentId, txid, buyer, amount } = seedOpenCredit({ amount: 1.5 });
+  const state = { chain: syncedChain(), tx: {} };
+  const client = makeClient(state);
+  const events = [];
+  const emit = (type, data) => events.push({ type, data });
+
+  for (let i = 1; i <= 3; i++) {
+    state.chain = syncedChain(BASE_HEIGHT + i * 20);
+    await reconcileUnconfirmedDeposits(agentId, client, T0 + i * 6 * MINUTE, emit);
+  }
+  const rev = events.find((e) => e.type === 'deposit.reversed');
+  assert.ok(rev, `expected a deposit.reversed event; got ${JSON.stringify(events.map((e) => e.type))}`);
+  assert.equal(rev.data.txid, txid);
+  assert.equal(rev.data.buyerVerusId, buyer);
+  assert.equal(rev.data.amount, amount);
+  assert.equal(rev.data.debited, true);
+
+  // The reversal was wrong after all.
+  state.tx[txid] = { confirmations: 4 };
+  await reconcileUnconfirmedDeposits(agentId, client, T0 + 40 * MINUTE, emit);
+  const res = events.find((e) => e.type === 'deposit.restored');
+  assert.ok(res, 'a restore must be as visible as the reversal that preceded it');
+  assert.equal(res.data.txid, txid);
+});
+
+test('an anomaly only a human can settle emits deposit.needs_operator', async () => {
+  const T0 = epoch();
+  setBackendFeatures(FLAG_ON);
+  const agentId = 'agent-emit-op';
+  const txid = 'tx_emit_op';
+  writeDeposits(agentId, {
+    processed: [], pending: [], creditedTxids: [],
+    reversed: [{
+      txid, buyerVerusId: 'buyer-op@', amount: 1.5,
+      reversedAt: new Date(T0).toISOString(), reason: 'test', debited: false,
+    }],
+  });
+  const state = { chain: syncedChain(), tx: { [txid]: { confirmations: 5 } } };
+  const events = [];
+
+  await reconcileUnconfirmedDeposits(agentId, makeClient(state), T0 + 10 * MINUTE,
+    (type, data) => events.push({ type, data }));
+
+  const ev = events.find((e) => e.type === 'deposit.needs_operator');
+  assert.ok(ev, `expected deposit.needs_operator; got ${JSON.stringify(events.map((e) => e.type))}`);
+  assert.equal(ev.data.where, 'reversed');
+  assert.ok(ev.data.reason);
+});
+
+test('a thrown event handler cannot break the money path', async () => {
+  const T0 = epoch();
+  setBackendFeatures(FLAG_ON);
+  const { agentId, buyer } = seedOpenCredit({ amount: 1.5 });
+  const state = { chain: syncedChain(), tx: {} };
+  const client = makeClient(state);
+  const hostile = () => { throw new Error('bus exploded'); };
+
+  for (let i = 1; i <= 3; i++) {
+    state.chain = syncedChain(BASE_HEIGHT + i * 20);
+    await reconcileUnconfirmedDeposits(agentId, client, T0 + i * 6 * MINUTE, hostile);
+  }
+  assert.equal(getBalance(agentId, buyer), 0, 'the reversal still completed');
+  assert.equal(readDeposits(agentId).reversed.length, 1, 'and was still recorded');
+});
+
+test('a restore emits even when the pass also has open credits to work through', async () => {
+  // Reconcile reaches _recheckReversals by TWO routes: an early return when
+  // nothing is open, and phase 4 at the end of a working pass. The obvious
+  // restore test only exercises the first, so the second's event threading can
+  // be deleted with the suite still green.
+  const T0 = epoch();
+  setBackendFeatures(FLAG_ON);
+  const { agentId, txid, buyer, amount } = seedOpenCredit({ amount: 1.5 });
+  const state = { chain: syncedChain(), tx: {} };
+  const client = makeClient(state);
+
+  for (let i = 1; i <= 3; i++) {
+    state.chain = syncedChain(BASE_HEIGHT + i * 20);
+    await reconcileUnconfirmedDeposits(agentId, client, T0 + i * 6 * MINUTE);
+  }
+  assert.equal(getBalance(agentId, buyer), 0, 'reversed');
+
+  // Give the agent a second, still-open credit so the pass does real work and
+  // reaches phase 4 rather than returning early.
+  const d = readDeposits(agentId);
+  const otherTxid = 'tx_other_open';
+  d.processed.push({
+    txid: otherTxid, buyerVerusId: 'someone-else@', amount: 1, confirmations: 0,
+    creditedAt: new Date(T0).toISOString(), unconfirmed: true, creditedAtMs: T0, misses: 0,
+  });
+  d.creditedTxids.push(otherTxid);
+  writeDeposits(agentId, d);
+  state.tx[otherTxid] = { confirmations: 0 }; // visibly in the mempool, so it just waits
+  state.tx[txid] = { confirmations: 4 };      // the reversed one confirmed after all
+
+  const events = [];
+  const res = await reconcileUnconfirmedDeposits(agentId, client, T0 + 40 * MINUTE,
+    (type, data) => events.push({ type, data }));
+
+  assert.equal(res.restored, 1);
+  assert.equal(getBalance(agentId, buyer), amount);
+  const ev = events.find((e) => e.type === 'deposit.restored');
+  assert.ok(ev, `phase 4 must emit too; got ${JSON.stringify(events.map((e) => e.type))}`);
+  assert.equal(ev.data.txid, txid);
+});

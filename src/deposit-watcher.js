@@ -716,7 +716,7 @@ function _backfillPrePortZeroConf(agentId, deposits, now) {
  *
  * @returns {{confirmed:number, reversed:number, waiting:number, restored:number, state:string}}
  */
-async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
+async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now(), emit) {
   const network = loadDispatcherConfig().platform.network;
 
   const seed = loadDeposits(agentId);
@@ -726,7 +726,7 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
   if (open.length === 0) {
     // No OPEN credits, but a reversal may still be waiting to be undone — and a
     // reversal is precisely the state in which nothing is open any more.
-    const restoredOnly = await _recheckReversals(agentId, client, now);
+    const restoredOnly = await _recheckReversals(agentId, client, now, emit);
     return { confirmed: 0, reversed: 0, waiting: 0, restored: restoredOnly, state: 'idle' };
   }
 
@@ -739,7 +739,7 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
     // A lagging, unreachable, isolated or wrong-chain node produces ZERO
     // evidence. No miss increments, no persistence — an outage cannot
     // accumulate its way to a reversal one pass at a time.
-    const restoredOnly = await _recheckReversals(agentId, client, now);
+    const restoredOnly = await _recheckReversals(agentId, client, now, emit);
     return { confirmed: 0, reversed: 0, waiting: open.length, restored: restoredOnly, state: 'inert-unsynced' };
   }
 
@@ -778,7 +778,7 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
   if (lookups.length > 1 && strongMisses === lookups.length) {
     console.error(`[Deposits] ${agentId}: all ${lookups.length} open 0-conf lookups returned TX_NOT_FOUND ` +
       'identically — treating as a backend-side fault, not as evidence about any transaction. Nothing counted.');
-    const restoredOnly = await _recheckReversals(agentId, client, now);
+    const restoredOnly = await _recheckReversals(agentId, client, now, emit);
     return { confirmed: 0, reversed: 0, waiting: lookups.length, restored: restoredOnly, state: 'systemic' };
   }
 
@@ -829,6 +829,7 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
         console.error(`[Deposits] ${agentId}: ⚠️  ${rec.txid.substring(0, 12)}… confirmed while a reversal was ` +
           `mid-flight. We CANNOT tell whether ${live.amount} VRSC was debited from ${live.buyerVerusId}. ` +
           'No money moved. Check the meter against the chain and correct it by hand.');
+        _emit(emit, 'deposit.needs_operator', { agentId, txid: live.txid, buyerVerusId: live.buyerVerusId, amount: live.amount, where: 'processed', reason: live.needsOperator });
       }
       delete live.unconfirmed;
       _clearMissRun(live);
@@ -889,6 +890,7 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
       console.error(`[Deposits] ${agentId}: ⛔ reversal budget exhausted (${REVERSAL_BUDGET_MAX} in the last hour). ` +
         `Withholding the reversal of ${live.amount} VRSC for ${live.buyerVerusId} and flagging for review. ` +
         'This usually means the backend is wrong, not that every buyer stopped paying at once.');
+      _emit(emit, 'deposit.needs_operator', { agentId, txid: live.txid, buyerVerusId: live.buyerVerusId, amount: live.amount, where: 'processed', reason: live.needsOperator });
       continue;
     }
 
@@ -940,10 +942,11 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
     console.error(`[Deposits] ${agentId}: ⛔ REVERSED ${live.amount} VRSC of credit for ${live.buyerVerusId} — ` +
       `funding tx ${live.txid.substring(0, 12)}… never confirmed and the chain does not know it. ` +
       'If the buyer disputes this, check the txid on-chain before re-crediting.');
+    _emit(emit, 'deposit.reversed', { agentId, txid: live.txid, buyerVerusId: live.buyerVerusId, amount: live.amount, debited: debitCertain });
   }
 
   // ── Phase 4: was a reversal wrong? ───────────────────────────────────────
-  const restored = await _recheckReversals(agentId, client, now);
+  const restored = await _recheckReversals(agentId, client, now, emit);
 
   if (confirmed || reversed || restored) {
     console.log(`[Deposits] ${agentId}: reconciled 0-conf credits — ${confirmed} confirmed, ${reversed} reversed, ` +
@@ -963,7 +966,7 @@ async function reconcileUnconfirmedDeposits(agentId, client, now = Date.now()) {
  * unlike the reversal path this needs no sync gate. An unknown or unreachable
  * lookup leaves the reversal standing.
  */
-async function _recheckReversals(agentId, client, now = Date.now()) {
+async function _recheckReversals(agentId, client, now = Date.now(), emit) {
   const d = loadDeposits(agentId);
 
   // A `restoring` stamp that survived a restart means we crashed between the
@@ -979,6 +982,7 @@ async function _recheckReversals(agentId, client, now = Date.now()) {
       flagged = true;
       console.error(`[Deposits] ${agentId}: ⚠️  restore of ${String(r.txid).substring(0, 12)}… was interrupted. ` +
         `Cannot tell whether ${r.amount} VRSC went back to ${r.buyerVerusId}. Check the meter by hand.`);
+      _emit(emit, 'deposit.needs_operator', { agentId, txid: r.txid, buyerVerusId: r.buyerVerusId, amount: r.amount, where: 'reversed', reason: r.needsOperator });
     }
   }
   if (flagged) saveDeposits(agentId, d);
@@ -1006,6 +1010,7 @@ async function _recheckReversals(agentId, client, now = Date.now()) {
         saveDeposits(agentId, fresh0);
         console.error(`[Deposits] ${agentId}: ⚠️  reversed tx ${String(cand.txid).substring(0, 12)}… has confirmed, ` +
           'but we cannot prove the reversal ever debited. No money moved. Check the meter by hand.');
+        _emit(emit, 'deposit.needs_operator', { agentId, txid: e0.txid, buyerVerusId: e0.buyerVerusId, amount: e0.amount, where: 'reversed', reason: e0.needsOperator });
       }
       continue;
     }
@@ -1063,8 +1068,123 @@ async function _recheckReversals(agentId, client, now = Date.now()) {
     console.warn(`[Deposits] ${agentId}: ↩️  RESTORED ${live.amount} VRSC to ${live.buyerVerusId} — ` +
       `reversed tx ${String(live.txid).substring(0, 12)}… has confirmed (${confs} block(s)) after all. ` +
       'The reversal was wrong; the credit is back.');
+    _emit(emit, 'deposit.restored', { agentId, txid: live.txid, buyerVerusId: live.buyerVerusId, amount: live.amount, confirmations: confs });
   }
   return restored;
+}
+
+// ── Read model ──────────────────────────────────────────────────────────────
+//
+// Every `needsOperator` state this file writes was, until now, write-only: four
+// write sites and a single console.error between them. That is the same shape as
+// the 2026-08-05 fee-tank failure — an agent silently unable to write on-chain
+// while everything reported healthy — and the fix is the same one that worked
+// there: one builder, consumed by every transport, so the socket, the HTTP
+// health document and the CLI cannot drift apart.
+//
+// `needsOperator` lives in two structurally different places: on a `processed`
+// record (the reversal-state ambiguity) and on a `reversed[]` entry (a restore
+// that could not be proven). A reader that scans only one of them is the
+// "guard at one of two sites" bug this codebase keeps re-finding, so both are
+// folded into one list here rather than at each call site.
+
+/**
+ * Fire a control-API event, never letting the notification break the money path.
+ * Optional by design: the reconciler is also called from tests and from a second
+ * process, neither of which has an event bus.
+ */
+function _emit(emit, type, data) {
+  if (typeof emit !== 'function') return;
+  try { emit(type, data); } catch {}
+}
+
+/** Unresolved means a human still has to decide. Resolving stamps `resolvedAt`. */
+function _isUnresolvedAnomaly(r) {
+  return !!(r && r.needsOperator && !r.resolvedAt);
+}
+
+// /health is polled continuously and a deposits file can hold a thousand records
+// plus ten thousand dedup txids, so re-parsing on every hit would be a real cost
+// for data that changes at most once a minute. Keyed on the file's mtime+size:
+// unchanged file, no re-parse; changed file, no stale answer.
+const _anomalyCache = new Map(); // agentId -> { mtimeMs, size, value }
+
+/**
+ * Everything an operator needs to see about one agent's deposits, from disk.
+ *
+ * Pure read: opens no session, touches no network, writes nothing. Safe to call
+ * from a second process while the daemon runs, which is what `deposits list`
+ * does.
+ */
+function listDepositAnomaliesForAgent(agentId) {
+  const p = depositsPath(agentId);
+  let st = null;
+  try { st = fs.statSync(p); } catch { st = null; }
+  if (!st) return { agentId, open: [], reversed: [], needsOperator: [] };
+
+  const hit = _anomalyCache.get(agentId);
+  if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.value;
+
+  const d = loadDeposits(agentId);
+  const open = d.processed
+    .filter((r) => r && (r.unconfirmed || r.crediting))
+    .map((r) => ({
+      txid: r.txid,
+      buyerVerusId: r.buyerVerusId || null,
+      amount: r.amount ?? null,
+      state: r.crediting ? 'crediting' : 'unconfirmed',
+      misses: r.misses || 0,
+      creditedAt: r.creditedAt || r.intentAt || null,
+    }));
+
+  const needsOperator = [
+    ...d.processed.filter(_isUnresolvedAnomaly).map((r) => ({
+      txid: r.txid,
+      buyerVerusId: r.buyerVerusId || null,
+      amount: r.amount ?? null,
+      where: 'processed',
+      reason: r.needsOperator,
+    })),
+    ...d.reversed.filter(_isUnresolvedAnomaly).map((r) => ({
+      txid: r.txid,
+      buyerVerusId: r.buyerVerusId || null,
+      amount: r.amount ?? null,
+      where: 'reversed',
+      reason: r.needsOperator,
+    })),
+  ];
+
+  const reversed = d.reversed
+    .slice(-25)
+    .map((r) => ({
+      txid: r.txid,
+      buyerVerusId: r.buyerVerusId || null,
+      amount: r.amount ?? null,
+      reversedAt: r.reversedAt || null,
+      debited: r.debited === true,
+      restoredAt: r.restoredAt || null,
+      restoring: r.restoring === true,
+    }));
+
+  const value = { agentId, open, reversed, needsOperator };
+  _anomalyCache.set(agentId, { mtimeMs: st.mtimeMs, size: st.size, value });
+  return value;
+}
+
+/**
+ * Fleet-wide deposit anomalies plus the two scalars /health publishes.
+ *
+ * @param {string[]} agentIds
+ */
+function listDepositAnomalies(agentIds) {
+  const agents = (agentIds || []).map((id) => listDepositAnomaliesForAgent(id));
+  return {
+    agents,
+    summary: {
+      deposits_unconfirmed_open: agents.reduce((n, a) => n + a.open.length, 0),
+      deposits_needs_operator: agents.reduce((n, a) => n + a.needsOperator.length, 0),
+    },
+  };
 }
 
 /**
@@ -1074,13 +1194,13 @@ async function _recheckReversals(agentId, client, now = Date.now()) {
  * @param agentId - Seller agent ID
  * @param client - Authenticated J41Client
  */
-async function pollPendingDeposits(agentId, client) {
+async function pollPendingDeposits(agentId, client, emit) {
   // Reconcile first. This is the only caller, so a 0-conf credit that never
   // lands is only ever clawed back from here — and unlike the pending sweep it
   // must run even when `pending` is empty, because a 0-conf credit is not
   // pending, it is already credited.
   try {
-    await reconcileUnconfirmedDeposits(agentId, client);
+    await reconcileUnconfirmedDeposits(agentId, client, Date.now(), emit);
   } catch (e) {
     console.warn(`[Deposits] ${agentId}: reconcile pass failed (${e.message}) — credits left standing`);
   }
@@ -1166,7 +1286,8 @@ function startDepositPoller(state, getAgentSession) {
 
       try {
         const agent = await getAgentSession(state, agentInfo);
-        await pollPendingDeposits(agentInfo.id, agent._client || agent.client);
+        await pollPendingDeposits(agentInfo.id, agent._client || agent.client,
+          (type, data) => { try { state.emitEvent?.(type, data); } catch {} });
       } catch (e) {
         // Silent — don't spam logs for agents with no pending deposits
       }
@@ -1307,4 +1428,4 @@ async function notifyJ41CreditLow(sellerWif, sellerVerusId, buyerVerusId, balanc
   }
 }
 
-module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, _recheckReversals, _settleReversedForTxid, _classifyLookupFailure, _syncedView, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_MIN_ADVANCE_BLOCKS, REVERSAL_RECHECK_WINDOW_MS, REVERSAL_BUDGET_MAX, PROCESSED_AUDIT_CAP, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
+module.exports = { reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, listDepositAnomalies, listDepositAnomaliesForAgent, _recheckReversals, _settleReversedForTxid, _classifyLookupFailure, _syncedView, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_MIN_ADVANCE_BLOCKS, REVERSAL_RECHECK_WINDOW_MS, REVERSAL_BUDGET_MAX, PROCESSED_AUDIT_CAP, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };

@@ -367,6 +367,27 @@ function buildInboxSurface(state) {
 }
 
 /**
+ * Read model of the deposit ledger, for every transport at once.
+ *
+ * Wraps `listDepositAnomalies` (which owns the on-disk format) so the socket,
+ * the health document, `GET /v1/deposits` and the `deposits` CLI all consume one
+ * builder — the same reason `buildInboxSurface` exists.
+ *
+ * Reads disk rather than dispatcher state on purpose: a `needsOperator` flag is
+ * durable and survives restarts, so gating it on `startupComplete` (as the
+ * status axes are gated) would hide the very thing it exists to show.
+ */
+function buildDepositSurface(state) {
+  try {
+    const { listDepositAnomalies } = require('./deposit-watcher.js');
+    return listDepositAnomalies((state.agents || []).map((a) => a.id));
+  } catch (e) {
+    // A read model must never be the reason /health stops answering.
+    return { agents: [], summary: { deposits_unconfirmed_open: 0, deposits_needs_operator: 0 }, error: String(e.message || e) };
+  }
+}
+
+/**
  * Read model of one agent's fee tank, from the sample `checkFeeTanks` records in
  * `state._feeTankLast` each cycle. Read side only — nothing here fetches UTXOs.
  *
@@ -470,6 +491,7 @@ function buildHealthDocument(state, startedAt) {
   const agentsBusy = agents.filter((a) => a.status !== 'available').length;
 
   const inbox = buildInboxSurface(state);
+  const deposits = buildDepositSurface(state);
 
   // Sampled tanks that cannot afford even one on-chain write. Deliberately NOT
   // folded into `status`: `_agentErrors` already carries FEE TANK EMPTY into
@@ -490,6 +512,16 @@ function buildHealthDocument(state, startedAt) {
     // unnoticed in the first place.
     status: (containersUnhealthy > 0
       || inbox.deadLettered.length > 0
+      // A needsOperator deposit means a buyer's balance may be wrong and only a
+      // human can say which way. That is strictly worse than a dead-lettered
+      // inbox item, and those already degrade. Durable disk state, so no
+      // startupComplete gating — it is true before the fleet finishes starting.
+      //
+      // Be aware this signal is weak in practice: `_containerCrashes` only ever
+      // increments, so one crash pins /health to `degraded` for the rest of the
+      // run and every later trigger is masked. `summary.deposits_needs_operator`
+      // above:0 is the watch that actually carries information.
+      || deposits.summary.deposits_needs_operator > 0
       // An agent carrying a live error cannot work, whatever its status axes say.
       // Both axes read `unknown` when the pre-start status check fails — which is
       // what happens during the daily platform outage — so a restart into that
@@ -508,6 +540,7 @@ function buildHealthDocument(state, startedAt) {
           && agents.some(a => _axisBlocks(a.platformStatus) || _axisBlocks(a.chainStatus))))
       ? 'degraded' : 'ok',
     inbox,
+    deposits,
     uptime,
     version: getVersionStamp(),
     agents,
@@ -523,6 +556,13 @@ function buildHealthDocument(state, startedAt) {
       containers_total: containers.length,
       containers_unhealthy: containersUnhealthy,
       fee_tanks_empty: feeTanksEmpty,
+      // 0-conf credits the reconciler is still tracking. Not itself a fault —
+      // it is the normal resting state of a small deposit — but a number that
+      // climbs and never falls means the reconciler has stopped resolving them.
+      deposits_unconfirmed_open: deposits.summary.deposits_unconfirmed_open,
+      // Buyers whose balance may be wrong, where only a human can decide.
+      // THE watch for this feature; see the degrade note above.
+      deposits_needs_operator: deposits.summary.deposits_needs_operator,
       // Agents whose auth is deliberately paused because the platform is down.
       // Without this an outage looks identical to a hang: agents present, no
       // work moving, nothing obviously wrong.
@@ -564,6 +604,9 @@ async function handleCommand(cmd, state, handlers, startedAt) {
 
     case 'inbox':
       return buildInboxSurface(state);
+
+    case 'deposits':
+      return buildDepositSurface(state);
 
     case 'inbox-redrive': {
       // Clear dead-letter quarantine without a restart, granting a fresh full
@@ -708,7 +751,7 @@ async function handleCommand(cmd, state, handlers, startedAt) {
     default:
       return {
         error: `Unknown command: ${action}`,
-        available: ['status', 'jobs', 'agents', 'resources', 'earnings', 'history', 'providers', 'shutdown', 'canary'],
+        available: ['status', 'jobs', 'agents', 'resources', 'earnings', 'history', 'providers', 'inbox', 'deposits', 'shutdown', 'canary'],
       };
   }
 }
@@ -785,6 +828,7 @@ module.exports = {
   buildEarnings,
   buildHealthDocument,
   buildInboxSurface,
+  buildDepositSurface,
   handleCommand,
   getVersionStamp,
 };

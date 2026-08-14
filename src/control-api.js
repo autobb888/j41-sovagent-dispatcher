@@ -150,7 +150,7 @@ function sendJson(res, status, body) {
  */
 function startControlApi(state, handlers, opts = {}) {
   const {
-    buildStatus, buildJobs, buildJob, buildAgents, buildEarnings,
+    buildStatus, buildJobs, buildJob, buildAgents, buildEarnings, buildDepositSurface,
   } = require('./control.js');
 
   const token = ensureToken();
@@ -191,6 +191,9 @@ function startControlApi(state, handlers, opts = {}) {
       }
       if (route === '/v1/earnings') {
         return sendJson(res, 200, await buildEarnings(state, handlers.getAgentSession));
+      }
+      if (route === '/v1/deposits') {
+        return sendJson(res, 200, buildDepositSurface(state));
       }
       if (route === '/v1/events') {
         const since = parseInt(url.searchParams.get('since') || '0', 10);

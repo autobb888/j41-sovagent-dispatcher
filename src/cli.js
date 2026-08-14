@@ -10580,7 +10580,7 @@ program
 // ── Control Plane Client ──
 program
   .command('ctl <command>')
-  .description('Send command to running dispatcher: status, jobs, agents, resources, earnings, history, providers, inbox, inbox-redrive, shutdown, canary')
+  .description('Send command to running dispatcher: status, jobs, agents, resources, earnings, history, providers, inbox, inbox-redrive, deposits, shutdown, canary')
   .option('--agent <id>', 'Agent ID (for canary command)')
   .option('--item <id>', 'Inbox item ID (for inbox-redrive; omit to redrive ALL dead letters)')
   .option('--json', 'Raw JSON output')
@@ -12322,6 +12322,76 @@ program
     console.error(`❌ Unknown refunds action '${action}'. Use: list | approve | reject`);
     process.exit(1);
   });
+
+// ── deposits ───────────────────────────────────────────────────────────────
+// Read-only view of the 0-conf deposit ledger. Reads DISK directly rather than
+// the control socket, so it works out-of-band while the daemon runs and still
+// works when it does not — the same reason `refunds list` does.
+//
+// Commander matches on the first word of a command name, so the `refunds`
+// pattern applies here too: one `deposits [action]` rather than separate
+// registrations that would collide.
+program
+  .command('deposits [action]')
+  .description('0-conf deposit ledger — actions: list (default)')
+  .option('--all', 'include settled reversals, not just the last few')
+  .option('--json', 'raw JSON output')
+  .action(async (action, options) => {
+    ensureDirs();
+    action = (action || 'list').toLowerCase();
+    if (action !== 'list') {
+      console.error(`Unknown action '${action}'. Available: list`);
+      console.error("(`deposits credit` and `deposits dismiss` are not implemented yet — " +
+        'they move money and need the inter-process lock that is still to come.)');
+      process.exitCode = 1;
+      return;
+    }
+
+    const { listDepositAnomalies } = require('./deposit-watcher.js');
+    const surface = listDepositAnomalies(listRegisteredAgents());
+
+    if (options.json) {
+      console.log(JSON.stringify(surface, null, 2));
+      return;
+    }
+
+    const { deposits_unconfirmed_open: openCount, deposits_needs_operator: opCount } = surface.summary;
+
+    // Blocked entries are loudest — an operator scanning this wants the thing
+    // only they can resolve at the top, not buried under routine activity.
+    if (opCount > 0) {
+      console.log(`\n⚠️  ${opCount} deposit(s) NEED AN OPERATOR DECISION\n`);
+      for (const a of surface.agents) {
+        for (const n of a.needsOperator) {
+          console.log(`  ${a.agentId}  ${String(n.txid).substring(0, 16)}…  ${n.amount} VRSC  ${n.buyerVerusId}`);
+          console.log(`    ${n.reason}`);
+          console.log(`    check: is tx ${String(n.txid).substring(0, 16)}… on-chain, and does ${n.buyerVerusId}'s`);
+          console.log('           meter balance reflect that amount? The ledger cannot tell you.\n');
+        }
+      }
+    } else {
+      console.log('\nNo deposits need an operator decision.\n');
+    }
+
+    console.log(`0-conf credits still open: ${openCount}`);
+    for (const a of surface.agents) {
+      for (const o of a.open) {
+        console.log(`  ${a.agentId}  ${String(o.txid).substring(0, 16)}…  ${o.amount} VRSC  ${o.buyerVerusId}  ` +
+          `[${o.state}${o.misses ? `, ${o.misses} miss(es)` : ''}]`);
+      }
+    }
+
+    const reversals = surface.agents.flatMap((a) => a.reversed.map((r) => ({ ...r, agentId: a.agentId })));
+    const shown = options.all ? reversals : reversals.filter((r) => !r.restoredAt);
+    console.log(`\nReversals${options.all ? '' : ' (unrestored)'}: ${shown.length}`);
+    for (const r of shown) {
+      const mark = r.restoring ? 'RESTORING' : (r.restoredAt ? 'restored' : 'standing');
+      console.log(`  ${r.agentId}  ${String(r.txid).substring(0, 16)}…  ${r.amount} VRSC  ${r.buyerVerusId}  ` +
+        `[${mark}${r.debited ? '' : ', debit NOT certain'}]`);
+    }
+    console.log('');
+  });
+
 
 // ── Entry point ──
 

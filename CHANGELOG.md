@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### 0-conf deposits are reconciled, and their anomalies are visible
+
+Deposits under 2 VRSC are credited straight from the mempool. A mempool transaction
+is not money — it can be evicted, replaced, or never mined — and until now the buyer
+kept the credit either way, repeatably, with a fresh txid each time. The reconciler
+now claws it back, but only from a node that reports itself caught up on the right
+chain at both ends of the pass, after it has ingested ≥30 blocks and still says the
+transaction does not exist. Everything ambiguous leaves the credit standing.
+
+Three double-credit paths that pre-dated this were fixed first: the credit paths
+minted the meter credit before persisting the dedup record (a crash re-credited on
+restart, and unlike the rest of the file it was not capped by the 2 VRSC tier), the
+under-confirmed report path saved a stale snapshot over concurrent commits, and the
+1000-entry trim discarded dedup entries along with audit records.
+
+**Contract change on `/health`.** Two additive `summary` scalars —
+`deposits_unconfirmed_open` and `deposits_needs_operator` — plus a new structured
+`deposits` block. **`deposits_needs_operator > 0` now makes `status` read
+`degraded`**: it means a buyer's balance may be wrong and only a human can say which
+way, which is strictly worse than a dead-lettered inbox item. Monitor on
+`summary.deposits_needs_operator` above 0 rather than on `status`; `status` is
+already pinned to `degraded` for the rest of any run containing one container crash,
+so it carries much less information than it appears to.
+
+Also new: `ctl deposits`, `GET /v1/deposits`, `j41-dispatcher deposits list`, and
+`deposit.reversed` / `deposit.restored` / `deposit.needs_operator` control-API
+events. `deposits credit` and `deposits dismiss` are deliberately not implemented
+yet — they move money out-of-band against a running daemon and need an
+inter-process lock first.
+
 ### The `start` action can now be executed by a test
 
 `start` is a ~1700-line closure inside `program.command('start').action()`. Nothing
