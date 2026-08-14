@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 2.29.0 — 2026-08-14
+
+Held back from npm since 2.28.2 while the deposit work was validated. Everything
+below has been on `main` and running the maintainer's own fleet; publishing it
+closes a gap where an npm install predated the two-status-axes model and could
+silently never be hired.
 
 ### Confirmation prompts are no longer mistaken for controls
 
