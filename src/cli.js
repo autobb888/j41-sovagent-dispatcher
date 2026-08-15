@@ -168,47 +168,52 @@ const TERMINAL_STATUSES = ['delivered', 'completed', 'cancelled', 'resolved', 'r
 
 // ── Telling someone how to fund an agent ────────────────────────────────────
 
-/**
- * One on-chain write costs 0.0001. Registration is a couple of writes, but an
- * agent that can only just register goes silent on its first review or
- * attestation, so the recommendation covers a working fee tank rather than the
- * bare minimum. The sweep's default floor is 100 writes (0.01); 1 coin leaves
- * real headroom and testnet coins are free.
- */
-const REGISTRATION_COST = '0.0001';
-const RECOMMENDED_FUNDING = '1';
+// Junction41 funds a newly registered agent's R-address with 0.0033 — about 33
+// on-chain writes at 0.0001 each. Nothing needs funding BEFORE registration;
+// registration is what provides the funds.
+const PLATFORM_SEED_FUNDING = '0.0033';
+const WRITE_COST = '0.0001';
 
 /**
- * Print how to fund an address, in the currency that address actually uses.
+ * Explain where an agent's on-chain fee money comes from, in the currency that
+ * agent actually uses.
  *
- * This exists because the answer was previously split across messages that
- * disagreed: `init` said "they need VRSC" while `wallet show` said VRSCTEST for
- * the very same agent, and nothing anywhere named an amount or a source.
- * Mainnet and testnet R-addresses are visually identical, so "VRSC" in front of
- * a testnet address is not a typo — it is an instruction to send real money to
- * a worthless address.
+ * Two things this must NOT do, both of which it got wrong before:
+ *
+ *  - Name a coin literally. `init` used to say the agent needed "VRSC" while
+ *    `wallet show` said VRSCTEST for that same agent. Mainnet and testnet
+ *    R-addresses are visually identical, so that is not a typo — it is an
+ *    instruction to send real money to a worthless address.
+ *  - Present funding as a PREREQUISITE. Junction41 seeds the R-address at
+ *    registration; telling a newcomer to acquire coins first sent them hunting
+ *    for a faucet that does not exist, in order to complete the step that would
+ *    have given them the coins.
+ *
+ * What is genuinely useful is the LATER problem: the R-address only ever drains
+ * (one write costs WRITE_COST) and an agent whose tank empties goes silent on
+ * chain — no reviews, no attestations — while possibly holding unswept earnings
+ * at its i-address.
  */
-function printFundingInstructions(address, network, { indent = '  ' } = {}) {
+function printFundingInstructions(address, network, { indent = '  ', seeded = false } = {}) {
   const { networkCurrency } = require('./deposit-watcher.js');
   const coin = networkCurrency(network);
-  const isTestnet = network !== 'verus';
   const i = indent;
 
-  console.log(`${i}Fund this address with ${coin}${isTestnet ? ' (testnet coins — not real money)' : ''}:`);
-  if (address) console.log(`${i}  ${address}`);
-  console.log(`${i}Registration costs about ${REGISTRATION_COST} ${coin}. Send ${RECOMMENDED_FUNDING} ${coin} so the`);
-  console.log(`${i}agent can keep writing reviews and attestations afterwards.`);
-  if (isTestnet) {
-    console.log(`${i}Getting ${coin}: there is NO automated faucet. Join the Verus Discord`);
-    console.log(`${i}  https://discord.gg/veruscoin  → ask in #pbaas-development, post this`);
-    console.log(`${i}  address, and a community member sends you coins by hand. Allow for`);
-    console.log(`${i}  a wait — a person has to see it. If someone invited you to test this,`);
-    console.log(`${i}  ask THEM to fund the address directly; it is far quicker.`);
-    console.log(`${i}⚠️  ${coin} is NOT VRSC. Testnet and mainnet addresses look identical —`);
-    console.log(`${i}   sending real VRSC here would lose it.`);
-  } else {
-    console.log(`${i}⚠️  MAINNET — this is real money.`);
+  if (seeded) {
+    console.log(`${i}Junction41 seeds a newly registered agent with ${PLATFORM_SEED_FUNDING} ${coin} —`);
+    console.log(`${i}about 33 on-chain writes at ${WRITE_COST} each. You do NOT need to acquire`);
+    console.log(`${i}coins before registering.`);
+    return;
   }
+
+  console.log(`${i}This address pays for on-chain writes (${WRITE_COST} ${coin} each) and only drains.`);
+  if (address) console.log(`${i}  ${address}`);
+  console.log(`${i}Junction41 seeds new agents with ${PLATFORM_SEED_FUNDING} ${coin} at registration.`);
+  console.log(`${i}To refill it afterwards:`);
+  console.log(`${i}  j41-dispatcher wallet sweep <agent-id>          # this agent's own earnings, i-address → R`);
+  console.log(`${i}  j41-dispatcher wallet send <from> <to> <amount> # top up from another fleet agent`);
+  console.log(`${i}An agent that has never earned cannot self-fund and needs an external transfer.`);
+  if (network === 'verus') console.log(`${i}⚠️  MAINNET — this is real money.`);
 }
 
 // Buyer-authored text rendering — shared with dashboard.js, see src/untrusted.js
@@ -1537,7 +1542,10 @@ function createFinalizeHooks(agentId, identityName, profile, services = [], disp
         // clears state, so the `ready` marker makes a rerun return instantly.
         // Throwing is what stops the state machine advancing on a step that did not
         // happen.
-        console.log('   ⚠️  No UTXOs available — identity needs funds for tx fee');
+        console.log('   ⚠️  No spendable UTXOs — this identity cannot pay the transaction fee.');
+        console.log('   ↳ New agents are seeded by Junction41 at registration, so an empty');
+        console.log('     balance here usually means the seed has not confirmed yet (wait a');
+        console.log('     block and retry) or the tank has since been spent.');
         printFundingInstructions(keys.address, J41_NETWORK, { indent: '   ↳ ' });
         console.log(`   ↳ VDXF plan saved to: ${planPath}`);
         console.log('   ↳ Then re-run this step; nothing was published on-chain.');
@@ -1886,13 +1894,12 @@ program
     
     console.log(`\n✅ ${count} agents initialized`);
     console.log('\nNext steps:');
-    console.log('  1. Fund each agent address — registration cannot complete without it:');
-    printFundingInstructions(null, J41_NETWORK, { indent: '     ' });
-    console.log('     Addresses are listed above, and by: j41-dispatcher wallet');
-    console.log('  2. Register each: j41-dispatcher register agent-1 <name>');
-    console.log('  3. Finalize each: j41-dispatcher finalize agent-1');
-    console.log('  4. Build the job image (once): j41-dispatcher build-image');
-    console.log('  5. Start dispatcher: j41-dispatcher start');
+    console.log('  1. Register each: j41-dispatcher register agent-1 <name>');
+    printFundingInstructions(null, J41_NETWORK, { indent: '     ', seeded: true });
+    console.log('  2. Finalize each: j41-dispatcher finalize agent-1');
+    console.log('  3. Build the job image (once): j41-dispatcher build-image');
+    console.log('  4. Start dispatcher: j41-dispatcher start');
+    console.log('\n  Check balances any time with: j41-dispatcher wallet');
   });
 
 // Register command — register an agent identity on-chain
@@ -3331,37 +3338,15 @@ program
     console.log('\nStep 2/4: Register identity on-chain');
     const { J41Agent, finalizeOnboarding, RegistrationTimeoutError } = require('@junction41/sovagent-sdk/dist/index.js');
 
-    // The address was printed one line ago and the next step needs it funded.
-    // Previously this ran straight on, so the documented instruction — "fund the
-    // displayed address before the register step can complete" — was literally
-    // unfollowable on the recommended path: you learned the address the same
-    // second registration started. Say what is needed and let the operator go
-    // get it. `--yes` keeps the old straight-through behaviour for anyone who
-    // funded ahead of time or is scripting.
-    if (!keys.identity && !options.yes) {
+    // NO funding gate here. An earlier version paused and asked the operator to
+    // fund the address before registering — which was backwards: Junction41
+    // seeds the R-address with 0.0033 at registration, so the pause blocked the
+    // very step that delivers the money, and sent newcomers hunting for a
+    // faucet that does not exist. Registration needs nothing up front.
+    if (!keys.identity) {
       console.log('');
-      printFundingInstructions(keys.address, J41_NETWORK, { indent: '  ' });
+      printFundingInstructions(keys.address, J41_NETWORK, { indent: '  ', seeded: true });
       console.log('');
-      if (process.stdin.isTTY) {
-        const readline = require('readline');
-        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-        const answer = await new Promise((resolve) => rl.question('  Funded and ready to register? (y/N) ', resolve));
-        rl.close();
-        const a = answer.trim().toLowerCase();
-        if (a !== 'y' && a !== 'yes') {
-          console.log('\n  Stopped before registering. Nothing was spent.');
-          console.log(`  Check the balance with: j41-dispatcher wallet show ${agentId}`);
-          console.log(`  Then run the same command again, or: j41-dispatcher register ${agentId} ${identityName}`);
-          return;
-        }
-      } else {
-        // Non-interactive and unfunded is the setup most likely to strand a
-        // half-registered agent. Refuse rather than guess.
-        console.error('\n❌ setup needs a terminal to confirm funding before it registers on-chain.');
-        console.error('   Nothing was spent. Fund the address above, then re-run with --yes,');
-        console.error(`   or run: j41-dispatcher register ${agentId} ${identityName}`);
-        process.exit(2);
-      }
     }
 
     if (keys.identity && keys.iAddress && keys.registrationStatus !== 'timeout') {

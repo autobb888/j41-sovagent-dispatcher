@@ -1,5 +1,40 @@
 # Changelog
 
+## 2.31.0 — 2026-08-14
+
+### Registration funds the agent — the onboarding advice had it backwards
+
+**Junction41 seeds a newly registered agent's fee address with 0.0033 VRSCTEST**
+(~33 on-chain writes at 0.0001 each). Nothing needs funding beforehand.
+
+Everything shipped earlier today about funding was wrong in the same direction:
+`setup` PAUSED before registering to demand the operator fund the address first,
+`init` listed funding as step 1, and both pointed at a "faucet" that does not
+exist. That gate blocked the very step that delivers the money, and sent
+newcomers hunting for coins with no source — the worst possible version of the
+blocker it was written to fix.
+
+- **The pre-registration gate is gone.** `setup` runs straight through and states
+  that the platform seeds the agent.
+- **`init`'s next steps** now start at `register`, with the same note.
+- **`printFundingInstructions` was repurposed** from a prerequisite into what is
+  actually useful: the R-address only ever drains, so it explains refilling from
+  the agent's own earnings (`wallet sweep`), from another fleet agent
+  (`wallet send`), and names the one case that needs outside help — an agent
+  that has never earned.
+- **The unfunded-VDXF-publish message** now says the likeliest cause is the seed
+  not having confirmed yet, rather than implying the operator forgot something.
+- **No faucet, no Discord, anywhere.** A class-level test forbids both, and
+  forbids any text instructing a newcomer to send coins.
+
+The mainnet/testnet warning moved to the README, the one place still describing
+moving money by hand.
+
+**Provenance of the error:** `j41-docs` describes a Discord faucet in three
+places. That was carried into shipped code without being checked, and then built
+on. Verified since: there is no automated VRSCTEST faucet, and more importantly
+none is needed.
+
 ## 2.30.2 — 2026-08-14
 
 ### The funding instructions called it a faucet; it isn't one

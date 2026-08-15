@@ -52,24 +52,51 @@ test('funding instructions name the network\'s own currency, not a hardcoded one
   assert.ok(!mainnet.includes('VRSCTEST'), 'a mainnet message must not mention testnet coins');
 });
 
-test('funding instructions state an amount', () => {
-  const out = capture(() => printFundingInstructions('Rabc', 'verustest'));
-  assert.match(out, /0\.0001/, 'the registration cost must be named');
-  assert.match(out, /Send 1 VRSCTEST/, 'a usable recommended amount must be named');
+test('the seeded message says the platform funds you, and names the amount', () => {
+  const out = capture(() => printFundingInstructions('Rabc', 'verustest', { seeded: true }));
+  assert.match(out, /0\.0033/, 'the seed amount must be named');
+  assert.match(out, /do NOT need to acquire/i,
+    'it must say plainly that no coins are needed up front');
 });
 
-test('funding instructions name where to actually get testnet coins', () => {
-  const out = capture(() => printFundingInstructions('Rabc', 'verustest'));
-  assert.match(out, /faucet/i);
-  assert.match(out, /discord\.gg\/veruscoin/, 'the faucet must be a real reachable pointer');
+test('CLASS: no funding text tells a newcomer to acquire coins before registering', () => {
+  // The original version of this feature was backwards: it presented funding as
+  // a prerequisite and pointed at a "faucet" that does not exist, blocking the
+  // very step (registration) that provides the money.
+  const both = capture(() => printFundingInstructions('Rabc', 'verustest', { seeded: true }))
+    + capture(() => printFundingInstructions('Rabc', 'verustest'));
+  assert.ok(!/faucet/i.test(both), 'there is no faucet — do not send anyone looking for one');
+  assert.ok(!/discord/i.test(both), 'coins do not come from a chat server');
+  // Look for the IMPERATIVE, not the word "before" — the correct copy legitimately
+  // says "you do NOT need to acquire coins before registering", and a naive
+  // keyword match flags that as the very thing it is denying.
+  assert.ok(!/^\s*Send \d/mi.test(both), 'must not instruct anyone to send coins anywhere');
+  assert.ok(!/Fund this address with/i.test(both),
+    'the R-address is seeded by the platform, not funded by the operator');
 });
 
-test('funding instructions warn that testnet and mainnet addresses are indistinguishable', () => {
-  // This is the one that loses real money: told "VRSC", a newcomer may buy and
-  // send mainnet coins to a testnet-purposed address that looks identical.
+test('the refill message points at the two real sources of more coins', () => {
   const out = capture(() => printFundingInstructions('Rabc', 'verustest'));
-  assert.match(out, /NOT VRSC/);
-  assert.match(out, /identical/i);
+  assert.match(out, /wallet sweep/, 'an earning agent refills itself from its own earnings');
+  assert.match(out, /wallet send/, 'a fleet agent can be topped up from another');
+  assert.match(out, /never earned cannot self-fund/,
+    'the one case needing outside help must be named');
+});
+
+test('the refill message still derives its currency from the network', () => {
+  const testnet = capture(() => printFundingInstructions('Rabc', 'verustest'));
+  const mainnet = capture(() => printFundingInstructions('Rabc', 'verus'));
+  assert.match(testnet, /VRSCTEST/);
+  assert.ok(!mainnet.includes('VRSCTEST'));
+  assert.match(mainnet, /MAINNET — this is real money/);
+});
+
+test('the mainnet/testnet warning survives where it still matters — the README', () => {
+  // The CLI no longer tells anyone to send coins anywhere, so the warning moved
+  // to the one place that still discusses moving money by hand.
+  const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
+  assert.match(readme, /addresses look identical/i);
+  assert.match(readme, /never send mainnet coins to a testnet agent/i);
 });
 
 test('a mainnet funding message says it is real money and offers no faucet', () => {
@@ -128,16 +155,17 @@ test('CLASS: service-currency defaults derive from the network', () => {
   assert.ok(['VRSC', 'VRSCTEST'].includes(NATIVE_COIN), `unexpected coin ${NATIVE_COIN}`);
 });
 
-test('setup pauses for funding before it spends, and refuses headless rather than guessing', () => {
+test('setup does NOT gate registration on funding', () => {
+  // It used to. That was backwards — Junction41 seeds the address AT
+  // registration, so the gate blocked the step that delivers the money and sent
+  // people looking for a faucet that does not exist.
   const start = CLI.indexOf('Step 2/4: Register identity on-chain');
   assert.ok(start > 0);
-  const body = CLI.slice(start, start + 2200);
-  assert.match(body, /printFundingInstructions\(keys\.address/,
-    'the funding instructions must appear before registration');
-  assert.match(body, /Funded and ready to register\?/);
-  assert.match(body, /process\.exit\(2\)/,
-    'a non-TTY unfunded setup must refuse with a distinct code, not register blindly');
-  assert.match(body, /options\.yes/, 'scripted callers who funded ahead must have a way through');
+  const body = CLI.slice(start, start + 2500);
+  assert.ok(!/Funded and ready to register/.test(body),
+    'no funding confirmation may stand between the operator and registration');
+  assert.match(body, /seeded: true/,
+    'it should instead explain that the platform funds the new agent');
 });
 
 // ── B3: the image build is reachable ────────────────────────────────────────

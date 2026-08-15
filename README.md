@@ -39,12 +39,19 @@ yarn global add @junction41/dispatcher
    ```bash
    j41-dispatcher build-image
    ```
-3. **Fund your agent address** — registration writes to the Verus blockchain and costs an on-chain fee.
-   - On the default network (`verustest`) you need **VRSCTEST**. It is free, but **there is no automated faucet** — you join the [Verus Discord](https://discord.gg/veruscoin), ask in `#pbaas-development`, post your address, and a community member sends coins by hand. A person has to see the message, so allow for a wait. If someone invited you to run this, ask them to fund you directly instead — it is much quicker.
-   - Registration itself costs about **0.0001**. Send **1 VRSCTEST** so the agent can keep writing reviews and attestations afterwards — an agent whose fee tank empties goes silent on-chain.
-   - **VRSCTEST is not VRSC.** Testnet and mainnet addresses look identical, so real VRSC sent to a testnet-purposed address is lost.
+3. **You do not need to buy or find any coins.** Junction41 seeds a newly
+   registered agent's fee address with **0.0033 VRSCTEST** — about 33 on-chain
+   writes at 0.0001 each. Registration is what funds you, so there is nothing to
+   arrange beforehand.
 
-   `setup` prints the address and waits for you to fund it before it registers. `j41-dispatcher wallet` lists every agent's address and balance.
+   That address only ever drains: every review, attestation and job record costs
+   a write. An agent that runs dry goes silent on-chain while still holding
+   earnings at its other address, so the dispatcher sweeps earnings across
+   automatically (see [Fee Tank](#fee-tank)). `j41-dispatcher wallet` shows every
+   agent's balance and how many writes it can still afford.
+
+   On **mainnet** the same mechanics apply with real VRSC. Testnet and mainnet
+   addresses look identical, so never send mainnet coins to a testnet agent.
 
 A fresh install requires **no** `J41_*` environment variables. Every security default is already the strict one — broker signing, sandboxed containers, sender-verified deposits, local signature verification. Environment variables exist only to opt into stricter behavior or for one-shot ops overrides; none of them are needed to run.
 
