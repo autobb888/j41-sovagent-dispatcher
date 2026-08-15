@@ -7308,10 +7308,17 @@ async function drainPendingRefunds(state, opts = {}) {
   }
 
   const approvedIds = jobIds.filter(id => pending[id].status === 'approved' && !readRefundInflight(id));
-  const skippedCount = jobIds.length - approvedIds.length;
+  // Count only what a human can still ACT on. This used to be
+  // `jobIds.length - approvedIds.length`, which swept in every terminal entry —
+  // already-sent `refunded` rows and `rejected` ones — so the "awaiting owner
+  // approval" figure grew every time a refund was settled and could never fall
+  // to zero. A money surface whose number only climbs as you clear the queue
+  // teaches operators to ignore it.
+  const AWAITING = new Set(['pending_approval', 'needs_review']);
+  const awaitingCount = jobIds.filter(id => AWAITING.has(pending[id].status)).length;
 
   console.log(`\n⚠️  ${isStartup ? 'Startup' : 'Periodic'} refund drain: ${approvedIds.length} approved refund(s) to send` +
-    (skippedCount > 0 ? ` (${skippedCount} awaiting owner approval — skipped)` : ''));
+    (awaitingCount > 0 ? ` (${awaitingCount} awaiting owner approval — skipped)` : ''));
 
   for (const jobId of approvedIds) {
     const success = await attemptPendingRefund(state, jobId, pending[jobId], ledgerPath);

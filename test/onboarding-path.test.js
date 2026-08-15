@@ -326,3 +326,21 @@ test('every TUI money CALL SITE passes a read-only verb', () => {
     }
   }
 });
+
+test('the refund drain counts only what an operator can still act on', () => {
+  // It used to be `jobIds.length - approvedIds.length`, which counted every
+  // terminal entry — already-sent `refunded` rows and `rejected` ones. The
+  // "awaiting owner approval" figure therefore GREW each time a refund was
+  // settled and could never reach zero. Found on the live fleet: it claimed 24
+  // awaiting when 20 were. A money number that only climbs as you clear the
+  // queue trains operators to ignore it.
+  const idx = CLI.indexOf('awaiting owner approval');
+  assert.ok(idx > 0, 'the drain summary must exist');
+  // Strip comment lines: the fix's own comment quotes the old expression to
+  // explain it, and matching raw source would flag the explanation as the bug.
+  const body = CLI.slice(idx - 1200, idx + 200)
+    .split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+  assert.match(body, /pending_approval/, 'the count must be status-filtered');
+  assert.ok(!/jobIds\.length - approvedIds\.length/.test(body),
+    'must not derive the count by subtracting from every ledger entry');
+});
