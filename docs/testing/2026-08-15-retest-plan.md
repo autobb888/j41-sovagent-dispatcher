@@ -143,16 +143,32 @@ invalidate comparison with this run.
 
 ---
 
-## R7 — dispatcher changes since the run
+## R7 — dispatcher changes since the run (three fixes, two need re-testing)
 
-Only one, and it is cosmetic-but-money-adjacent: the periodic refund drain was
-logging **"24 awaiting owner approval"** when 20 were. It counted every ledger
-entry, including 3 already-`refunded` and 1 `rejected`, so the figure grew each
-time a refund settled and could never reach zero. Fixed (`dc293a7`), counts
-`pending_approval` + `needs_review` only.
+**R7a — `/health` reported `ok` while the fleet could not sign in.** Found live
+during the outage above: 8 of 9 agents in auth backoff, `auth_backoff_agents: 8`
+in the very same payload that said `ok`. Auth backoff sets no `lastError`, so no
+existing degrade term caught it. Now degrades when a **majority** of the fleet is
+in backoff.
 
-**No re-test needed** — it never affected which refunds were sent, only the
-number reported. Noted so nobody chases the discrepancy in old logs.
+**Re-test:** during the next auth outage — or by stopping network access to the
+platform — confirm `/health` returns `degraded` and that a single agent flapping
+does **not** trip it.
+
+**R7b — an agent could sit in the available pool twice.** Same payload:
+`agents_available: 10` against `agents_total: 9`. Four call sites returned agents
+to the pool with no duplicate check. The count is the mild symptom — the pool is
+what work is assigned from, so a duplicated agent can be handed **two jobs
+concurrently**.
+
+**Re-test:** run several jobs through failure paths (container start failure,
+spawn error, timeout, pause/resume) and assert `agents_available` never exceeds
+`agents_total`. That invariant should now hold under any sequence.
+
+**R7c — refund drain overcounted.** Logged "24 awaiting owner approval" when 20
+were, counting settled entries. **No re-test needed** — it never affected which
+refunds were sent, only the number reported. Noted so nobody chases the
+discrepancy in old logs.
 
 ---
 
@@ -161,5 +177,7 @@ number reported. Noted so nobody chases the discrepancy in old logs.
 1. **R1** — 8.5/8.6 on a single build (fundamental, and currently split)
 2. **R2** — the refund route, end to end including the on-chain send
 3. **R3a** — does a fleet that cannot authenticate still read green?
-4. **R6** — the mobile mint; it is the actual cold-start question
-5. R4, R5 — after the backend answers
+4. **R7b** — the pool-duplicate invariant under failure paths (a duplicate means
+   two buyers on one agent)
+5. **R6** — the mobile mint; it is the actual cold-start question
+6. R4, R5, R7a — after the backend answers / next outage
