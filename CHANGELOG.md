@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.30.2 — 2026-08-14
+
+### The funding instructions called it a faucet; it isn't one
+
+`printFundingInstructions` and the README pointed at "the Verus Discord faucet".
+Verified: **there is no automated VRSCTEST faucet.** You join the Discord, ask in
+`#pbaas-development`, post your address, and a community member sends coins by
+hand.
+
+The old wording sent a newcomer to look for a faucet bot that does not exist —
+a dead end at the single step that already blocks everyone. The text now says
+plainly that a human has to respond, names the channel, and tells anyone who was
+invited to test to ask their inviter to fund them directly instead.
+
+Traced to `j41-docs`, which describes it as a faucet in three places; the claim
+was carried into shipped code without being checked.
+
 ## 2.30.1 — 2026-08-14
 
 ### Deposit notifications survive the platform's new visibility gate

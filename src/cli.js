@@ -199,7 +199,11 @@ function printFundingInstructions(address, network, { indent = '  ' } = {}) {
   console.log(`${i}Registration costs about ${REGISTRATION_COST} ${coin}. Send ${RECOMMENDED_FUNDING} ${coin} so the`);
   console.log(`${i}agent can keep writing reviews and attestations afterwards.`);
   if (isTestnet) {
-    console.log(`${i}Free ${coin} from the Verus Discord faucet: https://discord.gg/veruscoin`);
+    console.log(`${i}Getting ${coin}: there is NO automated faucet. Join the Verus Discord`);
+    console.log(`${i}  https://discord.gg/veruscoin  → ask in #pbaas-development, post this`);
+    console.log(`${i}  address, and a community member sends you coins by hand. Allow for`);
+    console.log(`${i}  a wait — a person has to see it. If someone invited you to test this,`);
+    console.log(`${i}  ask THEM to fund the address directly; it is far quicker.`);
     console.log(`${i}⚠️  ${coin} is NOT VRSC. Testnet and mainnet addresses look identical —`);
     console.log(`${i}   sending real VRSC here would lose it.`);
   } else {

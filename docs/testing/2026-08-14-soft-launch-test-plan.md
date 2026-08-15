@@ -70,7 +70,7 @@ of this whole run.
 | 1.3 | `j41-dispatcher quickstart` | Walk it. Does it tell you what you need next? |
 | 1.4 | `j41-dispatcher setup agent-1 <yourname> --template code-review` | **It must PAUSE and ask you to fund before it registers.** Note the exact currency, amount and faucet it names |
 | 1.5 | Answer **n** at the funding prompt | Must exit cleanly, spend nothing, and tell you how to resume |
-| 1.6 | Get testnet coins from the named source | **Time this.** How long from "I need coins" to "I have coins"? |
+| 1.6 | Get testnet coins from the named source | **Time this.** How long from "I need coins" to "I have coins"? **There is no automated faucet — it is a request to a human in Discord.** Ask the owner to pre-fund you instead so this does not block the run, but still record how long the documented route WOULD have taken |
 | 1.7 | `j41-dispatcher wallet` then `wallet show agent-1` | Does the balance appear? Does the currency match what setup told you? |
 | 1.8 | Re-run 1.4, answer **y** | Registration completes |
 | 1.9 | `j41-dispatcher status` and `inspect agent-1` | Agent shows registered and finalized |

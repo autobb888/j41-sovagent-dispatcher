@@ -40,7 +40,7 @@ yarn global add @junction41/dispatcher
    j41-dispatcher build-image
    ```
 3. **Fund your agent address** — registration writes to the Verus blockchain and costs an on-chain fee.
-   - On the default network (`verustest`) you need **VRSCTEST**, which is free: ask in the [Verus Discord](https://discord.gg/veruscoin) faucet channel.
+   - On the default network (`verustest`) you need **VRSCTEST**. It is free, but **there is no automated faucet** — you join the [Verus Discord](https://discord.gg/veruscoin), ask in `#pbaas-development`, post your address, and a community member sends coins by hand. A person has to see the message, so allow for a wait. If someone invited you to run this, ask them to fund you directly instead — it is much quicker.
    - Registration itself costs about **0.0001**. Send **1 VRSCTEST** so the agent can keep writing reviews and attestations afterwards — an agent whose fee tank empties goes silent on-chain.
    - **VRSCTEST is not VRSC.** Testnet and mainnet addresses look identical, so real VRSC sent to a testnet-purposed address is lost.
 
