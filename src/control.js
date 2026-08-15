@@ -439,6 +439,14 @@ const STARTUP_EXPECTED_MS = 20 * 60 * 1000;
 /** Does this status value block a hire? Mirrors the platform's fail-closed AND.
  *  `unknown` does not block — it means "not checked yet", and treating absence of
  *  information as failure makes every cold start look like an outage. */
+/** Agents currently waiting out an auth backoff. Never throws. */
+function _authBackoffCount(state) {
+  try {
+    const { summarizeAuthBackoff } = require('./auth-backoff.js');
+    return summarizeAuthBackoff(state._authBackoff, Date.now()).waiting || 0;
+  } catch { return 0; }
+}
+
 function _axisBlocks(v) {
   // Anything that is not positively `active` and not `unknown` blocks. Listing only
   // `inactive`/`disabled` contradicted the rule effectiveAgentStatus enforces — that
@@ -545,7 +553,21 @@ function buildHealthDocument(state, startedAt) {
       || (state.startupComplete !== true && state.startedAt
           && (now - state.startedAt) > STARTUP_EXPECTED_MS)
       || (state.startupComplete === true
-          && agents.some(a => _axisBlocks(a.platformStatus) || _axisBlocks(a.chainStatus))))
+          && agents.some(a => _axisBlocks(a.platformStatus) || _axisBlocks(a.chainStatus)))
+      // A fleet that cannot SIGN IN cannot take work, and auth backoff sets no
+      // `lastError`, so none of the terms above catch it. Observed live
+      // 2026-08-15: 8 of 9 agents in backoff for hours with 137-145 consecutive
+      // failures each, and /health still said `ok` — the same shape as the
+      // 2026-08-06 outage this chain was extended to catch.
+      //
+      // Majority, not `some`: a single agent flapping its auth is routine and
+      // self-heals, and an alert that fires on that is one operators learn to
+      // ignore. Losing more than half the fleet is not routine. Gated on
+      // startupComplete for the same reason as the axis term — the health server
+      // binds before agents authenticate.
+      || (state.startupComplete === true
+          && state.agents.length > 0
+          && _authBackoffCount(state) > state.agents.length / 2))
       ? 'degraded' : 'ok',
     inbox,
     deposits,
@@ -574,12 +596,7 @@ function buildHealthDocument(state, startedAt) {
       // Agents whose auth is deliberately paused because the platform is down.
       // Without this an outage looks identical to a hang: agents present, no
       // work moving, nothing obviously wrong.
-      auth_backoff_agents: (() => {
-        try {
-          const { summarizeAuthBackoff } = require('./auth-backoff.js');
-          return summarizeAuthBackoff(state._authBackoff, Date.now()).waiting;
-        } catch { return 0; }
-      })(),
+      auth_backoff_agents: _authBackoffCount(state),
       // Cycles a loop skipped because the previous one had not finished. Non-zero
       // means the dispatcher cannot keep up with its own interval at this agent
       // count — the fleet stops looking for work, and tanks stop being watched,

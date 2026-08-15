@@ -166,6 +166,29 @@ const SEEN_JOBS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 // Job statuses that are permanently done — never re-run (H1: terminal-status check on retry).
 const TERMINAL_STATUSES = ['delivered', 'completed', 'cancelled', 'resolved', 'resolved_rejected'];
 
+/**
+ * Return an agent to the available pool, at most once.
+ *
+ * Three call sites all "return agent to pool" and none checked whether it was
+ * already there. Observed live 2026-08-15: `agents_available: 10` against
+ * `agents_total: 9` — an impossible count, produced by one agent sitting in the
+ * pool twice.
+ *
+ * The count being wrong is the mild version. The pool is what the dispatcher
+ * picks from when assigning work, so a duplicated agent can be handed two jobs
+ * concurrently — one process, two buyers, two containers expected. The comment
+ * at the third site ("unless ... already returned during pause") shows the
+ * double-return was known; it was guarded in one case out of three.
+ *
+ * Idempotent by identity, so callers can stay naive.
+ */
+function returnAgentToPool(state, agentInfo) {
+  if (!state || !agentInfo || !agentInfo.id) return false;
+  if (state.available.some((a) => a && a.id === agentInfo.id)) return false;
+  state.available.push(agentInfo);
+  return true;
+}
+
 // ── Telling someone how to fund an agent ────────────────────────────────────
 
 // Junction41 funds a newly registered agent's R-address with 0.0033 — about 33
@@ -8479,7 +8502,7 @@ async function pollForJobs(state) {
     } catch (e) {
       console.error(`   ❌ Failed to start job ${queuedJob.id}: ${e.message}`);
       // Return agent to pool and re-queue the job at the back
-      state.available.push(agent);
+      returnAgentToPool(state, agent);
       state.queue.push(queuedJob);
       break; // Don't keep trying if container creation is failing
     }
@@ -10157,7 +10180,7 @@ async function startJobContainer(state, job, agentInfo) {
     try { if (signerTeardown) await signerTeardown(); } catch {}
     try { if (state.egressProxy && egressToken) state.egressProxy.revoke(egressToken); } catch {}
     // Return agent to pool
-    state.available.push(agentInfo);
+    returnAgentToPool(state, agentInfo);
   }
 }
 
@@ -10262,7 +10285,7 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
 
   // Return agent to pool (unless retrying or already returned during pause)
   if (!skipReturnAgent && !active.paused) {
-    state.available.push(active.agentInfo);
+    returnAgentToPool(state, active.agentInfo);
     state.retries.delete(jobId);
   } else if (!skipReturnAgent && active.paused) {
     state.retries.delete(jobId);
@@ -10503,7 +10526,7 @@ async function startJobLocal(state, job, agentInfo) {
   } catch (e) {
     console.error(`❌ Failed to start local process for ${job.id}:`, e.message);
     await reportSpawnAttachFailed(state, agentInfo, job, 'spawn-error: ' + e.message);
-    state.available.push(agentInfo);
+    returnAgentToPool(state, agentInfo);
   }
 }
 
@@ -10553,7 +10576,7 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
 
   // Only return agent to pool if not already returned during pause
   if (!skipReturnAgent && !active.paused) {
-    state.available.push(active.agentInfo);
+    returnAgentToPool(state, active.agentInfo);
     state.retries.delete(jobId);
   } else if (!skipReturnAgent && active.paused) {
     // Agent already in available pool from pause — just clean up retries

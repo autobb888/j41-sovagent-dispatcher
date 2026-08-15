@@ -344,3 +344,70 @@ test('the refund drain counts only what an operator can still act on', () => {
   assert.ok(!/jobIds\.length - approvedIds\.length/.test(body),
     'must not derive the count by subtracting from every ledger entry');
 });
+
+test('CLASS: agents are returned to the available pool only through the guard', () => {
+  // Four sites returned an agent to the pool and none checked whether it was
+  // already there. Observed live: agents_available 10 against agents_total 9 —
+  // one agent in the pool twice. The count is the mild symptom; the pool is what
+  // work is assigned from, so a duplicate can be handed two jobs at once.
+  //
+  // Asserted over the class because the fix initially missed the fourth site:
+  // its comment read differently from the other three.
+  const offenders = [];
+  CLI.split('\n').forEach((line, i) => {
+    if (!/state\.available\.push\(/.test(line)) return;
+    offenders.push(`cli.js:${i + 1}: ${line.trim()}`);
+  });
+  // The one legitimate push is inside the guard itself.
+  const guardStart = CLI.indexOf('function returnAgentToPool(');
+  const guardEnd = CLI.indexOf('\n}', guardStart);
+  const allowed = offenders.filter((o) => {
+    const ln = parseInt(o.match(/cli\.js:(\d+)/)[1], 10);
+    const upto = CLI.split('\n').slice(0, ln).join('\n').length;
+    return upto > guardStart && upto < guardEnd;
+  });
+  assert.equal(offenders.length - allowed.length, 0,
+    `these bypass returnAgentToPool():\n${offenders.filter(o => !allowed.includes(o)).join('\n')}`);
+});
+
+test('returnAgentToPool refuses a duplicate', () => {
+  const src = CLI.slice(CLI.indexOf('function returnAgentToPool('),
+                        CLI.indexOf('\n}', CLI.indexOf('function returnAgentToPool(')) + 2);
+  // eslint-disable-next-line no-new-func
+  const fn = new Function(`${src}; return returnAgentToPool;`)();
+  const state = { available: [] };
+  assert.equal(fn(state, { id: 'a' }), true, 'first return succeeds');
+  assert.equal(fn(state, { id: 'a' }), false, 'second return is refused');
+  assert.equal(state.available.length, 1);
+  assert.equal(fn(state, { id: 'b' }), true);
+  assert.equal(state.available.length, 2);
+  // Never throws on junk.
+  assert.equal(fn(state, null), false);
+  assert.equal(fn(null, { id: 'c' }), false);
+  assert.equal(fn(state, {}), false);
+});
+
+test('a fleet that cannot authenticate does not report healthy', () => {
+  // Observed live 2026-08-15: 8 of 9 agents in auth backoff for hours, 137-145
+  // consecutive failures each, and /health said `ok`. Auth backoff sets no
+  // lastError, so every other term in the degrade chain missed it — the same
+  // shape as the 2026-08-06 outage the chain was extended to catch.
+  const CTL = fs.readFileSync(path.join(SRC, 'control.js'), 'utf8');
+  const idx = CTL.indexOf("? 'degraded' : 'ok'");
+  assert.ok(idx > 0, 'the degrade chain must exist');
+  const chain = CTL.slice(CTL.indexOf('status: ('), idx);
+  assert.match(chain, /_authBackoffCount\(state\)/,
+    'auth backoff must participate in the degrade decision');
+  assert.match(chain, /state\.agents\.length \/ 2/,
+    'majority threshold — one flapping agent must not cry wolf');
+  assert.match(chain, /startupComplete === true[\s\S]*_authBackoffCount/,
+    'gated on startupComplete, like the other post-start terms');
+});
+
+test('the auth-backoff count has ONE definition', () => {
+  // The summary scalar and the degrade term must not drift apart.
+  const CTL = fs.readFileSync(path.join(SRC, 'control.js'), 'utf8');
+  assert.equal((CTL.match(/summarizeAuthBackoff\(/g) || []).length, 1,
+    'exactly one call site — the shared helper');
+  assert.match(CTL, /auth_backoff_agents: _authBackoffCount\(state\)/);
+});

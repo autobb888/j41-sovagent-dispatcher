@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+### A fleet that cannot sign in no longer reports healthy
+
+Observed live on 2026-08-15: **8 of 9 agents in auth backoff for hours** — 137 to
+145 consecutive failures each, the fleet unable to accept any work — and
+`/health` reported **`ok`**. `auth_backoff_agents: 8` sat right there in the same
+payload.
+
+Auth backoff sets no `lastError`, so every existing term in the degrade chain
+missed it. This is the shape of the 2026-08-06 outage the chain was extended to
+catch: every local surface green while the fleet earns nothing.
+
+Degrades now when **more than half** the fleet is in backoff — a majority rather
+than `some`, because one agent flapping its auth is routine and an alert that
+fires on that is one operators learn to ignore. Gated on `startupComplete` like
+the other post-start terms. The counter now has a single definition shared by the
+degrade term and the summary scalar, so they cannot drift.
+
+### An agent could sit in the available pool twice
+
+Same outage, same `/health` payload: `agents_available: 10` against
+`agents_total: 9`. An impossible count, caused by one agent being returned to the
+pool twice.
+
+The wrong number is the mild symptom. **The pool is what the dispatcher assigns
+work from**, so a duplicated agent can be handed two jobs concurrently — one
+process, two buyers. Four call sites returned agents to the pool and none checked
+whether the agent was already there; the comment at one of them ("unless …
+already returned during pause") shows the double-return was known and guarded in
+a single case.
+
+Returns now go through one idempotent guard. A class-level test forbids raw
+pushes — added because the first pass at this fix missed the fourth site, whose
+comment read differently from the other three.
+
 ## 2.31.0 — 2026-08-14
 
 ### Registration funds the agent — the onboarding advice had it backwards
