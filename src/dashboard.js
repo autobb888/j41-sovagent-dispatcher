@@ -21,6 +21,9 @@ const { untrusted, untrustedField } = require('./untrusted.js');
 // service-pricing surface, which is the mainnet mirror of the bug the CLI had.
 const NATIVE_COIN = networkCurrency(loadDispatcherConfig().platform.network);
 const { writeKeysFile, readKeysFile } = require('./keys-file.js');
+const keystore = require('./keystore.js');
+const MASTER_KEY_PATH = path.join(DISPATCHER_DIR, 'master-key.json');
+keystore.setMasterKeyPath(MASTER_KEY_PATH);
 const { sendCommand } = require('./control.js');
 const { renderActiveJobs, runLiveScreen } = require('./tui/live-screen.js');
 const { formatUpstreamHealthTag } = require('./tui/health-tag.js');
@@ -424,12 +427,20 @@ async function agentDetailScreen(inquirer, agentId) {
   }]);
 
   switch (action) {
-    case 'vdxf': await vdxfScreen(inquirer, keys); break;
-    case 'platform': await platformScreen(inquirer, keys); break;
-    case 'services': await servicesScreen(inquirer, keys); break;
+    case 'vdxf':
+    case 'platform':
+    case 'services':
+    case 'jobs':
+    case 'update_profile': {
+      const secretKeys = { id: agentId, ...readKeysFile(path.join(agentDir, 'keys.json')) };
+      if (action === 'vdxf') await vdxfScreen(inquirer, secretKeys);
+      else if (action === 'platform') await platformScreen(inquirer, secretKeys);
+      else if (action === 'services') await servicesScreen(inquirer, secretKeys);
+      else if (action === 'jobs') await jobsScreen(inquirer, secretKeys);
+      else await updateProfileScreen(inquirer, agentId, secretKeys);
+      break;
+    }
     case 'soul': await soulScreen(inquirer, agentDir); break;
-    case 'jobs': await jobsScreen(inquirer, keys); break;
-    case 'update_profile': await updateProfileScreen(inquirer, agentId, keys); break;
     case 'retry_register': await retryRegisterScreen(inquirer, agentId, keys); break;
     case 'retry_finalize': await retryFinalizeScreen(inquirer, agentId); break;
     case '__back': return;
@@ -1008,9 +1019,10 @@ let _cachedCategories = null;
 async function fetchCategories() {
   if (_cachedCategories) return _cachedCategories;
   try {
-    const agents = getAgents().filter(a => a.identity && a.wif);
+    const agents = getAgents().filter(a => a.identity);
     if (agents.length === 0) return [];
-    const agent = await createAgent(agents[0]);
+    const keys = readKeysFile(path.join(AGENTS_DIR, agents[0].id, 'keys.json'));
+    const agent = await createAgent(keys);
     try {
       const result = await agent.client.getServiceCategories();
       _cachedCategories = Array.isArray(result) ? result : (result?.data || []);
@@ -1299,8 +1311,8 @@ async function configureServicesScreen(inquirer) {
   }
 
   const { agentId } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'agentId', message: 'Select agent to manage services:', choices: agents.map(a => ({ name: `  ${a.id.padEnd(10)} ${a.identity}`, value: a.id })) }]);
-  const keys = agents.find(a => a.id === agentId);
-  if (!keys) return;
+  if (!agents.find(a => a.id === agentId)) return;
+  const keys = { id: agentId, ...readKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json')) };
 
   while (true) {
     console.clear();
@@ -2356,7 +2368,10 @@ async function batchActivateScreen(inquirer, activate) {
   console.clear();
   console.log(`\n  ═══ ${action} Agents ═══\n`);
 
-  const agents = getAgents().filter(a => a.identity && a.iAddress && a.wif);
+  const agents = getAgents()
+    .filter(a => a.identity && a.iAddress)
+    .map(a => ({ ...a, ...readKeysFile(path.join(AGENTS_DIR, a.id, 'keys.json')) }))
+    .filter(a => a.wif);
   if (agents.length === 0) {
     console.log('  No registered agents found.\n');
     await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
@@ -2472,7 +2487,10 @@ async function browseBountiesScreen(inquirer) {
   console.clear();
   console.log('\n  ═══ Open Bounties ═══\n');
 
-  const agents = getAgents().filter(a => a.identity && a.iAddress && a.wif);
+  const agents = getAgents()
+    .filter(a => a.identity && a.iAddress)
+    .map(a => ({ ...a, ...readKeysFile(path.join(AGENTS_DIR, a.id, 'keys.json')) }))
+    .filter(a => a.wif);
   if (agents.length === 0) {
     console.log('  No agents registered. Add an agent first.\n');
     await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
@@ -2528,7 +2546,7 @@ async function postBountyScreen(inquirer) {
 
   // Pick which agent posts the bounty
   const { agentId } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'agentId', message: 'Post as which agent?', choices: agents.map(a => ({ name: `  ${a.id.padEnd(10)} ${a.identity}`, value: a.id })) }]);
-  const agentKeys = agents.find(a => a.id === agentId);
+  const agentKeys = { id: agentId, ...readKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json')) };
 
   const { title } = await promptWithEsc(inquirer, [{ type: 'input', name: 'title', message: 'Bounty title:' }]);
   if (!title) { console.log('\n  Title required.\n'); return; }
@@ -2596,7 +2614,7 @@ async function myBountiesScreen(inquirer) {
   }
 
   const { agentId } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'agentId', message: 'View bounties for:', choices: agents.map(a => ({ name: `  ${a.id.padEnd(10)} ${a.identity}`, value: a.id })) }]);
-  const agentKeys = agents.find(a => a.id === agentId);
+  const agentKeys = { id: agentId, ...readKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json')) };
 
   let posted = [], applied = [];
   try {
@@ -2791,7 +2809,7 @@ async function apiEndpointSetupScreen(inquirer) {
   console.log('  API access to your LLM server on the J41 marketplace.\n');
 
   // Step 1: Select agent
-  const agents = getAgents().filter(a => a.identity && a.iAddress && a.wif);
+  const agents = getAgents().filter(a => a.identity && a.iAddress);
   if (agents.length === 0) {
     console.log('  No registered agents. Add and register an agent first.\n');
     await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
@@ -2799,7 +2817,7 @@ async function apiEndpointSetupScreen(inquirer) {
   }
 
   const { agentId } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'agentId', message: 'Which agent will sell API access?', choices: agents.map(a => ({ name: `  ${a.id.padEnd(12)} ${a.identity}`, value: a.id })) }]);
-  const agentKeys = agents.find(a => a.id === agentId);
+  const agentKeys = { id: agentId, ...readKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json')) };
 
   // Step 2: LLM server type
   console.log('\n  ── Step 1: LLM Server ──\n');
@@ -3119,6 +3137,30 @@ async function main() {
   const mod = await import('inquirer');
   const inquirer = mod.default || mod;
 
+  // Same sequence as cli.js start / ensureKeystoreUnlockedIfEncrypted.
+  // Listing stays allowLocked; write/sign screens re-read secrets after this.
+  let poolHasV2 = false;
+  try {
+    if (fs.existsSync(AGENTS_DIR)) {
+      for (const id of fs.readdirSync(AGENTS_DIR)) {
+        const kp = path.join(AGENTS_DIR, id, 'keys.json');
+        if (!fs.existsSync(kp)) continue;
+        try {
+          if (JSON.parse(fs.readFileSync(kp, 'utf8')).v === 2) { poolHasV2 = true; break; }
+        } catch { /* skip unreadable */ }
+      }
+    }
+  } catch { /* no agents dir */ }
+  if (poolHasV2 && !keystore.isUnlocked()) {
+    try {
+      const pass = await keystore.resolvePassphrase({ promptFn: () => keystore.promptHidden('🔐 Key pool is encrypted — unlock passphrase: ') });
+      keystore.unlock(pass, MASTER_KEY_PATH);
+    } catch (e) {
+      console.error(`\n❌ The key pool is encrypted; unlock required for this operation: ${e.message}`);
+      process.exit(1);
+    }
+  }
+
   while (true) {
     let choice;
     try { choice = await mainMenu(inquirer); } catch (e) { if (e === BACK) continue; throw e; }
@@ -3240,15 +3282,16 @@ async function main() {
         const agents = getAgents();
         if (agents.length === 0) { console.log('\n  No agents.\n'); return; }
         const { id } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'id', message: 'Select agent to inspect:', choices: agents.map(a => ({ name: `  ${a.id.padEnd(10)} ${a.identity}`, value: a.id })) }]);
-        const keys = agents.find(a => a.id === id);
-        if (keys) await vdxfScreen(inquirer, keys);
+        if (!agents.find(a => a.id === id)) return;
+        const keys = { id, ...readKeysFile(path.join(AGENTS_DIR, id, 'keys.json')) };
+        await vdxfScreen(inquirer, keys);
       }); break;
       case 'inbox': await withBack(async () => {
         const agents = getAgents();
         if (agents.length === 0) { console.log('\n  No agents.\n'); return; }
         const { id } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'id', message: 'Check inbox for:', choices: agents.map(a => ({ name: `  ${a.id.padEnd(10)} ${a.identity}`, value: a.id })) }]);
-        const keys = agents.find(a => a.id === id);
-        if (!keys) return;
+        if (!agents.find(a => a.id === id)) return;
+        const keys = { id, ...readKeysFile(path.join(AGENTS_DIR, id, 'keys.json')) };
         console.clear();
         console.log(`\n  ═══ Inbox: ${keys.identity} ═══\n`);
         try {
@@ -3284,7 +3327,8 @@ async function main() {
         const agents = getAgents();
         for (const a of agents) {
           try {
-            const agent = await createAgent(a);
+            const keys = { ...a, ...readKeysFile(path.join(AGENTS_DIR, a.id, 'keys.json')) };
+            const agent = await createAgent(keys);
             let bal, result, utxoRes = null;
             try {
               bal = await agent.client.getBalance();
