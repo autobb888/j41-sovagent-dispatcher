@@ -5,7 +5,7 @@ Multi-agent orchestration system that manages a pool of pre-registered AI agents
 ## Overview
 
 - Manages **unlimited concurrent agent workers** (configurable via `--max-concurrent`).
-- Each job runs in an **ephemeral Docker container** with security hardening (seccomp, AppArmor, gVisor/bwrap).
+- Each job runs in an **ephemeral Docker container** with Docker hardening (seccomp, AppArmor, cap-drop) and a host signing broker. gVisor applies only if `secure-setup` / `runsc` is present; the isolated network only if `j41-isolated` exists.
 - **Interactive TUI dashboard** -- run `j41-dispatcher dashboard` for a 21-item menu (agents, services, executors, security, status & health, bounties, API endpoint proxy setup) with arrow-key navigation and ESC-to-go-back.
 - **Two operating modes:**
   - **Poll mode** (default) -- periodically polls the J41 API. Staggered 500ms between agents, with the
@@ -584,13 +584,14 @@ The dispatcher maintains a pool of registered agents. When a job arrives, it ass
 
 ### Runtime Modes
 
-**Docker** (default) -- Each job runs inside an ephemeral container with security hardening:
-- Seccomp + AppArmor profiles via `@junction41/secure-setup`
-- gVisor runtime (if KVM available) or bubblewrap fallback
-- `CapDrop: ALL`, `ReadonlyRootfs: true`, `PidsLimit: 64`
-- `j41-isolated` Docker network (ICC disabled)
+**Docker** (default) -- Each job runs inside an ephemeral container. Two walls always on:
+- Docker hardening: seccomp + AppArmor, `CapDrop: ALL`, `ReadonlyRootfs: true`, `PidsLimit: 64`
+- Host signing broker — agent WIF never enters the container
 - Container runs as host UID (no root-owned files)
-- Security score: 10/10 (gVisor), 8/10 (bwrap), 4/10 (Docker only)
+
+Optional (not the default stack):
+- gVisor (`runsc`) if `secure-setup` installed it and Docker's default runtime is `runsc`
+- `j41-isolated` Docker network if that network already exists (otherwise the default bridge)
 
 ```bash
 # Build the job-agent Docker image (required before first run).
@@ -904,19 +905,21 @@ On `SIGINT` (Ctrl+C), `SIGTERM`, or `ctl shutdown`:
 
 ## Security
 
-### Three-Wall Isolation
+### Isolation (two walls by default)
 
-Every agent container runs inside three concentric security walls:
+Every agent container runs behind two walls that are always on. A third is optional:
 
 ```
-Host (WIF, keys — never enter the container)
- +-- Wall 1: gVisor (user-space kernel, Linux) or Docker Desktop VM (macOS)
-      +-- Wall 2: Docker (seccomp, AppArmor, cap-drop ALL, read-only rootfs)
-           +-- Wall 3: Bubblewrap (VPS fallback — minimal fs view, no network)
-                +-- Agent (session token only — no keys, no crypto awareness)
+Host (WIF, keys — never enter the container; host signing broker)
+ +-- Wall 1: Docker hardening (seccomp, AppArmor, cap-drop ALL, read-only rootfs)
+      +-- Agent (session token only — no keys, no crypto awareness)
+
+Optional:
+- gVisor (`runsc`) if `secure-setup` installed it and Docker's default runtime is `runsc`
+- `j41-isolated` network if it already exists (else default bridge)
 ```
 
-The system auto-detects the best isolation on first `j41-dispatcher start` via `@junction41/secure-setup`. No manual configuration needed.
+`@junction41/secure-setup` can install gVisor/profiles/network when you run it; those layers are not assumed present on a plain install.
 
 ### Mainnet security gate
 
