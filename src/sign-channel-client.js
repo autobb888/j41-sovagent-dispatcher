@@ -179,29 +179,15 @@ class SignChannelClient {
 
   /**
    * Find an empty host-created slot and write the request in-place.
-   * Never creates a new name (O_CREAT is not set).
+   * Never creates a new name (O_CREAT is not set). Claim is exclusive:
+   * `link(req, req.claim)` is atomic (EEXIST → that slot is taken).
    */
   async _claimAndWrite(method, params, deadline) {
     while (Date.now() < deadline) {
-      const slot = await this._findEmptySlot();
-      if (slot) {
-        const body = JSON.stringify({ id: slot.id, method, params });
-        try {
-          const fh = await fsp.open(
-            slot.reqPath,
-            fs.constants.O_WRONLY | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW,
-          );
-          try {
-            await fh.writeFile(body, 'utf8');
-            await fh.sync();
-          } finally {
-            await fh.close();
-          }
-          return slot;
-        } catch (e) {
-          if (e.code === 'ENOENT' || e.code === 'ELOOP') continue;
-          throw new SignChannelError('WRITE_ERROR', e.message);
-        }
+      const slots = await this._listEmptySlots();
+      for (const slot of slots) {
+        const taken = await this._tryExclusiveWrite(slot, method, params);
+        if (taken) return taken;
       }
       await new Promise((r) => setTimeout(r, RESP_POLL_INTERVAL_MS));
     }
@@ -211,7 +197,7 @@ class SignChannelClient {
     );
   }
 
-  async _findEmptySlot() {
+  async _listEmptySlots() {
     let names;
     try {
       names = await fsp.readdir(this.reqDir);
@@ -225,6 +211,7 @@ class SignChannelClient {
       throw e;
     }
     const prefix = this.reqPrefix;
+    const slots = [];
     for (const name of names) {
       if (!/^[a-f0-9-]{8,80}\.json$/i.test(name)) continue;
       if (prefix && !name.startsWith(prefix)) continue;
@@ -235,13 +222,53 @@ class SignChannelClient {
       } catch {
         continue;
       }
-      return {
+      slots.push({
         id: name.replace(/\.json$/i, ''),
         reqPath,
         respPath: path.join(this.respDir, name),
-      };
+      });
     }
-    return null;
+    return slots;
+  }
+
+  /**
+   * Atomically claim `slot` via a hardlink sibling, then write in-place.
+   * Returns the slot on success, null if another claimer got there first.
+   */
+  async _tryExclusiveWrite(slot, method, params) {
+    const claimPath = `${slot.reqPath}.claim`;
+    try {
+      await fsp.link(slot.reqPath, claimPath);
+    } catch (e) {
+      if (e.code === 'EEXIST' || e.code === 'ENOENT') return null;
+      throw new SignChannelError('WRITE_ERROR', e.message);
+    }
+    try {
+      let st;
+      try {
+        st = await fsp.lstat(slot.reqPath);
+      } catch {
+        return null;
+      }
+      if (!st.isFile() || st.size !== 0) return null;
+      const body = JSON.stringify({ id: slot.id, method, params });
+      const fh = await fsp.open(
+        slot.reqPath,
+        fs.constants.O_WRONLY | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW,
+      );
+      try {
+        await fh.writeFile(body, 'utf8');
+        await fh.sync();
+      } finally {
+        await fh.close();
+      }
+      return slot;
+    } catch (e) {
+      if (e.code === 'ENOENT' || e.code === 'ELOOP') return null;
+      throw new SignChannelError('WRITE_ERROR', e.message);
+    } finally {
+      await fsp.unlink(claimPath).catch(() => {});
+    }
   }
 }
 

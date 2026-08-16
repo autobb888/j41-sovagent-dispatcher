@@ -73,6 +73,15 @@ const SIGNING_BROKER_ENABLED = process.env.J41_SIGNING_BROKER === '1';
 /** Channel directory the dispatcher bind-mounts when broker mode is on.
  *  Both subdirs (`req/`, `resp/`) must exist before this process starts. */
 const SIGNING_BROKER_CHANNEL_DIR = process.env.J41_SIGNING_CHANNEL_DIR || '/app/sign';
+/** Host-issued request-slot prefix. Only write into names the host minted. */
+const SIGNING_BROKER_REQ_PREFIX = process.env.J41_SIGN_REQ_PREFIX || '';
+
+function makeSignChannelClient() {
+  return new SignChannelClient({
+    channelDir: SIGNING_BROKER_CHANNEL_DIR,
+    reqPrefix: SIGNING_BROKER_REQ_PREFIX,
+  });
+}
 
 /**
  * nextPollSince(highWaterIso, overlapMs) → string
@@ -317,7 +326,7 @@ async function selfReportAttach(agent, jobId, { isReconnect, failed, reason, sle
  */
 function buildSigner(keys) {
   const channelClient = SIGNING_BROKER_ENABLED
-    ? new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR })
+    ? makeSignChannelClient()
     : null;
   return createJobSigner({
     wif: keys?.wif,
@@ -529,7 +538,7 @@ async function main() {
   const agent = new J41Agent({
     apiUrl: API_URL,
     ...(SIGNING_BROKER_ENABLED
-      ? { signer: new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR }) }
+      ? { signer: makeSignChannelClient() }
       : { wif: keys.wif }),
     identityName: IDENTITY,
     iAddress: keys.iAddress,
@@ -1667,7 +1676,7 @@ process.on('SIGTERM', async () => {
     try {
       if (_agent) {
         const sigtermSigner = SIGNING_BROKER_ENABLED
-          ? createJobSigner({ channelClient: new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR }), brokerEnabled: true })
+          ? createJobSigner({ channelClient: makeSignChannelClient(), brokerEnabled: true })
           : createJobSigner({ wif: JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8')).wif, network: J41_NETWORK, brokerEnabled: false });
         const r = await signAndSubmitDeletionAttestation({
           client: _agent._client || _agent.client,
@@ -1743,7 +1752,7 @@ if (require.main === module) {
         keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
       }
       const timeoutSigner = SIGNING_BROKER_ENABLED
-        ? createJobSigner({ channelClient: new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR }), brokerEnabled: true })
+        ? createJobSigner({ channelClient: makeSignChannelClient(), brokerEnabled: true })
         : createJobSigner({ wif: keys.wif, network: J41_NETWORK, brokerEnabled: false });
       // Try to use the platform's canonical attestation flow (J4)
       // M14 fix: reuse existing _agent if available
@@ -1752,7 +1761,7 @@ if (require.main === module) {
           const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
           // In broker mode the agent runs without a WIF; pass signer instead.
           const cfg = SIGNING_BROKER_ENABLED
-            ? { apiUrl: API_URL, signer: new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR }), identityName: IDENTITY, iAddress: process.env.J41_IADDRESS }
+            ? { apiUrl: API_URL, signer: makeSignChannelClient(), identityName: IDENTITY, iAddress: process.env.J41_IADDRESS }
             : { apiUrl: API_URL, wif: keys.wif, identityName: IDENTITY, iAddress: keys.iAddress };
           const a = new J41Agent(cfg);
           return a;

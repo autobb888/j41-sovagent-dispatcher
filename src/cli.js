@@ -9920,7 +9920,7 @@ async function startJobContainer(state, job, agentInfo) {
     // (there is no keys.json inside the container to read it from). The
     // defensive guard in job-agent.js refuses to start if J41_SIGNING_BROKER=1
     // and /app/keys.json *also* exists.
-    const brokerEnv = [`J41_SIGNING_BROKER=1`, `J41_SIGNING_CHANNEL_DIR=/app/sign`, `J41_IADDRESS=${hostKeys.iAddress}`];
+    const brokerEnv = [`J41_SIGNING_BROKER=1`, `J41_SIGNING_CHANNEL_DIR=/app/sign`, `J41_IADDRESS=${hostKeys.iAddress}`, `J41_SIGN_REQ_PREFIX=${signerHost.reqPrefix}`];
 
     // The container only ever sees the bind-mounted JSON signing channel — never the WIF.
     const signingBinds = [`${signerChannelDir}:/app/sign`]; // rw — container writes req/, reads resp/

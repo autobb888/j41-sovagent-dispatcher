@@ -45,7 +45,10 @@ if (!mode || (mode !== 'creation' && mode !== 'deletion')) {
  */
 async function signMessage(message) {
   const { SignChannelClient } = require('./sign-channel-client.js');
-  const client = new SignChannelClient({ channelDir: SIGNING_BROKER_CHANNEL_DIR });
+  const client = new SignChannelClient({
+    channelDir: SIGNING_BROKER_CHANNEL_DIR,
+    reqPrefix: process.env.J41_SIGN_REQ_PREFIX || '',
+  });
   return client.signMessage(message);
 }
 

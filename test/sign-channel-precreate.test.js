@@ -91,6 +91,90 @@ test('write into a host-created placeholder is processed', async () => {
   }
 });
 
+test('two concurrent claims do not share a slot', async () => {
+  const { host, channelDir } = await makeHost();
+  const seen = [];
+  host.executors.ping = async (params) => {
+    seen.push(params.tag);
+    await new Promise((r) => setTimeout(r, 40));
+    return { pong: true, tag: params.tag };
+  };
+  await host.start();
+  const claimed = [];
+  const wrap = (client) => {
+    const orig = client._claimAndWrite.bind(client);
+    client._claimAndWrite = async (...args) => {
+      const slot = await orig(...args);
+      claimed.push(slot.id);
+      return slot;
+    };
+    return client;
+  };
+  const c1 = wrap(new SignChannelClient({ channelDir, timeoutMs: 4000, reqPrefix: host.reqPrefix }));
+  const c2 = wrap(new SignChannelClient({ channelDir, timeoutMs: 4000, reqPrefix: host.reqPrefix }));
+  try {
+    const [a, b] = await Promise.all([
+      c1.executeOnChain('ping', { tag: 'A' }),
+      c2.executeOnChain('ping', { tag: 'B' }),
+    ]);
+    assert.deepEqual(new Set([a.tag, b.tag]), new Set(['A', 'B']));
+    assert.deepEqual(new Set(seen), new Set(['A', 'B']));
+    assert.equal(new Set(claimed).size, 2, `concurrent claims must use distinct slots, got ${JSON.stringify(claimed)}`);
+  } finally {
+    await host.destroy();
+  }
+});
+
+test('client reqPrefix refuses empty decoy names the host did not mint', async () => {
+  const { host, channelDir } = await makeHost();
+  await host.start();
+  const client = new SignChannelClient({
+    channelDir,
+    timeoutMs: 3000,
+    reqPrefix: host.reqPrefix,
+  });
+  const claimed = [];
+  const orig = client._claimAndWrite.bind(client);
+  client._claimAndWrite = async (...args) => {
+    const slot = await orig(...args);
+    claimed.push(slot.id);
+    return slot;
+  };
+  try {
+    await fsp.writeFile(path.join(channelDir, 'req', 'abcd1234.json'), '');
+    await client.executeOnChain('ping', { tag: 'ok' });
+    assert.equal(claimed.length, 1);
+    assert.ok(claimed[0].startsWith(host.reqPrefix), 'must claim a host-prefixed slot');
+    assert.notEqual(claimed[0], 'abcd1234');
+  } finally {
+    await host.destroy();
+  }
+});
+
+test('CLASS: production wiring passes the host prefix into the container client', () => {
+  const cli = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
+  const job = fs.readFileSync(path.join(__dirname, '../src/job-agent.js'), 'utf8');
+  const attest = fs.readFileSync(path.join(__dirname, '../src/sign-attestation.js'), 'utf8');
+
+  assert.match(
+    cli,
+    /J41_SIGN_REQ_PREFIX=\$\{signerHost\.reqPrefix\}/,
+    'cli.js brokerEnv must inject the host-issued prefix',
+  );
+
+  const ctor = job.match(/new SignChannelClient\s*\(/g) || [];
+  assert.equal(ctor.length, 1, 'job-agent must construct SignChannelClient in one helper only');
+  assert.match(job, /reqPrefix:\s*SIGNING_BROKER_REQ_PREFIX/);
+  const helperCalls = job.match(/makeSignChannelClient\s*\(/g) || [];
+  assert.ok(helperCalls.length >= 6, `expected helper def + 5 call sites, got ${helperCalls.length}`);
+
+  assert.match(
+    attest,
+    /reqPrefix:\s*(?:process\.env\.J41_SIGN_REQ_PREFIX|SIGNING_BROKER_REQ_PREFIX)/,
+    'sign-attestation must pass the host prefix into SignChannelClient',
+  );
+});
+
 test('replaced host slot (unlink + new inode, same name) is ignored', async () => {
   const { host, channelDir, calls } = await makeHost();
   await host.start();
