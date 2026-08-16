@@ -6,11 +6,13 @@
  *     host:        /tmp/j41-sign-<jobId>/{req,resp}/   (mode 0700)
  *     container:   /app/sign/{req,resp}/                (bind-mounted)
  *
- * The container's `SignChannelClient` writes a JSON request to `req/<id>.json`
- * and polls `resp/<id>.json` for the response. The dispatcher's
- * `SignChannelHost` watches `req/`, runs each request through the broker
- * policy with the agent's WIF (which never leaves the host), and writes the
- * response.
+ * The host pre-creates empty `req/<id>.json` placeholders (owned by us,
+ * recorded in `_ours`). The container's `SignChannelClient` may only write
+ * *into* those files (`O_WRONLY`, no create) and polls `resp/<id>.json` for
+ * the response. The dispatcher's `SignChannelHost` watches `req/`, ignores
+ * any name it did not create, runs each authorised request through the
+ * broker policy with the agent's WIF (which never leaves the host), and
+ * writes the response.
  *
  * Wire format:
  *   request:  { id, method: 'signBrokered' | 'signMessage', params }
@@ -26,8 +28,10 @@
  *     never sent across the channel.
  *   - The channel is pinned to one `jobId` at construction; any request whose
  *     brokered params reference a different jobId is rejected.
- *   - The watcher only reads files matching `<32hex-or-uuid>.json` to avoid
- *     accidental processing of unrelated files dropped into the dir.
+ *   - The watcher only reads files matching `<32hex-or-uuid>.json` *and*
+ *     whose name+inode were `openSync`'d by this host (`start` / `nextReqId`
+ *     / `expect`). A file that appeared only from the container is ignored
+ *     (I1 watch-race / K3–K4 forged-name planting).
  *   - The dispatcher fetches the authoritative job from the platform itself
  *     (via the `getJob` closure) — never trusts the request for fund-bearing
  *     fields.
@@ -52,6 +56,16 @@ const REQ_FILENAME_RE = /^[a-f0-9-]{8,80}\.json$/i;
  *  primary trigger; this is the belt-and-braces fallback for filesystems that
  *  don't emit reliably (some overlayfs configs). */
 const POLL_INTERVAL_MS = 200;
+
+/** How many empty request slots to keep ready. Sequential clients need one;
+ *  a small pool covers a burst of in-flight signs without waiting for
+ *  replenish. */
+const REQ_POOL_TARGET = 4;
+
+const OPEN_CREATE_EXCL = fs.constants.O_WRONLY
+  | fs.constants.O_CREAT
+  | fs.constants.O_EXCL
+  | fs.constants.O_NOFOLLOW;
 
 class SignChannelHost {
   /**
@@ -107,6 +121,19 @@ class SignChannelHost {
     this._inflight = new Set(); // request IDs currently being processed
     this._started = false;
     this._stopped = false;
+    // filename → ino of placeholders *we* created. Names that appear only
+    // from the container are not in this map and are never processed.
+    this._ours = new Map();
+    this._ignored = new Set();
+    this._seenSize = new Map();
+    this._reqPrefix = crypto.randomBytes(8).toString('hex');
+    this._poolTarget = REQ_POOL_TARGET;
+  }
+
+  /** Prefix baked into every `nextReqId()` slot. Pass to the container as
+   *  `J41_SIGN_REQ_PREFIX` so it only writes names we could have created. */
+  get reqPrefix() {
+    return this._reqPrefix;
   }
 
   /** Create the channel dir + start watching. Idempotent on second call. */
@@ -125,6 +152,10 @@ class SignChannelHost {
     try { await fsp.chmod(this.reqDir, 0o700); } catch { /* not our dir */ }
     await fsp.mkdir(this.respDir, { recursive: true, mode: 0o700 });
     try { await fsp.chmod(this.respDir, 0o700); } catch { /* not our dir */ }
+
+    // Pre-create empty request slots *we* own. Do not adopt anything that
+    // was already sitting in req/ — those names are not ours (K3).
+    this._ensurePool();
 
     // Process anything already sitting in req/ before we started.
     await this._drainOnce().catch((e) => this.log(`[sign-channel] initial drain failed: ${e.message}`));
@@ -172,6 +203,71 @@ class SignChannelHost {
     } catch (e) {
       this.log(`[sign-channel] failed to remove ${this.channelDir}: ${e.message}`);
     }
+    this._ours.clear();
+    this._ignored.clear();
+    this._seenSize.clear();
+  }
+
+  /**
+   * Create one empty `req/<id>.json` owned by us and record its inode.
+   * Returns the bare id (no `.json`). The container may write *into* this
+   * file; `_tryProcess` ignores every other name.
+   */
+  nextReqId() {
+    fs.mkdirSync(this.reqDir, { recursive: true, mode: 0o700 });
+    for (let i = 0; i < 8; i++) {
+      const id = this._reqPrefix + crypto.randomBytes(8).toString('hex');
+      try {
+        this._createPlaceholder(`${id}.json`);
+        return id;
+      } catch (e) {
+        if (e.code === 'EEXIST') continue;
+        throw e;
+      }
+    }
+    throw new Error('SignChannelHost.nextReqId: failed to allocate a request slot');
+  }
+
+  /**
+   * Pre-create a specific request id (tests / explicit issuance). Does not
+   * adopt a pre-existing file — O_EXCL so a planted name stays untrusted.
+   */
+  expect(id) {
+    if (typeof id !== 'string' || !/^[a-f0-9-]{1,80}$/i.test(id)) {
+      throw new Error('SignChannelHost.expect: id must match [a-f0-9-]{1,80}');
+    }
+    const filename = `${id}.json`;
+    if (this._ours.has(filename)) return id;
+    fs.mkdirSync(this.reqDir, { recursive: true, mode: 0o700 });
+    this._createPlaceholder(filename);
+    return id;
+  }
+
+  _createPlaceholder(filename) {
+    const reqPath = path.join(this.reqDir, filename);
+    const fd = fs.openSync(reqPath, OPEN_CREATE_EXCL, 0o600);
+    let st;
+    try {
+      st = fs.fstatSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    this._ours.set(filename, st.ino);
+  }
+
+  _ensurePool() {
+    if (this._stopped) return;
+    while (this._ours.size < this._poolTarget) {
+      this.nextReqId();
+    }
+  }
+
+  /** Drop a consumed / replaced slot and mint a replacement. */
+  _releaseSlot(filename) {
+    this._ours.delete(filename);
+    this._seenSize.delete(filename);
+    try { this._ensurePool(); }
+    catch (e) { this.log(`[sign-channel] replenish failed: ${e.message}`); }
   }
 
   /** One sweep of req/ for any unprocessed files. */
@@ -196,6 +292,15 @@ class SignChannelHost {
   async _tryProcess(filename) {
     if (this._stopped) return;
     if (!REQ_FILENAME_RE.test(filename)) return;
+    // I1 / K3 / K4: a file the host never created is not a request. Return
+    // before open / inflight / broker — planted names must not be signed.
+    if (!this._ours.has(filename)) {
+      if (!this._ignored.has(filename)) {
+        this._ignored.add(filename);
+        this.log(`[sign-channel] ignoring unsolicited request ${filename}`);
+      }
+      return;
+    }
     if (this._inflight.has(filename)) return;
     this._inflight.add(filename);
     try {
@@ -215,20 +320,39 @@ class SignChannelHost {
       } catch (e) {
         if (e.code === 'ELOOP') {
           this.log(`[sign-channel] refusing symlinked request ${filename}`);
+          this._releaseSlot(filename);
           return;
         }
-        if (e.code === 'ENOENT') return;
+        if (e.code === 'ENOENT') {
+          this._releaseSlot(filename);
+          return;
+        }
         this.log(`[sign-channel] open ${filename} failed: ${e.message}`);
         return;
       }
       let raw;
+      let st;
       try {
-        const st = await fh.stat();
+        st = await fh.stat();
+        const expectedIno = this._ours.get(filename);
+        if (expectedIno !== undefined && st.ino !== expectedIno) {
+          this.log(`[sign-channel] refusing replaced request ${filename} (ino ${st.ino} != ${expectedIno})`);
+          this._releaseSlot(filename);
+          return;
+        }
+        if (!st.isFile()) {
+          this.log(`[sign-channel] refusing non-regular request ${filename}`);
+          this._releaseSlot(filename);
+          return;
+        }
+        // Empty = still the host-created placeholder; client has not written.
+        if (st.size === 0) return;
         if (st.size > MAX_SIGN_REQ_BYTES) {
           await this._writeResponse(filename.replace(/\.json$/, ''), {
             ok: false,
             error: { code: 'REQ_TOO_LARGE', message: `request exceeds ${MAX_SIGN_REQ_BYTES} bytes (${st.size})` },
           });
+          this._releaseSlot(filename);
           await this._removeReq(reqPath);
           return;
         }
@@ -250,10 +374,18 @@ class SignChannelHost {
       try {
         req = JSON.parse(raw);
       } catch (e) {
+        // First torn write: leave the slot; the poll retries. Same size
+        // seen twice → stable garbage → fail closed.
+        const prev = this._seenSize.get(filename);
+        if (prev !== st.size) {
+          this._seenSize.set(filename, st.size);
+          return;
+        }
         await this._writeResponse(filename.replace(/\.json$/, ''), {
           ok: false,
           error: { code: 'BAD_JSON', message: e.message },
         });
+        this._releaseSlot(filename);
         await this._removeReq(reqPath);
         return;
       }
@@ -270,6 +402,7 @@ class SignChannelHost {
 
       const response = await this._handle(req);
       await this._writeResponse(safeId, response);
+      this._releaseSlot(filename);
       await this._removeReq(reqPath);
     } finally {
       this._inflight.delete(filename);
@@ -379,4 +512,4 @@ class SignChannelHost {
   }
 }
 
-module.exports = { SignChannelHost, REQ_FILENAME_RE, POLL_INTERVAL_MS };
+module.exports = { SignChannelHost, REQ_FILENAME_RE, POLL_INTERVAL_MS, REQ_POOL_TARGET };

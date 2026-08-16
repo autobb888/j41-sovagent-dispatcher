@@ -10,7 +10,9 @@
  * routes every signing path to the dispatcher's host-side broker.
  *
  * The container has NO access to the agent's WIF — it only writes JSON
- * requests to `/app/sign/req/<id>.json` and polls for `/app/sign/resp/<id>.json`.
+ * *into* a host-created `/app/sign/req/<id>.json` placeholder (`O_WRONLY`,
+ * no create) and polls for `/app/sign/resp/<id>.json`. Names the host did
+ * not pre-create are ignored host-side.
  *
  * Failure modes that callers should expect:
  *   - timeout (`SIGN_TIMEOUT`): the dispatcher didn't respond within `timeoutMs`.
@@ -23,7 +25,6 @@
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
-const crypto = require('node:crypto');
 
 /** How often the client polls resp/ for its response (ms). The dispatcher
  *  responds within ~POLL_INTERVAL_MS (host-side poll) + signing latency
@@ -48,12 +49,16 @@ class SignChannelClient {
    * @param {string} [opts.channelDir]  Container-side channel root. Defaults
    *                                    to `/app/sign` (the bind-mount path).
    * @param {number} [opts.timeoutMs]   Per-request timeout. Default 10s.
+   * @param {string} [opts.reqPrefix]   If set (or `J41_SIGN_REQ_PREFIX` in
+   *                                    env), only write into host slots whose
+   *                                    filename starts with this prefix.
    */
-  constructor({ channelDir = '/app/sign', timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  constructor({ channelDir = '/app/sign', timeoutMs = DEFAULT_TIMEOUT_MS, reqPrefix } = {}) {
     this.channelDir = channelDir;
     this.reqDir = path.join(channelDir, 'req');
     this.respDir = path.join(channelDir, 'resp');
     this.timeoutMs = timeoutMs;
+    this.reqPrefix = reqPrefix || process.env.J41_SIGN_REQ_PREFIX || '';
   }
 
   /** RemoteSigner.signMessage — sign an arbitrary message. */
@@ -118,17 +123,12 @@ class SignChannelClient {
       );
     }
 
-    const id = crypto.randomUUID().replace(/-/g, ''); // 32 hex chars
-    const reqPath = path.join(this.reqDir, `${id}.json`);
-    const respPath = path.join(this.respDir, `${id}.json`);
-
-    // Atomic write so the dispatcher's reader never sees a partial file.
-    const tmpPath = path.join(this.reqDir, `.${id}.${crypto.randomBytes(4).toString('hex')}.tmp`);
-    const body = JSON.stringify({ id, method, params });
-    await fsp.writeFile(tmpPath, body, { mode: 0o600 });
-    await fsp.rename(tmpPath, reqPath);
-
+    // Write *into* a host-created placeholder (O_WRONLY|O_TRUNC, no O_CREAT).
+    // Creating a new name would be ignored by the host (`_ours`).
     const deadline = Date.now() + this.timeoutMs;
+    const claimed = await this._claimAndWrite(method, params, deadline);
+    const { id, reqPath, respPath } = claimed;
+
     let responseRaw = null;
     while (Date.now() < deadline) {
       try {
@@ -175,6 +175,73 @@ class SignChannelClient {
       throw new SignChannelError('BAD_RESPONSE', 'broker response missing result');
     }
     return response.result;
+  }
+
+  /**
+   * Find an empty host-created slot and write the request in-place.
+   * Never creates a new name (O_CREAT is not set).
+   */
+  async _claimAndWrite(method, params, deadline) {
+    while (Date.now() < deadline) {
+      const slot = await this._findEmptySlot();
+      if (slot) {
+        const body = JSON.stringify({ id: slot.id, method, params });
+        try {
+          const fh = await fsp.open(
+            slot.reqPath,
+            fs.constants.O_WRONLY | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW,
+          );
+          try {
+            await fh.writeFile(body, 'utf8');
+            await fh.sync();
+          } finally {
+            await fh.close();
+          }
+          return slot;
+        } catch (e) {
+          if (e.code === 'ENOENT' || e.code === 'ELOOP') continue;
+          throw new SignChannelError('WRITE_ERROR', e.message);
+        }
+      }
+      await new Promise((r) => setTimeout(r, RESP_POLL_INTERVAL_MS));
+    }
+    throw new SignChannelError(
+      'SIGN_TIMEOUT',
+      `no host-created request slot in ${this.timeoutMs}ms (method=${method})`,
+    );
+  }
+
+  async _findEmptySlot() {
+    let names;
+    try {
+      names = await fsp.readdir(this.reqDir);
+    } catch (e) {
+      if (e.code === 'ENOENT') {
+        throw new SignChannelError(
+          'CHANNEL_DOWN',
+          `signing channel missing at ${this.channelDir}`,
+        );
+      }
+      throw e;
+    }
+    const prefix = this.reqPrefix;
+    for (const name of names) {
+      if (!/^[a-f0-9-]{8,80}\.json$/i.test(name)) continue;
+      if (prefix && !name.startsWith(prefix)) continue;
+      const reqPath = path.join(this.reqDir, name);
+      try {
+        const st = await fsp.lstat(reqPath);
+        if (!st.isFile() || st.size !== 0) continue;
+      } catch {
+        continue;
+      }
+      return {
+        id: name.replace(/\.json$/i, ''),
+        reqPath,
+        respPath: path.join(this.respDir, name),
+      };
+    }
+    return null;
   }
 }
 
