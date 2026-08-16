@@ -125,3 +125,37 @@ test('every violation names its flag, so the operator can act on the message alo
     assert.match(msg, / — /, `violation must explain itself: ${msg}`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// I5 leftover: config.toml hatches (runtime.allow_local_upstream /
+// runtime.skip_status_check) must be visible to the mainnet gate. The proxy
+// already honors cfg.runtime.*; without this the TOML form bypasses the gate.
+// ---------------------------------------------------------------------------
+
+test('runtime.allow_local_upstream=true (config.toml) produces a violation', () => {
+  const v = findMainnetSecurityViolations({}, {}, { allow_local_upstream: true });
+  assert.ok(v.length >= 1, 'config.toml allow_local_upstream must not bypass the gate');
+  assert.ok(v.some(s => /ALLOW_LOCAL_UPSTREAM|allow_local_upstream|SSRF/.test(s)));
+});
+
+test('runtime.skip_status_check=true (config.toml) produces a violation', () => {
+  const v = findMainnetSecurityViolations({}, {}, { skip_status_check: true });
+  assert.ok(v.length >= 1, 'config.toml skip_status_check must not bypass the gate');
+  assert.ok(v.some(s => /SKIP_STATUS_CHECK|skip_status_check|status/.test(s)));
+});
+
+test('runtime hatches false/absent are not violations', () => {
+  assert.deepEqual(findMainnetSecurityViolations({}, {}, {}), []);
+  assert.deepEqual(findMainnetSecurityViolations({}, {}, { allow_local_upstream: false, skip_status_check: false }), []);
+  assert.deepEqual(findMainnetSecurityViolations({}, {}, undefined), []);
+  assert.deepEqual(findMainnetSecurityViolations({}, {}), []); // third arg omitted
+});
+
+test('env and runtime both set produce one violation each (no double-count)', () => {
+  const v = findMainnetSecurityViolations(
+    { J41_ALLOW_LOCAL_UPSTREAM: '1', J41_SKIP_STATUS_CHECK: '1' },
+    {},
+    { allow_local_upstream: true, skip_status_check: true },
+  );
+  assert.equal(v.length, 2);
+});

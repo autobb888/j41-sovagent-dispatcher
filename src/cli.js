@@ -3750,7 +3750,7 @@ program
     // Mainnet security gate (fail-closed): on network=verus, refuse to start
     // if any insecure escape hatch is set. IS_MAINNET comes from config, not env.
     if (IS_MAINNET) {
-      const violations = findMainnetSecurityViolations(process.env, { devUnsafe: !!options.devUnsafe });
+      const violations = findMainnetSecurityViolations(process.env, { devUnsafe: !!options.devUnsafe }, cfg.runtime);
       if (violations.length) {
         console.error('');
         console.error('  ══════════════════════════════════════════════════');

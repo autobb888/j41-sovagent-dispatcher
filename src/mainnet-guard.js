@@ -14,20 +14,26 @@
  * what gets forwarded into job containers, so an SDK bypass set here reaches the
  * containers too.
  *
+ * Two hatches also exist as config.toml keys under [runtime] (and are what the
+ * proxy actually reads). Pass `cfg.runtime` as the third arg so a mainnet
+ * operator cannot open them via TOML without the start gate seeing them (I5).
+ *
  * Pure: depends only on its arguments; never throws; no I/O.
  * @param {object} env - process.env (or a test double)
  * @param {{devUnsafe?: boolean}} [opts] - parsed start options
+ * @param {{allow_local_upstream?: boolean, skip_status_check?: boolean}} [runtime] - cfg.runtime
  * @returns {string[]} human-readable violation messages (empty = safe)
  */
-function findMainnetSecurityViolations(env, opts) {
+function findMainnetSecurityViolations(env, opts, runtime) {
   const e = env || {};
   const o = opts || {};
+  const r = runtime || {};
   const v = [];
   if (e.J41_SIGNING_BROKER === '0') v.push('J41_SIGNING_BROKER=0 — broker signing disabled; the host-side signing broker is mandatory so the agent WIF never enters the job container');
   if (o.devUnsafe) v.push('--dev-unsafe — local mode with zero container isolation');
   if (e.J41_DISABLE_BWRAP === '1') v.push('J41_DISABLE_BWRAP=1 — disables the bwrap entrypoint sandbox');
-  if (e.J41_ALLOW_LOCAL_UPSTREAM === '1') v.push('J41_ALLOW_LOCAL_UPSTREAM=1 — disables SSRF protection on the proxy');
-  if (e.J41_SKIP_STATUS_CHECK === '1') v.push('J41_SKIP_STATUS_CHECK=1 — skips agent platform-status checks');
+  if (e.J41_ALLOW_LOCAL_UPSTREAM === '1' || r.allow_local_upstream) v.push('J41_ALLOW_LOCAL_UPSTREAM=1 — disables SSRF protection on the proxy');
+  if (e.J41_SKIP_STATUS_CHECK === '1' || r.skip_status_check) v.push('J41_SKIP_STATUS_CHECK=1 — skips agent platform-status checks');
   if (e.J41_ALLOW_LEGACY_REVOKE === '1') v.push('J41_ALLOW_LEGACY_REVOKE=1 — accepts replayable legacy revoke webhooks');
   if (e.J41_WITNESS_VERIFY === 'off') v.push('J41_WITNESS_VERIFY=off — disables platform-witness verification of on-chain job records');
 
