@@ -8847,6 +8847,7 @@ async function checkFeeTanks(state) {
         });
 
         if (res.swept) {
+          recordSendOutcome({ kind: 'fee_sweep', jobId: agentInfo.id, toAddress: rAddress, amountSats: plan.amountSats, txid: res.txid });
           state._feeSweepPending.set(agentInfo.id, { txid: res.txid, at: now });
           const after = writesAffordable(s.feeSats + plan.amountSats);
           console.log(`[FeeTank] ✅ ${agentInfo.id}: swept in ${res.txid.substring(0, 12)} — ~${after} writes once confirmed`);
@@ -11692,6 +11693,7 @@ async function walletSweepOne(state, agentInfo, opts = {}) {
 
     out.swept = true;
     out.txid = res.txid;
+    recordSendOutcome({ kind: 'fee_sweep', jobId: id, toAddress: rAddress, amountSats: plan.amountSats, txid: res.txid });
     try {
       saveWalletPending(id, { txid: res.txid, at: Date.now(), kind: 'sweep' });
     } catch (e) {
@@ -11962,6 +11964,9 @@ async function walletSend(state, fromId, toId, amountStr, opts = {}) {
 
   out.sent = true;
   out.txid = res.txid;
+  // Ledger the self-directed transfer (P4). No suspension/allowlist gate — it moves
+  // only to a fleet agent's own R-address; the advisory absolute cap warns, never blocks.
+  recordSendOutcome({ kind: 'fleet_transfer', jobId: null, toAddress: to.address, amountSats: plan.sendSats, txid: res.txid });
   try {
     saveWalletPending(from.id, { txid: res.txid, at: Date.now(), kind: 'send' });
   } catch (e) {

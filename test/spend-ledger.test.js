@@ -60,6 +60,24 @@ test('an allowed send + recorded outcome leave both a decision and an outcome li
   assert.equal(outcome.amountSats, '100000000'); // 1 VRSC in sats, as a string
 });
 
+test('fleet-internal sends are ledgered and NEVER blocked by the absolute cap', () => {
+  SP._resetDispatcherRateLimit(false);
+  // A huge self-directed sweep: recorded + advisory-warned, never denied.
+  SP.recordSendOutcome({ kind: 'fee_sweep', jobId: 'agent-x', toAddress: 'iOWN', amountSats: 500000000000, txid: 'TX-sweep-big' });
+  const l = readLedger().find(x => x.txid === 'TX-sweep-big');
+  assert.ok(l, 'a fee_sweep outcome line was written');
+  assert.equal(l.event, 'broadcast_outcome');
+  assert.equal(l.kind, 'fee_sweep');
+  assert.equal(l.amountSats, '500000000000');
+});
+
+test('a fleet_transfer outcome does NOT consume the refund limiter budget', () => {
+  SP._resetDispatcherRateLimit(false);
+  const before = SP.loadSendHistory().global.length;
+  SP.recordSendOutcome({ kind: 'fleet_transfer', jobId: null, toAddress: 'iOWN2', amountSats: 100000000, txid: 'TX-fleet' });
+  assert.equal(SP.loadSendHistory().global.length, before, 'self-directed sends must not deplete the refund budget');
+});
+
 test('fail-closed: an unwritable ledger denies an otherwise-allowed send RETRYABLE', () => {
   SP._resetDispatcherRateLimit(false);
   seedAllowlist('iLEDGER2');

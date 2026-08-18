@@ -595,11 +595,11 @@ function _amountSatsStr(amount) {
   return s === null ? null : s.toString();
 }
 
-function _ledgerBase(kind, jobId, toAddress, amount, now) {
+function _ledgerBase(kind, jobId, toAddress, amount, now, amountSatsOverride) {
   return {
     ts: new Date(now).toISOString(), kind,
     jobId: jobId || null, toAddress: toAddress || null,
-    amountSats: _amountSatsStr(amount),
+    amountSats: amountSatsOverride != null ? String(amountSatsOverride) : _amountSatsStr(amount),
   };
 }
 
@@ -689,12 +689,25 @@ function gateExternalSend({ jobId, toAddress, amount, jobPrice, kind, expectedRe
   return finish(true, false, null);
 }
 
-/** Record the result of a send: limiter state for external kinds; ledger for all. */
-function recordSendOutcome({ kind, jobId, toAddress, amount, txid, denial, now = Date.now() }) {
-  if (EXTERNAL_KINDS.has(kind)) recordDispatcherSend(jobId, amount, now);
+/**
+ * Record the result of a send. External kinds consume the refund limiter budget;
+ * self-directed kinds (fleet_transfer / fee_sweep) do NOT — they only ledger, plus
+ * an ADVISORY absolute-cap warning (never a block: terminally capping a self→self
+ * sweep would strand the fee tank, C1). `amountSats` may be supplied directly (the
+ * fleet paths already hold integer sats); otherwise it is derived from `amount`.
+ */
+function recordSendOutcome({ kind, jobId, toAddress, amount, amountSats, txid, denial, now = Date.now() }) {
+  if (EXTERNAL_KINDS.has(kind)) {
+    recordDispatcherSend(jobId, amount, now);
+  } else {
+    const sats = amountSats != null ? amountSats : _amountSats(amount);
+    if (sats !== null && sats > HARD_MAX_SINGLE_SEND_SATS) {
+      console.warn(`[spend-policy] ${kind} of ${sats} sat exceeds the advisory per-tx cap — allowed (self-directed), logged.`);
+    }
+  }
   // Best-effort: the money already moved, so a lost audit line must not crash us.
   try {
-    appendLedger({ event: 'broadcast_outcome', ..._ledgerBase(kind, jobId, toAddress, amount, now),
+    appendLedger({ event: 'broadcast_outcome', ..._ledgerBase(kind, jobId, toAddress, amount, now, amountSats),
       txid: txid || null, denial: denial || null });
   } catch (e) {
     console.warn(`[spend-ledger] could not record ${kind} outcome (money already moved): ${e.message}`);
