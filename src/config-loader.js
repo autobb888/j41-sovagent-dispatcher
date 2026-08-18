@@ -83,6 +83,12 @@ const DEFAULTS = Object.freeze({
     max_sends_per_hour: 10,      // fleet-wide; a pause, not a refusal — see attemptPendingRefund
     cooldown_ms: 30000,          // between two sends for the SAME job
   },
+  // P6 — external-send approval mode. "always" (the default and today's behaviour)
+  // means EVERY external send (a buyer refund) is owner-approved before it drains:
+  // entries enter the refund ledger as pending_approval and only `approved` sends.
+  // Formalization only — there is deliberately NO auto-approve path here; adding one
+  // would introduce a new unattended send into the money path.
+  spend_policy: { approval: 'always' },
   health: { poll_interval_ms: 60000 },
   webhook: { max_body_bytes: 1048576 },
   retry: { rate_limit_backoff_multiplier: 3 },

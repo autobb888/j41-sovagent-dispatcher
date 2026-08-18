@@ -713,6 +713,16 @@ not currently appear in `ctl status` or `/health` — so check
 `j41-dispatcher refunds` after any crash or dispute. Until an entry is
 approved, the buyer has not been paid.
 
+**Every outbound send passes one spend-policy gate** (`src/spend-policy.js`):
+counterparty authorization (the allowlist for refunds; the job record for
+payments), per-job / value-ceiling / hourly / cooldown rate limits, and a
+compiled **hard ceiling** (`×2.0` of job price, 10 sends/job, 100/hour, 1000 VRSC
+per tx) that a hand-edited `refund_limits` config **cannot widen** — anything
+above is clamped and, on mainnet, refuses startup. Every gate decision and
+broadcast outcome is appended to `~/.j41/spend-ledger.jsonl`. Approval mode is
+`spend_policy.approval = "always"` (the default): external sends are owner-approved,
+with no auto-approve path.
+
 ```bash
 j41-dispatcher refunds                    # list pending (default action)
 j41-dispatcher refunds list --all         # include refunded/rejected entries too
