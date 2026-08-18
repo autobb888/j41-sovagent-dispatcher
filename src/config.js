@@ -10,6 +10,7 @@ const DISPATCHER_DIR = path.join(os.homedir(), '.j41', 'dispatcher');
 const CONFIG_PATH = path.join(DISPATCHER_DIR, 'config.json');
 const ACTIVE_JOBS_PATH = path.join(DISPATCHER_DIR, 'active-jobs.json');
 const REACTIVATION_QUEUE_PATH = path.join(DISPATCHER_DIR, 'reactivation-queue.json');
+const LEASES_PATH = path.join(DISPATCHER_DIR, 'leases.json');
 
 const DEFAULTS = {
   runtime: 'docker',
@@ -104,10 +105,35 @@ function loadReactivationQueue() {
   }
 }
 
+// S5 — compute leases. The lease file is the source of truth for crash-recovery
+// release: a leaked lease is capacity (and eventually money) burning, so the write
+// is atomic tmp→rename like the other financial-adjacent state above.
+function persistLeases(leaseMap) {
+  try {
+    fs.mkdirSync(DISPATCHER_DIR, { recursive: true });
+    const obj = leaseMap instanceof Map ? Object.fromEntries(leaseMap) : (leaseMap || {});
+    const tmp = LEASES_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+    fs.renameSync(tmp, LEASES_PATH); // atomic replace
+  } catch (e) {
+    console.error(`[config] Failed to persist leases: ${e.message}`);
+  }
+}
+
+function loadLeases() {
+  try {
+    if (!fs.existsSync(LEASES_PATH)) return {};
+    return JSON.parse(fs.readFileSync(LEASES_PATH, 'utf8')) || {};
+  } catch {
+    return {};
+  }
+}
+
 module.exports = {
   CONFIG_PATH,
   ACTIVE_JOBS_PATH,
   REACTIVATION_QUEUE_PATH,
+  LEASES_PATH,
   loadConfig,
   saveConfig,
   getRuntime,
@@ -115,4 +141,6 @@ module.exports = {
   loadActiveJobs,
   persistReactivationQueue,
   loadReactivationQueue,
+  persistLeases,
+  loadLeases,
 };
