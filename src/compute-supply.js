@@ -47,6 +47,31 @@ function createSupplyController({ cfg, agentConfigs, now = Date.now }) {
     persist();
   }
 
+  // Provision rented (vast) leases. OFF unless compute.max_usd_per_hour > 0 — paid
+  // provisioning is opt-in. Every acquire passes the ceiling gate. Never auto-spends
+  // when disabled.
+  async function attachVastLeases() {
+    const max = Number(compute.max_usd_per_hour) || 0;
+    for (const [name, pcfg] of Object.entries(provCfgs)) {
+      if (pcfg.type !== 'vast') continue;
+      if (max <= 0) { console.log(`  Compute: vast "${name}" provisioning off (set compute.max_usd_per_hour > 0)`); continue; }
+      const provider = createProvider('vast', { id: `vast:${name}`, ...pcfg });
+      try {
+        const cands = await provider.discover({});
+        if (!cands.length) { console.log(`  Compute: vast "${name}" — no offers matched the spec`); continue; }
+        let lease = await acquireUnderCeiling(provider, cands[0]);
+        lease = await provider.waitReady(lease, { timeoutMs: 300000 });
+        leases.set(lease.id, lease);
+        bound.set(lease.id, { provider, agentId: pcfg.agent_id });
+        if (lease.state === 'ready') publishUpstream(pcfg.agent_id, lease);
+        else unpublishUpstream(pcfg.agent_id);
+      } catch (e) {
+        console.error(`  Compute: vast "${name}" attach failed: ${e.message}`);
+      }
+    }
+    persist();
+  }
+
   async function reconcileTick() {
     // Snapshot: a replacement adds a fresh lease mid-loop, and iterating the live Map
     // would re-probe it in the same tick (an unhealthy-probe provider would loop forever).
@@ -128,7 +153,7 @@ function createSupplyController({ cfg, agentConfigs, now = Date.now }) {
     bound.set(lease.id, { provider, agentId });
   }
 
-  return { attachLocalLeases, reconcileTick, releaseOrphansOnBoot, getLeases, publishUpstream, unpublishUpstream, committedUsdPerHour, acquireUnderCeiling, _injectBoundLease };
+  return { attachLocalLeases, attachVastLeases, reconcileTick, releaseOrphansOnBoot, getLeases, publishUpstream, unpublishUpstream, committedUsdPerHour, acquireUnderCeiling, _injectBoundLease };
 }
 
 // Singleton handle for the control API (T10). Set by maybeStartComputeSupply.
@@ -142,6 +167,7 @@ async function maybeStartComputeSupply({ cfg, agentConfigs }) {
   const ctrl = createSupplyController({ cfg, agentConfigs });
   try { await ctrl.releaseOrphansOnBoot(); } catch { /* boot best-effort */ }
   await ctrl.attachLocalLeases();
+  await ctrl.attachVastLeases();
   const ms = Number(cfg.compute.reconcile_ms) || 60000;
   const timer = setInterval(() => { ctrl.reconcileTick().catch(() => {}); }, ms);
   if (timer.unref) timer.unref();
