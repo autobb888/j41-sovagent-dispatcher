@@ -177,20 +177,28 @@ one step):
 
 ### 4.3 Which checks apply by kind
 
-| Check | refund | payment | fleet_transfer | fee_sweep |
-|---|---|---|---|---|
-| suspension | ✓ | ✓ | ✓ | ✓ |
-| counterparty authorization | allowlist + refund-target | `expectedRecipients` (job record) | own-addr invariant | own-addr invariant |
-| per-job cap | ✓ | ✓ | — | — |
-| value ceiling | ✓ | ✓ | — | — |
-| hourly cap | ✓ | ✓ | — | — |
-| cooldown | ✓ | ✓ | — | — |
-| absolute per-tx cap | ✓ terminal | ✓ terminal | ⚠ advisory (warn) | ⚠ advisory (warn) |
-| ledger | ✓ | ✓ | ✓ | ✓ |
+**Only external kinds pass through `gateExternalSend`.** Fleet-internal kinds are
+ledgered via `recordSendOutcome` and never enter the gate — so the suspension /
+counterparty / rate checks below simply do not apply to them (routing them through
+the gate would newly subject an operator's fleet transfer/sweep to the financial
+kill switch, a behavior change we deliberately avoid). Their only spend-policy
+touch is the ledger line and the **advisory** absolute-cap warning.
+
+| Check (gate) | refund | payment | fleet_transfer / fee_sweep |
+|---|---|---|---|
+| unknown-kind / bad-amount fail-closed | ✓ terminal | ✓ terminal | n/a (not gated) |
+| suspension | ✓ | ✓ | not gated |
+| counterparty authorization | allowlist + refund-target | `expectedRecipients` (pinned fee addr + platform-trusted payout) | own-addr invariant (in wallet.js) |
+| per-job cap / value ceiling / hourly / cooldown | ✓ (kind-scoped key) | ✓ (kind-scoped key) | — |
+| absolute per-tx cap | ✓ terminal (null → deny) | ✓ terminal (null → deny) | ⚠ advisory via recordSendOutcome |
+| ledger | ✓ (gate + outcome) | ✓ (gate + outcome) | ✓ (outcome only) |
 
 **⚠ advisory** = ledger the breach + loud WARN, but **do not deny** — a
 self-directed sweep/transfer has no counterparty risk and a terminal deny there
-strands the fee tank (C1).
+strands the fee tank (C1). **Kind-scoped key:** refunds use `jobId`; payments use
+`payment:${jobId}` so the two never share a per-job/value/cooldown budget. **null →
+deny:** an amount the cap cannot evaluate is a terminal deny on external kinds
+(fail-closed), never a silently-skipped `pass`.
 
 The **counterparty authorization** row is the one gate whose *source of truth*
 differs by kind (allowlist for refunds, authoritative job record for payments,

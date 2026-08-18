@@ -17,7 +17,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { loadDispatcherConfig } = require('./config-loader.js');
 const { untrusted } = require('./untrusted.js');
-const { parseVrscAmount } = require('./wallet.js'); // string→BigInt-sats; the only float-safe parse
+const { parseVrscAmount } = require('./wallet.js'); // string→Number-sats (checked, capped 2^50)
 
 const J41_DIR = path.join(os.homedir(), '.j41');
 const DISPATCHER_DIR = path.join(J41_DIR, 'dispatcher');
@@ -482,12 +482,17 @@ function _resetDispatcherRateLimit(suspended = false) {
 
 // ── The funnel: gateExternalSend / recordSendOutcome (P1) ──
 //
-// One entry point every outbound send passes. It composes the primitives above
-// (suspension, allowlist, rate limiter) and — from P2/P3 — the absolute per-tx
-// cap and the unified ledger. `kind` selects which checks apply:
-//   refund / payment          → external: counterparty + full rate family + abs cap
-//   fleet_transfer / fee_sweep → self-directed: suspension + advisory abs cap
+// gateExternalSend is the single gate before an EXTERNAL (counterparty) broadcast —
+// a refund or a payment. It composes suspension + counterparty + the rate family +
+// the absolute per-tx cap + the unified ledger, and fails CLOSED on anything it does
+// not understand (unknown kind, uninterpretable amount).
+//
+// Self-directed moves (fleet_transfer / fee_sweep) are deliberately NOT gated here —
+// they are only ledgered, via recordSendOutcome. Routing them through the gate would
+// newly subject an operator's fleet transfer / fee sweep to the financial kill
+// switch, which they have never been subject to. See recordSendOutcome.
 const EXTERNAL_KINDS = new Set(['refund', 'payment']);
+const KNOWN_KINDS = new Set(['refund', 'payment', 'fleet_transfer', 'fee_sweep']);
 
 // ── Compiled hard ceilings (P2) ──────────────────────────────────────────────
 //
@@ -507,10 +512,13 @@ const _clampedKeysSet = new Set();
 function _clampedKeys() { return [..._clampedKeysSet]; }
 
 function _clamp(key, val, hard) {
-  if (Number.isFinite(val) && val > hard) {
+  // Clamp when over the ceiling OR non-finite (NaN/Infinity/undefined/string). Production
+  // config is already sanitized to finite defaults by dispatcherRateLimits(); this also
+  // protects the effectiveLimits(raw) override path from a non-finite widen.
+  if (!Number.isFinite(val) || val > hard) {
     if (!_clampedKeysSet.has(key)) {
       _clampedKeysSet.add(key);
-      console.warn(`[spend-policy] ${key}=${val} exceeds the compiled ceiling ${hard} — clamped. ` +
+      console.warn(`[spend-policy] ${key}=${val} is not within the compiled ceiling ${hard} — clamped. ` +
         'A configured limit above the hard cap means the config/env was hand-edited.');
     }
     return hard;
@@ -529,10 +537,23 @@ function effectiveLimits(raw) {
   };
 }
 
-/** Decimal amount (number or string) → integer satoshis (Number), or null if unparseable. */
+/**
+ * Decimal amount (number or string) → integer satoshis (Number), or null ONLY when the
+ * amount is genuinely uninterpretable (NaN / Infinity / <= 0 / non-numeric).
+ *
+ * Prefers the exact parse (parseVrscAmount: canonical decimal, <=8 dp, <=2^50 sat).
+ * Falls back to Math.round(n * 1e8) for any OTHER finite positive number — because float
+ * arithmetic upstream (refundAmount = jobAmount * pct/100; a payout+fee sum) routinely
+ * yields >8 decimals the strict parser rejects. A satoshi of rounding is irrelevant to a
+ * 1000-VRSC threshold and to the audit amount, and it means a large/float-dust amount is
+ * bounded and recorded — NEVER silently skipped past the absolute cap.
+ */
 function _amountSats(amount) {
   const r = parseVrscAmount(typeof amount === 'string' ? amount : String(amount));
-  return r.ok ? r.sats : null;
+  if (r.ok) return r.sats;
+  const n = typeof amount === 'string' ? Number(amount) : amount;
+  if (Number.isFinite(n) && n > 0) return Math.round(n * 1e8);
+  return null;
 }
 
 // ── Unified append-only ledger (P3) ──────────────────────────────────────────
@@ -569,6 +590,12 @@ function _withLedgerLock(fn) {
       if (stale) { try { fs.unlinkSync(SPEND_LEDGER_LOCK); } catch { /* raced */ } continue; }
       const until = Date.now() + 15; while (Date.now() < until) { /* brief spin */ }
     }
+  }
+  if (!held) {
+    // Deadline hit: append unserialized rather than drop the line. Worst case is an
+    // interleaved audit line under multi-process contention — never a money effect —
+    // but say so, so a persistently-stuck lock is visible (matches withSendHistoryLock).
+    console.warn('[spend-ledger] lock not acquired within 5s — appending UNSERIALIZED; a concurrent writer could interleave this audit line.');
   }
   try { return fn(); }
   finally {
@@ -633,7 +660,7 @@ function _rateCheckField(checks, reason) {
  *   `retryable` distinguishes "wait and retry" from "needs operator action";
  *   callers must not drop a retryable send.
  */
-function gateExternalSend({ jobId, toAddress, amount, jobPrice, kind, expectedRecipients, now = Date.now() }) {
+function gateExternalSend({ jobId, toAddress, amount, amountSats, jobPrice, kind, expectedRecipients, now = Date.now() }) {
   const checks = {
     suspension: 'skip', counterparty: 'skip', perJobCap: 'skip',
     valueCeiling: 'skip', hourlyCap: 'skip', cooldown: 'skip', absoluteCap: 'skip',
@@ -646,7 +673,7 @@ function gateExternalSend({ jobId, toAddress, amount, jobPrice, kind, expectedRe
   const finish = (allowed, retryable, reason) => {
     const decision = { allowed, retryable: !!retryable, reason: reason || undefined, checks };
     try {
-      appendLedger({ event: 'gate_decision', ..._ledgerBase(kind, jobId, toAddress, amount, now),
+      appendLedger({ event: 'gate_decision', ..._ledgerBase(kind, jobId, toAddress, amount, now, amountSats),
         allowed: decision.allowed, retryable: decision.retryable, reason: reason || null, checks });
     } catch (e) {
       if (allowed) {
@@ -657,6 +684,27 @@ function gateExternalSend({ jobId, toAddress, amount, jobPrice, kind, expectedRe
     }
     return decision;
   };
+
+  // 0. Fail CLOSED on an unrecognized kind — a money gate must never default-allow an
+  //    input it does not understand (an unknown kind would otherwise be treated as
+  //    self-directed and skip every external check).
+  if (!KNOWN_KINDS.has(kind)) return finish(false, false, `Unknown send kind: ${kind}`);
+
+  // Kind-scoped limiter key: refunds keep the bare jobId (behaviour-preserving), every
+  // OTHER external kind gets its own namespace so a payment can never deplete a refund's
+  // per-job / value-ceiling / cooldown budget for the same job (or vice versa).
+  const limiterKey = kind === 'refund' ? jobId : `${kind}:${jobId}`;
+
+  // For external kinds, coerce+validate the amount up front: the rate-family math and the
+  // cap both need a finite positive number, and a string would corrupt the ceiling
+  // arithmetic (0 + "5" = "05"). An uninterpretable external amount fails closed.
+  let amtNum = null;
+  if (external) {
+    amtNum = typeof amount === 'string' ? Number(amount) : amount;
+    if (!Number.isFinite(amtNum) || amtNum <= 0) {
+      return finish(false, false, `Uninterpretable send amount: ${amount}`);
+    }
+  }
 
   // 1. Counterparty authorization (external only) — FIRST, matching the historical
   //    allowlist-before-ratelimit order in attemptPendingRefund.
@@ -674,28 +722,35 @@ function gateExternalSend({ jobId, toAddress, amount, jobPrice, kind, expectedRe
 
   // 2. Suspension + rate family.
   if (external) {
-    const rl = checkDispatcherRateLimit(jobId, amount, jobPrice, now);
+    const rl = checkDispatcherRateLimit(limiterKey, amtNum, jobPrice, now);
     if (!rl.allowed) { _rateCheckField(checks, rl.reason); return finish(false, rl.retryable, rl.reason); }
     checks.suspension = 'pass';
     checks.perJobCap = 'pass'; checks.valueCeiling = 'pass';
     checks.hourlyCap = 'pass'; checks.cooldown = 'pass';
   } else {
-    // Self-directed: the only shared gate is the kill switch.
+    // Self-directed: the only shared gate is the kill switch. (No production caller
+    // reaches this branch today — fleet sends ledger via recordSendOutcome — but it is
+    // kept correct so a future gated fleet path is safe by construction.)
     if (isFinanciallySuspended()) { checks.suspension = 'fail'; return finish(false, true, 'Financial operations suspended (API outage)'); }
     checks.suspension = 'pass';
   }
 
-  // 3. Absolute per-tx cap (P2). Terminal for external kinds; advisory (warn, never
-  //    deny) for self-directed sweeps — a self→self move has no counterparty risk,
-  //    and terminally blocking a large sweep would strand the fee tank (C1).
-  const sats = _amountSats(amount);
-  if (sats !== null && sats > HARD_MAX_SINGLE_SEND_SATS) {
+  // 3. Absolute per-tx cap (P2). Prefer the exact amountSats the caller supplied (pay-jobs
+  //    holds it); else derive from the amount. Terminal for external kinds — and an
+  //    UNRESOLVABLE cap value on an external send is a terminal deny (fail closed), never a
+  //    skipped 'pass'. Advisory (warn, never deny) for self-directed sweeps: a self→self
+  //    move has no counterparty risk and blocking a large sweep would strand the fee tank (C1).
+  const sats = amountSats != null ? amountSats : _amountSats(amount);
+  if (sats === null) {
+    if (external) { checks.absoluteCap = 'fail'; return finish(false, false, `Uninterpretable amount for the per-tx cap: ${amount}`); }
+    checks.absoluteCap = 'warn';
+  } else if (sats > HARD_MAX_SINGLE_SEND_SATS) {
     if (external) {
       checks.absoluteCap = 'fail';
-      return finish(false, false, `Amount ${amount} exceeds the hard per-tx cap of ${HARD_MAX_SINGLE_SEND_SATS} sats`);
+      return finish(false, false, `Amount ${amount} (${sats} sat) exceeds the hard per-tx cap of ${HARD_MAX_SINGLE_SEND_SATS} sats`);
     }
     checks.absoluteCap = 'warn';
-    console.warn(`[spend-policy] ${kind} of ${amount} exceeds the advisory per-tx cap — allowed (self-directed), logged.`);
+    console.warn(`[spend-policy] ${kind} of ${sats} sat exceeds the advisory per-tx cap — allowed (self-directed), logged.`);
   } else {
     checks.absoluteCap = 'pass';
   }
@@ -712,7 +767,10 @@ function gateExternalSend({ jobId, toAddress, amount, jobPrice, kind, expectedRe
  */
 function recordSendOutcome({ kind, jobId, toAddress, amount, amountSats, txid, denial, now = Date.now() }) {
   if (EXTERNAL_KINDS.has(kind)) {
-    recordDispatcherSend(jobId, amount, now);
+    // Same kind-scoped key the gate read from, so the record lands in the budget the
+    // gate checked (refund → jobId; payment → payment:${jobId}).
+    const limiterKey = kind === 'refund' ? jobId : `${kind}:${jobId}`;
+    recordDispatcherSend(limiterKey, amount, now);
   } else {
     const sats = amountSats != null ? amountSats : _amountSats(amount);
     if (sats !== null && sats > HARD_MAX_SINGLE_SEND_SATS) {

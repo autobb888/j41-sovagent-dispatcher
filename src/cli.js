@@ -3305,6 +3305,18 @@ program
   .action(async (options) => {
     ensureDirs();
 
+    // Spend-policy approval mode (P6): "always" is the only supported value — every
+    // external send is owner-approved. There is deliberately no auto-approve path, so
+    // any OTHER value is a misconfiguration that would silently promise automation we
+    // do not implement. Refuse to start (fail-closed) rather than run under a false
+    // belief about how money leaves the host.
+    const _approval = (loadDispatcherConfig().spend_policy || {}).approval;
+    if (_approval !== 'always') {
+      console.error(`[spend-policy] spend_policy.approval="${_approval}" is not supported — only "always" exists ` +
+        '(every external send is owner-approved; there is no auto-approve path). Set it to "always" or remove it.');
+      process.exit(1);
+    }
+
     // Mainnet security gate (fail-closed): on network=verus, refuse to start
     // if any insecure escape hatch is set. IS_MAINNET comes from config, not env.
     if (IS_MAINNET) {
@@ -6753,9 +6765,10 @@ async function attemptPendingRefund(state, jobId, entry, ledgerPath = PENDING_RE
     const _gate = gateExternalSend({ jobId, toAddress: buyerAddress, amount: refundAmount, jobPrice: _jobPrice, kind: 'refund' });
     if (!_gate.allowed) {
       if (_gate.retryable) {
-        // Cooldown / hourly cap / outage suspension: the entry STAYS in the ledger
-        // and the next drain retries it. An operator with a large approved backlog
-        // raises refund_limits.max_sends_per_hour rather than waiting it out.
+        // Cooldown / hourly cap / outage suspension: the entry STAYS in the ledger and
+        // the next drain retries it. An operator with a large approved backlog raises
+        // refund_limits.max_sends_per_hour (up to the compiled ceiling of 100/hr) rather
+        // than waiting it out.
         console.log(`  [refund] ⏸  ${jobId.substring(0, 8)}: ${_gate.reason} — deferring to the next drain`);
         return false;
       }
@@ -6765,8 +6778,8 @@ async function attemptPendingRefund(state, jobId, entry, ledgerPath = PENDING_RE
         console.error(`  [refund] ❌ BLOCKED: Refund address ${untrusted(buyerAddress, 60)} not in allowlist — skipping refund for ${jobId.substring(0, 8)}`);
         return true;
       }
-      console.error(`  [refund] ⛔ ${jobId.substring(0, 8)}: BLOCKED — ${_gate.reason}`);
-      console.error('  [refund]    This job has already been paid up to its limit. Nothing was sent.');
+      console.error(`  [refund] ⛔ ${jobId.substring(0, 8)}: BLOCKED — ${_gate.reason}. Nothing was sent.`);
+      console.error('  [refund]    A human must review this before it can be paid (it will not retry on its own).');
       console.error(`  [refund]    Inspect it, then drop it with:  j41-dispatcher refunds reject ${jobId}`);
       return false;
     }

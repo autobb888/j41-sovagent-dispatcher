@@ -145,3 +145,56 @@ test('an in-cap external send passes the absolute cap', () => {
   assert.equal(r.allowed, true);
   assert.equal(r.checks.absoluteCap, 'pass');
 });
+
+// ── Audit-fix regressions (would have caught the fail-open defects) ──
+
+test('B1: a huge amount above parseVrscAmount ceiling is DENIED, not silently skipped', () => {
+  SP._resetDispatcherRateLimit(false);
+  seedAllowlist('iHuge');
+  // 12M VRSC — above parseVrscAmount's 2^50-sat ceiling; the exploit that slipped the cap.
+  const r = SP.gateExternalSend({ jobId: 'huge', toAddress: 'iHuge', amount: 12000000, jobPrice: 20000000, kind: 'refund' });
+  assert.equal(r.allowed, false);
+  assert.equal(r.checks.absoluteCap, 'fail');
+});
+
+test('B1: float-dust amounts are rounded and cap-checked (over → deny, under → pass, never skipped)', () => {
+  SP._resetDispatcherRateLimit(false);
+  seedAllowlist('iDustOver');
+  const over = SP.gateExternalSend({ jobId: 'dustover', toAddress: 'iDustOver', amount: 1000.1999999999999, jobPrice: 2000, kind: 'refund' });
+  assert.equal(over.allowed, false);
+  assert.equal(over.checks.absoluteCap, 'fail');
+
+  SP._resetDispatcherRateLimit(false);
+  seedAllowlist('iDustUnder');
+  const under = SP.gateExternalSend({ jobId: 'dustunder', toAddress: 'iDustUnder', amount: 0.1 + 0.2, jobPrice: 1, kind: 'refund' });
+  assert.equal(under.allowed, true);
+  assert.equal(under.checks.absoluteCap, 'pass'); // evaluated, not skipped
+});
+
+test('Finding 3: an uninterpretable external amount fails CLOSED', () => {
+  SP._resetDispatcherRateLimit(false);
+  seedAllowlist('iBad');
+  for (const bad of [NaN, -5, 0, 'not-a-number', Infinity]) {
+    const r = SP.gateExternalSend({ jobId: 'bad', toAddress: 'iBad', amount: bad, jobPrice: 1, kind: 'refund' });
+    assert.equal(r.allowed, false, `amount ${bad} must be denied`);
+  }
+});
+
+test('Finding 2: an unknown/typo\'d kind fails CLOSED (never default-allow)', () => {
+  SP._resetDispatcherRateLimit(false);
+  for (const k of [undefined, 'pay', 'Payment', '', 'transfer']) {
+    const r = SP.gateExternalSend({ jobId: 'k', toAddress: 'iX', amount: 999999, jobPrice: 1, kind: k });
+    assert.equal(r.allowed, false, `kind ${String(k)} must be denied`);
+  }
+});
+
+test('B2: a payment does not deplete the same job\'s refund budget', () => {
+  SP._resetDispatcherRateLimit(false);
+  seedAllowlist('iBuyerB2');
+  // Three payments to the job — would exhaust the per-job cap (3) if the budget were shared.
+  for (let i = 0; i < 3; i++) {
+    SP.recordSendOutcome({ kind: 'payment', jobId: 'sharedjob', toAddress: 'iAgent', amount: 1, amountSats: 100000000, txid: `p${i}`, now: Date.now() - (i + 1) * 60000 });
+  }
+  const r = SP.gateExternalSend({ jobId: 'sharedjob', toAddress: 'iBuyerB2', amount: 0.5, jobPrice: 1, kind: 'refund' });
+  assert.equal(r.allowed, true, 'the refund budget must be independent of payments to the same job');
+});

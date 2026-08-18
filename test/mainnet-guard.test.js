@@ -148,3 +148,14 @@ test('clean spend-policy facts add no violations', () => {
 test('a writable ledger (true) and absent clamps add nothing', () => {
   assert.deepEqual(findMainnetSecurityViolations({}, { spendLedgerWritable: true }), []);
 });
+
+test('B3: a clamped COUNT limit is NOT a mainnet violation (documented backlog workflow)', () => {
+  assert.deepEqual(findMainnetSecurityViolations({}, { clampedConfigKeys: ['max_sends_per_hour'] }), []);
+  assert.deepEqual(findMainnetSecurityViolations({}, { clampedConfigKeys: ['max_sends_per_job'] }), []);
+});
+
+test('B3: only a clamped VALUE multiplier blocks a mainnet start', () => {
+  const v = findMainnetSecurityViolations({}, { clampedConfigKeys: ['max_sends_per_hour', 'max_value_multiplier'] });
+  assert.equal(v.length, 1);
+  assert.match(v[0], /max_value_multiplier/);
+});

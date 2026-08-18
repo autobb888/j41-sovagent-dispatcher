@@ -46,7 +46,7 @@ function planPayJob(job, opts = {}) {
   if (feeStated) {
     const fee = parseVrscAmount(String(feeRaw));
     if (!fee.ok) return deny(`bad fee amount: ${fee.error}`);
-    if (fee.sats > 0n) {
+    if (fee.sats > 0) { // parseVrscAmount returns Number sats (it already rejects zero)
       if (!feeAddr) return deny('a fee is stated but no platform fee address is configured');
       outputs.push({ address: feeAddr, amount: String(feeRaw), amountSats: fee.sats });
     }
@@ -98,10 +98,14 @@ async function main() {
       const plan = planPayJob(job, { platformFeeAddress: PLATFORM_FEE_ADDRESS, expected });
       if (!plan.gate.allowed) { console.error(`  ${jobId.slice(0, 8)}: refused — ${plan.gate.reason}`); continue; }
 
-      // Authorize the whole multi-output tx as a UNIT: caps, hard ceilings, ledger.
+      // planPayJob already authorized every output against the expected recipients
+      // (the per-output unit check). Here the gate enforces caps + hard ceilings + the
+      // ledger for the whole tx. Pass the EXACT integer-sats sum for the absolute cap —
+      // never the float VRSC sum (that is what lets a dusty amount slip the cap).
+      const totalSats = plan.outputs.reduce((s, o) => s + o.amountSats, 0);
       const totalVrsc = plan.outputs.reduce((s, o) => s + Number(o.amount), 0);
       const gate = gateExternalSend({
-        jobId, toAddress: job.payment.address, amount: totalVrsc,
+        jobId, toAddress: job.payment.address, amount: totalVrsc, amountSats: totalSats,
         jobPrice: Number(job.amount), kind: 'payment', expectedRecipients: expected,
       });
       if (!gate.allowed) { console.error(`  ${jobId.slice(0, 8)}: gate denied — ${gate.reason}`); continue; }
@@ -110,7 +114,7 @@ async function main() {
       const outputs = plan.outputs.map((o) => ({ address: o.address, amount: o.amount }));
       console.log(`  ${jobId.slice(0, 8)}: sending ${outputs.map((o) => `${o.amount}→${o.address.slice(0, 12)}…`).join(', ')}`);
       const txid = await agent.sendMultiPayment(outputs);
-      recordSendOutcome({ kind: 'payment', jobId, toAddress: job.payment.address, amount: totalVrsc, txid });
+      recordSendOutcome({ kind: 'payment', jobId, toAddress: job.payment.address, amount: totalVrsc, amountSats: totalSats, txid });
       await agent.client.recordPaymentCombined(jobId, txid);
       console.log(`  ${jobId.slice(0, 8)}: ✅ ${txid}`);
     } catch (e) {
