@@ -15,18 +15,17 @@ function relProvider(released) {
   };
 }
 
-test('reconcileTick releases a rental lease past its expiry and clears its upstream', async () => {
+test('reconcileTick releases a rental lease past its expiry', async () => {
   let t = 5000;
   const released = [];
   const agentConfigs = new Map();
   const ctrl = createSupplyController({ cfg: { compute: { enabled: true, max_usd_per_hour: 1, providers: {} } }, agentConfigs, now: () => t });
   const lease = { id: 'vast:r', provider: 'vast', state: 'ready', usdPerHour: 0.3, baseUrl: 'http://r/v1', jobId: 'job-1', expiresAt: 4000, private: false, meta: {} };
   ctrl._injectBoundLease(lease, relProvider(released), 'agent-1');
-  ctrl.publishUpstream('agent-1', lease);
   await ctrl.reconcileTick();
   assert.ok(released.includes('vast:r'), 'expired rental was released');
   assert.equal(ctrl.getLeases().find((l) => l.id === 'vast:r').state, 'released');
-  assert.equal(agentConfigs.get('agent-1').endpointUrl, null);
+  // (a rental box is never published as a proxy upstream — H6b — so there is none to clear)
 });
 
 test('a not-yet-expired rental is NOT released', async () => {
@@ -40,8 +39,11 @@ test('a not-yet-expired rental is NOT released', async () => {
 });
 
 test('releaseOrphansOnBoot releases a persisted rental whose job is no longer active', async () => {
-  persistLeases(new Map([['vast:r', { id: 'vast:r', provider: 'vast', state: 'ready', jobId: 'job-dead', baseUrl: 'http://x/v1' }]]));
-  const ctrl = createSupplyController({ cfg: { compute: { enabled: true, providers: {} } }, agentConfigs: new Map() });
+  // Reconstructs the provider WITH its real config (api_key), so the DELETE is
+  // authenticated and the release actually succeeds (C1). A fake fetch answers DELETE 200.
+  const okDelete = async (url, opts = {}) => ({ status: (opts.method || 'GET') === 'DELETE' ? 200 : 404, ok: true, async json() { return {}; }, async text() { return ''; } });
+  persistLeases(new Map([['vast:r', { id: 'vast:r', provider: 'vast', state: 'ready', jobId: 'job-dead', providerName: 'cloud', meta: { instanceId: 5 } }]]));
+  const ctrl = createSupplyController({ cfg: { compute: { enabled: true, providers: { cloud: { type: 'vast', api_key: 'k', fetchImpl: okDelete } } } }, agentConfigs: new Map() });
   await ctrl.releaseOrphansOnBoot(() => false);
-  assert.deepEqual(loadLeases(), {});
+  assert.deepEqual(loadLeases(), {}, 'terminal-job rental released and file cleared');
 });
