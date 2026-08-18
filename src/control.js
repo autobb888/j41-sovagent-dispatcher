@@ -633,6 +633,13 @@ async function handleCommand(cmd, state, handlers, startedAt) {
     case 'deposits':
       return buildDepositSurface(state);
 
+    case 'leases': {
+      // S5 — compute-supply leases. Empty when [compute] is disabled.
+      const { getCurrentController } = require('./compute-supply');
+      const c = getCurrentController();
+      return { leases: c ? c.getLeases() : [] };
+    }
+
     case 'inbox-redrive': {
       // Clear dead-letter quarantine without a restart, granting a fresh full
       // budget. Deliberate operator action — nothing calls this automatically.

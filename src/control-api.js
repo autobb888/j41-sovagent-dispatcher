@@ -199,6 +199,12 @@ function startControlApi(state, handlers, opts = {}) {
         const since = parseInt(url.searchParams.get('since') || '0', 10);
         return sendJson(res, 200, bus.query(Number.isNaN(since) ? 0 : since));
       }
+      if (route === '/v1/leases') {
+        // S5 — compute-supply leases. Empty array when [compute] is disabled.
+        const { getCurrentController } = require('./compute-supply');
+        const ctrl = getCurrentController();
+        return sendJson(res, 200, { leases: ctrl ? ctrl.getLeases() : [] });
+      }
 
       return sendJson(res, 404, { error: `unknown endpoint: ${route}` });
     } catch (e) {

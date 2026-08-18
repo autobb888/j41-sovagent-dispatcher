@@ -10508,7 +10508,7 @@ program
 // ── Control Plane Client ──
 program
   .command('ctl <command>')
-  .description('Send command to running dispatcher: status, jobs, agents, resources, earnings, history, providers, inbox, inbox-redrive, deposits, shutdown, canary')
+  .description('Send command to running dispatcher: status, jobs, agents, resources, earnings, history, providers, inbox, inbox-redrive, deposits, leases, shutdown, canary')
   .option('--agent <id>', 'Agent ID (for canary command)')
   .option('--item <id>', 'Inbox item ID (for inbox-redrive)')
   .option('--all', 'inbox-redrive: redrive EVERY dead letter (destructive — hands fresh budgets to poisoned items)')
@@ -10634,6 +10634,21 @@ program
             console.log(`Available: ${(result.available || []).join(', ')}\n`);
           }
           break;
+
+        case 'leases': {
+          const leases = result.leases || [];
+          if (leases.length === 0) {
+            console.log('\nNo compute leases ([compute] disabled or none active).\n');
+          } else {
+            console.log(`\nCompute leases (${leases.length}):\n`);
+            for (const l of leases) {
+              const gpu = l.gpu?.name ? `${l.gpu.name}${l.gpu.count > 1 ? `×${l.gpu.count}` : ''}` : '?';
+              console.log(`  ${l.id.padEnd(20)} ${String(l.state).padEnd(9)} ${gpu.padEnd(14)} $${l.usdPerHour}/h  → ${l.baseUrl || '(no upstream)'}${l.private ? '  [private]' : ''}`);
+            }
+            console.log('');
+          }
+          break;
+        }
 
         case 'earnings':
           console.log('\n╔══════════════════════════════════════════╗');
