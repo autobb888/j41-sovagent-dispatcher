@@ -476,6 +476,78 @@ function _resetDispatcherRateLimit(suspended = false) {
   setFinancialSuspended(suspended);
 }
 
+// ── The funnel: gateExternalSend / recordSendOutcome (P1) ──
+//
+// One entry point every outbound send passes. It composes the primitives above
+// (suspension, allowlist, rate limiter) and — from P2/P3 — the absolute per-tx
+// cap and the unified ledger. `kind` selects which checks apply:
+//   refund / payment          → external: counterparty + full rate family + abs cap
+//   fleet_transfer / fee_sweep → self-directed: suspension + advisory abs cap
+const EXTERNAL_KINDS = new Set(['refund', 'payment']);
+
+/** Map a checkDispatcherRateLimit reason onto the specific `checks` field. */
+function _rateCheckField(checks, reason) {
+  const r = String(reason || '');
+  if (/Max sends per job/.test(r)) checks.perJobCap = 'fail';
+  else if (/exceeds job price/.test(r)) checks.valueCeiling = 'fail';
+  else if (/Hourly global limit/.test(r)) checks.hourlyCap = 'fail';
+  else if (/Cooldown/.test(r)) checks.cooldown = 'fail';
+  else if (/suspend/i.test(r)) checks.suspension = 'fail';
+}
+
+/**
+ * The single gate before an outbound broadcast.
+ * @returns {{allowed:boolean, retryable:boolean, reason?:string, checks:object}}
+ *   `retryable` distinguishes "wait and retry" from "needs operator action";
+ *   callers must not drop a retryable send.
+ */
+function gateExternalSend({ jobId, toAddress, amount, jobPrice, kind, expectedRecipients, now = Date.now() }) {
+  const checks = {
+    suspension: 'skip', counterparty: 'skip', perJobCap: 'skip',
+    valueCeiling: 'skip', hourlyCap: 'skip', cooldown: 'skip', absoluteCap: 'skip',
+  };
+  const external = EXTERNAL_KINDS.has(kind);
+  const decide = (allowed, retryable, reason) => ({ allowed, retryable: !!retryable, reason: reason || undefined, checks });
+
+  // 1. Counterparty authorization (external only) — FIRST, matching the historical
+  //    allowlist-before-ratelimit order in attemptPendingRefund.
+  if (external) {
+    const ok = kind === 'refund'
+      ? isAddressInAllowlist(loadFinancialAllowlist(), toAddress)
+      : (Array.isArray(expectedRecipients) && expectedRecipients.includes(toAddress));
+    checks.counterparty = ok ? 'pass' : 'fail';
+    if (!ok) {
+      return decide(false, false, kind === 'refund'
+        ? 'Refund address not in allowlist'
+        : "Payment destination not in the job's expected recipients");
+    }
+  }
+
+  // 2. Suspension + rate family.
+  if (external) {
+    const rl = checkDispatcherRateLimit(jobId, amount, jobPrice, now);
+    if (!rl.allowed) { _rateCheckField(checks, rl.reason); return decide(false, rl.retryable, rl.reason); }
+    checks.suspension = 'pass';
+    checks.perJobCap = 'pass'; checks.valueCeiling = 'pass';
+    checks.hourlyCap = 'pass'; checks.cooldown = 'pass';
+  } else {
+    // Self-directed: the only shared gate is the kill switch.
+    if (isFinanciallySuspended()) { checks.suspension = 'fail'; return decide(false, true, 'Financial operations suspended (API outage)'); }
+    checks.suspension = 'pass';
+  }
+
+  // 3. Absolute per-tx cap — filled by P2 (external terminal, self-directed advisory).
+  //    Task 2 leaves checks.absoluteCap = 'skip'.
+
+  return decide(true, false, null);
+}
+
+/** Record the result of a send: limiter state for external kinds; ledger (P3) for all. */
+function recordSendOutcome({ kind, jobId, amount, now = Date.now() }) {
+  if (EXTERNAL_KINDS.has(kind)) recordDispatcherSend(jobId, amount, now);
+  // P3/Task 4 appends the unified ledger line here.
+}
+
 module.exports = {
   // allowlist
   ALLOWLIST_PATH, loadFinancialAllowlist, isAddressInAllowlist,
@@ -486,4 +558,6 @@ module.exports = {
   _resetDispatcherRateLimit,
   // kill switch
   FINANCIAL_SUSPENDED_PATH, isFinanciallySuspended, setFinancialSuspended,
+  // funnel
+  gateExternalSend, recordSendOutcome, EXTERNAL_KINDS,
 };

@@ -54,3 +54,52 @@ test('the limiter still enforces its documented defaults after the move', () => 
   assert.equal(r.allowed, false);
   assert.equal(r.retryable, false);
 });
+
+// ── Task 2: the gateExternalSend / recordSendOutcome funnel ──
+function seedAllowlist(addr, jobId = 'seed') {
+  const list = SP.loadFinancialAllowlist();
+  if (!list.permanent.some(e => e.address === addr)) list.permanent.push({ address: addr, jobId });
+  fs.writeFileSync(SP.ALLOWLIST_PATH, JSON.stringify(list));
+}
+
+test('refund gate: allows an allowlisted address within limits', () => {
+  SP._resetDispatcherRateLimit(false);
+  seedAllowlist('iBUYER1');
+  const r = SP.gateExternalSend({ jobId: 'g1', toAddress: 'iBUYER1', amount: 1, jobPrice: 1, kind: 'refund' });
+  assert.equal(r.allowed, true);
+  assert.equal(r.checks.counterparty, 'pass');
+});
+
+test('refund gate: denies a non-allowlisted address (terminal)', () => {
+  SP._resetDispatcherRateLimit(false);
+  const r = SP.gateExternalSend({ jobId: 'g2', toAddress: 'iSTRANGER', amount: 1, jobPrice: 1, kind: 'refund' });
+  assert.equal(r.allowed, false);
+  assert.equal(r.retryable, false);
+  assert.equal(r.checks.counterparty, 'fail');
+});
+
+test('payment gate: destination must be in expectedRecipients', () => {
+  SP._resetDispatcherRateLimit(false);
+  const ok = SP.gateExternalSend({ jobId: 'p1', toAddress: 'iAGENT', amount: 1, jobPrice: 1, kind: 'payment', expectedRecipients: ['iAGENT', 'iFEE'] });
+  assert.equal(ok.allowed, true);
+  const bad = SP.gateExternalSend({ jobId: 'p2', toAddress: 'iEVIL', amount: 1, jobPrice: 1, kind: 'payment', expectedRecipients: ['iAGENT', 'iFEE'] });
+  assert.equal(bad.allowed, false);
+  assert.equal(bad.checks.counterparty, 'fail');
+});
+
+test('fleet_transfer gate: skips counterparty + value checks', () => {
+  SP._resetDispatcherRateLimit(false);
+  const r = SP.gateExternalSend({ jobId: null, toAddress: 'iOWN', amount: 5, jobPrice: 0, kind: 'fleet_transfer' });
+  assert.equal(r.allowed, true);
+  assert.equal(r.checks.counterparty, 'skip');
+  assert.equal(r.checks.valueCeiling, 'skip');
+});
+
+test('refund gate: value ceiling is preserved (terminal)', () => {
+  SP._resetDispatcherRateLimit(false);
+  seedAllowlist('iBUYER3');
+  const r = SP.gateExternalSend({ jobId: 'g3', toAddress: 'iBUYER3', amount: 100, jobPrice: 1, kind: 'refund' });
+  assert.equal(r.allowed, false);
+  assert.equal(r.retryable, false);
+  assert.equal(r.checks.valueCeiling, 'fail');
+});
