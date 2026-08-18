@@ -17,6 +17,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { loadDispatcherConfig } = require('./config-loader.js');
 const { untrusted } = require('./untrusted.js');
+const { parseVrscAmount } = require('./wallet.js'); // string→BigInt-sats; the only float-safe parse
 
 const J41_DIR = path.join(os.homedir(), '.j41');
 const DISPATCHER_DIR = path.join(J41_DIR, 'dispatcher');
@@ -485,6 +486,74 @@ function _resetDispatcherRateLimit(suspended = false) {
 //   fleet_transfer / fee_sweep → self-directed: suspension + advisory abs cap
 const EXTERNAL_KINDS = new Set(['refund', 'payment']);
 
+// ── Unified append-only ledger (P3) ──────────────────────────────────────────
+//
+// One JSON line per gate decision (allow AND deny) and per broadcast outcome,
+// covering every kind. Append is a single write() to an O_APPEND fd, taken under a
+// DEDICATED lock (not the send-history lock — reusing it would drag daemon fee
+// sweeps into the refund limiter's critical section). A `checks` object can exceed
+// PIPE_BUF (4 KB), so the lock is what keeps concurrent lines from interleaving.
+const SPEND_LEDGER_PATH = path.join(DISPATCHER_DIR, 'spend-ledger.jsonl');
+const SPEND_LEDGER_LOCK = `${SPEND_LEDGER_PATH}.lock`;
+let _ledgerLockSeq = 0;
+
+function _withLedgerLock(fn) {
+  const deadline = Date.now() + 5000;
+  const token = `${process.pid}:${Date.now()}:${++_ledgerLockSeq}`;
+  let held = false;
+  while (Date.now() < deadline) {
+    try {
+      fs.mkdirSync(path.dirname(SPEND_LEDGER_LOCK), { recursive: true });
+      const fd = fs.openSync(SPEND_LEDGER_LOCK, 'wx');
+      fs.writeSync(fd, token); fs.closeSync(fd); held = true; break;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e; // real fault (perms, EISDIR on the dir) — surface it
+      let stale = false;
+      try {
+        const raw = String(fs.readFileSync(SPEND_LEDGER_LOCK, 'utf8'));
+        const pid = parseInt(raw.split(':')[0], 10);
+        if (Number.isInteger(pid) && pid > 0) {
+          let alive = true; try { process.kill(pid, 0); } catch (er) { alive = (er.code === 'EPERM'); }
+          stale = !alive;
+        } else { stale = (Date.now() - fs.statSync(SPEND_LEDGER_LOCK).mtimeMs) > 2000; }
+      } catch { continue; }
+      if (stale) { try { fs.unlinkSync(SPEND_LEDGER_LOCK); } catch { /* raced */ } continue; }
+      const until = Date.now() + 15; while (Date.now() < until) { /* brief spin */ }
+    }
+  }
+  try { return fn(); }
+  finally {
+    if (held) {
+      try { if (String(fs.readFileSync(SPEND_LEDGER_LOCK, 'utf8')) === token) fs.unlinkSync(SPEND_LEDGER_LOCK); }
+      catch { /* already stolen/gone */ }
+    }
+  }
+}
+
+/** Append one line. THROWS on a write failure — callers decide fail-closed vs best-effort. */
+function appendLedger(obj) {
+  const line = JSON.stringify(obj) + '\n';
+  _withLedgerLock(() => {
+    fs.mkdirSync(path.dirname(SPEND_LEDGER_PATH), { recursive: true });
+    const fd = fs.openSync(SPEND_LEDGER_PATH, 'a'); // EISDIR / ENOSPC surface here
+    try { fs.writeSync(fd, line); } finally { fs.closeSync(fd); }
+  });
+}
+
+/** Decimal amount (number or string) → satoshi string, or null if unparseable. */
+function _amountSatsStr(amount) {
+  const r = parseVrscAmount(typeof amount === 'string' ? amount : String(amount));
+  return r.ok ? r.sats.toString() : null;
+}
+
+function _ledgerBase(kind, jobId, toAddress, amount, now) {
+  return {
+    ts: new Date(now).toISOString(), kind,
+    jobId: jobId || null, toAddress: toAddress || null,
+    amountSats: _amountSatsStr(amount),
+  };
+}
+
 /** Map a checkDispatcherRateLimit reason onto the specific `checks` field. */
 function _rateCheckField(checks, reason) {
   const r = String(reason || '');
@@ -507,7 +576,24 @@ function gateExternalSend({ jobId, toAddress, amount, jobPrice, kind, expectedRe
     valueCeiling: 'skip', hourlyCap: 'skip', cooldown: 'skip', absoluteCap: 'skip',
   };
   const external = EXTERNAL_KINDS.has(kind);
-  const decide = (allowed, retryable, reason) => ({ allowed, retryable: !!retryable, reason: reason || undefined, checks });
+
+  // finish() records the decision to the ledger and returns it. For an ALLOW, a
+  // ledger-write failure flips to a RETRYABLE deny (fail-closed): an irreversible
+  // send whose authorization we could not record must not go out.
+  const finish = (allowed, retryable, reason) => {
+    const decision = { allowed, retryable: !!retryable, reason: reason || undefined, checks };
+    try {
+      appendLedger({ event: 'gate_decision', ..._ledgerBase(kind, jobId, toAddress, amount, now),
+        allowed: decision.allowed, retryable: decision.retryable, reason: reason || null, checks });
+    } catch (e) {
+      if (allowed) {
+        const denied = { allowed: false, retryable: true, reason: `spend-ledger unwritable: ${e.message}`, checks };
+        return denied;
+      }
+      console.warn(`[spend-ledger] could not record a denied ${kind}: ${e.message}`);
+    }
+    return decision;
+  };
 
   // 1. Counterparty authorization (external only) — FIRST, matching the historical
   //    allowlist-before-ratelimit order in attemptPendingRefund.
@@ -517,7 +603,7 @@ function gateExternalSend({ jobId, toAddress, amount, jobPrice, kind, expectedRe
       : (Array.isArray(expectedRecipients) && expectedRecipients.includes(toAddress));
     checks.counterparty = ok ? 'pass' : 'fail';
     if (!ok) {
-      return decide(false, false, kind === 'refund'
+      return finish(false, false, kind === 'refund'
         ? 'Refund address not in allowlist'
         : "Payment destination not in the job's expected recipients");
     }
@@ -526,26 +612,32 @@ function gateExternalSend({ jobId, toAddress, amount, jobPrice, kind, expectedRe
   // 2. Suspension + rate family.
   if (external) {
     const rl = checkDispatcherRateLimit(jobId, amount, jobPrice, now);
-    if (!rl.allowed) { _rateCheckField(checks, rl.reason); return decide(false, rl.retryable, rl.reason); }
+    if (!rl.allowed) { _rateCheckField(checks, rl.reason); return finish(false, rl.retryable, rl.reason); }
     checks.suspension = 'pass';
     checks.perJobCap = 'pass'; checks.valueCeiling = 'pass';
     checks.hourlyCap = 'pass'; checks.cooldown = 'pass';
   } else {
     // Self-directed: the only shared gate is the kill switch.
-    if (isFinanciallySuspended()) { checks.suspension = 'fail'; return decide(false, true, 'Financial operations suspended (API outage)'); }
+    if (isFinanciallySuspended()) { checks.suspension = 'fail'; return finish(false, true, 'Financial operations suspended (API outage)'); }
     checks.suspension = 'pass';
   }
 
   // 3. Absolute per-tx cap — filled by P2 (external terminal, self-directed advisory).
   //    Task 2 leaves checks.absoluteCap = 'skip'.
 
-  return decide(true, false, null);
+  return finish(true, false, null);
 }
 
-/** Record the result of a send: limiter state for external kinds; ledger (P3) for all. */
-function recordSendOutcome({ kind, jobId, amount, now = Date.now() }) {
+/** Record the result of a send: limiter state for external kinds; ledger for all. */
+function recordSendOutcome({ kind, jobId, toAddress, amount, txid, denial, now = Date.now() }) {
   if (EXTERNAL_KINDS.has(kind)) recordDispatcherSend(jobId, amount, now);
-  // P3/Task 4 appends the unified ledger line here.
+  // Best-effort: the money already moved, so a lost audit line must not crash us.
+  try {
+    appendLedger({ event: 'broadcast_outcome', ..._ledgerBase(kind, jobId, toAddress, amount, now),
+      txid: txid || null, denial: denial || null });
+  } catch (e) {
+    console.warn(`[spend-ledger] could not record ${kind} outcome (money already moved): ${e.message}`);
+  }
 }
 
 module.exports = {
@@ -560,4 +652,6 @@ module.exports = {
   FINANCIAL_SUSPENDED_PATH, isFinanciallySuspended, setFinancialSuspended,
   // funnel
   gateExternalSend, recordSendOutcome, EXTERNAL_KINDS,
+  // ledger
+  SPEND_LEDGER_PATH, appendLedger,
 };
