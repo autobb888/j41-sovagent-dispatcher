@@ -3,15 +3,29 @@ const { ComputeProvider } = require('./base');
 const { scoreOffers } = require('./vast-offers');
 
 // Vast.ai provider. All HTTP goes through an injectable fetch (llm-health.js idiom),
-// so CI drives it with fixtures and never spends a dollar. Error mapping is load-
-// bearing: 410 on create = offer evaporated (retry the SEARCH not the create),
-// 429 = backoff, 400 = fatal config (bad/missing SSH key).
+// so CI drives it with fixtures and never spends a dollar.
+//
+// Money-safety invariants (hardened after adversarial review):
+//   - release() marks a lease released ONLY on 404/410/2xx. Any other status (401 from
+//     a mis-keyed provider, 429, 5xx) THROWS so the caller keeps retrying — a box wrongly
+//     marked released bills forever.
+//   - Cat-1 rentals are on-demand: when interruptible=false, acquire() omits the bid
+//     `price`, so the instance can't be reclaimed mid-hour.
+//   - probe() is service-level (a running instance with a dead vLLM is NOT healthy).
 class VastProvider extends ComputeProvider {
   constructor(cfg = {}) {
     super();
     this.cfg = cfg;
     this.base = (cfg.base || 'https://cloud.vast.ai/api/v0').replace(/\/$/, '');
     this.fetchImpl = cfg.fetchImpl || globalThis.fetch;
+    // Config tables are snake_case ([compute.providers.*]); accept camelCase too.
+    this.minVramGb = cfg.min_vram_gb ?? cfg.minVramGb;
+    this.maxUsdPerHour = cfg.max_usd_per_hour ?? cfg.maxUsdPerHour;
+    this.minGpuCount = cfg.min_gpu_count ?? cfg.minGpuCount;
+    this.interruptible = cfg.interruptible !== undefined ? cfg.interruptible : true;
+    this.image = cfg.image || 'vllm/vllm-openai:latest';
+    this.diskGb = Number(cfg.disk_gb) || 40;
+    this.onstart = cfg.onstart || null; // vLLM launch command (model arg etc.)
   }
 
   async _req(method, path, body) {
@@ -27,15 +41,19 @@ class VastProvider extends ComputeProvider {
     if (!res.ok) throw new Error(`VAST_DISCOVER_FAILED status=${res.status}`);
     const data = await res.json();
     return scoreOffers(data.offers || [], {
-      minVramGb: this.cfg.minVramGb, maxUsdPerHour: this.cfg.maxUsdPerHour, minGpuCount: this.cfg.minGpuCount, ...spec,
+      minVramGb: this.minVramGb, maxUsdPerHour: this.maxUsdPerHour, minGpuCount: this.minGpuCount,
+      interruptible: this.interruptible, ...spec,
     });
   }
 
   async acquire(candidate) {
     const askId = candidate && candidate.meta && candidate.meta.askId;
-    const res = await this._req('PUT', `/asks/${askId}/`, {
-      price: candidate.usdPerHour, disk: 20, image: this.cfg.image || 'vllm/vllm-openai:latest',
-    });
+    const body = { disk: this.diskGb, image: this.image };
+    if (this.onstart) body.onstart = this.onstart;
+    // On-demand (interruptible=false) omits the bid price; a bid price makes the
+    // instance interruptible and reclaimable — never for a Cat-1 rental.
+    if (this.interruptible) body.price = candidate.usdPerHour;
+    const res = await this._req('PUT', `/asks/${askId}/`, body);
     if (res.status === 410) throw new Error('VAST_OFFER_GONE');
     if (res.status === 429) throw new Error('VAST_RATE_LIMITED');
     if (res.status === 400) throw new Error(`VAST_CONFIG_ERROR ${await res.text()}`);
@@ -45,7 +63,7 @@ class VastProvider extends ComputeProvider {
     return {
       id: `vast:${instanceId}`, provider: 'vast', state: 'pending', baseUrl: null, ssh: null,
       gpu: candidate.gpu || null, usdPerHour: candidate.usdPerHour, acquiredAt: Date.now(), expiresAt: null,
-      private: false, meta: { instanceId, askId },
+      private: false, meta: { instanceId, askId, interruptible: this.interruptible },
     };
   }
 
@@ -56,35 +74,53 @@ class VastProvider extends ComputeProvider {
     return (data.instances || []).find((i) => String(i.id) === String(instanceId)) || null;
   }
 
+  _baseUrlFor(inst, lease) {
+    const hostPort = inst.ports && inst.ports['8000/tcp'] && inst.ports['8000/tcp'][0] && inst.ports['8000/tcp'][0].HostPort;
+    return this.cfg.public_url_for ? this.cfg.public_url_for(lease) : `http://${inst.ssh_host}:${hostPort || 8000}/v1`;
+  }
+
   async waitReady(lease, { timeoutMs = 300000 } = {}) {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const inst = await this._instance(lease.meta.instanceId);
       if (inst && inst.actual_status === 'running' && inst.ssh_host) {
-        const hostPort = inst.ports && inst.ports['8000/tcp'] && inst.ports['8000/tcp'][0] && inst.ports['8000/tcp'][0].HostPort;
-        const baseUrl = this.cfg.public_url_for
-          ? this.cfg.public_url_for(lease)
-          : `http://${inst.ssh_host}:${hostPort || 8000}/v1`;
-        return { ...lease, state: 'ready', baseUrl, ssh: { host: inst.ssh_host, port: inst.ssh_port, user: 'root' } };
+        const baseUrl = this._baseUrlFor(inst, lease);
+        // Service-level readiness: the instance is up AND vLLM answers /models.
+        if (await this._serviceUp(baseUrl)) {
+          return { ...lease, state: 'ready', baseUrl, ssh: { host: inst.ssh_host, port: inst.ssh_port, user: 'root' } };
+        }
       }
       if (Date.now() > deadline) return { ...lease, state: 'degraded' };
       await new Promise((r) => setTimeout(r, 5000));
     }
   }
 
+  async _serviceUp(baseUrl) {
+    try { const res = await this.fetchImpl(baseUrl + '/models', { method: 'GET' }); return res.status === 200; }
+    catch { return false; }
+  }
+
   async probe(lease) {
     const inst = await this._instance(lease.meta.instanceId);
-    return { healthy: !!inst && inst.actual_status === 'running', reason: inst ? inst.actual_status : 'instance not found' };
+    if (!inst || inst.actual_status !== 'running') {
+      return { healthy: false, reason: inst ? inst.actual_status : 'instance not found' };
+    }
+    // A running instance whose vLLM has crashed is NOT healthy — probe the endpoint.
+    const base = lease.baseUrl || this._baseUrlFor(inst, lease);
+    const up = await this._serviceUp(base);
+    return { healthy: up, reason: up ? undefined : 'models endpoint not serving' };
   }
 
   async release(lease) {
-    try {
-      const res = await this._req('DELETE', `/instances/${lease.meta.instanceId}/`);
-      if (res.status >= 500) throw new Error(`VAST_RELEASE_FAILED status=${res.status}`); // 404 = already gone
-    } catch (e) {
-      if (!/status=4\d\d/.test(e.message)) throw e; // network error — let caller retry
+    const res = await this._req('DELETE', `/instances/${lease.meta.instanceId}/`);
+    // Idempotent success ONLY on already-gone (404/410) or a real 2xx. Any other
+    // status — 401 (mis-keyed), 403, 429, 5xx — means the box may still be billing:
+    // THROW so the reconcile/boot loop keeps the lease and retries. Network errors
+    // from fetchImpl propagate for the same reason.
+    if (res.status === 404 || res.status === 410 || (res.status >= 200 && res.status < 300)) {
+      return { ...lease, state: 'released' };
     }
-    return { ...lease, state: 'released' };
+    throw new Error(`VAST_RELEASE_FAILED status=${res.status}`);
   }
 
   describeCost(lease) { return { usdPerHour: Number(lease.usdPerHour) || 0, source: 'quoted' }; }
