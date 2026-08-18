@@ -33,4 +33,18 @@ function formatRentalDeliverable(lease, { jobTimeoutMin } = {}) {
   };
 }
 
-module.exports = { assertRentalEligibleAgent, assertApiEligibleAgent, assertProviderCanSsh, formatRentalDeliverable };
+// Acquire a rental lease for a job: canSsh-gated, on-demand pinned (a Cat-1 rental
+// must not be reclaimed mid-hour), job-bound with an expiry. Returns the lease plus
+// the credentials deliverable the (owner-reviewed) worker hook will hand to the buyer.
+async function acquireRentalLease({ controller, provider, spec = {}, jobId, agentId, jobTimeoutMin = 60, now = Date.now() }) {
+  assertProviderCanSsh(provider);
+  const cands = await provider.discover({ ...spec, interruptible: false });
+  if (!cands.length) throw new Error('RENTAL_NO_CAPACITY: no on-demand offer matched the spec');
+  let lease = await controller.acquireUnderCeiling(provider, cands[0]);
+  lease = await provider.waitReady(lease, { timeoutMs: 300000 });
+  lease = { ...lease, jobId, expiresAt: now + jobTimeoutMin * 60000 };
+  controller.bindJobLease(lease, provider, agentId, jobId);
+  return { lease, deliverable: formatRentalDeliverable(lease, { jobTimeoutMin }) };
+}
+
+module.exports = { assertRentalEligibleAgent, assertApiEligibleAgent, assertProviderCanSsh, formatRentalDeliverable, acquireRentalLease };

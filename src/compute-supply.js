@@ -153,7 +153,16 @@ function createSupplyController({ cfg, agentConfigs, now = Date.now }) {
     bound.set(lease.id, { provider, agentId });
   }
 
-  return { attachLocalLeases, attachVastLeases, reconcileTick, releaseOrphansOnBoot, getLeases, publishUpstream, unpublishUpstream, committedUsdPerHour, acquireUnderCeiling, _injectBoundLease };
+  // Bind a lease to a rental job (S7). The jobId + expiresAt on the lease drive
+  // release from reconcile/boot, so the box is freed even if the job loop never gets to.
+  function bindJobLease(lease, provider, agentId, jobId) {
+    const l = { ...lease, jobId };
+    leases.set(l.id, l);
+    bound.set(l.id, { provider, agentId, jobId });
+    return l;
+  }
+
+  return { attachLocalLeases, attachVastLeases, reconcileTick, releaseOrphansOnBoot, getLeases, publishUpstream, unpublishUpstream, committedUsdPerHour, acquireUnderCeiling, bindJobLease, _injectBoundLease };
 }
 
 // Singleton handle for the control API (T10). Set by maybeStartComputeSupply.
