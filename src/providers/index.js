@@ -20,3 +20,6 @@ module.exports = { registerProvider, createProvider, listProviderTypes };
 
 const { LocalProvider } = require('./local');
 registerProvider('local', (cfg) => new LocalProvider(cfg));
+
+const { VastProvider } = require('./vast');
+registerProvider('vast', (cfg) => new VastProvider(cfg));
