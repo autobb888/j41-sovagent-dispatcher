@@ -252,6 +252,7 @@ const {
   SEND_HISTORY_PATH, loadSendHistory,
   FINANCIAL_SUSPENDED_PATH, isFinanciallySuspended, setFinancialSuspended,
   checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit,
+  gateExternalSend, recordSendOutcome,
 } = _spendPolicy;
 
 // ── Dispatcher-side allowlist sweep timer ──
@@ -6735,34 +6736,31 @@ async function attemptPendingRefund(state, jobId, entry, ledgerPath = PENDING_RE
 
     const agent = await getAgentSession(state, agentInfo);
 
-    // ── Allowlist check before refund ──
-    const allowlist = loadFinancialAllowlist();
-    if (!isAddressInAllowlist(allowlist, buyerAddress)) {
-      console.error(`  [refund] ❌ BLOCKED: Refund address ${untrusted(buyerAddress, 60)} not in allowlist — skipping refund for ${jobId.substring(0, 8)}`);
-      // Drop this entry permanently (allowlist block is not a transient failure).
-      return true;
-    }
-
-    // ── Rate limit before the broadcast (M3) ──
-    // The last gate before an irreversible send, and the only one that bounds the
-    // BLAST RADIUS of a bug in the gates above it: the allowlist checks WHO, the
-    // ledger checks WHETHER-ALREADY, the lock checks WHO-ELSE-IS-SENDING — none of
-    // them checks how much, how often, or whether the platform is even reachable.
+    // ── Spend-policy gate before the broadcast (P1) ──
+    // One funnel: counterparty (allowlist) + the rate family (per-job cap, value
+    // ceiling, hourly cap, cooldown, outage suspension). The last gate before an
+    // irreversible send, bounding the blast radius of a bug in any gate above it.
+    // The gate decision is recorded (ledger, P3) here — BEFORE the inflight marker
+    // below — so a denied send leaves nothing behind (C3).
     const _jobPrice = Number(orphan?.jobAmount ?? orphan?.amount);
-    const _rl = checkDispatcherRateLimit(jobId, refundAmount, _jobPrice);
-    if (!_rl.allowed) {
-      if (_rl.retryable) {
+    const _gate = gateExternalSend({ jobId, toAddress: buyerAddress, amount: refundAmount, jobPrice: _jobPrice, kind: 'refund' });
+    if (!_gate.allowed) {
+      if (_gate.retryable) {
         // Cooldown / hourly cap / outage suspension: the entry STAYS in the ledger
         // and the next drain retries it. An operator with a large approved backlog
         // raises refund_limits.max_sends_per_hour rather than waiting it out.
-        console.log(`  [refund] ⏸  ${jobId.substring(0, 8)}: ${_rl.reason} — deferring to the next drain`);
-      } else {
-        // Per-job cap or value ceiling. Retrying cannot help, and dropping the entry
-        // would hide it — leave it queued and say plainly that a human must look.
-        console.error(`  [refund] ⛔ ${jobId.substring(0, 8)}: BLOCKED by rate limit — ${_rl.reason}`);
-        console.error('  [refund]    This job has already been paid up to its limit. Nothing was sent.');
-        console.error(`  [refund]    Inspect it, then drop it with:  j41-dispatcher refunds reject ${jobId}`);
+        console.log(`  [refund] ⏸  ${jobId.substring(0, 8)}: ${_gate.reason} — deferring to the next drain`);
+        return false;
       }
+      // Terminal. Preserve the historical differential: an allowlist block DROPS the
+      // entry (it will never pass), a rate/value block KEEPS it for operator review.
+      if (_gate.checks.counterparty === 'fail') {
+        console.error(`  [refund] ❌ BLOCKED: Refund address ${untrusted(buyerAddress, 60)} not in allowlist — skipping refund for ${jobId.substring(0, 8)}`);
+        return true;
+      }
+      console.error(`  [refund] ⛔ ${jobId.substring(0, 8)}: BLOCKED — ${_gate.reason}`);
+      console.error('  [refund]    This job has already been paid up to its limit. Nothing was sent.');
+      console.error(`  [refund]    Inspect it, then drop it with:  j41-dispatcher refunds reject ${jobId}`);
       return false;
     }
 
@@ -6783,8 +6781,9 @@ async function attemptPendingRefund(state, jobId, entry, ledgerPath = PENDING_RE
     markJobRefunded(jobId);
     clearRefundInflight(jobId); // the send is now recorded; intent resolved
     // Count it AFTER the broadcast, not before: a send that failed to build never
-    // left the host and must not consume the buyer's hourly budget.
-    recordDispatcherSend(jobId, refundAmount);
+    // left the host and must not consume the buyer's hourly budget. recordSendOutcome
+    // both counts against the limiter and (P3) appends the broadcast-outcome ledger line.
+    recordSendOutcome({ kind: 'refund', jobId, toAddress: buyerAddress, amount: refundAmount, txid });
     console.log(`  [refund] ✅ Refund TX: ${txid}`);
 
     // Persist txid to the ledger BEFORE the platform call that follows, so a crash
