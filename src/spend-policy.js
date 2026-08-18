@@ -498,7 +498,9 @@ const EXTERNAL_KINDS = new Set(['refund', 'payment']);
 const HARD_MAX_VALUE_MULTIPLIER = 2.0;
 const HARD_MAX_SENDS_PER_JOB    = 10;
 const HARD_MAX_SENDS_PER_HOUR   = 100;
-const HARD_MAX_SINGLE_SEND_SATS = 1000n * 100_000_000n; // 1000 VRSC, absolute per-tx
+// Integer satoshis as a Number — parseVrscAmount caps amounts at 2^50 sat, well
+// inside MAX_SAFE_INTEGER, so a Number is exact here (same convention as the SDK).
+const HARD_MAX_SINGLE_SEND_SATS = 1000 * 100_000_000; // 1000 VRSC, absolute per-tx
 
 const _clampedKeysSet = new Set();
 /** Keys whose configured value had to be clamped this process (read by the mainnet guard, P5). */
@@ -527,7 +529,7 @@ function effectiveLimits(raw) {
   };
 }
 
-/** Decimal amount (number or string) → BigInt satoshis, or null if unparseable. */
+/** Decimal amount (number or string) → integer satoshis (Number), or null if unparseable. */
 function _amountSats(amount) {
   const r = parseVrscAmount(typeof amount === 'string' ? amount : String(amount));
   return r.ok ? r.sats : null;
