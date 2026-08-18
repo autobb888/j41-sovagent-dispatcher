@@ -48,16 +48,42 @@ function createSupplyController({ cfg, agentConfigs, now = Date.now }) {
   }
 
   async function reconcileTick() {
-    for (const [id, lease] of leases) {
+    // Snapshot: a replacement adds a fresh lease mid-loop, and iterating the live Map
+    // would re-probe it in the same tick (an unhealthy-probe provider would loop forever).
+    for (const [id, lease] of [...leases.entries()]) {
       if (lease.state === 'released') continue;
       const b = bound.get(id);
       const provider = b ? b.provider : createProvider(lease.provider, { id, base_url: lease.baseUrl });
       const agentId = b ? b.agentId : null;
       const health = await provider.probe(lease);
-      const next = { ...lease, state: health.healthy ? 'ready' : 'degraded' };
-      leases.set(id, next);
-      if (health.healthy) publishUpstream(agentId, next);
-      else unpublishUpstream(agentId);
+      if (health.healthy) {
+        const next = { ...lease, state: 'ready' };
+        leases.set(id, next);
+        publishUpstream(agentId, next);
+        continue;
+      }
+      // Unhealthy. For an elastic, provisionable provider (vast), replace-on-death.
+      const caps = (provider && provider.capabilities) || {};
+      if (caps.isElastic && caps.canProvision) {
+        try {
+          const cands = await provider.discover({});
+          if (cands.length) {
+            let fresh = await acquireUnderCeiling(provider, cands[0]);
+            fresh = await provider.waitReady(fresh, { timeoutMs: 300000 });
+            try { await provider.release(lease); } catch { /* best effort */ }
+            leases.delete(id);
+            bound.delete(id);
+            leases.set(fresh.id, fresh);
+            if (b) bound.set(fresh.id, b);
+            if (fresh.state === 'ready') publishUpstream(agentId, fresh);
+            else unpublishUpstream(agentId);
+            continue;
+          }
+        } catch { /* fall through to degrade-in-place */ }
+      }
+      // Non-elastic (local) or replacement failed: degrade in place, clear upstream.
+      leases.set(id, { ...lease, state: 'degraded' });
+      unpublishUpstream(agentId);
     }
     persist();
   }
