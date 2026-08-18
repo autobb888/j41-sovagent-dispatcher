@@ -4241,6 +4241,19 @@ program
         startHealthPoller(agentConfigs, undefined, cfgForHealth.proxy.circuit_threshold);
         console.log(`  Upstream health: polling every 60s (circuit threshold=${cfgForHealth.proxy.circuit_threshold})`);
 
+        // S5 — compute-supply owns lease lifecycle and mutates agentConfigs upstreams at
+        // runtime (a lease's baseUrl becomes an agent's proxy upstream). No-op unless
+        // [compute] enabled=true, so default behaviour is byte-for-byte unchanged.
+        try {
+          const { maybeStartComputeSupply } = require('./compute-supply');
+          proxyContext.computeSupply = await maybeStartComputeSupply({ cfg: cfgForHealth, agentConfigs });
+          if (proxyContext.computeSupply) {
+            const n = proxyContext.computeSupply.getLeases().length;
+            const secs = Math.round((cfgForHealth.compute.reconcile_ms || 60000) / 1000);
+            console.log(`  Compute supply: ${n} lease(s) active (reconcile every ${secs}s)`);
+          }
+        } catch (e) { console.error('compute-supply start failed:', e.message); }
+
         // Backend feature-flag check (soft-required: signing.canonical-v1).
         // Matches the rollout pattern from auth.rpc-unavailable-code. Warn at startup if backend
         // hasn't yet advertised canonical-v1; dispatcher still accepts v1 and continues.
