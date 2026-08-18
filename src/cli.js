@@ -3954,6 +3954,17 @@ program
       options.webhookUrl = cfg.runtime.webhook_url;
       console.log(`  Webhook mode from config.toml: ${options.webhookUrl}`);
     }
+    // H5 — money-safety backstop that runs in BOTH webhook and poll modes and with ZERO
+    // api-endpoint agents: release any orphaned PAID compute lease left by a prior boot,
+    // so a rented box can never keep billing just because this boot has no proxy path. The
+    // full reconcile/attach still runs later (webhook mode) with the live proxy Map.
+    if (cfg.compute && cfg.compute.enabled) {
+      try {
+        const { createSupplyController } = require('./compute-supply');
+        await createSupplyController({ cfg, agentConfigs: new Map() }).releaseOrphansOnBoot();
+      } catch (e) { console.error('  Compute: boot orphan-recovery failed:', e.message); }
+    }
+
     if (options.webhookUrl) {
       // ── WEBHOOK MODE ──
       const webhookPort = parseInt(options.webhookPort) || 9841;

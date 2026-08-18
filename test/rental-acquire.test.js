@@ -40,3 +40,17 @@ test('acquireRentalLease respects the spend ceiling', async () => {
   const ctrl = createSupplyController({ cfg: { compute: { enabled: true, max_usd_per_hour: 0.1, providers: {} } }, agentConfigs: new Map() });
   await assert.rejects(() => acquireRentalLease({ controller: ctrl, provider: sshProvider(), spec: {}, jobId: 'j', agentId: 'a', jobTimeoutMin: 60 }), /CEILING_EXCEEDED/);
 });
+
+test('M4/C4: a box that fails to come up is released, not delivered as ssh:null', async () => {
+  const released = [];
+  const provider = {
+    get capabilities() { return { canProvision: true, canSsh: true, isElastic: true }; },
+    async discover() { return [{ provider: 'vast', usdPerHour: 0.3, gpu: {}, meta: { askId: 1 } }]; },
+    async acquire(c) { return { id: 'vast:r1', provider: 'vast', state: 'pending', usdPerHour: c.usdPerHour, ssh: null, meta: {} }; },
+    async waitReady(l) { return { ...l, state: 'degraded', ssh: null }; }, // never came up
+    async release(l) { released.push(l.id); return { ...l, state: 'released' }; },
+  };
+  const ctrl = createSupplyController({ cfg: { compute: { enabled: true, max_usd_per_hour: 1, providers: {} } }, agentConfigs: new Map() });
+  await assert.rejects(() => acquireRentalLease({ controller: ctrl, provider, spec: {}, jobId: 'j', agentId: 'a', jobTimeoutMin: 60 }), /RENTAL_NOT_READY/);
+  assert.ok(released.includes('vast:r1'), 'the failed box was released (no dangling charge)');
+});

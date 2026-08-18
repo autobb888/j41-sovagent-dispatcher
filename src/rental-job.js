@@ -36,14 +36,21 @@ function formatRentalDeliverable(lease, { jobTimeoutMin } = {}) {
 // Acquire a rental lease for a job: canSsh-gated, on-demand pinned (a Cat-1 rental
 // must not be reclaimed mid-hour), job-bound with an expiry. Returns the lease plus
 // the credentials deliverable the (owner-reviewed) worker hook will hand to the buyer.
-async function acquireRentalLease({ controller, provider, spec = {}, jobId, agentId, jobTimeoutMin = 60, now = Date.now() }) {
+async function acquireRentalLease({ controller, provider, spec = {}, jobId, agentId, jobTimeoutMin = 60, providerName, now = Date.now() }) {
   assertProviderCanSsh(provider);
   const cands = await provider.discover({ ...spec, interruptible: false });
   if (!cands.length) throw new Error('RENTAL_NO_CAPACITY: no on-demand offer matched the spec');
-  let lease = await controller.acquireUnderCeiling(provider, cands[0]);
-  lease = await provider.waitReady(lease, { timeoutMs: 300000 });
-  lease = { ...lease, jobId, expiresAt: now + jobTimeoutMin * 60000 };
-  controller.bindJobLease(lease, provider, agentId, jobId);
+  // acquireUnderCeiling records the pending lease (with jobId) BEFORE waitReady (C4), so a
+  // crash/timeout can't leak an untracked billing box.
+  const pending = await controller.acquireUnderCeiling(provider, cands[0], { agentId, providerName, jobId });
+  const expiresAt = now + jobTimeoutMin * 60000;
+  const ready = await provider.waitReady(pending, { timeoutMs: 300000 });
+  const lease = controller.recordLease({ ...ready, jobId, expiresAt }, provider, agentId, { providerName });
+  // M4 — never hand degraded / ssh:null credentials to a paying buyer. Release + fail.
+  if (lease.state !== 'ready' || !lease.ssh) {
+    await controller.releaseLease(lease);
+    throw new Error('RENTAL_NOT_READY: the rental box did not come up in time (released; no charge should stand)');
+  }
   return { lease, deliverable: formatRentalDeliverable(lease, { jobTimeoutMin }) };
 }
 
