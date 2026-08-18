@@ -78,7 +78,31 @@ function createSupplyController({ cfg, agentConfigs, now = Date.now }) {
 
   function getLeases() { return [...leases.values()]; }
 
-  return { attachLocalLeases, reconcileTick, releaseOrphansOnBoot, getLeases, publishUpstream, unpublishUpstream };
+  // Sum USD/hour committed across held (non-released) leases.
+  function committedUsdPerHour() {
+    let sum = 0;
+    for (const l of leases.values()) if (l.state !== 'released') sum += Number(l.usdPerHour) || 0;
+    return sum;
+  }
+
+  // The hard spend ceiling (spec §7 / GPU doc §7): a paid acquire is refused unless
+  // committed + this candidate stays within compute.max_usd_per_hour. max<=0 blocks
+  // ALL paid provisioning — provisioning is off until the operator opts in with a number.
+  async function acquireUnderCeiling(provider, candidate, opts = {}) {
+    const max = opts.maxUsdPerHour != null ? Number(opts.maxUsdPerHour) : Number(compute.max_usd_per_hour) || 0;
+    const committed = opts.committedUsdPerHour != null ? Number(opts.committedUsdPerHour) : committedUsdPerHour();
+    const add = Number(candidate.usdPerHour) || 0;
+    if (committed + add > max) throw new Error(`CEILING_EXCEEDED committed=${committed} add=${add} max=${max}`);
+    return provider.acquire(candidate);
+  }
+
+  // Test seam: register a pre-built lease + its provider binding (used by replace-on-death tests).
+  function _injectBoundLease(lease, provider, agentId) {
+    leases.set(lease.id, lease);
+    bound.set(lease.id, { provider, agentId });
+  }
+
+  return { attachLocalLeases, reconcileTick, releaseOrphansOnBoot, getLeases, publishUpstream, unpublishUpstream, committedUsdPerHour, acquireUnderCeiling, _injectBoundLease };
 }
 
 // Singleton handle for the control API (T10). Set by maybeStartComputeSupply.
