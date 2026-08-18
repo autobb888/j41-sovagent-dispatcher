@@ -14,6 +14,9 @@ function createProvider(type, cfg) {
 
 function listProviderTypes() { return [...registry.keys()]; }
 
-// Built-in providers self-register on require (see the require at the bottom,
-// added per-provider). `local` is wired in Task 4.
+// Built-in providers self-register on require (see the requires below, added
+// per-provider). Placed after module.exports to avoid a circular-load hazard.
 module.exports = { registerProvider, createProvider, listProviderTypes };
+
+const { LocalProvider } = require('./local');
+registerProvider('local', (cfg) => new LocalProvider(cfg));
