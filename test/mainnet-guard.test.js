@@ -125,3 +125,26 @@ test('every violation names its flag, so the operator can act on the message alo
     assert.match(msg, / — /, `violation must explain itself: ${msg}`);
   }
 });
+
+// ── P5: spend-policy integrity facts (passed in to keep the function pure) ──
+test('a clamped refund_limits key is a mainnet violation', () => {
+  const v = findMainnetSecurityViolations({}, { clampedConfigKeys: ['max_value_multiplier'] });
+  assert.equal(v.length, 1);
+  assert.match(v[0], /max_value_multiplier/);
+  assert.match(v[0], /clamped/);
+});
+
+test('an unwritable spend-ledger is a mainnet violation', () => {
+  const v = findMainnetSecurityViolations({}, { spendLedgerWritable: false });
+  assert.equal(v.length, 1);
+  assert.match(v[0], /spend-ledger/);
+});
+
+test('clean spend-policy facts add no violations', () => {
+  const v = findMainnetSecurityViolations({}, { clampedConfigKeys: [], spendLedgerWritable: true });
+  assert.deepEqual(v, []);
+});
+
+test('a writable ledger (true) and absent clamps add nothing', () => {
+  assert.deepEqual(findMainnetSecurityViolations({}, { spendLedgerWritable: true }), []);
+});

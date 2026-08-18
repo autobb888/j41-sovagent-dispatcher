@@ -3308,7 +3308,14 @@ program
     // Mainnet security gate (fail-closed): on network=verus, refuse to start
     // if any insecure escape hatch is set. IS_MAINNET comes from config, not env.
     if (IS_MAINNET) {
-      const violations = findMainnetSecurityViolations(process.env, { devUnsafe: !!options.devUnsafe });
+      // Force a clamp evaluation against the live config so _clampedKeys() reflects
+      // any refund_limits value edited above the compiled ceiling (P5).
+      _spendPolicy.effectiveLimits();
+      const violations = findMainnetSecurityViolations(process.env, {
+        devUnsafe: !!options.devUnsafe,
+        clampedConfigKeys: _spendPolicy._clampedKeys(),
+        spendLedgerWritable: _spendPolicy.spendLedgerWritable(),
+      });
       if (violations.length) {
         console.error('');
         console.error('  ══════════════════════════════════════════════════');

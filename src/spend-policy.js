@@ -595,6 +595,20 @@ function _amountSatsStr(amount) {
   return s === null ? null : s.toString();
 }
 
+/** Whether the ledger can be appended to (P5 startup probe — the gate fails closed if not). */
+function spendLedgerWritable() {
+  try {
+    fs.mkdirSync(DISPATCHER_DIR, { recursive: true });
+    if (fs.existsSync(SPEND_LEDGER_PATH)) {
+      if (!fs.statSync(SPEND_LEDGER_PATH).isFile()) return false; // a directory where the log should be
+      fs.accessSync(SPEND_LEDGER_PATH, fs.constants.W_OK);
+    } else {
+      fs.accessSync(DISPATCHER_DIR, fs.constants.W_OK);
+    }
+    return true;
+  } catch { return false; }
+}
+
 function _ledgerBase(kind, jobId, toAddress, amount, now, amountSatsOverride) {
   return {
     ts: new Date(now).toISOString(), kind,
@@ -731,4 +745,6 @@ module.exports = {
   // hard ceilings (P2)
   effectiveLimits, _clampedKeys,
   HARD_MAX_VALUE_MULTIPLIER, HARD_MAX_SENDS_PER_JOB, HARD_MAX_SENDS_PER_HOUR, HARD_MAX_SINGLE_SEND_SATS,
+  // mainnet-guard probe (P5)
+  spendLedgerWritable,
 };

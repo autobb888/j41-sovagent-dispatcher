@@ -47,6 +47,16 @@ function findMainnetSecurityViolations(env, opts) {
   if (e.J41_LOCAL_SIGNER_TEST_MODE === '1') v.push('J41_LOCAL_SIGNER_TEST_MODE=1 — lets the local signer sign a deliver message without the authoritative jobHash; a test-only path that must never reach production');
   if (e.J41_TRUST_PLATFORM_RESOLUTION === '1') v.push('J41_TRUST_PLATFORM_RESOLUTION=1 — trusts platform-supplied identity resolution instead of verifying locally, so the platform decides where a payment goes');
 
+  // ── Spend-policy integrity (P5) ──
+  // These are FACTS the caller computed and passed in, so this function stays pure
+  // (no fs/config reads). Each downgrades a money-safety default.
+  for (const key of (Array.isArray(o.clampedConfigKeys) ? o.clampedConfigKeys : [])) {
+    v.push(`refund_limits.${key} exceeds the compiled hard ceiling and was clamped — the config/env was hand-edited above the cap the code enforces`);
+  }
+  if (o.spendLedgerWritable === false) {
+    v.push('the spend-ledger (~/.j41/spend-ledger.jsonl) is not writable — external sends fail closed (nothing broadcasts) until it is');
+  }
+
   return v;
 }
 
