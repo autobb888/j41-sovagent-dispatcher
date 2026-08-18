@@ -112,6 +112,12 @@ const DEFAULTS = Object.freeze({
   // opts back in with JAILBOX_ENABLED=1. The audit-log / attestation machinery
   // is retained intact regardless of this flag.
   jailbox: { enabled: false },
+  // S5 — compute-provider seam. enabled=false ⇒ byte-for-byte current behaviour.
+  // `providers` is a passthrough map of [compute.providers.<name>] tables (deepMerge
+  // carries the dynamic keys through), validated by compute-supply, not here — so an
+  // operator adds a provider without a code change. max_usd_per_hour is the fleet
+  // spend ceiling for paid provisioning (S6/Vast); 0 = no paid provisioning.
+  compute: { enabled: false, default_provider: 'local', reconcile_ms: 60000, max_usd_per_hour: 0, providers: {} },
 });
 
 function deepClone(o) { return JSON.parse(JSON.stringify(o)); }
@@ -158,6 +164,9 @@ const ENV_OVERRIDES = [
   ['J41_REFUND_MAX_VALUE_MULT',     'refund_limits.max_value_multiplier','float'],
   ['J41_REFUND_MAX_SENDS_PER_HOUR', 'refund_limits.max_sends_per_hour',  'int'],
   ['J41_REFUND_COOLDOWN_MS',        'refund_limits.cooldown_ms',         'int'],
+  ['J41_COMPUTE_ENABLED',          'compute.enabled',          'bool'],
+  ['J41_COMPUTE_MAX_USD_PER_HOUR', 'compute.max_usd_per_hour', 'float'],
+  ['J41_COMPUTE_RECONCILE_MS',     'compute.reconcile_ms',     'int'],
   // `bool` (not bool1) deliberately: this is default-ON, so J41_FEE_SWEEP=true
   // must not silently mean "disabled". See applyEnvOverrides.
   ['J41_FEE_SWEEP',            'fee_sweep.enabled',        'bool'],
