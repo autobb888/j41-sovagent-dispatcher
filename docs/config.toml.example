@@ -168,3 +168,11 @@ max_usd_per_hour = 0.0        # fleet spend ceiling for paid provisioning (S6/Va
 # min_vram_gb   = 24
 # min_gpu_count = 1
 # interruptible = true          # Cat-2 tolerates it; Cat-1 (S7) forces false
+#
+# Cat-1 raw-GPU RENTAL (S7): a rental is sold as a JOB whose deliverable is SSH
+# credentials, bounded by [runtime] jobTimeoutMin, all-or-nothing (no pro-rata).
+# It requires an SSH-capable provider (a `local` box returns canSsh:false and is
+# refused — never rent a home LAN bare-metal). A rental service and an api-endpoint
+# service must live on SEPARATE agent slots (the dispatcher enforces this). The
+# rental lease is released automatically at expiry by the compute reconcile loop and,
+# after a crash, by boot recovery — a leaked lease is money burning.

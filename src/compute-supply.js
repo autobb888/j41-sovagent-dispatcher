@@ -5,7 +5,7 @@
 // that Map's entries. No money moves; no external API is called (local only).
 // Spec: junction41/docs/superpowers/specs/2026-08-18-sovereign-supply-integration-design.md §6.2
 const { createProvider } = require('./providers');
-const { persistLeases, loadLeases } = require('./config');
+const { persistLeases, loadLeases, loadActiveJobs } = require('./config');
 
 function createSupplyController({ cfg, agentConfigs, now = Date.now }) {
   const leases = new Map(); // leaseId -> lease
@@ -77,6 +77,16 @@ function createSupplyController({ cfg, agentConfigs, now = Date.now }) {
     // would re-probe it in the same tick (an unhealthy-probe provider would loop forever).
     for (const [id, lease] of [...leases.entries()]) {
       if (lease.state === 'released') continue;
+      // Rental expiry (S7): a job-bound lease past its window is released here, so the
+      // box is freed by the reconcile loop even if the job loop never got to it.
+      if (lease.expiresAt && now() > lease.expiresAt) {
+        const bx = bound.get(id);
+        const prov = bx ? bx.provider : createProvider(lease.provider, { id, base_url: lease.baseUrl });
+        try { await prov.release(lease); } catch { /* idempotent */ }
+        leases.set(id, { ...lease, state: 'released' });
+        unpublishUpstream(bx ? bx.agentId : null);
+        continue;
+      }
       const b = bound.get(id);
       const provider = b ? b.provider : createProvider(lease.provider, { id, base_url: lease.baseUrl });
       const agentId = b ? b.agentId : null;
@@ -116,10 +126,17 @@ function createSupplyController({ cfg, agentConfigs, now = Date.now }) {
   // Boot crash-recovery: release any persisted, non-terminal lease, then clear the
   // file. release() is idempotent, so a double-release (or a lease already gone) is
   // safe. A leaked lease is capacity/money burning — this is the backstop.
-  async function releaseOrphansOnBoot() {
+  async function releaseOrphansOnBoot(isJobActive) {
+    const activeSet = typeof isJobActive === 'function' ? null : new Set(Object.keys(loadActiveJobs()));
+    const active = isJobActive || ((jobId) => activeSet.has(jobId));
     const persisted = loadLeases();
     for (const [id, lease] of Object.entries(persisted)) {
-      if (lease && lease.state && lease.state !== 'released') {
+      if (!lease || !lease.state || lease.state === 'released') continue;
+      // Release a non-job lease (S5: local re-attaches fresh) OR a job-bound lease
+      // whose job is terminal (S7: a leaked rental is money burning). Keep a
+      // job-bound lease whose job is still active.
+      const terminalJob = lease.jobId && !active(lease.jobId);
+      if (terminalJob || !lease.jobId) {
         try { await createProvider(lease.provider, { id, base_url: lease.baseUrl }).release(lease); }
         catch { /* idempotent; ignore */ }
       }
