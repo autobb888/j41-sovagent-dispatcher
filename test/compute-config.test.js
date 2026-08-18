@@ -31,6 +31,16 @@ test('a [compute.providers.*] table is parsed through', () => {
   assert.equal(cfg.compute.providers.workshop.base_url, 'http://192.168.1.50:8000/v1');
 });
 
+test('a [compute.providers.*] vast table is parsed through with the fleet ceiling', () => {
+  fs.writeFileSync(cfgPath, TOML.stringify({
+    compute: { enabled: true, max_usd_per_hour: 0.5, providers: { cloud: { type: 'vast', api_key: 'k', agent_id: 'a1', min_vram_gb: 24 } } },
+  }));
+  const cfg = loadDispatcherConfig({ useCache: false });
+  assert.equal(cfg.compute.providers.cloud.type, 'vast');
+  assert.equal(cfg.compute.max_usd_per_hour, 0.5);
+  assert.equal(cfg.compute.providers.cloud.min_vram_gb, 24);
+});
+
 test('J41_COMPUTE_ENABLED env override flips enabled', () => {
   fs.writeFileSync(cfgPath, '');
   process.env.J41_COMPUTE_ENABLED = 'true';

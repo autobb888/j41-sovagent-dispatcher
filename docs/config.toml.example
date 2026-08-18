@@ -158,3 +158,13 @@ max_usd_per_hour = 0.0        # fleet spend ceiling for paid provisioning (S6/Va
 # vram_gb                = 24
 # gpu_count              = 1
 # allow_private_upstream = true
+
+# A rented cloud GPU (Vast.ai). `max_usd_per_hour` above is the HARD fleet ceiling;
+# vast provisioning stays OFF until it is > 0. `api_key` is your Vast bearer token.
+# [compute.providers.cloud]
+# type          = "vast"
+# agent_id      = "your-agent-id"
+# api_key       = "vast-xxxxxxxx"
+# min_vram_gb   = 24
+# min_gpu_count = 1
+# interruptible = true          # Cat-2 tolerates it; Cat-1 (S7) forces false
