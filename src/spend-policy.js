@@ -389,7 +389,10 @@ function dispatcherRateLimits() {
  *   (per-job cap, value ceiling). Callers must not drop a retryable refund.
  */
 function checkDispatcherRateLimit(jobId, amount, jobPrice, now = Date.now()) {
-  const LIM = dispatcherRateLimits();
+  // effectiveLimits() clamps the configured limits to the compiled hard ceilings
+  // (P2) — this is the single place the value-multiplier / per-job / hourly caps
+  // are enforced, so clamping here is what closes the config-widen gap.
+  const LIM = effectiveLimits();
   if (isFinanciallySuspended()) {
     return {
       allowed: false,
@@ -486,6 +489,50 @@ function _resetDispatcherRateLimit(suspended = false) {
 //   fleet_transfer / fee_sweep → self-directed: suspension + advisory abs cap
 const EXTERNAL_KINDS = new Set(['refund', 'payment']);
 
+// ── Compiled hard ceilings (P2) ──────────────────────────────────────────────
+//
+// Un-widenable. config/env can raise a limit only UP TO these; anything higher is
+// clamped (and logged), so a hand-edited config or a compromised env can never
+// widen the money limiter past them. Set generously — they bound tampering and
+// fat-fingers, not the operator workflows the docs endorse (e.g. backlog drains).
+const HARD_MAX_VALUE_MULTIPLIER = 2.0;
+const HARD_MAX_SENDS_PER_JOB    = 10;
+const HARD_MAX_SENDS_PER_HOUR   = 100;
+const HARD_MAX_SINGLE_SEND_SATS = 1000n * 100_000_000n; // 1000 VRSC, absolute per-tx
+
+const _clampedKeysSet = new Set();
+/** Keys whose configured value had to be clamped this process (read by the mainnet guard, P5). */
+function _clampedKeys() { return [..._clampedKeysSet]; }
+
+function _clamp(key, val, hard) {
+  if (Number.isFinite(val) && val > hard) {
+    if (!_clampedKeysSet.has(key)) {
+      _clampedKeysSet.add(key);
+      console.warn(`[spend-policy] ${key}=${val} exceeds the compiled ceiling ${hard} — clamped. ` +
+        'A configured limit above the hard cap means the config/env was hand-edited.');
+    }
+    return hard;
+  }
+  return val;
+}
+
+/** dispatcherRateLimits() (or a supplied raw object) clamped to the hard ceilings. */
+function effectiveLimits(raw) {
+  const l = raw || dispatcherRateLimits();
+  return {
+    maxSendsPerJob: _clamp('max_sends_per_job', l.maxSendsPerJob, HARD_MAX_SENDS_PER_JOB),
+    maxValueMultiplier: _clamp('max_value_multiplier', l.maxValueMultiplier, HARD_MAX_VALUE_MULTIPLIER),
+    maxSendsPerHour: _clamp('max_sends_per_hour', l.maxSendsPerHour, HARD_MAX_SENDS_PER_HOUR),
+    cooldownMs: l.cooldownMs,
+  };
+}
+
+/** Decimal amount (number or string) → BigInt satoshis, or null if unparseable. */
+function _amountSats(amount) {
+  const r = parseVrscAmount(typeof amount === 'string' ? amount : String(amount));
+  return r.ok ? r.sats : null;
+}
+
 // ── Unified append-only ledger (P3) ──────────────────────────────────────────
 //
 // One JSON line per gate decision (allow AND deny) and per broadcast outcome,
@@ -542,8 +589,8 @@ function appendLedger(obj) {
 
 /** Decimal amount (number or string) → satoshi string, or null if unparseable. */
 function _amountSatsStr(amount) {
-  const r = parseVrscAmount(typeof amount === 'string' ? amount : String(amount));
-  return r.ok ? r.sats.toString() : null;
+  const s = _amountSats(amount);
+  return s === null ? null : s.toString();
 }
 
 function _ledgerBase(kind, jobId, toAddress, amount, now) {
@@ -622,8 +669,20 @@ function gateExternalSend({ jobId, toAddress, amount, jobPrice, kind, expectedRe
     checks.suspension = 'pass';
   }
 
-  // 3. Absolute per-tx cap — filled by P2 (external terminal, self-directed advisory).
-  //    Task 2 leaves checks.absoluteCap = 'skip'.
+  // 3. Absolute per-tx cap (P2). Terminal for external kinds; advisory (warn, never
+  //    deny) for self-directed sweeps — a self→self move has no counterparty risk,
+  //    and terminally blocking a large sweep would strand the fee tank (C1).
+  const sats = _amountSats(amount);
+  if (sats !== null && sats > HARD_MAX_SINGLE_SEND_SATS) {
+    if (external) {
+      checks.absoluteCap = 'fail';
+      return finish(false, false, `Amount ${amount} exceeds the hard per-tx cap of ${HARD_MAX_SINGLE_SEND_SATS} sats`);
+    }
+    checks.absoluteCap = 'warn';
+    console.warn(`[spend-policy] ${kind} of ${amount} exceeds the advisory per-tx cap — allowed (self-directed), logged.`);
+  } else {
+    checks.absoluteCap = 'pass';
+  }
 
   return finish(true, false, null);
 }
@@ -654,4 +713,7 @@ module.exports = {
   gateExternalSend, recordSendOutcome, EXTERNAL_KINDS,
   // ledger
   SPEND_LEDGER_PATH, appendLedger,
+  // hard ceilings (P2)
+  effectiveLimits, _clampedKeys,
+  HARD_MAX_VALUE_MULTIPLIER, HARD_MAX_SENDS_PER_JOB, HARD_MAX_SENDS_PER_HOUR, HARD_MAX_SINGLE_SEND_SATS,
 };
