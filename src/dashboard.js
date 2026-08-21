@@ -21,6 +21,14 @@ const { untrusted, untrustedField } = require('./untrusted.js');
 // service-pricing surface, which is the mainnet mirror of the bug the CLI had.
 const NATIVE_COIN = networkCurrency(loadDispatcherConfig().platform.network);
 const { writeKeysFile, readKeysFile } = require('./keys-file.js');
+const {
+  parseListingKind,
+  advertisedIdentity,
+  kindFromIdentityName,
+  leafFromIdentity,
+  listingIdPrefix,
+  KIND_BLURB,
+} = require('./listing-kind.js');
 const { sendCommand } = require('./control.js');
 const { renderActiveJobs, runLiveScreen } = require('./tui/live-screen.js');
 const { formatUpstreamHealthTag } = require('./tui/health-tag.js');
@@ -282,8 +290,8 @@ async function mainMenu(inquirer) {
     name: 'choice',
     message: 'What would you like to do?',
     choices: [
-      { name: `[1]  View Agents (${agents.length} registered)`, value: 'agents' },
-      { name: '[2]  Add New Agent', value: 'add' },
+      { name: `[1]  View listings (${agents.length} registered)`, value: 'agents' },
+      { name: '[2]  Sign up — register a listing', value: 'add' },
       { name: '[3]  Configure Agent Executor', value: 'executor' },
       { name: '[4]  Configure Global LLM Default', value: 'llm' },
       { name: '[5]  Configure Services', value: 'services' },
@@ -1189,63 +1197,91 @@ async function createCustomTemplate(inquirer, tplDir) {
 
 async function addAgentScreen(inquirer) {
   console.clear();
-  console.log('\n  ═══ Add New Agent ═══\n');
+  console.log('\n  ═══ Sign up — register a listing ═══\n');
+  console.log('  What are you listing?\n');
+
+  const { kindChoice } = await promptWithEsc(inquirer, [{
+    type: 'list', pageSize: 10, name: 'kindChoice',
+    message: 'Kind:',
+    choices: [
+      { name: `  agent     ${KIND_BLURB.agent}  → name.sovagent@`, value: 'agent' },
+      { name: `  compute   ${KIND_BLURB.compute}  → name.sovcompute@`, value: 'compute' },
+      { name: `  data      ${KIND_BLURB.data}  → name.sovdata@`, value: 'data' },
+      { name: '  model     coming soon — catalog over compute+data, not mintable yet', value: '__model', disabled: 'coming soon' },
+    ],
+  }]);
+  const kind = parseListingKind(kindChoice);
+  if (!kind) return;
 
   const agents = getAgents();
-  const nextNum = agents.length + 1;
-  const defaultId = `agent-${nextNum}`;
+  const sameKind = agents.filter(a => (a.kind || 'agent') === kind).length;
+  const defaultId = `${listingIdPrefix(kind)}-${sameKind + 1}`;
 
-  const { agentId } = await promptWithEsc(inquirer, [{ type: 'input', name: 'agentId', message: 'Agent ID (local identifier):', default: defaultId }]);
+  const { agentId } = await promptWithEsc(inquirer, [{ type: 'input', name: 'agentId', message: 'Local ID (folder name on this machine):', default: defaultId }]);
   if (fs.existsSync(path.join(AGENTS_DIR, agentId, 'keys.json'))) {
-    console.log(`\n  ❌ Agent ${agentId} already exists.\n`);
+    console.log(`\n  ❌ ${agentId} already exists.\n`);
     await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
     return;
   }
 
-  const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'Identity name (lowercase, no spaces — becomes <name>.agentplatform@):' }]);
+  const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: `Identity name (lowercase, no spaces — becomes ${advertisedIdentity('<name>', kind)}):` }]);
   if (!name) { console.log('\n  ❌ Name required.\n'); return; }
 
-  // Check available templates
+  const preview = advertisedIdentity(name, kind);
+
   const tplDir = path.join(__dirname, '..', 'templates');
   let templates = [];
   try { templates = fs.readdirSync(tplDir).filter(d => fs.existsSync(path.join(tplDir, d, 'config.json'))); } catch {}
 
-  const { tpl } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'tpl', message: 'Select template:', choices: [
-    ...templates.map(t => {
-      try {
-        const cfg = JSON.parse(fs.readFileSync(path.join(tplDir, t, 'config.json'), 'utf8'));
-        return { name: `  ${t.padEnd(22)} ${cfg.profile?.description?.substring(0, 50) || ''}`, value: t };
-      } catch { return { name: `  ${t}`, value: t }; }
-    }),
-    new inquirer.Separator(),
-    { name: '  + Create Custom Template', value: '__custom' },
-  ]}]);
-
-  let template = tpl;
-
-  if (template === '__custom') {
-    template = await createCustomTemplate(inquirer, tplDir);
-    if (!template) return;
+  let template = '';
+  if (kind === 'agent') {
+    const { tpl } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'tpl', message: 'Select template:', choices: [
+      ...templates.map(t => {
+        try {
+          const cfg = JSON.parse(fs.readFileSync(path.join(tplDir, t, 'config.json'), 'utf8'));
+          return { name: `  ${t.padEnd(22)} ${cfg.profile?.description?.substring(0, 50) || ''}`, value: t };
+        } catch { return { name: `  ${t}`, value: t }; }
+      }),
+      new inquirer.Separator(),
+      { name: '  + Create Custom Template', value: '__custom' },
+    ]}]);
+    template = tpl;
+    if (template === '__custom') {
+      template = await createCustomTemplate(inquirer, tplDir);
+      if (!template) return;
+    }
   }
 
-  console.log(`\n  ─── Creating Agent ───`);
+  console.log(`\n  ─── Creating listing ───`);
+  console.log(`  Kind:     ${kind}`);
   console.log(`  ID:       ${agentId}`);
-  console.log(`  Identity: ${name}.agentplatform@`);
-  console.log(`  Template: ${template}\n`);
+  console.log(`  Identity: ${preview}`);
+  if (template) console.log(`  Template: ${template}`);
+  if (kind === 'compute') console.log(`  Next:      point this at a GPU / inference URL after it confirms`);
+  if (kind === 'data') console.log(`  Next:      attach a data policy; you keep hosting the bytes`);
+  console.log('');
 
   const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Proceed with setup?', default: false }]);
   if (!confirm) return;
 
-  // Run the setup command (async — registration can take 20+ minutes for block confirmations)
   try {
     console.log('');
     console.log('  ℹ️  Registration waits for block confirmations (can take 5-20 min).');
     console.log('  Press Ctrl+C to return to menu — registration continues on the platform.\n');
-    const exitCode = await runCommandAsync(process.execPath, [process.argv[1], 'setup', agentId, name, '--template', template]);
+    const setupArgs = [process.argv[1], 'setup', agentId, name, '--kind', kind];
+    if (template) setupArgs.push('--template', template);
+    const exitCode = await runCommandAsync(process.execPath, setupArgs);
     if (exitCode === 0) {
-      console.log('\n  ✅ Agent created successfully.\n');
+      console.log('\n  ✅ Listing created successfully.\n');
 
-      // Offer immediate executor configuration
+      if (kind !== 'agent') {
+        console.log(kind === 'compute'
+          ? '  Use [5] Configure Services / API endpoint, or [compute] in config.toml, to start earning.\n'
+          : '  Use [5] Configure Services to attach the data policy and endpoint you host.\n');
+        await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+        return;
+      }
+
       const { configNow } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'configNow', message: 'Configure executor for this agent now?', default: true }]);
       if (configNow) {
         const execConfig = { executor: 'local-llm' };
@@ -2085,12 +2121,15 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
 
   if (action === 'recover') {
     if (!identityName) {
-      const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'What name did you register? (e.g. "myagent" for myagent.agentplatform@):' }]);
+      const retryKind = parseListingKind(keysData.kind) || 'agent';
+      const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: `What name did you register? (e.g. "myagent" for ${advertisedIdentity('myagent', retryKind)}):` }]);
       if (!name) { console.log('\n  ❌ Name required.\n'); return; }
       identityName = name;
     }
 
-    keysData.identity = identityName.includes('@') ? identityName : identityName + '.agentplatform@';
+    const recoverKind = parseListingKind(keysData.kind) || kindFromIdentityName(identityName) || 'agent';
+    keysData.identity = identityName.includes('@') ? identityName : advertisedIdentity(identityName, recoverKind);
+    keysData.kind = recoverKind;
     keysData.registrationStatus = 'timeout';
     writeKeysFile(keysPath, keysData);
 
@@ -2116,20 +2155,22 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
     writeKeysFile(keysPath, keysData);
     console.log('\n  ✅ Stale registration state cleared.\n');
 
-    const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'Identity name:', default: previousName ? previousName.replace('.agentplatform@', '') : '' }]);
+    const cleanKind = parseListingKind(keysData.kind) || kindFromIdentityName(previousName) || 'agent';
+    const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'Identity name:', default: previousName ? leafFromIdentity(previousName) : '' }]);
     if (!name) { console.log('\n  ❌ Name required.\n'); return; }
     identityName = name;
 
-    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${identityName}.agentplatform@ on-chain?`, default: false }]);
+    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${advertisedIdentity(identityName, cleanKind)} on-chain?`, default: false }]);
     if (!confirm) return;
 
     keysData.pendingName = identityName;
+    keysData.kind = cleanKind;
     writeKeysFile(keysPath, keysData);
 
     console.log('');
     console.log('  ℹ️  Registration waits for block confirmations (can take 5-20 min).');
     console.log('  Press Ctrl+C to return to menu — registration continues on the platform.\n');
-    const exitCode = await runCommandAsync(process.execPath, [process.argv[1], 'register', agentId, identityName]);
+    const exitCode = await runCommandAsync(process.execPath, [process.argv[1], 'register', agentId, identityName, '--kind', cleanKind]);
 
     if (exitCode === 0) {
       console.log('\n  ✅ Registration successful!\n');
@@ -2141,6 +2182,7 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
     }
   } else {
     // Register fresh with a new name
+    const freshKind = parseListingKind(keysData.kind) || 'agent';
     const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'New identity name (lowercase, no spaces):' }]);
     if (!name) { console.log('\n  ❌ Name required.\n'); return; }
     identityName = name;
@@ -2154,15 +2196,16 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
     delete keysData.pendingName;
     delete keysData.registrationTimestamp;
     keysData.pendingName = identityName;
+    keysData.kind = freshKind;
     writeKeysFile(keysPath, keysData);
 
-    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${identityName}.agentplatform@ on-chain?`, default: false }]);
+    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${advertisedIdentity(identityName, freshKind)} on-chain?`, default: false }]);
     if (!confirm) return;
 
     console.log('');
     console.log('  ℹ️  Registration waits for block confirmations (can take 5-20 min).');
     console.log('  Press Ctrl+C to return to menu — registration continues on the platform.\n');
-    const exitCode = await runCommandAsync(process.execPath, [process.argv[1], 'register', agentId, identityName]);
+    const exitCode = await runCommandAsync(process.execPath, [process.argv[1], 'register', agentId, identityName, '--kind', freshKind]);
 
     if (exitCode === 0) {
       console.log('\n  ✅ Registration successful!\n');

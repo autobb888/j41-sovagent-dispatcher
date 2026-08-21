@@ -241,6 +241,21 @@ function printFundingInstructions(address, network, { indent = '  ', seeded = fa
 
 // Buyer-authored text rendering — shared with dashboard.js, see src/untrusted.js
 const { untrusted, untrustedField } = require('./untrusted.js');
+const {
+  parseListingKind,
+  advertisedIdentity,
+  listingsCollide,
+  listingIdPrefix,
+} = require('./listing-kind.js');
+
+function requireListingKind(raw, fallback = 'agent') {
+  const kind = parseListingKind(raw) || (raw == null || raw === '' ? parseListingKind(fallback) : null);
+  if (!kind) {
+    console.error('❌ --kind must be agent, compute, or data (sovmodel is not mintable yet)');
+    process.exit(1);
+  }
+  return kind;
+}
 
 // ── Spend policy (allowlist + rate limiter + kill switch) ──
 // Extracted to src/spend-policy.js (P1). Re-imported + re-exported so existing
@@ -1321,7 +1336,7 @@ program
 // Init command — create N agent identities
 program
   .command('quickstart')
-  .description('Guided first-run setup — creates agent, picks template, configures LLM')
+  .description('Guided first-run setup — pick a listing kind, register, configure')
   .action(async () => {
     ensureDirs();
     const readline = require('readline');
@@ -1335,53 +1350,69 @@ program
     console.log('║     J41 Dispatcher — Quick Start         ║');
     console.log('╚══════════════════════════════════════════╝\n');
 
-    // 1. Identity name
-    const name = await ask('Choose a name for your agent (lowercase, no spaces)', '');
+    console.log('What are you listing?\n');
+    console.log('  agent    An AI that takes jobs          → name.sovagent@');
+    console.log('  compute  GPUs / an inference endpoint   → name.sovcompute@');
+    console.log('  data     A dataset or query API you host → name.sovdata@');
+    console.log('  model    coming soon (catalog, not mintable)\n');
+    const kindRaw = await ask('Kind', 'agent');
+    const kind = parseListingKind(kindRaw);
+    if (!kind) {
+      console.error('❌ Kind must be agent, compute, or data');
+      rl.close();
+      process.exit(1);
+    }
+
+    const name = await ask(`Choose a name (lowercase, no spaces — becomes ${advertisedIdentity('<name>', kind)})`, '');
     if (!name) { console.error('❌ Name required'); rl.close(); process.exit(1); }
 
-    // 2. Template
-    const tplDir = path.join(__dirname, '..', 'templates');
-    const templates = fs.readdirSync(tplDir).filter(d => fs.existsSync(path.join(tplDir, d, 'config.json')));
-    console.log(`\nAvailable templates: ${templates.join(', ')}`);
-    const template = await ask('Choose a template', 'general-assistant');
-
-    // 3. LLM provider
-    // F3 — "claude" is not a preset. The real ones are claude-opus / claude-sonnet /
-    // claude-haiku (they route via OpenRouter, because Anthropic's native API uses
-    // /messages rather than /chat/completions). Offering a name that does not resolve
-    // sent the operator straight to a fleet that declines every job.
-    console.log('\nPopular LLM providers: openai, claude-sonnet, groq, deepseek, ollama');
-    const { LLM_PRESETS: _PRESETS } = require('./executors/local-llm.js');
-    let provider = await ask('LLM provider', 'openai');
-    while (provider && !_PRESETS[provider]) {
-      console.log(`  ✗ "${provider}" is not a known provider. Valid: ${Object.keys(_PRESETS).join(', ')}`);
-      provider = await ask('LLM provider', 'openai');
-    }
-
-    // 4. API key
+    let template = '';
+    let provider = '';
     let apiKey = '';
-    if (provider !== 'ollama' && provider !== 'lmstudio' && provider !== 'vllm') {
-      apiKey = await ask(`API key for ${provider}`, '');
-      if (!apiKey) {
-        // NOT an environment variable — host env vars are deliberately never
-        // read for provider keys; they are forwarded per-job into containers
-        // from config.toml. The old advice here told users to do the one thing
-        // that does not work, and the comment below records the result: a fleet
-        // that declined every job.
-        console.log('  (Add it later under [provider_keys] in ~/.j41/dispatcher/config.toml,');
-        console.log('   or re-run: j41-dispatcher quickstart — an agent with no key declines every job.)');
+    if (kind === 'agent') {
+      const tplDir = path.join(__dirname, '..', 'templates');
+      const templates = fs.readdirSync(tplDir).filter(d => fs.existsSync(path.join(tplDir, d, 'config.json')));
+      console.log(`\nAvailable templates: ${templates.join(', ')}`);
+      template = await ask('Choose a template', 'general-assistant');
+
+      // F3 — "claude" is not a preset. The real ones are claude-opus / claude-sonnet /
+      // claude-haiku (they route via OpenRouter, because Anthropic's native API uses
+      // /messages rather than /chat/completions). Offering a name that does not resolve
+      // sent the operator straight to a fleet that declines every job.
+      console.log('\nPopular LLM providers: openai, claude-sonnet, groq, deepseek, ollama');
+      const { LLM_PRESETS: _PRESETS } = require('./executors/local-llm.js');
+      provider = await ask('LLM provider', 'openai');
+      while (provider && !_PRESETS[provider]) {
+        console.log(`  ✗ "${provider}" is not a known provider. Valid: ${Object.keys(_PRESETS).join(', ')}`);
+        provider = await ask('LLM provider', 'openai');
       }
+
+      if (provider !== 'ollama' && provider !== 'lmstudio' && provider !== 'vllm') {
+        apiKey = await ask(`API key for ${provider}`, '');
+        if (!apiKey) {
+          console.log('  (Add it later under [provider_keys] in ~/.j41/dispatcher/config.toml,');
+          console.log('   or re-run: j41-dispatcher quickstart — an agent with no key declines every job.)');
+        }
+      }
+    } else if (kind === 'compute') {
+      console.log('\nAfter registration, point this listing at a local or Vast GPU via');
+      console.log('Configure Services / api-endpoint (or [compute] in config.toml).');
+    } else {
+      console.log('\nAfter registration, attach a data policy and an endpoint you host.');
+      console.log('Junction41 never stores the dataset bytes.');
     }
 
-    // 5. Runtime
     const runtime = await ask('Runtime mode (docker or local)', 'docker');
 
     rl.close();
 
+    const preview = advertisedIdentity(name, kind);
+    const localId = `${listingIdPrefix(kind)}-1`;
     console.log('\n─── Configuration ───');
-    console.log(`  Agent:    ${name}.agentplatform@`);
-    console.log(`  Template: ${template}`);
-    console.log(`  LLM:      ${provider}`);
+    console.log(`  Kind:     ${kind}`);
+    console.log(`  Identity: ${preview}`);
+    if (template) console.log(`  Template: ${template}`);
+    if (provider) console.log(`  LLM:      ${provider}`);
     console.log(`  Runtime:  ${runtime}`);
     console.log('');
 
@@ -1395,20 +1426,25 @@ program
     // from config.toml's [provider_keys] (cli.js:7952), deliberately never from the
     // dispatcher's own environment. Following the printed instructions exactly produced
     // a fleet that declined every job. Persist it where the dispatcher actually looks.
-    try {
-      const { saveDispatcherConfig } = require('./config-loader.js');
-      const partial = { llm: { provider } };
-      if (apiKey) partial.provider_keys = { [provider]: apiKey };
-      saveDispatcherConfig(partial);
-      console.log(`\n  ✅ Saved provider${apiKey ? ' + API key' : ''} to ~/.j41/dispatcher/config.toml`);
-    } catch (e) {
-      console.log(`\n  ⚠️  Could not write config.toml (${e.message}).`);
-      console.log(`     Set it by hand: [provider_keys] ${provider} = "<your key>"`);
+    if (kind === 'agent' && provider) {
+      try {
+        const { saveDispatcherConfig } = require('./config-loader.js');
+        const partial = { llm: { provider } };
+        if (apiKey) partial.provider_keys = { [provider]: apiKey };
+        saveDispatcherConfig(partial);
+        console.log(`\n  ✅ Saved provider${apiKey ? ' + API key' : ''} to ~/.j41/dispatcher/config.toml`);
+      } catch (e) {
+        console.log(`\n  ⚠️  Could not write config.toml (${e.message}).`);
+        console.log(`     Set it by hand: [provider_keys] ${provider} = "<your key>"`);
+      }
     }
 
     console.log('\nNext steps:\n');
-    console.log(`  1. Set up your agent:`);
-    console.log(`     j41-dispatcher setup agent-1 ${name} --template ${template}`);
+    console.log(`  1. Set up your listing:`);
+    const setupCmd = template
+      ? `j41-dispatcher setup ${localId} ${name} --kind ${kind} --template ${template}`
+      : `j41-dispatcher setup ${localId} ${name} --kind ${kind}`;
+    console.log(`     ${setupCmd}`);
     console.log(`\n  2. Start the dispatcher:`);
     console.log(`     j41-dispatcher start`);
     console.log('');
@@ -1486,7 +1522,8 @@ program
 // Register command — register an agent identity on-chain
 program
   .command('register <agent-id> <identity-name>')
-  .description('Register an agent identity on J41 platform')
+  .description('Register a listing identity on J41 (agent | compute | data)')
+  .option('--kind <kind>', 'Listing kind: agent | compute | data', 'agent')
   .option('--finalize', 'Run onboarding finalization after identity registration')
   .option('--interactive', 'Interactive finalize mode (prompts for profile/service)')
   .option('--profile-name <name>', 'Profile display name for headless finalize')
@@ -1529,15 +1566,15 @@ program
       process.exit(1);
     }
 
-    // Check if any other local agent already has this name (prevent duplicates)
-    const fullName = identityName.includes('@') ? identityName : identityName + '.agentplatform@';
+    const kind = requireListingKind(options.kind);
+    const preview = advertisedIdentity(identityName, kind);
     const allAgents = listRegisteredAgents();
     for (const other of allAgents) {
       if (other === agentId) continue;
       const otherKeys = loadAgentKeys(other);
       if (!otherKeys) continue;
       const otherName = otherKeys.identity || otherKeys.pendingName;
-      if (otherName && (otherName === fullName || otherName === identityName || otherName.replace('.agentplatform@', '') === identityName)) {
+      if (otherName && listingsCollide(otherName, identityName, kind)) {
         const status = otherKeys.registrationStatus || (otherKeys.iAddress ? 'registered' : 'pending');
         console.error(`❌ Name "${identityName}" is already ${status} on ${other}.`);
         if (status === 'timeout') {
@@ -1550,7 +1587,7 @@ program
       }
     }
 
-    console.log(`\n→ Registering ${agentId} as ${identityName}.agentplatform@...`);
+    console.log(`\n→ Registering ${agentId} as ${preview} (kind=${kind})...`);
     console.log(`   Address: ${keys.address}`);
 
     const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
@@ -1560,11 +1597,12 @@ program
     });
 
     try {
-      const result = await agent.register(identityName, J41_NETWORK);
+      const result = await agent.register(identityName, J41_NETWORK, { kind });
 
       // Save identity to keys file
       keys.identity = result.identity;
       keys.iAddress = result.iAddress;
+      keys.kind = result.kind || kind;
       writeKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json'), keys);
 
       console.log(`\n✅ ${agentId} identity registered on-chain!`);
@@ -1649,7 +1687,8 @@ program
 
       // Save partial state on timeout so the user can recover
       if (e.name === 'RegistrationTimeoutError' || (e.message && e.message.includes('timed out'))) {
-        keys.identity = e.identityName || (identityName + '.agentplatform@');
+        keys.identity = e.identityName || advertisedIdentity(identityName, kind);
+        keys.kind = kind;
         keys.registrationStatus = 'timeout';
         keys.registrationTimestamp = new Date().toISOString();
         if (e.onboardId) keys.onboardId = e.onboardId;
@@ -2799,6 +2838,7 @@ program
 program
   .command('setup <agent-id> <identity-name>')
   .description('One-command setup: init keys + register on-chain + finalize with profile & service')
+  .option('--kind <kind>', 'Listing kind: agent | compute | data', 'agent')
   .option('--template <name>', 'Use a template (code-review, general-assistant, data-analyst, character-roleplay, workspace-reviewer)')
   .option('--yes', 'Skip the funding pause and register immediately (the address must already hold funds)')
   .option('--profile-name <name>', 'Profile display name')
@@ -2933,15 +2973,15 @@ program
     if (keys.identity && keys.iAddress && keys.registrationStatus !== 'timeout') {
       console.log(`  ✓ Already registered: ${keys.identity}`);
     } else {
-      // Check for duplicate name across local agents
-      const setupFullName = identityName + '.agentplatform@';
+      const kind = requireListingKind(options.kind, keys.kind || 'agent');
+      const setupPreview = advertisedIdentity(identityName, kind);
       const setupAllAgents = listRegisteredAgents();
       for (const other of setupAllAgents) {
         if (other === agentId) continue;
         const otherKeys = loadAgentKeys(other);
         if (!otherKeys) continue;
         const otherName = otherKeys.identity || otherKeys.pendingName;
-        if (otherName && (otherName === setupFullName || otherName.replace('.agentplatform@', '') === identityName)) {
+        if (otherName && listingsCollide(otherName, identityName, kind)) {
           console.error(`  ❌ Name "${identityName}" is already claimed by ${other}.`);
           console.error(`     Pick a different name, or clear ${other}'s state first.`);
           process.exit(1);
@@ -2953,22 +2993,24 @@ program
       });
 
       try {
-        console.log(`  → Registering ${identityName}.agentplatform@ (this may take several minutes)...`);
-        const regResult = await agent.register(identityName, J41_NETWORK);
+        console.log(`  → Registering ${setupPreview} (kind=${kind}, this may take several minutes)...`);
+        const regResult = await agent.register(identityName, J41_NETWORK, { kind });
         keys.identity = regResult.identity;
         keys.iAddress = regResult.iAddress;
+        keys.kind = regResult.kind || kind;
         delete keys.registrationStatus;
         delete keys.onboardId;
         writeKeysFile(path.join(agentDir, 'keys.json'), keys);
         console.log(`  ✓ Registered: ${regResult.identity} (${regResult.iAddress})`);
       } catch (e) {
         if (e.name === 'RegistrationTimeoutError' || (e.message && e.message.includes('timed out'))) {
-          keys.identity = e.identityName || (identityName + '.agentplatform@');
+          keys.identity = e.identityName || setupPreview;
+          keys.kind = kind;
           keys.registrationStatus = 'timeout';
           if (e.onboardId) keys.onboardId = e.onboardId;
           writeKeysFile(path.join(agentDir, 'keys.json'), keys);
           console.error(`  ⚠️  Registration timed out. Run: j41-dispatcher recover ${agentId}`);
-          console.error(`     Then re-run: j41-dispatcher setup ${agentId} ${identityName} [flags...]`);
+          console.error(`     Then re-run: j41-dispatcher setup ${agentId} ${identityName} --kind ${kind} [flags...]`);
           process.exit(1);
         }
         console.error(`  ❌ ${e.message}`);
@@ -4289,6 +4331,11 @@ program
 
       // Start webhook HTTP server (with proxy context if api-endpoint agents exist)
       const { startWebhookServer } = require('./webhook-server');
+      // H7 — handleWebhookEvent must be able to call onApiAccessRevoke when the
+      // platform delivers proxy.access_revoked on the generic /webhook/:agentId
+      // path. J41 never POSTs /j41/api-access/revoke (that route stays for
+      // direct callers); the signed platform event is the real channel.
+      state.proxyContext = proxyContext;
       startWebhookServer(webhookPort, agentWebhooks, async (agentId, payload) => {
         await handleWebhookEvent(state, agentId, payload);
       }, proxyContext);
@@ -8493,6 +8540,33 @@ async function handleWebhookEvent(state, agentId, payload) {
       break;
     }
 
+    case 'proxy.access_revoked': {
+      // Platform DELETE /v1/me/api-access/:grantId emits this on the seller's
+      // registered webhook URL. The dedicated POST /j41/api-access/revoke route
+      // is never called from J41 — without this case the minted proxy key
+      // stays live after the buyer revoked.
+      const buyerVerusId = data?.buyerVerusId;
+      if (!buyerVerusId) {
+        console.error('[Webhook] proxy.access_revoked missing buyerVerusId — ignoring');
+        break;
+      }
+      const revoke = state.proxyContext?.onApiAccessRevoke;
+      if (typeof revoke !== 'function') {
+        console.warn(`[Webhook] proxy.access_revoked for ${agentInfo.id} — no proxy context (no api-endpoint agents)`);
+        break;
+      }
+      try {
+        const result = await revoke({
+          sellerVerusId: agentInfo.iAddress || agentInfo.identity,
+          buyerVerusId,
+        });
+        console.log(`[Webhook] API access revoked for buyer ${untrusted(buyerVerusId, 60)} on ${agentInfo.id}: ${result?.revoked ?? 0} key(s)`);
+      } catch (e) {
+        console.error(`[Webhook] API access revoke failed: ${e.message}`);
+      }
+      break;
+    }
+
     // ── SovGuard limit webhooks ──
     case 'limit.warning': {
       const usage = data?.usage || '?';
@@ -10863,16 +10937,21 @@ async function mainMenu() {
       return;
     }
 
-    const name = await ask('  Identity name (without .agentplatform@): ');
+    const kindRaw = await ask('  Kind (agent | compute | data) [agent]: ');
+    const kind = parseListingKind(kindRaw || 'agent');
+    if (!kind) { console.error('  Kind must be agent, compute, or data\n'); return; }
+    const name = await ask(`  Identity name (without parent — becomes ${advertisedIdentity('<name>', kind)}): `);
     if (!name) return;
 
-    console.log(`  Registering ${name}.agentplatform@... (this may take several minutes)`);
+    const preview = advertisedIdentity(name, kind);
+    console.log(`  Registering ${preview} (kind=${kind})... (this may take several minutes)`);
     try {
       const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
       const a = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif });
-      const result = await a.register(name, J41_NETWORK);
+      const result = await a.register(name, J41_NETWORK, { kind });
       keys.identity = result.identity;
       keys.iAddress = result.iAddress;
+      keys.kind = result.kind || kind;
       writeKeysFile(keysPath, keys);
       console.log(`  Done: ${result.identity} (${result.iAddress})\n`);
     } catch (e) {
@@ -12551,7 +12630,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState, untrusted, untrustedField, requireInteractiveConfirm, printFundingInstructions, jobImageExists, JOB_IMAGE, NATIVE_COIN,
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState, untrusted, untrustedField, requireInteractiveConfirm, printFundingInstructions, handleWebhookEvent, jobImageExists, JOB_IMAGE, NATIVE_COIN,
     // Execution-harness seam: `program` so a test can drive the REAL `start`
     // action through commander, and `__getState` so it can then assert on what
     // that action actually did. See test/helpers/dispatcher-harness.js.

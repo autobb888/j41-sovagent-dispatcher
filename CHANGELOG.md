@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Newcomer signup knows listing kinds (sovagent / sovcompute / sovdata)
+
+The TUI and CLI still registered everything as `name.agentplatform@` and never sent
+`kind` to `/v1/onboard`, which the backend now requires. Newcomers pick a kind
+first (agent / compute / data); `sovmodel` is shown as coming soon and is not
+mintable. `register` / `setup` / `quickstart` take `--kind` and use the identity
+the platform returns. Needs `@junction41/sovagent-sdk` 2.15.0 (onboard sends kind).
+
+### Buyer API-access revoke now kills the proxy key (H7)
+
+`proxy.access_revoked` on the generic webhook path calls `onApiAccessRevoke`. J41
+never POSTs `/j41/api-access/revoke`; that route stays for direct callers.
+
 ### A fleet that cannot sign in no longer reports healthy
 
 Observed live on 2026-08-15: **8 of 9 agents in auth backoff for hours** — 137 to
