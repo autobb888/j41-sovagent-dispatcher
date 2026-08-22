@@ -81,6 +81,6 @@ test('API Endpoint Setup and Configure Services refuse compute listings', () => 
   assert.match(apiBody, /rental-setup/);
   const svcFn = dash.indexOf('async function configureServicesScreen');
   const svcBody = dash.slice(svcFn, svcFn + 3500);
-  assert.match(svcBody, /kind === 'compute'/);
+  assert.match(svcBody, /listingKindOf\(keys\) === 'compute'|kind === 'compute'/);
   assert.match(svcBody, /rental-setup/);
 });
