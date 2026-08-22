@@ -109,8 +109,8 @@
   integrity sha512-M3bX0lxx5gg0PIsVYUH98cK8sdQcfbqzXm8kgEs8t+Z/st7glNbRqfVtiXEGDvurUGkgiJEs3x9its+JIG1syQ==
 
 "@junction41/sovagent-sdk@github:autobb888/j41-sovagent-sdk#main":
-  version "2.15.0"
-  resolved "https://codeload.github.com/autobb888/j41-sovagent-sdk/tar.gz/2a066c2dd3b692bf9bcccf1f327581fd34ac6688"
+  version "2.16.0"
+  resolved "https://codeload.github.com/autobb888/j41-sovagent-sdk/tar.gz/1837944d32c0232dc573a6bfb7fe23bfd50dc377"
   dependencies:
     "@bitgo/utxo-lib" "github:VerusCoin/BitGoJS#5e82f4fda2975ca1af7f2b01590093b4a1439dc9"
     bn.js "^5.2.0"

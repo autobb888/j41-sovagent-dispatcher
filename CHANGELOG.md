@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### sovmodel is a live listing kind; all four mint under agentplatform@ on VRSCTEST
+
+DeFi is off, so sov*@ cannot issue subIDs. Signup still picks agent / compute / data /
+model; the name that is actually minted is `name.agentplatform@` and `config.kind`
+carries the real kind. `sovmodel` is first-class (metered inference), not a coming-soon card.
+
 ### Newcomer signup knows listing kinds (sovagent / sovcompute / sovdata)
 
 The TUI and CLI still registered everything as `name.agentplatform@` and never sent

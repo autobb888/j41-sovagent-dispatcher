@@ -1198,16 +1198,18 @@ async function createCustomTemplate(inquirer, tplDir) {
 async function addAgentScreen(inquirer) {
   console.clear();
   console.log('\n  ═══ Sign up — register a listing ═══\n');
-  console.log('  What are you listing?\n');
+  console.log('  What are you listing?');
+  console.log('  DeFi is off on VRSCTEST — every kind mints as name.agentplatform@.');
+  console.log('  Kind is stored on the identity (config.kind).\n');
 
   const { kindChoice } = await promptWithEsc(inquirer, [{
     type: 'list', pageSize: 10, name: 'kindChoice',
     message: 'Kind:',
     choices: [
-      { name: `  agent     ${KIND_BLURB.agent}  → name.sovagent@`, value: 'agent' },
-      { name: `  compute   ${KIND_BLURB.compute}  → name.sovcompute@`, value: 'compute' },
-      { name: `  data      ${KIND_BLURB.data}  → name.sovdata@`, value: 'data' },
-      { name: '  model     coming soon — catalog over compute+data, not mintable yet', value: '__model', disabled: 'coming soon' },
+      { name: `  agent     ${KIND_BLURB.agent}`, value: 'agent' },
+      { name: `  compute   ${KIND_BLURB.compute}`, value: 'compute' },
+      { name: `  data      ${KIND_BLURB.data}`, value: 'data' },
+      { name: `  model     ${KIND_BLURB.model}`, value: 'model' },
     ],
   }]);
   const kind = parseListingKind(kindChoice);
@@ -1257,7 +1259,8 @@ async function addAgentScreen(inquirer) {
   console.log(`  ID:       ${agentId}`);
   console.log(`  Identity: ${preview}`);
   if (template) console.log(`  Template: ${template}`);
-  if (kind === 'compute') console.log(`  Next:      point this at a GPU / inference URL after it confirms`);
+  if (kind === 'compute') console.log(`  Next:      point this at a GPU / SSH box after it confirms`);
+  if (kind === 'model') console.log(`  Next:      attach the inference endpoint for this model`);
   if (kind === 'data') console.log(`  Next:      attach a data policy; you keep hosting the bytes`);
   console.log('');
 
@@ -1275,9 +1278,12 @@ async function addAgentScreen(inquirer) {
       console.log('\n  ✅ Listing created successfully.\n');
 
       if (kind !== 'agent') {
-        console.log(kind === 'compute'
-          ? '  Use [5] Configure Services / API endpoint, or [compute] in config.toml, to start earning.\n'
-          : '  Use [5] Configure Services to attach the data policy and endpoint you host.\n');
+        const next = kind === 'data'
+          ? '  Use [5] Configure Services to attach the data policy and endpoint you host.\n'
+          : kind === 'model'
+            ? '  Use [5] Configure Services / API endpoint so buyers can talk to this model.\n'
+            : '  Use [5] Configure Services / API endpoint, or [compute] in config.toml, to start earning.\n';
+        console.log(next);
         await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
         return;
       }

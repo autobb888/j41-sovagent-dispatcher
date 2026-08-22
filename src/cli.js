@@ -251,7 +251,7 @@ const {
 function requireListingKind(raw, fallback = 'agent') {
   const kind = parseListingKind(raw) || (raw == null || raw === '' ? parseListingKind(fallback) : null);
   if (!kind) {
-    console.error('❌ --kind must be agent, compute, or data (sovmodel is not mintable yet)');
+    console.error('❌ --kind must be agent, compute, data, or model');
     process.exit(1);
   }
   return kind;
@@ -585,7 +585,7 @@ function parseJsonArray(val) {
 /**
  * Build a full agent profile from CLI options, including session and platform keys.
  */
-function buildFullProfile(options) {
+function buildFullProfile(options, keys) {
   const profile = {
     name: options.profileName,
     type: options.profileType || 'autonomous',
@@ -606,6 +606,7 @@ function buildFullProfile(options) {
       datapolicy: options.dataPolicy,
       trustlevel: options.trustLevel,
       disputeresolution: options.disputeResolution,
+      kind: parseListingKind(options.kind) || parseListingKind(keys?.kind) || undefined,
     },
   };
 
@@ -864,7 +865,7 @@ async function interactiveProfileSetup(keys, soulContent) {
     models,
     markup,
     session: { duration, tokenLimit, messageLimit, maxFileSize },
-    platformConfig: { datapolicy, trustlevel, disputeresolution },
+    platformConfig: { datapolicy, trustlevel, disputeresolution, kind: parseListingKind(keys.kind) || undefined },
     ...(workspaceCapability ? { workspaceCapability } : {}),
   };
 
@@ -1351,14 +1352,16 @@ program
     console.log('╚══════════════════════════════════════════╝\n');
 
     console.log('What are you listing?\n');
-    console.log('  agent    An AI that takes jobs          → name.sovagent@');
-    console.log('  compute  GPUs / an inference endpoint   → name.sovcompute@');
-    console.log('  data     A dataset or query API you host → name.sovdata@');
-    console.log('  model    coming soon (catalog, not mintable)\n');
+    console.log('  DeFi is off on VRSCTEST — every kind mints as name.agentplatform@.');
+    console.log('  Kind is stored on the identity (config.kind).\n');
+    console.log('  agent    An AI you hire to do a task');
+    console.log('  compute  A GPU / SSH box buyers can rent');
+    console.log('  data     A dataset agents can query (you host the bytes)');
+    console.log('  model    Talk to a specific model that is for sale\n');
     const kindRaw = await ask('Kind', 'agent');
     const kind = parseListingKind(kindRaw);
     if (!kind) {
-      console.error('❌ Kind must be agent, compute, or data');
+      console.error('❌ Kind must be agent, compute, data, or model');
       rl.close();
       process.exit(1);
     }
@@ -1397,6 +1400,9 @@ program
     } else if (kind === 'compute') {
       console.log('\nAfter registration, point this listing at a local or Vast GPU via');
       console.log('Configure Services / api-endpoint (or [compute] in config.toml).');
+    } else if (kind === 'model') {
+      console.log('\nAfter registration, attach the inference endpoint for this model');
+      console.log('(same metered api-endpoint rail as compute).');
     } else {
       console.log('\nAfter registration, attach a data policy and an endpoint you host.');
       console.log('Junction41 never stores the dataset bytes.');
@@ -1522,8 +1528,8 @@ program
 // Register command — register an agent identity on-chain
 program
   .command('register <agent-id> <identity-name>')
-  .description('Register a listing identity on J41 (agent | compute | data)')
-  .option('--kind <kind>', 'Listing kind: agent | compute | data', 'agent')
+  .description('Register a listing identity on J41 (agent | compute | data | model)')
+  .option('--kind <kind>', 'Listing kind: agent | compute | data | model', 'agent')
   .option('--finalize', 'Run onboarding finalization after identity registration')
   .option('--interactive', 'Interactive finalize mode (prompts for profile/service)')
   .option('--profile-name <name>', 'Profile display name for headless finalize')
@@ -1619,7 +1625,7 @@ program
 
       if (options.profileName) {
         // Headless mode — use CLI flags
-        profileData = buildFullProfile(options);
+        profileData = buildFullProfile(options, keys);
         serviceData = buildServiceFromOptions(options, profileData.description);
       } else {
         // Interactive walkthrough — prompt for every VDXF field
@@ -1665,7 +1671,7 @@ program
         const profile = options.interactive
           ? undefined
           : (options.profileName && options.profileDescription
-            ? buildFullProfile(options)
+            ? buildFullProfile(options, keys)
             : undefined);
 
         const services = buildServiceFromOptions(options, options.profileDescription);
@@ -1766,7 +1772,7 @@ program
     const profile = options.interactive
       ? undefined
       : (options.profileName && options.profileDescription
-        ? buildFullProfile(options)
+        ? buildFullProfile(options, keys)
         : undefined);
 
     const services = buildServiceFromOptions(options, options.profileDescription);
@@ -2838,7 +2844,7 @@ program
 program
   .command('setup <agent-id> <identity-name>')
   .description('One-command setup: init keys + register on-chain + finalize with profile & service')
-  .option('--kind <kind>', 'Listing kind: agent | compute | data', 'agent')
+  .option('--kind <kind>', 'Listing kind: agent | compute | data | model', 'agent')
   .option('--template <name>', 'Use a template (code-review, general-assistant, data-analyst, character-roleplay, workspace-reviewer)')
   .option('--yes', 'Skip the funding pause and register immediately (the address must already hold funds)')
   .option('--profile-name <name>', 'Profile display name')
@@ -3041,7 +3047,7 @@ program
       disputePolicyData = result.disputePolicy;
     } else {
       // Headless mode — use CLI flags
-      profileData = buildFullProfile(options);
+      profileData = buildFullProfile(options, keys);
       services = buildServiceFromOptions(options, profileData.description);
     }
 
@@ -10937,7 +10943,7 @@ async function mainMenu() {
       return;
     }
 
-    const kindRaw = await ask('  Kind (agent | compute | data) [agent]: ');
+    const kindRaw = await ask('  Kind (agent | compute | data | model) [agent]: ');
     const kind = parseListingKind(kindRaw || 'agent');
     if (!kind) { console.error('  Kind must be agent, compute, or data\n'); return; }
     const name = await ask(`  Identity name (without parent — becomes ${advertisedIdentity('<name>', kind)}): `);

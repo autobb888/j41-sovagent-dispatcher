@@ -2,27 +2,32 @@
 /**
  * Listing kinds the platform mints. Keep in lockstep with
  * @junction41/sovagent-sdk hosting/kinds and junction41 src/hosting/kinds.ts.
- * sovmodel is a catalog, not a mintable kind.
+ *
+ * Intended parents: sovagent@ / sovcompute@ / sovdata@ / sovmodel@.
+ * VRSCTEST DeFi is off, so new names mint under agentplatform@ and the real
+ * kind is stored in platform.config.kind / keys.json.
  */
 
-const LISTING_KINDS = Object.freeze(['agent', 'compute', 'data']);
+const LISTING_KINDS = Object.freeze(['agent', 'compute', 'data', 'model']);
 
 const KIND_PARENTS = Object.freeze({
   agent: 'sovagent@',
   compute: 'sovcompute@',
   data: 'sovdata@',
+  model: 'sovmodel@',
 });
 
 const LEGACY_AGENT_PARENT = 'agentplatform@';
 
 const KIND_BLURB = Object.freeze({
-  agent: 'An AI that takes jobs on the marketplace',
-  compute: 'GPUs or an inference endpoint buyers can meter',
-  data: 'A dataset or query API you host yourself',
+  agent: 'An AI you hire to do an advertised task',
+  compute: 'A GPU / SSH box buyers can rent and run their own workload',
+  data: 'A dataset agents can query (you host the bytes)',
+  model: 'Talk to a specific model that is for sale (metered inference)',
 });
 
 function parseListingKind(raw) {
-  if (raw === 'agent' || raw === 'compute' || raw === 'data') return raw;
+  if (raw === 'agent' || raw === 'compute' || raw === 'data' || raw === 'model') return raw;
   return null;
 }
 
@@ -30,8 +35,7 @@ function advertisedIdentity(name, kind) {
   const n = String(name || '').trim().replace(/@+$/, '');
   if (!n) return '';
   if (n.includes('.')) return n.endsWith('@') ? n : `${n}@`;
-  const k = parseListingKind(kind) || 'agent';
-  return `${n}.${KIND_PARENTS[k]}`;
+  return `${n}.${LEGACY_AGENT_PARENT}`;
 }
 
 function kindFromIdentityName(name) {
@@ -40,6 +44,7 @@ function kindFromIdentityName(name) {
   if (n.endsWith('.sovagent@') || n.endsWith('.agentplatform@')) return 'agent';
   if (n.endsWith('.sovcompute@')) return 'compute';
   if (n.endsWith('.sovdata@')) return 'data';
+  if (n.endsWith('.sovmodel@')) return 'model';
   return null;
 }
 
@@ -63,16 +68,15 @@ function identitiesEqual(a, b) {
 }
 
 /**
- * True if two names collide as the same listing: same fully-qualified identity,
- * or the same leaf under the same kind (including legacy agentplatform@ ≡ sovagent@).
+ * Same leaf under agentplatform@ is a collision even across kinds — DeFi is
+ * off, so there is only one parent.
  */
 function listingsCollide(existing, candidate, kind) {
   if (!existing || !candidate) return false;
   const want = advertisedIdentity(candidate, kind);
   if (identitiesEqual(existing, want) || identitiesEqual(existing, candidate)) return true;
-  const existingKind = kindFromIdentityName(existing) || 'agent';
-  const wantKind = parseListingKind(kind) || kindFromIdentityName(candidate) || 'agent';
-  return existingKind === wantKind && leafFromIdentity(existing) === leafFromIdentity(candidate);
+  return leafFromIdentity(existing) === leafFromIdentity(candidate)
+    && leafFromIdentity(existing) === leafFromIdentity(want);
 }
 
 module.exports = {
