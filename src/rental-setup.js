@@ -1,7 +1,7 @@
 'use strict';
 const { assertRentalEligibleAgent, assertProviderCanSsh } = require('./rental-job');
 const { createProvider } = require('./providers');
-const { assertTunnelHostname } = require('./providers/home-gpu');
+const { assertTunnelHostname, assertTunnelPort, assertJailResources } = require('./providers/home-gpu');
 
 function providerCfgForAgent(cfg, agentId) {
   const tables = (cfg.compute && cfg.compute.providers) || {};
@@ -27,12 +27,19 @@ function applyRentalAgentConfig(existing, { ackPostpayVastRisk } = {}) {
 
 function assertRentalSetupAllowed({ agentId, cfg, services, paymentTerms, ackPostpayVastRisk }) {
   assertRentalEligibleAgent(services);
+  if (!cfg || !cfg.compute || cfg.compute.enabled !== true) {
+    throw new Error('RENTAL_COMPUTE_DISABLED: set [compute] enabled=true before rental-setup');
+  }
   const found = providerCfgForAgent(cfg, agentId);
   if (!found) throw new Error('RENTAL_NO_PROVIDER: declare [compute.providers.*] with agent_id=' + agentId);
   const [name, pcfg] = found;
   if (pcfg.type === 'local') throw new Error('RENTAL_NO_SSH: local is Cat-2 inference; use home-gpu for a jail or vast for a sourced box');
-  // Tunnel check before createProvider so HOME_GPU_NO_TUNNEL wins over a dockerode constructor error.
-  if (pcfg.type === 'home-gpu') assertTunnelHostname(pcfg.ssh_hostname);
+  // Tunnel/resource checks before createProvider so HOME_GPU_NO_TUNNEL / HOME_GPU_NO_RAM win over a dockerode constructor error.
+  if (pcfg.type === 'home-gpu') {
+    assertTunnelHostname(pcfg.ssh_hostname);
+    assertTunnelPort(pcfg.ssh_tunnel_port);
+    assertJailResources(pcfg);
+  }
   const provider = createProvider(pcfg.type, { id: name, ...pcfg });
   assertProviderCanSsh(provider);
   if (pcfg.type === 'vast' && paymentTerms === 'postpay' && !ackPostpayVastRisk) {

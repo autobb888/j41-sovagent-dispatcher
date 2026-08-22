@@ -13,6 +13,18 @@ test('rental-setup refuses api-endpoint mix', () => {
   assert.throws(() => assertRentalEligibleAgent([{ serviceType: 'api-endpoint' }]), /RENTAL_SLOT_CONFLICT/);
 });
 
+test('rental-setup refuses when [compute] enabled=false', () => {
+  const cfg = { compute: { enabled: false, providers: { card0: { type: 'home-gpu', agent_id: 'gpu-1', ssh_hostname: 'gpu.example.com', ssh_tunnel_port: 2222, memory_mb: 8192, disk_gb: 40 } } } };
+  assert.throws(() => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay' }), /RENTAL_COMPUTE_DISABLED/);
+});
+
+test('rental-setup refuses home-gpu without ssh_tunnel_port or memory_mb', () => {
+  const base = { type: 'home-gpu', agent_id: 'gpu-1', ssh_hostname: 'gpu.example.com' };
+  const on = (p) => ({ compute: { enabled: true, providers: { card0: p } } });
+  assert.throws(() => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg: on({ ...base, memory_mb: 8192, disk_gb: 40 }), services: [], paymentTerms: 'prepay' }), /HOME_GPU_NO_TUNNEL/);
+  assert.throws(() => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg: on({ ...base, ssh_tunnel_port: 2222, disk_gb: 40 }), services: [], paymentTerms: 'prepay' }), /HOME_GPU_NO_RAM/);
+});
+
 test('rental-setup fails closed without a TCP-tunnel hostname on home-gpu', () => {
   const cfg = { compute: { enabled: true, providers: { card0: { type: 'home-gpu', agent_id: 'gpu-1' } } } };
   assert.throws(() => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay' }), /HOME_GPU_NO_TUNNEL/);
