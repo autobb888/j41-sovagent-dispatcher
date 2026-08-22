@@ -96,6 +96,15 @@ class HomeGpuProvider extends ComputeProvider {
     };
   }
 
+  async _forceRemove(id) {
+    if (!id) return;
+    try {
+      await this.docker.getContainer(id).remove({ force: true });
+    } catch (err) {
+      if (!gone(err)) throw err;
+    }
+  }
+
   async waitReady(lease, { timeoutMs = 60000 } = {}) {
     const hostname = assertTunnelHostname(this.cfg.ssh_hostname);
     const memoryMb = Number(this.cfg.memory_mb);
@@ -114,6 +123,8 @@ class HomeGpuProvider extends ComputeProvider {
         Memory: Number.isFinite(memoryMb) && memoryMb > 0 ? memoryMb * 1024 * 1024 : 0,
         PidsLimit: 1024,
         CapDrop: ['ALL'],
+        CapAdd: ['NET_BIND_SERVICE', 'SETUID', 'SETGID', 'SYS_CHROOT', 'CHOWN', 'AUDIT_WRITE', 'KILL'],
+        SecurityOpt: ['no-new-privileges:true'],
         DeviceRequests: [{
           Driver: 'nvidia',
           DeviceIDs: [deviceId],
@@ -121,29 +132,37 @@ class HomeGpuProvider extends ComputeProvider {
         }],
       },
     });
-    await container.start();
-    const inspect = await container.inspect();
-    const binding = inspect && inspect.NetworkSettings && inspect.NetworkSettings.Ports
-      && inspect.NetworkSettings.Ports['22/tcp'] && inspect.NetworkSettings.Ports['22/tcp'][0];
-    const publishedPort = binding ? Number(binding.HostPort) : 0;
-
+    // Record before start so a throw cannot orphan the jail or hide the id from release.
     this._containerId = container.id;
     lease.meta.containerId = container.id;
-    lease.meta.publishedPort = publishedPort;
 
-    const ssh = {
-      host: hostname,
-      port: this.cfg.ssh_tunnel_port,
-      user: 'renter',
-    };
+    try {
+      await container.start();
+      const inspect = await container.inspect();
+      const binding = inspect && inspect.NetworkSettings && inspect.NetworkSettings.Ports
+        && inspect.NetworkSettings.Ports['22/tcp'] && inspect.NetworkSettings.Ports['22/tcp'][0];
+      const publishedPort = binding ? Number(binding.HostPort) : 0;
+      lease.meta.publishedPort = publishedPort;
 
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      let up = false;
-      try { up = !!(await this.__probeSsh(publishedPort)); } catch { up = false; }
-      if (up) return { ...lease, state: 'ready', ssh, meta: { ...lease.meta } };
-      if (Date.now() >= deadline) return { ...lease, state: 'degraded', meta: { ...lease.meta } };
-      await new Promise((r) => setTimeout(r, 50));
+      const ssh = {
+        host: hostname,
+        port: this.cfg.ssh_tunnel_port,
+        user: 'renter',
+      };
+
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        let up = false;
+        try { up = !!(await this.__probeSsh(publishedPort)); } catch { up = false; }
+        if (up) return { ...lease, state: 'ready', ssh, meta: { ...lease.meta } };
+        if (Date.now() >= deadline) return { ...lease, state: 'degraded', meta: { ...lease.meta } };
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    } catch (err) {
+      try { await this._forceRemove(this._containerId || container.id); } catch { /* still unlock */ }
+      this._containerId = null;
+      this._busy = false;
+      throw err;
     }
   }
 
@@ -166,13 +185,7 @@ class HomeGpuProvider extends ComputeProvider {
 
   async release(lease) {
     const id = (lease && lease.meta && lease.meta.containerId) || this._containerId;
-    if (id) {
-      try {
-        await this.docker.getContainer(id).remove({ force: true });
-      } catch (err) {
-        if (!gone(err)) throw err;
-      }
-    }
+    await this._forceRemove(id);
     this._containerId = null;
     this._busy = false;
     return { ...lease, state: 'released' };

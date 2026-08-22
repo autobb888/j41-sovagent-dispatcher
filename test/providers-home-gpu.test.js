@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const { HomeGpuProvider } = require('../src/providers/home-gpu');
 const { listProviderTypes } = require('../src/providers');
 
-function stubDocker({ publishedPort = 22001 } = {}) {
+function stubDocker({ publishedPort = 22001, startError } = {}) {
   const created = []; const removed = [];
   return {
     created, removed,
@@ -13,7 +13,7 @@ function stubDocker({ publishedPort = 22001 } = {}) {
       const id = 'ctr-' + created.length;
       return {
         id,
-        async start() {},
+        async start() { if (startError) throw startError; },
         async inspect() {
           return { NetworkSettings: { Ports: { '22/tcp': [{ HostIp: '127.0.0.1', HostPort: String(publishedPort) }] } } };
         },
@@ -58,12 +58,25 @@ test('waitReady publishes 22/tcp on 127.0.0.1, never 0.0.0.0, never host net, an
   assert.equal(spec.HostConfig.Memory, 8192 * 1024 * 1024);
   assert.deepEqual(spec.HostConfig.DeviceRequests[0].DeviceIDs, ['0']);
   assert.ok(spec.HostConfig.CapDrop.includes('ALL'));
+  assert.ok(spec.HostConfig.CapAdd.includes('SETUID'));
+  assert.ok(spec.HostConfig.CapAdd.includes('SETGID'));
+  assert.ok(spec.HostConfig.CapAdd.includes('NET_BIND_SERVICE'));
 });
 
 test('waitReady fails closed without ssh_hostname', async () => {
   const p = new HomeGpuProvider({ docker: stubDocker(), __probeSsh: async () => true });
   const lease = await p.acquire((await p.discover())[0]);
   await assert.rejects(() => p.waitReady(lease, { timeoutMs: 100 }), /HOME_GPU_NO_TUNNEL/);
+});
+
+test('waitReady start failure removes the container and does not stick the lock', async () => {
+  const docker = stubDocker({ startError: new Error('start failed') });
+  const p = new HomeGpuProvider({ ssh_hostname: 'gpu.example.com', docker, __probeSsh: async () => true });
+  const lease = await p.acquire((await p.discover())[0]);
+  await assert.rejects(() => p.waitReady(lease, { timeoutMs: 1000 }), /start failed/);
+  assert.equal(docker.removed.length, 1);
+  assert.equal(docker.removed[0].opts.force, true);
+  assert.equal((await p.discover()).length, 1);
 });
 
 test('release twice is success', async () => {
