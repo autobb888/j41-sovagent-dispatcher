@@ -7,7 +7,7 @@ const { VDXF_KEYS } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js'
 const {
   loadBuyerAllowlist, buyerMatchesAllowlist, decideAutoAccept,
   addBuyerAllowlistEntry, removeBuyerAllowlistEntry,
-  readChainSalesStatus, resolveAllowlistEntries, clearAllowlistResolveCache,
+  readChainSalesStatus, inspectChainSalesStatus, resolveAllowlistEntries, clearAllowlistResolveCache,
   hasAllowlistedRequestedSibling, buyerNamesFromJob,
 } = require('../src/buyer-allowlist');
 
@@ -137,4 +137,66 @@ test('readChainSalesStatus reads VDXF agent.status from contentmultimap (invite)
     identity: { contentmultimap: { [key]: [{ message: 'active' }] } },
   }), 'active');
   assert.equal(readChainSalesStatus({ contentmultimap: {} }), null);
+});
+
+test('readChainSalesStatus unwraps makeSubDD DataDescriptor (last array entry)', () => {
+  const { VDXF_KEYS: keys, makeSubDD } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+  assert.equal(readChainSalesStatus({
+    identity: { contentmultimap: { [keys.agent.status]: [makeSubDD(keys.agent.status, 'invite')] } },
+  }), 'invite');
+  assert.equal(readChainSalesStatus({
+    contentmultimap: {
+      [keys.agent.status]: [
+        makeSubDD(keys.agent.status, 'active'),
+        makeSubDD(keys.agent.status, 'invite'),
+      ],
+    },
+  }), 'invite');
+});
+
+test('readChainSalesStatus unwraps hex objectdata like parseSubDD', () => {
+  const { DATA_DESCRIPTOR_KEY } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+  const key = VDXF_KEYS.agent.status;
+  const hexJson = Buffer.from(JSON.stringify('invite'), 'utf8').toString('hex');
+  assert.equal(readChainSalesStatus({
+    contentmultimap: {
+      [key]: [{ [DATA_DESCRIPTOR_KEY]: { objectdata: hexJson, label: key } }],
+    },
+  }), 'invite');
+});
+
+test('inspectChainSalesStatus distinguishes missing vs unparseable vs unread', () => {
+  const key = VDXF_KEYS.agent.status;
+  assert.deepEqual(inspectChainSalesStatus({ contentmultimap: {} }), {
+    status: null, present: false, unparseable: false, unread: false,
+  });
+  assert.deepEqual(inspectChainSalesStatus(null), {
+    status: null, present: false, unparseable: false, unread: true,
+  });
+  const garbage = inspectChainSalesStatus({ contentmultimap: { [key]: { garbage: true } } });
+  assert.equal(garbage.present, true);
+  assert.equal(garbage.unparseable, true);
+  assert.equal(garbage.status, null);
+  assert.equal(inspectChainSalesStatus({ contentmultimap: { [key]: 'invite' } }).status, 'invite');
+});
+
+test('resolveAllowlistEntries falls back to getAgent when getIdentityKeys throws', async () => {
+  clearAllowlistResolveCache();
+  const getKeys = async () => {
+    const err = new Error('getIdentityKeys refused on mainnet: J41_PLATFORM_SIGNER is unset');
+    err.code = 'PLATFORM_SIGNER_REQUIRED';
+    throw err;
+  };
+  const getAgent = async (name) => {
+    assert.equal(name, 'bob.agentplatform@');
+    return { id: 'iBobFromAgent', verusId: 'iBobFromAgent' };
+  };
+  const resolved = await resolveAllowlistEntries(['bob.agentplatform@'], getKeys, getAgent);
+  assert.deepEqual(resolved, ['iBobFromAgent']);
+  assert.equal(decideAutoAccept({
+    chainStatus: 'invite',
+    allowlist: ['bob.agentplatform@', ...resolved],
+    buyerVerusId: 'iBobFromAgent',
+    resolved: [],
+  }).action, 'accept');
 });

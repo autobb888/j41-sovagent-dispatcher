@@ -177,6 +177,15 @@ test('planAgentActivation does not repair chain invite', () => {
   assert.equal(p.repairChain, false);
 });
 
+test('planAgentActivation does not rewrite invite → active even with on-chain toggle', () => {
+  const p = planAgentActivation(
+    { platformStatus: 'inactive', chainStatus: 'invite' },
+    { toggleOnChain: true },
+  );
+  assert.equal(p.onChain, false);
+  assert.equal(p.repairChain, false);
+});
+
 test('shouldWriteChainActiveOnActivate is false for invite', () => {
   assert.equal(shouldWriteChainActiveOnActivate('invite'), false);
   assert.equal(shouldWriteChainActiveOnActivate('active'), true);

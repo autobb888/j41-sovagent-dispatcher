@@ -103,6 +103,7 @@ const {
   removeBuyerAllowlistEntry,
   resolveAllowlistEntries,
   readChainSalesStatus,
+  inspectChainSalesStatus,
   hasAllowlistedRequestedSibling,
   buyerNamesFromJob,
   clearSalesStatusCache,
@@ -2256,12 +2257,18 @@ program
         try {
           await agent.authenticate();
           const raw = await agent.client.getIdentityRaw();
-          const chainStatus = readChainSalesStatus(raw && (raw.data || raw));
-          if (!shouldWriteChainActiveOnActivate(chainStatus)) {
+          const inspect = inspectChainSalesStatus(raw && (raw.data || raw));
+          if (inspect.unread || inspect.unparseable) {
+            onChain = false;
+            console.warn(`   Could not read on-chain status — skipping chain write.`);
+          } else if (!shouldWriteChainActiveOnActivate(inspect.status)) {
             onChain = false;
             console.log(`   On-chain status is invite — skipping chain write. \`sales-mode open\` is the floodgate.`);
           }
-        } catch { /* could not read chain status — proceed with requested onChain */ }
+        } catch {
+          onChain = false;
+          console.warn(`   Could not read on-chain status — skipping chain write.`);
+        }
       }
       const result = await agent.activate({ onChain });
 
@@ -2348,12 +2355,18 @@ program
           try {
             await agent.authenticate();
             const raw = await agent.client.getIdentityRaw();
-            const chainStatus = readChainSalesStatus(raw && (raw.data || raw));
-            if (!shouldWriteChainActiveOnActivate(chainStatus)) {
+            const inspect = inspectChainSalesStatus(raw && (raw.data || raw));
+            if (inspect.unread || inspect.unparseable) {
+              onChain = false;
+              console.warn(`   ${agentId}: could not read on-chain status — skipping chain write.`);
+            } else if (!shouldWriteChainActiveOnActivate(inspect.status)) {
               onChain = false;
               console.log(`   ${agentId}: on-chain status is invite — skipping chain write. \`sales-mode open\` is the floodgate.`);
             }
-          } catch { /* could not read chain status — proceed with requested onChain */ }
+          } catch {
+            onChain = false;
+            console.warn(`   ${agentId}: could not read on-chain status — skipping chain write.`);
+          }
         }
         const result = await agent.activate({ onChain });
         // Re-activate services
@@ -2498,9 +2511,38 @@ program
       console.error(`❌ Usage: allowlist <agent-id> ${act} <identity>`);
       process.exit(1);
     }
-    cfg = act === 'add'
-      ? addBuyerAllowlistEntry(cfg, identity)
-      : removeBuyerAllowlistEntry(cfg, identity);
+    if (act === 'add') {
+      const pasted = String(identity).trim();
+      cfg = addBuyerAllowlistEntry(cfg, pasted);
+      const alreadyIAddr = /^i[1-9A-HJ-NP-Za-km-z]{25,}$/.test(pasted);
+      if (!alreadyIAddr) {
+        try {
+          const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+          const agent = new J41Agent({
+            apiUrl: J41_API_URL,
+            wif: keys.wif,
+            identityName: keys.identity,
+            iAddress: keys.iAddress,
+          });
+          if (keys.wif && keys.identity) await agent.authenticate();
+          const resolved = await resolveAllowlistEntries(
+            [pasted],
+            (id) => agent.client.getIdentityKeys(id).then(k => ({ identityaddress: k.iaddress, iAddress: k.iaddress, iaddress: k.iaddress })),
+            (id) => agent.client.getAgent(id),
+          );
+          if (resolved[0]) {
+            cfg = addBuyerAllowlistEntry(cfg, resolved[0]);
+            console.log(`   resolved ${pasted} → ${resolved[0]}`);
+          } else {
+            console.warn(`⚠️  Could not resolve ${pasted} to an i-address. Auto-accept will not match buyerVerusId until it resolves. Re-run allowlist add after the name is listed, or add the i-address directly.`);
+          }
+        } catch (e) {
+          console.warn(`⚠️  Could not resolve ${pasted} to an i-address (${e.message}). Auto-accept will not match buyerVerusId until it resolves.`);
+        }
+      }
+    } else {
+      cfg = removeBuyerAllowlistEntry(cfg, identity);
+    }
     fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + '\n');
     fs.chmodSync(configPath, 0o600);
     console.log(`✅ ${act === 'add' ? 'Added' : 'Removed'} ${identity} ${act === 'add' ? 'to' : 'from'} ${agentId} allowlist`);
@@ -2601,6 +2643,10 @@ program
       const timestamp = Math.floor(Date.now() / 1000);
       const sig = signMessage(keys.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
       await agent.client.acceptJob(jobId, sig, timestamp, keys.address);
+      const buyerPayAddr = fullJob.buyerPayAddress || fullJob.buyer?.payAddress;
+      if (buyerPayAddr) {
+        addActiveJobToAllowlist(jobId, buyerPayAddr);
+      }
       console.log(`✅ Job ${jobId} accepted (signed, pay→${keys.address.slice(0, 8)}...) — awaiting buyer payment`);
     } catch (e) {
       console.error(`❌ ${e.message}`);
@@ -6498,6 +6544,8 @@ function planAgentActivation(agentInfo, opts = {}) {
   // `unknown` is NOT a repair trigger: we could not read it, and writing on-chain
   // on a guess costs a fee and risks a collision.
   const chainNeedsRepair = chain === 'inactive';
+  // Spec §0.10: start must not rewrite invite → active, even with the on-chain toggle.
+  const writeOnChain = toggleOnChain && chain !== 'invite';
 
   if (platform === 'active' && !chainNeedsRepair && !toggleOnChain) {
     // Both axes already good (or the chain axis unreadable) and we are not being
@@ -6507,7 +6555,7 @@ function planAgentActivation(agentInfo, opts = {}) {
   }
   return {
     skip: false,
-    onChain: toggleOnChain,
+    onChain: writeOnChain,
     // Do not repair separately when the activate itself is already writing
     // on-chain — that would be two identity writes for one agent in one pass,
     // which is the double-spend this whole release exists to remove.
@@ -8291,11 +8339,30 @@ async function pollForJobs(state) {
               }
               if (!state._inviteHeld) state._inviteHeld = new Set();
               const agentCfg = loadAgentConfig(agentInfo.id);
-              const raw = await agent.client.getIdentityRaw(agentInfo.iAddress || agentInfo.identity).catch(() => null);
-              const chainStatus = readChainSalesStatus(raw && (raw.data || raw));
+              let inspect;
+              try {
+                const raw = await agent.client.getIdentityRaw(agentInfo.iAddress || agentInfo.identity);
+                inspect = inspectChainSalesStatus(raw && (raw.data || raw));
+              } catch {
+                inspect = { status: null, present: false, unparseable: false, unread: true };
+              }
+              const statusHold = inspect.unread ? 'status unread' : (inspect.unparseable ? 'status unparseable' : null);
+              if (statusHold) {
+                const holdKey = `${statusHold}:${agentInfo.id}`;
+                if (!state._inviteHeld.has(holdKey)) {
+                  state._inviteHeld.add(holdKey);
+                  console.warn(`[INVITE] ${agentInfo.id} on-chain ${statusHold} — holding jobs`);
+                }
+                continue;
+              }
+              const chainStatus = inspect.status;
               const prefer = agentCfg.preferAllowlist === true;
               const allowlist = loadBuyerAllowlist(agentCfg);
-              const resolved = await resolveAllowlistEntries(allowlist, (id) => agent.client.getIdentityKeys(id).then(k => ({ identityaddress: k.iaddress, iAddress: k.iaddress })));
+              const resolved = await resolveAllowlistEntries(
+                allowlist,
+                (id) => agent.client.getIdentityKeys(id).then(k => ({ identityaddress: k.iaddress, iAddress: k.iaddress, iaddress: k.iaddress })),
+                (id) => agent.client.getAgent(id),
+              );
               const decision = decideAutoAccept({
                 chainStatus,
                 allowlist: [...allowlist, ...resolved],
@@ -8307,7 +8374,11 @@ async function pollForJobs(state) {
               });
               if (decision.action !== 'accept') {
                 if (decision.reason === 'empty allowlist') {
-                  console.log(`[INVITE] ${agentInfo.id} is invite-only with an empty allowlist — accepting nobody`);
+                  const emptyKey = `empty:${agentInfo.id}`;
+                  if (!state._inviteHeld.has(emptyKey)) {
+                    state._inviteHeld.add(emptyKey);
+                    console.log(`[INVITE] ${agentInfo.id} is invite-only with an empty allowlist — accepting nobody`);
+                  }
                 } else if (!state._inviteHeld.has(job.id)) {
                   state._inviteHeld.add(job.id);
                   const verb = decision.action === 'defer' ? 'deferring' : 'holding';
@@ -8641,11 +8712,30 @@ async function handleWebhookEvent(state, agentId, payload) {
           }
           if (!state._inviteHeld) state._inviteHeld = new Set();
           const agentCfg = loadAgentConfig(agentInfo.id);
-          const raw = await agent.client.getIdentityRaw(agentInfo.iAddress || agentInfo.identity).catch(() => null);
-          const chainStatus = readChainSalesStatus(raw && (raw.data || raw));
+          let inspect;
+          try {
+            const raw = await agent.client.getIdentityRaw(agentInfo.iAddress || agentInfo.identity);
+            inspect = inspectChainSalesStatus(raw && (raw.data || raw));
+          } catch {
+            inspect = { status: null, present: false, unparseable: false, unread: true };
+          }
+          const statusHold = inspect.unread ? 'status unread' : (inspect.unparseable ? 'status unparseable' : null);
+          if (statusHold) {
+            const holdKey = `${statusHold}:${agentInfo.id}`;
+            if (!state._inviteHeld.has(holdKey)) {
+              state._inviteHeld.add(holdKey);
+              console.warn(`[INVITE] ${agentInfo.id} on-chain ${statusHold} — holding jobs`);
+            }
+            return;
+          }
+          const chainStatus = inspect.status;
           const prefer = agentCfg.preferAllowlist === true;
           const allowlist = loadBuyerAllowlist(agentCfg);
-          const resolved = await resolveAllowlistEntries(allowlist, (id) => agent.client.getIdentityKeys(id).then(k => ({ identityaddress: k.iaddress, iAddress: k.iaddress })));
+          const resolved = await resolveAllowlistEntries(
+            allowlist,
+            (id) => agent.client.getIdentityKeys(id).then(k => ({ identityaddress: k.iaddress, iAddress: k.iaddress, iaddress: k.iaddress })),
+            (id) => agent.client.getAgent(id),
+          );
           const decision = decideAutoAccept({
             chainStatus,
             allowlist: [...allowlist, ...resolved],
@@ -8658,7 +8748,11 @@ async function handleWebhookEvent(state, agentId, payload) {
           });
           if (decision.action !== 'accept') {
             if (decision.reason === 'empty allowlist') {
-              console.log(`[INVITE] ${agentInfo.id} is invite-only with an empty allowlist — accepting nobody`);
+              const emptyKey = `empty:${agentInfo.id}`;
+              if (!state._inviteHeld.has(emptyKey)) {
+                state._inviteHeld.add(emptyKey);
+                console.log(`[INVITE] ${agentInfo.id} is invite-only with an empty allowlist — accepting nobody`);
+              }
             } else if (!state._inviteHeld.has(jobId)) {
               state._inviteHeld.add(jobId);
               const verb = decision.action === 'defer' ? 'deferring' : 'holding';
