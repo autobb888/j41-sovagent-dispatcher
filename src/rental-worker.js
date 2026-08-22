@@ -134,8 +134,10 @@ async function startRentalJob(opts) {
   return { lease, deliverable };
 }
 
-const TERMINAL_RENTAL_STATUSES = Object.freeze([
-  'delivered', 'completed', 'cancelled', 'resolved', 'resolved_rejected',
+// Delivered/completed is NOT a yank — Cat-1 credentials delivered means the buyer
+// still owns the box until expiresAt. Compute-supply reconcile releases on expiry.
+const YANK_RENTAL_STATUSES = Object.freeze([
+  'cancelled', 'resolved', 'resolved_rejected',
 ]);
 
 function resolveComputeController(state) {
@@ -161,7 +163,7 @@ function rentalLeaseGoneOrExpired(lease, now = Date.now()) {
 }
 
 function shouldTeardownRental({ state, jobId, active, job, now = Date.now() }) {
-  if (job && TERMINAL_RENTAL_STATUSES.includes(job.status)) return true;
+  if (job && YANK_RENTAL_STATUSES.includes(job.status)) return true;
   const ctrl = resolveComputeController(state);
   const lease = findRentalLease(ctrl, active, jobId);
   return rentalLeaseGoneOrExpired(lease, now);
@@ -210,5 +212,5 @@ module.exports = {
   agentIsRentalSlot,
   resolveRentalProvider,
   ensureComputeController,
-  TERMINAL_RENTAL_STATUSES,
+  YANK_RENTAL_STATUSES,
 };

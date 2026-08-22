@@ -83,8 +83,16 @@ test('handleWebhookEvent job.cancelled on gpu-rental releases the lease, not con
   assert.equal(state.available[0] && state.available[0].id, 'gpu-1');
 });
 
-test('cleanup of a gpu-rental with terminal job status deletes active without startJobContainer', async () => {
-  const { state, released, stopped } = rentalState({ status: 'delivered' });
+test('cleanup of a delivered gpu-rental with future expiresAt keeps the box (buyer still owns it)', async () => {
+  const { state, released, stopped } = rentalState({ status: 'delivered', expiresAt: Date.now() + 60_000 });
+  await _cleanupCompletedJobs(state);
+  assert.equal(state.active.has('job-1'), true);
+  assert.equal(released.length, 0);
+  assert.equal(stopped.length, 0);
+});
+
+test('cleanup of a cancelled gpu-rental yanks the box without startJobContainer', async () => {
+  const { state, released, stopped } = rentalState({ status: 'cancelled', expiresAt: Date.now() + 60_000 });
   await _cleanupCompletedJobs(state);
   assert.equal(state.active.has('job-1'), false);
   assert.deepEqual(released, ['home:1']);
