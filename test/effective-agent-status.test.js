@@ -24,6 +24,7 @@ const {
   chainAgentStatus,
   platformAgentStatus,
   planAgentActivation,
+  shouldWriteChainActiveOnActivate,
   decidePlatformStatusSupport,
   backendSupportsPlatformStatus,
   PLATFORM_STATUS_FEATURE,
@@ -164,6 +165,23 @@ test('the on-chain opt-in never skips — the operator asked for the write', () 
   const plan = planAgentActivation({ platformStatus: 'active', chainStatus: 'active' }, { toggleOnChain: true });
   assert.equal(plan.skip, false);
   assert.equal(plan.onChain, true);
+});
+
+test('invite on chain + active platform is invite, not inactive', () => {
+  assert.equal(effectiveAgentStatus({ status: 'invite', platformStatus: 'active' }), 'invite');
+});
+
+test('planAgentActivation does not repair chain invite', () => {
+  const p = planAgentActivation({ platformStatus: 'active', chainStatus: 'invite' });
+  assert.equal(p.skip, true);
+  assert.equal(p.repairChain, false);
+});
+
+test('shouldWriteChainActiveOnActivate is false for invite', () => {
+  assert.equal(shouldWriteChainActiveOnActivate('invite'), false);
+  assert.equal(shouldWriteChainActiveOnActivate('active'), true);
+  assert.equal(shouldWriteChainActiveOnActivate('inactive'), true);
+  assert.equal(shouldWriteChainActiveOnActivate(null), true);
 });
 
 // ── The default must be earned from the backend, not assumed ────────────────

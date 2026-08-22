@@ -409,6 +409,7 @@ async function agentDetailScreen(inquirer, agentId) {
   if (!needsRegister && !needsFinalize && !finalizeIncomplete) {
     choices.push(new inquirer.Separator('  ── Edit ──'));
     choices.push({ name: '  Update Profile (change on-chain VDXF fields)', value: 'update_profile' });
+    choices.push({ name: '  Prefer allowlist even when open?', value: 'prefer_allowlist' });
   }
 
   // Add retry/register/finalize options for incomplete agents
@@ -438,6 +439,7 @@ async function agentDetailScreen(inquirer, agentId) {
     case 'soul': await soulScreen(inquirer, agentDir); break;
     case 'jobs': await jobsScreen(inquirer, keys); break;
     case 'update_profile': await updateProfileScreen(inquirer, agentId, keys); break;
+    case 'prefer_allowlist': await preferAllowlistScreen(inquirer, agentId); break;
     case 'retry_register': await retryRegisterScreen(inquirer, agentId, keys); break;
     case 'retry_finalize': await retryFinalizeScreen(inquirer, agentId); break;
     case '__back': return;
@@ -1300,6 +1302,7 @@ async function addAgentScreen(inquirer) {
             console.log('\n  Skipped. Next is still rental-setup, not start:\n');
             console.log('    j41-dispatcher rental-setup ' + agentId + '\n');
           }
+          await promptPreferAllowlist(inquirer, agentId);
           await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
           return;
         }
@@ -1894,6 +1897,26 @@ function saveAgentConfig(agentId, config) {
   fs.mkdirSync(agentDir, { recursive: true, mode: 0o700 });
   const configPath = path.join(agentDir, 'agent-config.json');
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+}
+
+async function promptPreferAllowlist(inquirer, agentId) {
+  const cfg = loadAgentConfig(agentId);
+  const { prefer } = await promptWithEsc(inquirer, [{
+    type: 'confirm',
+    name: 'prefer',
+    message: 'Prefer allowlist even when open?',
+    default: false,
+  }]);
+  cfg.preferAllowlist = prefer === true;
+  saveAgentConfig(agentId, cfg);
+}
+
+async function preferAllowlistScreen(inquirer, agentId) {
+  await promptPreferAllowlist(inquirer, agentId);
+  const cfg = loadAgentConfig(agentId);
+  console.log(cfg.preferAllowlist
+    ? '\n  preferAllowlist on — friends first when sales-mode is open.\n'
+    : '\n  preferAllowlist off — sales-mode open is a real floodgate.\n');
 }
 
 async function executorConfigScreen(inquirer) {

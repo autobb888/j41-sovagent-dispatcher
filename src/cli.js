@@ -99,10 +99,13 @@ const { isGpuRentalJob, startRentalJob, stopRentalJob, shouldTeardownRental, ser
 const {
   decideAutoAccept,
   loadBuyerAllowlist,
+  addBuyerAllowlistEntry,
+  removeBuyerAllowlistEntry,
   resolveAllowlistEntries,
   readChainSalesStatus,
   hasAllowlistedRequestedSibling,
   buyerNamesFromJob,
+  clearSalesStatusCache,
 } = require('./buyer-allowlist');
 const crypto = require('crypto');
 
@@ -2248,7 +2251,19 @@ program
     });
 
     try {
-      const result = await agent.activate({ onChain: !options.platformOnly });
+      let onChain = !options.platformOnly;
+      if (onChain) {
+        try {
+          await agent.authenticate();
+          const raw = await agent.client.getIdentityRaw();
+          const chainStatus = readChainSalesStatus(raw && (raw.data || raw));
+          if (!shouldWriteChainActiveOnActivate(chainStatus)) {
+            onChain = false;
+            console.log(`   On-chain status is invite — skipping chain write. \`sales-mode open\` is the floodgate.`);
+          }
+        } catch { /* could not read chain status — proceed with requested onChain */ }
+      }
+      const result = await agent.activate({ onChain });
 
       // Re-activate services
       let svcCount = 0;
@@ -2280,7 +2295,7 @@ program
         state.stage = 'ready';
         delete state.deactivatedAt;
         state.notes = state.notes || [];
-        state.notes.push(`${new Date().toISOString()} Agent reactivated (on-chain: ${!options.platformOnly})`);
+        state.notes.push(`${new Date().toISOString()} Agent reactivated (on-chain: ${onChain})`);
         fs.writeFileSync(finalizePath, JSON.stringify(state, null, 2));
       }
 
@@ -2328,7 +2343,19 @@ program
           identityName: keys.identity,
           iAddress: keys.iAddress,
         });
-        const result = await agent.activate({ onChain: !options.platformOnly });
+        let onChain = !options.platformOnly;
+        if (onChain) {
+          try {
+            await agent.authenticate();
+            const raw = await agent.client.getIdentityRaw();
+            const chainStatus = readChainSalesStatus(raw && (raw.data || raw));
+            if (!shouldWriteChainActiveOnActivate(chainStatus)) {
+              onChain = false;
+              console.log(`   ${agentId}: on-chain status is invite — skipping chain write. \`sales-mode open\` is the floodgate.`);
+            }
+          } catch { /* could not read chain status — proceed with requested onChain */ }
+        }
+        const result = await agent.activate({ onChain });
         // Re-activate services
         try {
           const svcResp = await agent._client.getMyServices();
@@ -2346,7 +2373,7 @@ program
           state.stage = 'ready';
           delete state.deactivatedAt;
           state.notes = state.notes || [];
-          state.notes.push(`${new Date().toISOString()} Batch activated (on-chain: ${!options.platformOnly})`);
+          state.notes.push(`${new Date().toISOString()} Batch activated (on-chain: ${onChain})`);
           fs.writeFileSync(finalizePath, JSON.stringify(state, null, 2));
         }
         succeeded++;
@@ -2431,6 +2458,154 @@ program
     }
 
     console.log(`\n✅ Done: ${succeeded} deactivated, ${failed} failed`);
+  });
+
+program
+  .command('allowlist <agent-id> [action] [identity]')
+  .description('List, add, or remove buyer identities this listing will auto-accept when sales-mode is invite')
+  .action(async (agentId, action, identity) => {
+    await ensureKeystoreUnlockedIfEncrypted();
+    ensureDirs();
+
+    const keys = loadAgentKeys(agentId);
+    if (!keys) {
+      console.error(`❌ Agent ${agentId} not found.`);
+      process.exit(1);
+    }
+
+    const configPath = path.join(AGENTS_DIR, agentId, 'agent-config.json');
+    let cfg = {};
+    try {
+      if (fs.existsSync(configPath)) cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    } catch {}
+
+    const act = String(action || 'list').trim().toLowerCase();
+    if (!action || act === 'list') {
+      const list = loadBuyerAllowlist(cfg);
+      if (list.length === 0) {
+        console.log(`Allowlist for ${agentId}: (empty)`);
+      } else {
+        console.log(`Allowlist for ${agentId}:`);
+        for (const e of list) console.log(`  ${e}`);
+      }
+      return;
+    }
+    if (act !== 'add' && act !== 'remove') {
+      console.error('❌ Action must be add, remove, or omitted (list)');
+      process.exit(1);
+    }
+    if (!identity) {
+      console.error(`❌ Usage: allowlist <agent-id> ${act} <identity>`);
+      process.exit(1);
+    }
+    cfg = act === 'add'
+      ? addBuyerAllowlistEntry(cfg, identity)
+      : removeBuyerAllowlistEntry(cfg, identity);
+    fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + '\n');
+    fs.chmodSync(configPath, 0o600);
+    console.log(`✅ ${act === 'add' ? 'Added' : 'Removed'} ${identity} ${act === 'add' ? 'to' : 'from'} ${agentId} allowlist`);
+  });
+
+// NOT gated: do not run while an inbox identity tx for this agent is unconfirmed
+// (see /health pendingWrites). Same hazard as update-profile.
+program
+  .command('sales-mode <agent-id> [mode]')
+  .description('On-chain floodgate: invite (allowlist) or open (active). Writes agent.status VDXF. Do not run while the dispatcher has an unconfirmed identity write for this agent.')
+  .action(async (agentId, mode) => {
+    await ensureKeystoreUnlockedIfEncrypted();
+    ensureDirs();
+
+    const keys = loadAgentKeys(agentId);
+    if (!keys) {
+      console.error(`❌ Agent ${agentId} not found.`);
+      process.exit(1);
+    }
+    if (!keys.identity || !keys.iAddress || !keys.wif) {
+      console.error(`❌ Agent ${agentId} is not registered on-chain. Register first.`);
+      process.exit(1);
+    }
+
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+    const agent = new J41Agent({
+      apiUrl: J41_API_URL,
+      wif: keys.wif,
+      identityName: keys.identity,
+      iAddress: keys.iAddress,
+    });
+
+    try {
+      await agent.authenticate();
+      const raw = await agent.client.getIdentityRaw();
+      const current = readChainSalesStatus(raw && (raw.data || raw));
+      const m = String(mode || '').trim().toLowerCase();
+      if (!m || m === 'status') {
+        const label = current === 'active' ? 'open (on-chain active)' : (current || '(unset)');
+        console.log(`Sales mode for ${agentId}: ${label}`);
+        return;
+      }
+      if (m !== 'invite' && m !== 'open') {
+        console.error('❌ Mode must be invite, open, or omitted (print current)');
+        process.exit(1);
+      }
+
+      console.warn('⚠️  Do not run sales-mode while the dispatcher has an unconfirmed identity write for this agent (see /health pendingWrites).');
+
+      let txid;
+      if (m === 'open') {
+        txid = await agent.setOnChainStatus('active');
+      } else {
+        txid = await agent.setOnChainStatus('invite');
+      }
+      clearSalesStatusCache();
+      try { await agent.client.refreshAgent(keys.iAddress); } catch {}
+      console.log(`✅ Sales mode → ${m} (on-chain ${m === 'open' ? 'active' : 'invite'})${txid ? ' tx:' + String(txid).substring(0, 12) + '...' : ''}`);
+    } catch (e) {
+      console.error(`❌ ${e.message}`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('accept-job <agent-id> <job-id>')
+  .description('One-shot accept a stacked hire without changing sales-mode or preferAllowlist')
+  .action(async (agentId, jobId) => {
+    await ensureKeystoreUnlockedIfEncrypted();
+    ensureDirs();
+
+    const keys = loadAgentKeys(agentId);
+    if (!keys) {
+      console.error(`❌ Agent ${agentId} not found.`);
+      process.exit(1);
+    }
+    if (!keys.identity || !keys.wif || !keys.address) {
+      console.error(`❌ Agent ${agentId} is not registered.`);
+      process.exit(1);
+    }
+
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+    const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
+    const agent = new J41Agent({
+      apiUrl: J41_API_URL,
+      wif: keys.wif,
+      identityName: keys.identity,
+      iAddress: keys.iAddress,
+    });
+
+    try {
+      await agent.authenticate();
+      const fullJob = await agent.client.getJob(jobId);
+      if (!fullJob?.jobHash || !fullJob?.buyerVerusId) {
+        console.error('❌ Job is missing jobHash or buyerVerusId — cannot sign accept');
+        process.exit(1);
+      }
+      const timestamp = Math.floor(Date.now() / 1000);
+      const sig = signMessage(keys.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
+      await agent.client.acceptJob(jobId, sig, timestamp, keys.address);
+      console.log(`✅ Job ${jobId} accepted (signed, pay→${keys.address.slice(0, 8)}...) — awaiting buyer payment`);
+    } catch (e) {
+      console.error(`❌ ${e.message}`);
+      process.exit(1);
+    }
   });
 
 /**
@@ -6339,6 +6514,11 @@ function planAgentActivation(agentInfo, opts = {}) {
     repairChain: chainNeedsRepair && !toggleOnChain,
     reason: chainNeedsRepair ? 'chain axis inactive — needs repair' : 'platform axis needs a write',
   };
+}
+
+/** False when the VDXF is already `invite` — `sales-mode open` is the floodgate, not activate. */
+function shouldWriteChainActiveOnActivate(chainStatus) {
+  return String(chainStatus || '').trim().toLowerCase() !== 'invite';
 }
 
 // ── Shutdown/start fleet-state handoff ───────────────────────────────────────
@@ -12959,7 +13139,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState, untrusted, untrustedField, requireInteractiveConfirm, printFundingInstructions, handleWebhookEvent, stopJobContainer, stopJobLocal, _cleanupCompletedJobs, jobImageExists, JOB_IMAGE, jailImageExists, JAIL_IMAGE, NATIVE_COIN,
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, shouldWriteChainActiveOnActivate, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState, untrusted, untrustedField, requireInteractiveConfirm, printFundingInstructions, handleWebhookEvent, stopJobContainer, stopJobLocal, _cleanupCompletedJobs, jobImageExists, JOB_IMAGE, jailImageExists, JAIL_IMAGE, NATIVE_COIN,
     // Execution-harness seam: `program` so a test can drive the REAL `start`
     // action through commander, and `__getState` so it can then assert on what
     // that action actually did. See test/helpers/dispatcher-harness.js.
