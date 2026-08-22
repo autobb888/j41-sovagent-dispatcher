@@ -96,6 +96,14 @@ const keystore = require('./keystore.js');
 const { encryptAllKeys, decryptAllKeys, listPlaintextKeys } = require('./keys-migrate.js');
 const { preflightAllowsAccept } = require('./preflight-gate.js');
 const { isGpuRentalJob, startRentalJob, stopRentalJob, shouldTeardownRental, servicesForAgent, resolveRentalProvider, ensureComputeController } = require('./rental-worker.js');
+const {
+  decideAutoAccept,
+  loadBuyerAllowlist,
+  resolveAllowlistEntries,
+  readChainSalesStatus,
+  hasAllowlistedRequestedSibling,
+  buyerNamesFromJob,
+} = require('./buyer-allowlist');
 const crypto = require('crypto');
 
 /** Feature flag: route in-container signing through the host-side broker
@@ -8101,6 +8109,32 @@ async function pollForJobs(state) {
                   continue;
                 }
               }
+              if (!state._inviteHeld) state._inviteHeld = new Set();
+              const agentCfg = loadAgentConfig(agentInfo.id);
+              const raw = await agent.client.getIdentityRaw(agentInfo.iAddress || agentInfo.identity).catch(() => null);
+              const chainStatus = readChainSalesStatus(raw && (raw.data || raw));
+              const prefer = agentCfg.preferAllowlist === true;
+              const allowlist = loadBuyerAllowlist(agentCfg);
+              const resolved = await resolveAllowlistEntries(allowlist, (id) => agent.client.getIdentityKeys(id).then(k => ({ identityaddress: k.iaddress, iAddress: k.iaddress })));
+              const decision = decideAutoAccept({
+                chainStatus,
+                allowlist: [...allowlist, ...resolved],
+                preferAllowlist: prefer,
+                buyerVerusId: fullJob.buyerVerusId,
+                names: buyerNamesFromJob(fullJob),
+                resolved: [],
+                hasAllowlistedSibling: hasAllowlistedRequestedSibling(jobs, job.id, [...allowlist, ...resolved]),
+              });
+              if (decision.action !== 'accept') {
+                if (decision.reason === 'empty allowlist') {
+                  console.log(`[INVITE] ${agentInfo.id} is invite-only with an empty allowlist — accepting nobody`);
+                } else if (!state._inviteHeld.has(job.id)) {
+                  state._inviteHeld.add(job.id);
+                  const verb = decision.action === 'defer' ? 'deferring' : 'holding';
+                  console.log(`[INVITE] ${verb} job ${String(job.id).substring(0, 8)} for ${agentInfo.id} (${decision.reason})`);
+                }
+                continue;
+              }
               const timestamp = Math.floor(Date.now() / 1000);
               const acceptSig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
               await agent.client.acceptJob(job.id, acceptSig, timestamp, agentInfo.address);
@@ -8424,6 +8458,33 @@ async function handleWebhookEvent(state, agentId, payload) {
               state.emitEvent?.('job.declined_llm_down', { jobId, agentId: agentInfo.id });
               return;
             }
+          }
+          if (!state._inviteHeld) state._inviteHeld = new Set();
+          const agentCfg = loadAgentConfig(agentInfo.id);
+          const raw = await agent.client.getIdentityRaw(agentInfo.iAddress || agentInfo.identity).catch(() => null);
+          const chainStatus = readChainSalesStatus(raw && (raw.data || raw));
+          const prefer = agentCfg.preferAllowlist === true;
+          const allowlist = loadBuyerAllowlist(agentCfg);
+          const resolved = await resolveAllowlistEntries(allowlist, (id) => agent.client.getIdentityKeys(id).then(k => ({ identityaddress: k.iaddress, iAddress: k.iaddress })));
+          const decision = decideAutoAccept({
+            chainStatus,
+            allowlist: [...allowlist, ...resolved],
+            preferAllowlist: prefer,
+            buyerVerusId: fullJob.buyerVerusId,
+            names: buyerNamesFromJob(fullJob),
+            resolved: [],
+            // webhook: unknown siblings → defer unmatched strangers to poll
+            hasAllowlistedSibling: prefer,
+          });
+          if (decision.action !== 'accept') {
+            if (decision.reason === 'empty allowlist') {
+              console.log(`[INVITE] ${agentInfo.id} is invite-only with an empty allowlist — accepting nobody`);
+            } else if (!state._inviteHeld.has(jobId)) {
+              state._inviteHeld.add(jobId);
+              const verb = decision.action === 'defer' ? 'deferring' : 'holding';
+              console.log(`[INVITE] ${verb} job ${String(jobId).substring(0, 8)} for ${agentInfo.id} (${decision.reason})`);
+            }
+            return;
           }
           const timestamp = Math.floor(Date.now() / 1000);
           const sig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);

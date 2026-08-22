@@ -83,11 +83,28 @@ async function resolveAllowlistEntries(allowlist, getIdentity) {
     if (_resolveCache.has(e)) { out.push(_resolveCache.get(e)); continue; }
     try {
       const id = await getIdentity(e);
-      const iAddr = id?.identity?.identityaddress || id?.identityaddress || id?.iAddress;
+      const iAddr = id?.identity?.identityaddress || id?.identityaddress || id?.iAddress || id?.iaddress;
       if (iAddr) { _resolveCache.set(e, iAddr); out.push(iAddr); }
     } catch { /* leave unmatched */ }
   }
   return out;
+}
+
+function buyerNamesFromJob(job) {
+  if (!job) return [];
+  return [job.buyer?.identityName, job.buyer?.name, job.buyerIdentity].filter(Boolean);
+}
+
+function hasAllowlistedRequestedSibling(jobs, currentJobId, allowlist) {
+  const list = Array.isArray(allowlist) ? allowlist : [];
+  for (const other of jobs || []) {
+    if (!other || other.id === currentJobId) continue;
+    if (other.status !== 'requested') continue;
+    if (buyerMatchesAllowlist(other.buyerVerusId, list, {
+      names: buyerNamesFromJob(other),
+    })) return true;
+  }
+  return false;
 }
 
 function clearSalesStatusCache() { /* chain-status cache lives next to this; export for sales-mode */ }
@@ -97,5 +114,6 @@ module.exports = {
   loadBuyerAllowlist, buyerMatchesAllowlist, decideAutoAccept,
   addBuyerAllowlistEntry, removeBuyerAllowlistEntry,
   readChainSalesStatus, resolveAllowlistEntries,
+  buyerNamesFromJob, hasAllowlistedRequestedSibling,
   clearAllowlistResolveCache, clearSalesStatusCache,
 };

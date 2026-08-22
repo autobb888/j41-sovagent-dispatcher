@@ -8,6 +8,7 @@ const {
   loadBuyerAllowlist, buyerMatchesAllowlist, decideAutoAccept,
   addBuyerAllowlistEntry, removeBuyerAllowlistEntry,
   readChainSalesStatus, resolveAllowlistEntries, clearAllowlistResolveCache,
+  hasAllowlistedRequestedSibling, buyerNamesFromJob,
 } = require('../src/buyer-allowlist');
 
 test('active without preferAllowlist auto-accepts strangers (floodgate)', () => {
@@ -88,6 +89,42 @@ test('resolveAllowlistEntries resolves names via getIdentity; decideAutoAccept u
     resolved: ['iBob'],
   }).action, 'accept');
   assert.equal(buyerMatchesAllowlist('iBob', resolved, { resolved: ['iBob'] }), true);
+});
+
+test('resolveAllowlistEntries reads getIdentityKeys iaddress; callers merge into allowlist', async () => {
+  clearAllowlistResolveCache();
+  const allowlist = ['bob.agentplatform@'];
+  const resolved = await resolveAllowlistEntries(allowlist, async () => ({ iaddress: 'iBob' }));
+  assert.deepEqual(resolved, ['iBob']);
+  // resolved as buyer-side candidates against a name entry does NOT match iBob
+  assert.equal(decideAutoAccept({
+    chainStatus: 'invite', allowlist, buyerVerusId: 'iBob', resolved,
+  }).action, 'hold');
+  // spec §2: merge resolved i-addrs into allowlist, then compare to buyerVerusId
+  assert.equal(decideAutoAccept({
+    chainStatus: 'invite',
+    allowlist: [...allowlist, ...resolved],
+    buyerVerusId: 'iBob',
+    resolved,
+  }).action, 'accept');
+});
+
+test('hasAllowlistedRequestedSibling scans other requested jobs on the merged list', () => {
+  const allowlist = ['bob.agentplatform@', 'iFriend'];
+  const jobs = [
+    { id: 'stranger', status: 'requested', buyerVerusId: 'iStranger' },
+    { id: 'friend', status: 'requested', buyerVerusId: 'iFriend' },
+    { id: 'done', status: 'accepted', buyerVerusId: 'iFriend' },
+  ];
+  assert.equal(hasAllowlistedRequestedSibling(jobs, 'stranger', allowlist), true);
+  assert.equal(hasAllowlistedRequestedSibling(jobs, 'friend', allowlist), false);
+  assert.equal(hasAllowlistedRequestedSibling(
+    [{ id: 'stranger', status: 'requested', buyerVerusId: 'iStranger' }],
+    'stranger', allowlist,
+  ), false);
+  assert.deepEqual(buyerNamesFromJob({ buyer: { identityName: 'bob.agentplatform@' }, buyerIdentity: 'x@' }), [
+    'bob.agentplatform@', 'x@',
+  ]);
 });
 
 test('readChainSalesStatus reads VDXF agent.status from contentmultimap (invite)', () => {
