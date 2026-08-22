@@ -177,7 +177,20 @@ max_usd_per_hour = 0.0        # fleet spend ceiling for paid provisioning (S6/Va
 # rental lease is released automatically at expiry by the compute reconcile loop and,
 # after a crash, by boot recovery — a leaked lease is money burning.
 #
-# home-gpu (raw GPU jail): v1 runs ONE dispatcher process per GPU host. The
-# in-process device_index lock is primary; ~/.j41/dispatcher/locks/gpu-<n>.lock
-# fails closed if a second process tries the same card. Full home-gpu provider
-# stanza is documented with the home-gpu config work.
+# Cat-1 home GPU (whole card, one renter). Dispatcher MUST run on the GPU
+# machine with docker.sock (root-equivalent). Jail SSH binds 127.0.0.1 only.
+# ssh_hostname is a TCP tunnel (Cloudflare named tunnel, or equivalent) to
+# that loopback port — NOT runtime.webhook_url (that is HTTP).
+# [compute.providers.card0]
+# type            = "home-gpu"
+# agent_id        = "gpu-1"
+# gpu             = "RTX 5090"
+# vram_gb         = 32
+# gpu_count       = 1
+# device_index    = 0
+# memory_mb       = 32768
+# disk_gb         = 100
+# usd_per_hour    = 0
+# ssh_hostname    = "gpu.example.com"
+# ssh_tunnel_port = 2222
+# jail_image      = "j41/gpu-jail:latest"

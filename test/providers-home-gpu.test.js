@@ -8,8 +8,16 @@ os.homedir = () => TEST_HOME;
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { HomeGpuProvider } = require('../src/providers/home-gpu');
+const { HomeGpuProvider, assertTunnelHostname } = require('../src/providers/home-gpu');
 const { listProviderTypes } = require('../src/providers');
+
+test('assertTunnelHostname refuses loopback, wildcard, and HTTP webhook URLs', () => {
+  assert.throws(() => assertTunnelHostname(''), /HOME_GPU_NO_TUNNEL/);
+  assert.throws(() => assertTunnelHostname('127.0.0.1'), /HOME_GPU_NO_TUNNEL/);
+  assert.throws(() => assertTunnelHostname('0.0.0.0'), /HOME_GPU_NO_TUNNEL/);
+  assert.throws(() => assertTunnelHostname('https://alice.example.com'), /HOME_GPU_NO_TUNNEL/);
+  assert.equal(assertTunnelHostname('gpu.alice.example.com'), 'gpu.alice.example.com');
+});
 
 function stubDocker({ publishedPort = 22001, startError, createError } = {}) {
   const created = []; const removed = [];

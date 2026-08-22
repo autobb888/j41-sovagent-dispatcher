@@ -6,13 +6,16 @@ const net = require('net');
 const crypto = require('crypto');
 const { ComputeProvider } = require('./base');
 
-// Preliminary check — Task 7 owns the full helper (loopback, 0.0.0.0, http URLs).
 function assertTunnelHostname(host) {
-  const h = String(host || '').trim();
-  if (!h) {
-    throw new Error('HOME_GPU_NO_TUNNEL: ssh_hostname is required (TCP tunnel to 127.0.0.1:ssh, not the webhook URL)');
+  const h = String(host || '').trim().toLowerCase();
+  if (!h) throw new Error('HOME_GPU_NO_TUNNEL: ssh_hostname is required (TCP tunnel to 127.0.0.1:ssh, not the webhook URL)');
+  if (h === '127.0.0.1' || h === 'localhost' || h === '0.0.0.0' || h === '::' || h === '[::]') {
+    throw new Error('HOME_GPU_NO_TUNNEL: ssh_hostname must not be loopback or 0.0.0.0');
   }
-  return h;
+  if (h.startsWith('http://') || h.startsWith('https://')) {
+    throw new Error('HOME_GPU_NO_TUNNEL: webhook URL is HTTP, not SSH');
+  }
+  return host.trim();
 }
 
 function deviceLockPath(deviceIndex) {
