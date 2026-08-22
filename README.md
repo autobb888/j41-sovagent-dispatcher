@@ -35,7 +35,7 @@ yarn global add @junction41/dispatcher
 ### Before you begin
 
 1. **Node 20 or newer, and Docker installed** — every job runs in a fresh Docker container, so there is no mode that works without it. Verify with `node --version` and `docker --version`.
-2. **Build the job-agent image** — one command, a few minutes, once. `start` refuses to run without it rather than failing after a buyer has already paid:
+2. **Build the job-agent and `j41/gpu-jail` images** — one command, a few minutes, once. `start` refuses to run without the job-agent image rather than failing after a buyer has already paid; Cat-1 rental also needs the jail image:
    ```bash
    j41-dispatcher build-image
    ```
@@ -195,7 +195,8 @@ from an ordinary failure.
 | `status` | Show the dispatcher pool status (active workers, queued jobs) |
 | `logs [job-id]` | View job logs; use `-f` for follow/tail mode |
 | `config` | View/change dispatcher settings (max-concurrent, timeouts, extension thresholds) |
-| `build-image` | Build the pre-baked job-agent Docker image (required once, before `start`); `--force` rebuilds |
+| `build-image` | Build the pre-baked job-agent **and** `j41/gpu-jail` images (required once, before `start`); `--force` rebuilds |
+| `rental-setup <agent-id>` | Register a Cat-1 `gpu-rental` service (contained SSH jail). Fails closed without `[compute] enabled=true`, a `home-gpu`/`vast` provider, TCP tunnel hostname, RAM/disk, docker/nvidia, and StorageOpt |
 | `update-profile <agent-id>` | Edit on-chain VDXF profile fields in one transaction; `--dry-run` previews |
 | `post-bounty <agent-id>` | Post a bounty (awarding a winner is TUI-only) |
 | `list-bounties` / `my-bounties <agent-id>` | Browse open bounties / your own; both support `--json` |
@@ -818,6 +819,23 @@ Two settle rules are worth knowing because they are deliberate, not defaults:
 
 
 See [docs.junction41.io/dispatcher/api-endpoint-proxy](https://docs.junction41.io/dispatcher/api-endpoint-proxy) for the full buyer/seller flow and SDK helpers.
+
+## Raw GPU rental (Cat-1)
+
+Sell **the card**, not tokens. One renter, whole GPU, contained SSH into a jail — never host SSH, never `0.0.0.0`. Vast.ai is the only third-party source. Billing is existing per-job pay (all-or-nothing). This is a provider plugin in the dispatcher you already run.
+
+Cat-2 (`[18] API Endpoint Setup`) is metered inference on a different listing. Do not mix `gpu-rental` and `api-endpoint` on one agent id.
+
+### Friend boot (home GPU)
+
+1. `j41-dispatcher build-image` — builds **job-agent and** `j41/gpu-jail`.
+2. In `~/.j41/dispatcher/config.toml` set `[compute] enabled = true` and paste a `home-gpu` provider (see `docs/config.toml.example`, the PASTE RECIPE). Required keys: `agent_id`, `device_index`, `memory_mb` (≥ 256), `disk_gb` (≥ 1), `ssh_hostname`, `ssh_tunnel_port`.
+3. Point a **Cloudflare named TCP tunnel** (or equivalent) at `127.0.0.1:$ssh_tunnel_port`. This is not the HTTP webhook / `cloudflared` URL used for jobs. `ssh_hostname` is a hostname, not `127.0.0.1`, not `0.0.0.0`, not `https://…`.
+4. NVIDIA Container Toolkit + `docker.sock` on the **GPU machine**. The dispatcher for `home-gpu` runs on that box. Typical overlay2/ext4 without quota cannot cap `disk_gb` — `rental-setup` and `start` refuse rather than list an uncapped jail.
+5. `j41-dispatcher rental-setup <agent-id>` (prepay). Do **not** set `RENTAL_SECRETS_KEY` here — that 64-hex key lives on the Junction41 API `.env` (`openssl rand -hex 32`); it is not a dispatcher env. A `RENTAL_SECRETS_KEY_MISSING` 503 is the **platform** operator, not your laptop.
+6. `j41-dispatcher start`.
+
+TCP tunnel stays your job. The dispatcher will not run `cloudflared` for you.
 
 ## Control Plane
 

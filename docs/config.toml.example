@@ -177,10 +177,19 @@ max_usd_per_hour = 0.0        # fleet spend ceiling for paid provisioning (S6/Va
 # rental lease is released automatically at expiry by the compute reconcile loop and,
 # after a crash, by boot recovery — a leaked lease is money burning.
 #
-# Cat-1 home GPU (whole card, one renter). Dispatcher MUST run on the GPU
-# machine with docker.sock (root-equivalent). Jail SSH binds 127.0.0.1 only.
-# ssh_hostname is a TCP tunnel (Cloudflare named tunnel, or equivalent) to
-# that loopback port — NOT runtime.webhook_url (that is HTTP).
+# PASTE RECIPE — Cat-1 home GPU (whole card, one renter).
+# 1. Set enabled = true
+# 2. Uncomment the card0 stanza and set agent_id / gpu / ssh_hostname
+# 3. default_provider = "home-gpu"
+# 4. Named TCP tunnel to 127.0.0.1:$ssh_tunnel_port — NOT runtime.webhook_url
+# 5. j41-dispatcher rental-setup <agent-id>
+# Dispatcher MUST run on the GPU machine with docker.sock. Jail SSH binds 127.0.0.1 only.
+# Never 0.0.0.0. Do not set RENTAL_SECRETS_KEY on this host.
+#
+# [compute]
+# enabled          = true
+# default_provider = "home-gpu"
+#
 # [compute.providers.card0]
 # type            = "home-gpu"
 # agent_id        = "gpu-1"

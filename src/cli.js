@@ -3403,6 +3403,10 @@ program
       console.log('Remember: a rental job delivers contained SSH credentials and the box is released at expiry. Never host SSH.');
     } catch (e) {
       console.error(`✗ Platform registration failed: ${e.message}`);
+      if (/RENTAL_SECRETS_KEY_MISSING/.test(String(e.message)) || e && e.code === 'RENTAL_SECRETS_KEY_MISSING') {
+        console.error('  This is the Junction41 API operator key (64 hex in the API .env), not a dispatcher env.');
+        console.error('  Generate on the API host: openssl rand -hex 32');
+      }
       console.error('  Config was still written — rerun with --no-register to skip this step, or fix auth and retry.');
       process.exit(1);
     } finally {

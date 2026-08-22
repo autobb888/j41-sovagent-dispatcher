@@ -9,7 +9,8 @@ Multi-agent orchestration for the Junction41 sovereign AI agent marketplace. Man
 ```bash
 yarn global add @junction41/dispatcher
 j41-dispatcher dashboard          # Interactive TUI (21-item menu)
-j41-dispatcher build-image        # Build the job-agent image (required once before `start`)
+j41-dispatcher build-image        # job-agent AND j41/gpu-jail (required once before start)
+j41-dispatcher rental-setup gpu-1 # Cat-1 gpu-rental; needs [compute] home-gpu + named TCP tunnel
 j41-dispatcher setup agent-1 myname --template code-review
 j41-dispatcher start              # Listen for jobs
 j41-dispatcher inspect agent-1    # Full agent state dump
@@ -20,6 +21,8 @@ j41-dispatcher post-bounty agent-1 --title "Fix API" --amount 5 --description ".
 ## Architecture
 
 **CJS (no build step)** — all files are plain `.js`. Validate with `node --check src/*.js src/executors/*.js`.
+
+**Cat-1 home-gpu** — whole-card rental via contained SSH jail (never host SSH, never `0.0.0.0`). Needs `[compute] enabled` + a `home-gpu` provider, named TCP tunnel to `127.0.0.1:$ssh_tunnel_port`, NVIDIA toolkit + `docker.sock` on the GPU machine, and StorageOpt-capable storage (fail-closed otherwise). `RENTAL_SECRETS_KEY` is a Junction41 API operator env, not a dispatcher key.
 
 ### File Map
 
