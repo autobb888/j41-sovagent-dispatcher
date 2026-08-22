@@ -1,4 +1,7 @@
 'use strict';
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const net = require('net');
 const crypto = require('crypto');
 const { ComputeProvider } = require('./base');
@@ -10,6 +13,10 @@ function assertTunnelHostname(host) {
     throw new Error('HOME_GPU_NO_TUNNEL: ssh_hostname is required (TCP tunnel to 127.0.0.1:ssh, not the webhook URL)');
   }
   return h;
+}
+
+function deviceLockPath(deviceIndex) {
+  return path.join(os.homedir(), '.j41', 'dispatcher', 'locks', `gpu-${deviceIndex}.lock`);
 }
 
 // Loopback-only SSH banner probe. Never dials the tunnel hostname.
@@ -54,10 +61,16 @@ class HomeGpuProvider extends ComputeProvider {
     this.__probeSsh = cfg.__probeSsh || defaultProbeSsh;
     this._busy = false;
     this._containerId = null;
+    this._lockFd = null;
+    this._lockPath = null;
   }
 
   get capabilities() {
     return { canProvision: true, canSsh: true, canScaleToZero: true, isElastic: false };
+  }
+
+  _deviceIndex() {
+    return this.cfg.device_index ?? 0;
   }
 
   _gpu() {
@@ -66,6 +79,40 @@ class HomeGpuProvider extends ComputeProvider {
       vramGb: this.cfg.vram_gb || null,
       count: this.cfg.gpu_count || 1,
     };
+  }
+
+  _takeFileLock() {
+    const lockPath = deviceLockPath(this._deviceIndex());
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    let fd;
+    try {
+      fd = fs.openSync(lockPath, 'wx');
+    } catch (err) {
+      if (err && err.code === 'EEXIST') {
+        throw new Error(`HOME_GPU_BUSY: device_index ${this._deviceIndex()} lock held at ${lockPath}`);
+      }
+      throw err;
+    }
+    this._lockFd = fd;
+    this._lockPath = lockPath;
+  }
+
+  _dropFileLock() {
+    if (this._lockFd != null) {
+      try { fs.closeSync(this._lockFd); } catch { /* already closed */ }
+      this._lockFd = null;
+    }
+    if (this._lockPath) {
+      try { fs.unlinkSync(this._lockPath); } catch (err) {
+        if (!(err && err.code === 'ENOENT')) throw err;
+      }
+      this._lockPath = null;
+    }
+  }
+
+  _unlock() {
+    this._busy = false;
+    this._dropFileLock();
   }
 
   async discover() {
@@ -79,10 +126,14 @@ class HomeGpuProvider extends ComputeProvider {
   }
 
   async acquire(candidate) {
+    if (this._busy) {
+      throw new Error(`HOME_GPU_BUSY: device_index ${this._deviceIndex()} already leased`);
+    }
+    this._takeFileLock();
     this._busy = true;
     const password = crypto.randomBytes(16).toString('hex');
     return {
-      id: this.cfg.id || `home-gpu:${this.cfg.device_index ?? 0}`,
+      id: this.cfg.id || `home-gpu:${this._deviceIndex()}`,
       provider: 'home-gpu',
       state: 'pending',
       baseUrl: null,
@@ -106,37 +157,38 @@ class HomeGpuProvider extends ComputeProvider {
   }
 
   async waitReady(lease, { timeoutMs = 60000 } = {}) {
-    const hostname = assertTunnelHostname(this.cfg.ssh_hostname);
-    const memoryMb = Number(this.cfg.memory_mb);
-    const deviceId = String(this.cfg.device_index ?? 0);
-    const password = (lease.meta && lease.meta.password) || crypto.randomBytes(16).toString('hex');
-    if (lease.meta) lease.meta.password = password;
-    else lease.meta = { password };
-
-    const container = await this.docker.createContainer({
-      Image: this.cfg.jail_image || 'j41/gpu-jail:latest',
-      Env: [`J41_RENTER_PASSWORD=${password}`],
-      ExposedPorts: { '22/tcp': {} },
-      HostConfig: {
-        NetworkMode: 'bridge',
-        PortBindings: { '22/tcp': [{ HostIp: '127.0.0.1', HostPort: '0' }] },
-        Memory: Number.isFinite(memoryMb) && memoryMb > 0 ? memoryMb * 1024 * 1024 : 0,
-        PidsLimit: 1024,
-        CapDrop: ['ALL'],
-        CapAdd: ['NET_BIND_SERVICE', 'SETUID', 'SETGID', 'SYS_CHROOT', 'CHOWN', 'AUDIT_WRITE', 'KILL'],
-        SecurityOpt: ['no-new-privileges:true'],
-        DeviceRequests: [{
-          Driver: 'nvidia',
-          DeviceIDs: [deviceId],
-          Capabilities: [['gpu']],
-        }],
-      },
-    });
-    // Record before start so a throw cannot orphan the jail or hide the id from release.
-    this._containerId = container.id;
-    lease.meta.containerId = container.id;
-
+    let container = null;
     try {
+      const hostname = assertTunnelHostname(this.cfg.ssh_hostname);
+      const memoryMb = Number(this.cfg.memory_mb);
+      const deviceId = String(this._deviceIndex());
+      const password = (lease.meta && lease.meta.password) || crypto.randomBytes(16).toString('hex');
+      if (lease.meta) lease.meta.password = password;
+      else lease.meta = { password };
+
+      container = await this.docker.createContainer({
+        Image: this.cfg.jail_image || 'j41/gpu-jail:latest',
+        Env: [`J41_RENTER_PASSWORD=${password}`],
+        ExposedPorts: { '22/tcp': {} },
+        HostConfig: {
+          NetworkMode: 'bridge',
+          PortBindings: { '22/tcp': [{ HostIp: '127.0.0.1', HostPort: '0' }] },
+          Memory: Number.isFinite(memoryMb) && memoryMb > 0 ? memoryMb * 1024 * 1024 : 0,
+          PidsLimit: 1024,
+          CapDrop: ['ALL'],
+          CapAdd: ['NET_BIND_SERVICE', 'SETUID', 'SETGID', 'SYS_CHROOT', 'CHOWN', 'AUDIT_WRITE', 'KILL'],
+          SecurityOpt: ['no-new-privileges:true'],
+          DeviceRequests: [{
+            Driver: 'nvidia',
+            DeviceIDs: [deviceId],
+            Capabilities: [['gpu']],
+          }],
+        },
+      });
+      // Record before start so a throw cannot orphan the jail or hide the id from release.
+      this._containerId = container.id;
+      lease.meta.containerId = container.id;
+
       await container.start();
       const inspect = await container.inspect();
       const binding = inspect && inspect.NetworkSettings && inspect.NetworkSettings.Ports
@@ -159,9 +211,9 @@ class HomeGpuProvider extends ComputeProvider {
         await new Promise((r) => setTimeout(r, 50));
       }
     } catch (err) {
-      try { await this._forceRemove(this._containerId || container.id); } catch { /* still unlock */ }
+      try { await this._forceRemove(this._containerId || (container && container.id)); } catch { /* still unlock */ }
       this._containerId = null;
-      this._busy = false;
+      this._unlock();
       throw err;
     }
   }
@@ -187,7 +239,7 @@ class HomeGpuProvider extends ComputeProvider {
     const id = (lease && lease.meta && lease.meta.containerId) || this._containerId;
     await this._forceRemove(id);
     this._containerId = null;
-    this._busy = false;
+    this._unlock();
     return { ...lease, state: 'released' };
   }
 

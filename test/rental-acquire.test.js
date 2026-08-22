@@ -54,3 +54,15 @@ test('M4/C4: a box that fails to come up is released, not delivered as ssh:null'
   await assert.rejects(() => acquireRentalLease({ controller: ctrl, provider, spec: {}, jobId: 'j', agentId: 'a', jobTimeoutMin: 60 }), /RENTAL_NOT_READY/);
   assert.ok(released.includes('vast:r1'), 'the failed box was released (no dangling charge)');
 });
+
+test('acquireRentalLease throws RENTAL_NO_CAPACITY when discover is empty', async () => {
+  const provider = {
+    get capabilities() { return { canProvision: true, canSsh: true, isElastic: false }; },
+    async discover() { return []; },
+  };
+  const ctrl = createSupplyController({ cfg: { compute: { enabled: true, max_usd_per_hour: 1, providers: {} } }, agentConfigs: new Map() });
+  await assert.rejects(
+    () => acquireRentalLease({ controller: ctrl, provider, spec: {}, jobId: 'j', agentId: 'a', jobTimeoutMin: 60 }),
+    /RENTAL_NO_CAPACITY/,
+  );
+});

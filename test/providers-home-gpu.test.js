@@ -1,14 +1,22 @@
 'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-home-gpu-'));
+process.env.HOME = TEST_HOME;
+os.homedir = () => TEST_HOME;
+
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { HomeGpuProvider } = require('../src/providers/home-gpu');
 const { listProviderTypes } = require('../src/providers');
 
-function stubDocker({ publishedPort = 22001, startError } = {}) {
+function stubDocker({ publishedPort = 22001, startError, createError } = {}) {
   const created = []; const removed = [];
   return {
     created, removed,
     async createContainer(spec) {
+      if (createError) throw createError;
       created.push(spec);
       const id = 'ctr-' + created.length;
       return {
@@ -24,6 +32,20 @@ function stubDocker({ publishedPort = 22001, startError } = {}) {
     },
   };
 }
+
+function lockPath(deviceIndex = 0) {
+  return path.join(TEST_HOME, '.j41', 'dispatcher', 'locks', `gpu-${deviceIndex}.lock`);
+}
+
+function clearLocks() {
+  const dir = path.join(TEST_HOME, '.j41', 'dispatcher', 'locks');
+  if (!fs.existsSync(dir)) return;
+  for (const name of fs.readdirSync(dir)) {
+    try { fs.unlinkSync(path.join(dir, name)); } catch { /* ignore */ }
+  }
+}
+
+test.afterEach(() => { clearLocks(); });
 
 test('home-gpu capabilities: contained SSH, not elastic', () => {
   const p = new HomeGpuProvider({ ssh_hostname: 'gpu.example.com' });
@@ -61,29 +83,72 @@ test('waitReady publishes 22/tcp on 127.0.0.1, never 0.0.0.0, never host net, an
   assert.ok(spec.HostConfig.CapAdd.includes('SETUID'));
   assert.ok(spec.HostConfig.CapAdd.includes('SETGID'));
   assert.ok(spec.HostConfig.CapAdd.includes('NET_BIND_SERVICE'));
+  await p.release(lease);
 });
 
-test('waitReady fails closed without ssh_hostname', async () => {
-  const p = new HomeGpuProvider({ docker: stubDocker(), __probeSsh: async () => true });
+test('waitReady fails closed without ssh_hostname and unlocks so discover is not stuck', async () => {
+  const p = new HomeGpuProvider({ device_index: 0, docker: stubDocker(), __probeSsh: async () => true });
   const lease = await p.acquire((await p.discover())[0]);
   await assert.rejects(() => p.waitReady(lease, { timeoutMs: 100 }), /HOME_GPU_NO_TUNNEL/);
+  assert.equal((await p.discover()).length, 1);
+  assert.equal(fs.existsSync(lockPath(0)), false);
 });
 
 test('waitReady start failure removes the container and does not stick the lock', async () => {
   const docker = stubDocker({ startError: new Error('start failed') });
-  const p = new HomeGpuProvider({ ssh_hostname: 'gpu.example.com', docker, __probeSsh: async () => true });
+  const p = new HomeGpuProvider({ ssh_hostname: 'gpu.example.com', device_index: 0, docker, __probeSsh: async () => true });
   const lease = await p.acquire((await p.discover())[0]);
   await assert.rejects(() => p.waitReady(lease, { timeoutMs: 1000 }), /start failed/);
   assert.equal(docker.removed.length, 1);
   assert.equal(docker.removed[0].opts.force, true);
   assert.equal((await p.discover()).length, 1);
+  assert.equal(fs.existsSync(lockPath(0)), false);
+});
+
+test('waitReady createContainer failure unlocks', async () => {
+  const docker = stubDocker({ createError: new Error('create blew up') });
+  const p = new HomeGpuProvider({ ssh_hostname: 'gpu.example.com', device_index: 0, docker, __probeSsh: async () => true });
+  const lease = await p.acquire((await p.discover())[0]);
+  await assert.rejects(() => p.waitReady(lease, { timeoutMs: 1000 }), /create blew up/);
+  assert.equal((await p.discover()).length, 1);
+  assert.equal(fs.existsSync(lockPath(0)), false);
+});
+
+test('second discover is empty while the card is leased', async () => {
+  const docker = stubDocker();
+  const p = new HomeGpuProvider({ ssh_hostname: 'gpu.example.com', device_index: 0, docker, __probeSsh: async () => true });
+  assert.equal((await p.discover()).length, 1);
+  const lease = await p.acquire((await p.discover())[0]);
+  assert.equal((await p.discover()).length, 0);
+  assert.equal(fs.existsSync(lockPath(0)), true);
+  await p.release(lease);
+});
+
+test('release unlocks; discover returns the card again', async () => {
+  const docker = stubDocker();
+  const p = new HomeGpuProvider({ ssh_hostname: 'gpu.example.com', device_index: 0, docker, __probeSsh: async () => true });
+  const lease = await p.acquire((await p.discover())[0]);
+  await p.waitReady(lease, { timeoutMs: 1000 });
+  assert.equal((await p.discover()).length, 0);
+  assert.equal((await p.release(lease)).state, 'released');
+  assert.equal((await p.discover()).length, 1);
+  assert.equal(fs.existsSync(lockPath(0)), false);
+});
+
+test('file lock fails closed for a second provider instance on the same device_index', async () => {
+  const p1 = new HomeGpuProvider({ ssh_hostname: 'gpu.example.com', device_index: 0, docker: stubDocker(), __probeSsh: async () => true });
+  await p1.acquire((await p1.discover())[0]);
+  const p2 = new HomeGpuProvider({ ssh_hostname: 'gpu.example.com', device_index: 0, docker: stubDocker(), __probeSsh: async () => true });
+  await assert.rejects(() => p2.acquire({}), /HOME_GPU_BUSY|EEXIST/);
+  await p1.release({});
 });
 
 test('release twice is success', async () => {
   const docker = stubDocker();
-  const p = new HomeGpuProvider({ ssh_hostname: 'gpu.example.com', docker, __probeSsh: async () => true });
+  const p = new HomeGpuProvider({ ssh_hostname: 'gpu.example.com', device_index: 0, docker, __probeSsh: async () => true });
   const lease = await p.acquire((await p.discover())[0]);
   await p.waitReady(lease, { timeoutMs: 1000 });
   assert.equal((await p.release(lease)).state, 'released');
   assert.equal((await p.release(lease)).state, 'released');
+  assert.equal(fs.existsSync(lockPath(0)), false);
 });
