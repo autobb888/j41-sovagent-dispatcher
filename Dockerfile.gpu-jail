@@ -1,0 +1,23 @@
+# Cat-1 GPU jail (sshd + user renter). NOT the job-agent image.
+# Dispatcher MUST run on the GPU host with access to docker.sock
+# (root-equivalent trust). Nested GPU is not a second product.
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      openssh-server \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --create-home --shell /bin/bash renter \
+ && mkdir -p /run/sshd \
+ && printf '%s\n' \
+      'PasswordAuthentication yes' \
+      'PermitRootLogin no' \
+      'PermitEmptyPasswords no' \
+      'UsePAM no' \
+      > /etc/ssh/sshd_config.d/j41-jail.conf
+
+EXPOSE 22
+
+# Password is written at container start from J41_RENTER_PASSWORD.
+CMD ["sh", "-c", "ssh-keygen -A && echo \"renter:${J41_RENTER_PASSWORD}\" | chpasswd && exec /usr/sbin/sshd -D -e"]

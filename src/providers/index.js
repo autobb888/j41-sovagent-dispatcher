@@ -23,3 +23,6 @@ registerProvider('local', (cfg) => new LocalProvider(cfg));
 
 const { VastProvider } = require('./vast');
 registerProvider('vast', (cfg) => new VastProvider(cfg));
+
+const { HomeGpuProvider } = require('./home-gpu');
+registerProvider('home-gpu', (cfg) => new HomeGpuProvider(cfg));
