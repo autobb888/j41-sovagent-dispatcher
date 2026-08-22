@@ -853,6 +853,8 @@ j41-dispatcher sales-mode gpu-1 open
 
 Overnight floodgate is `sales-mode open` (`active`). Real floodgate only if TUI “Prefer allowlist even when open?” is off (default). `accept-job` one-shot stacked stranger.
 
+The dispatcher TUI (agent detail) has the same operator actions: **Buyer allowlist**, **Sales mode (invite / open)**, **Accept stacked job**, and the prefer-allowlist confirm. Compute signup also offers sales-mode after rental-setup (default skip — new listings stay open).
+
 ## Control Plane
 
 The dispatcher exposes a Unix domain socket at `~/.j41/dispatcher/control.sock` for live management:

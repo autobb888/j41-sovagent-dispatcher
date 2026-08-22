@@ -409,6 +409,9 @@ async function agentDetailScreen(inquirer, agentId) {
   if (!needsRegister && !needsFinalize && !finalizeIncomplete) {
     choices.push(new inquirer.Separator('  ── Edit ──'));
     choices.push({ name: '  Update Profile (change on-chain VDXF fields)', value: 'update_profile' });
+    choices.push({ name: '  Buyer allowlist', value: 'allowlist' });
+    choices.push({ name: '  Sales mode (invite / open)', value: 'sales_mode' });
+    choices.push({ name: '  Accept stacked job', value: 'accept_job' });
     choices.push({ name: '  Prefer allowlist even when open?', value: 'prefer_allowlist' });
   }
 
@@ -439,6 +442,9 @@ async function agentDetailScreen(inquirer, agentId) {
     case 'soul': await soulScreen(inquirer, agentDir); break;
     case 'jobs': await jobsScreen(inquirer, keys); break;
     case 'update_profile': await updateProfileScreen(inquirer, agentId, keys); break;
+    case 'allowlist': await allowlistScreen(inquirer, agentId); break;
+    case 'sales_mode': await salesModeScreen(inquirer, agentId); break;
+    case 'accept_job': await acceptJobScreen(inquirer, agentId); break;
     case 'prefer_allowlist': await preferAllowlistScreen(inquirer, agentId); break;
     case 'retry_register': await retryRegisterScreen(inquirer, agentId, keys); break;
     case 'retry_finalize': await retryFinalizeScreen(inquirer, agentId); break;
@@ -1302,6 +1308,7 @@ async function addAgentScreen(inquirer) {
             console.log('\n  Skipped. Next is still rental-setup, not start:\n');
             console.log('    j41-dispatcher rental-setup ' + agentId + '\n');
           }
+          await promptSalesMode(inquirer, agentId);
           await promptPreferAllowlist(inquirer, agentId);
           await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
           return;
@@ -1917,6 +1924,120 @@ async function preferAllowlistScreen(inquirer, agentId) {
   console.log(cfg.preferAllowlist
     ? '\n  preferAllowlist on — friends first when sales-mode is open.\n'
     : '\n  preferAllowlist off — sales-mode open is a real floodgate.\n');
+}
+
+function runDispatcherCli(args) {
+  return runCommandAsync(process.execPath, [process.argv[1], ...args]);
+}
+
+async function allowlistScreen(inquirer, agentId) {
+  const { loadBuyerAllowlist } = require('./buyer-allowlist');
+  for (;;) {
+    console.clear();
+    console.log(`\n  ═══ Buyer allowlist: ${agentId} ═══\n`);
+    const cfg = loadAgentConfig(agentId);
+    const list = loadBuyerAllowlist(cfg);
+    if (list.length === 0) {
+      console.log('  (empty — invite-only will accept nobody)\n');
+    } else {
+      for (const e of list) console.log(`  ${e}`);
+      console.log('');
+    }
+    const { action } = await promptWithEsc(inquirer, [{
+      type: 'list', pageSize: 12, name: 'action',
+      message: 'Allowlist:',
+      choices: [
+        { name: '  Add identity (name or i-address)', value: 'add' },
+        { name: '  Remove identity', value: 'remove' },
+        new inquirer.Separator(),
+        { name: '  ← Back', value: '__back' },
+      ],
+    }]);
+    if (action === '__back') return;
+    if (action === 'add') {
+      const { identity } = await promptWithEsc(inquirer, [{
+        type: 'input', name: 'identity',
+        message: 'Friend VerusID name or i-address:',
+      }]);
+      const id = String(identity || '').trim();
+      if (!id) continue;
+      console.log('');
+      await runDispatcherCli(['allowlist', agentId, 'add', id]);
+    } else if (action === 'remove') {
+      if (list.length === 0) {
+        console.log('\n  Nothing to remove.\n');
+      } else {
+        const { victim } = await promptWithEsc(inquirer, [{
+          type: 'list', pageSize: 16, name: 'victim',
+          message: 'Remove:',
+          choices: [
+            ...list.map((e) => ({ name: `  ${e}`, value: e })),
+            new inquirer.Separator(),
+            { name: '  ← Cancel', value: '__back' },
+          ],
+        }]);
+        if (victim && victim !== '__back') {
+          console.log('');
+          await runDispatcherCli(['allowlist', agentId, 'remove', victim]);
+        }
+      }
+    }
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to continue' }]);
+  }
+}
+
+async function promptSalesMode(inquirer, agentId) {
+  const { mode } = await promptWithEsc(inquirer, [{
+    type: 'list', name: 'mode',
+    message: 'Sales mode (on-chain floodgate)?',
+    default: 'keep',
+    choices: [
+      { name: '  Keep / skip (new listings stay open unless you already set invite)', value: 'keep' },
+      { name: '  Invite-only — auto-accept allowlist only (identity write)', value: 'invite' },
+      { name: '  Open — auto-accept everyone (identity write)', value: 'open' },
+    ],
+  }]);
+  if (mode === 'keep') return;
+  console.log('\n  ⚠️  Writes agent.status on-chain. Do not run with a pending identity tx.\n');
+  const { confirm } = await promptWithEsc(inquirer, [{
+    type: 'confirm', name: 'confirm',
+    message: `Write sales-mode ${mode} now?`,
+    default: false,
+  }]);
+  if (!confirm) return;
+  console.log('');
+  await runDispatcherCli(['sales-mode', agentId, mode]);
+}
+
+async function salesModeScreen(inquirer, agentId) {
+  console.clear();
+  console.log(`\n  ═══ Sales mode: ${agentId} ═══\n`);
+  console.log('  Current on-chain status:\n');
+  await runDispatcherCli(['sales-mode', agentId]);
+  console.log('');
+  await promptSalesMode(inquirer, agentId);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
+async function acceptJobScreen(inquirer, agentId) {
+  console.clear();
+  console.log(`\n  ═══ Accept stacked job: ${agentId} ═══\n`);
+  console.log('  One-shot accept. Does not change sales-mode or preferAllowlist.\n');
+  const { jobId } = await promptWithEsc(inquirer, [{
+    type: 'input', name: 'jobId',
+    message: 'Job id to accept:',
+  }]);
+  const id = String(jobId || '').trim();
+  if (!id) return;
+  const { confirm } = await promptWithEsc(inquirer, [{
+    type: 'confirm', name: 'confirm',
+    message: `Accept job ${id} now?`,
+    default: false,
+  }]);
+  if (!confirm) return;
+  console.log('');
+  await runDispatcherCli(['accept-job', agentId, id]);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
 async function executorConfigScreen(inquirer) {

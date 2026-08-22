@@ -113,6 +113,20 @@ test('dashboard offers preferAllowlist confirm, not a VDXF write', () => {
   assert.match(DASH, /preferAllowlist/);
 });
 
+test('TUI agent detail offers allowlist, sales-mode, and accept-job (operator does not need CLI)', () => {
+  const DASH = fs.readFileSync(path.join(__dirname, '../src/dashboard.js'), 'utf8');
+  assert.match(DASH, /Buyer allowlist/);
+  assert.match(DASH, /Sales mode \(invite \/ open\)/);
+  assert.match(DASH, /Accept stacked job/);
+  const detail = DASH.slice(DASH.indexOf('async function agentDetailScreen'), DASH.indexOf('async function updateProfileScreen'));
+  assert.match(detail, /allowlistScreen/);
+  assert.match(detail, /salesModeScreen/);
+  assert.match(detail, /acceptJobScreen/);
+  assert.match(DASH, /'allowlist'/);
+  assert.match(DASH, /'sales-mode'/);
+  assert.match(DASH, /'accept-job'/);
+});
+
 test('README documents sales-mode and allowlist', () => {
   const README = fs.readFileSync(path.join(__dirname, '../README.md'), 'utf8');
   assert.match(README, /sales-mode/);

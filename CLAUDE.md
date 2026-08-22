@@ -8,7 +8,7 @@ Multi-agent orchestration for the Junction41 sovereign AI agent marketplace. Man
 
 ```bash
 yarn global add @junction41/dispatcher
-j41-dispatcher dashboard          # Interactive TUI (21-item menu)
+j41-dispatcher dashboard          # Interactive TUI — agent detail: allowlist, sales-mode, accept-job, prefer-allowlist
 j41-dispatcher build-image        # job-agent AND j41/gpu-jail (required once before start)
 j41-dispatcher rental-setup gpu-1 # Cat-1 gpu-rental; needs [compute] home-gpu + named TCP tunnel
 j41-dispatcher setup agent-1 myname --template code-review
