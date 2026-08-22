@@ -1259,7 +1259,7 @@ async function addAgentScreen(inquirer) {
   console.log(`  ID:       ${agentId}`);
   console.log(`  Identity: ${preview}`);
   if (template) console.log(`  Template: ${template}`);
-  if (kind === 'compute') console.log(`  Next:      point this at a GPU / SSH box after it confirms`);
+  if (kind === 'compute') console.log(`  Next:      paste [compute.providers.card0] then rental-setup`);
   if (kind === 'model') console.log(`  Next:      attach the inference endpoint for this model`);
   if (kind === 'data') console.log(`  Next:      attach a data policy; you keep hosting the bytes`);
   console.log('');
@@ -1279,7 +1279,15 @@ async function addAgentScreen(inquirer) {
 
       if (kind !== 'agent') {
         if (kind === 'compute') {
-          console.log('  Next: add [compute.providers.card0] (home-gpu or vast), then: j41-dispatcher rental-setup <id>\n');
+          console.log('  Cat-1 GPU rental — contained SSH jail, never host SSH, never 0.0.0.0.\n');
+          console.log('  Do these in order before start:');
+          console.log('    1. Paste the home-gpu PASTE RECIPE from docs/config.toml.example');
+          console.log('       into ~/.j41/dispatcher/config.toml ([compute] enabled=true).');
+          console.log('    2. Point a named TCP tunnel at 127.0.0.1:$ssh_tunnel_port');
+          console.log('       (not the HTTP webhook / cloudflared URL).');
+          console.log('    3. j41-dispatcher rental-setup ' + agentId);
+          console.log('    4. j41-dispatcher start\n');
+          console.log('  Do not use [18] API Endpoint Setup on this listing.\n');
           const { runRental } = await promptWithEsc(inquirer, [{
             type: 'confirm',
             name: 'runRental',
@@ -1287,9 +1295,10 @@ async function addAgentScreen(inquirer) {
             default: false,
           }]);
           if (runRental) {
-            // Fail-closed on missing tunnel/provider: rental-setup prints the error.
-            // Return to the menu either way — never register an api-endpoint on this slot.
             await runCommandAsync(process.execPath, [process.argv[1], 'rental-setup', agentId]);
+          } else {
+            console.log('\n  Skipped. Next is still rental-setup, not start:\n');
+            console.log('    j41-dispatcher rental-setup ' + agentId + '\n');
           }
           await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
           return;
@@ -1357,6 +1366,13 @@ async function configureServicesScreen(inquirer) {
   const { agentId } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'agentId', message: 'Select agent to manage services:', choices: agents.map(a => ({ name: `  ${a.id.padEnd(10)} ${a.identity}`, value: a.id })) }]);
   const keys = agents.find(a => a.id === agentId);
   if (!keys) return;
+
+  if (keys.kind === 'compute') {
+    console.log('  This is a compute listing. Do not attach labour or api-endpoint here.');
+    console.log('  Use: j41-dispatcher rental-setup ' + agentId + '\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
 
   while (true) {
     console.clear();
@@ -2854,9 +2870,12 @@ async function apiEndpointSetupScreen(inquirer) {
   console.log('  API access to your LLM server on the J41 marketplace.\n');
 
   // Step 1: Select agent
-  const agents = getAgents().filter(a => a.identity && a.iAddress && a.wif);
+  const agents = getAgents()
+    .filter(a => a.identity && a.iAddress && a.wif)
+    .filter(a => a.kind !== 'compute');
   if (agents.length === 0) {
-    console.log('  No registered agents. Add and register an agent first.\n');
+    console.log('  No agent/model listings available for API Endpoint Setup.');
+    console.log('  Compute listings use: j41-dispatcher rental-setup <agent-id>\n');
     await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
     return;
   }

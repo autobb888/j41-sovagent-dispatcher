@@ -56,3 +56,31 @@ test('rental-setup registration error names RENTAL_SECRETS_KEY as platform-side'
   assert.match(body, /RENTAL_SECRETS_KEY_MISSING/);
   assert.match(body, /not a dispatcher/i);
 });
+
+test('compute signup TUI prints numbered next steps and skip still names rental-setup, not start', () => {
+  const dash = fs.readFileSync(path.join(__dirname, '../src/dashboard.js'), 'utf8');
+  const runRental = dash.indexOf("message: 'Run rental-setup now?'");
+  assert.ok(runRental > 0);
+  const window = dash.slice(runRental - 1200, runRental + 1200);
+  assert.match(window, /Do these in order before start/);
+  assert.match(window, /j41-dispatcher rental-setup/);
+  assert.match(window, /config\.toml/);
+  assert.match(window, /named TCP|ssh_tunnel_port/);
+  assert.match(window, /Skipped\. Next is still rental-setup, not start/);
+  // TUI does not write [compute.providers.*], so default-true would always
+  // fail with RENTAL_NO_PROVIDER. default false is correct; skip must not
+  // imply the fleet is start-ready.
+  assert.match(window, /default:\s*false/);
+});
+
+test('API Endpoint Setup and Configure Services refuse compute listings', () => {
+  const dash = fs.readFileSync(path.join(__dirname, '../src/dashboard.js'), 'utf8');
+  const apiFn = dash.indexOf('async function apiEndpointSetupScreen');
+  const apiBody = dash.slice(apiFn, apiFn + 2500);
+  assert.match(apiBody, /kind !== 'compute'|kind === 'compute'/);
+  assert.match(apiBody, /rental-setup/);
+  const svcFn = dash.indexOf('async function configureServicesScreen');
+  const svcBody = dash.slice(svcFn, svcFn + 3500);
+  assert.match(svcBody, /kind === 'compute'/);
+  assert.match(svcBody, /rental-setup/);
+});
