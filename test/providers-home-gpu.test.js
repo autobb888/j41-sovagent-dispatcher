@@ -8,7 +8,7 @@ os.homedir = () => TEST_HOME;
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { HomeGpuProvider, assertTunnelHostname, assertTunnelPort } = require('../src/providers/home-gpu');
+const { HomeGpuProvider, assertTunnelHostname, assertTunnelPort, assertJailResources } = require('../src/providers/home-gpu');
 const { listProviderTypes } = require('../src/providers');
 
 test('assertTunnelHostname refuses loopback, wildcard, and HTTP webhook URLs', () => {
@@ -26,6 +26,17 @@ test('assertTunnelPort requires integer 1-65535', () => {
   assert.throws(() => assertTunnelPort(22.5), /HOME_GPU_NO_TUNNEL/);
   assert.equal(assertTunnelPort(2222), 2222);
   assert.equal(assertTunnelPort('22'), 22);
+});
+
+test('assertJailResources requires memory_mb >= 256 and disk_gb >= 1', () => {
+  assert.equal(typeof assertJailResources, 'function');
+  assert.throws(() => assertJailResources({}), /HOME_GPU_NO_RAM/);
+  assert.throws(() => assertJailResources({ memory_mb: 255, disk_gb: 40 }), /HOME_GPU_NO_RAM/);
+  assert.throws(() => assertJailResources({ memory_mb: 0, disk_gb: 40 }), /HOME_GPU_NO_RAM/);
+  assert.throws(() => assertJailResources({ memory_mb: 8192 }), /HOME_GPU_NO_DISK/);
+  assert.throws(() => assertJailResources({ memory_mb: 8192, disk_gb: 0 }), /HOME_GPU_NO_DISK/);
+  assert.deepEqual(assertJailResources({ memory_mb: 256, disk_gb: 1 }), { memoryMb: 256, diskGb: 1 });
+  assert.deepEqual(assertJailResources({ memory_mb: '8192', disk_gb: '40' }), { memoryMb: 8192, diskGb: 40 });
 });
 
 function stubDocker({ publishedPort, startError, createError } = {}) {
@@ -59,6 +70,8 @@ function homeCfg(extra = {}) {
     ssh_hostname: 'gpu.example.com',
     ssh_tunnel_port: 2222,
     device_index: 0,
+    memory_mb: 8192,
+    disk_gb: 40,
     docker: stubDocker(),
     __probeSsh: async () => true,
     ...extra,
@@ -114,6 +127,12 @@ test('waitReady publishes 22/tcp on 127.0.0.1:ssh_tunnel_port, never 0.0.0.0, ne
   assert.deepEqual(spec.HostConfig.PortBindings['22/tcp'][0], { HostIp: '127.0.0.1', HostPort: '2222' });
   assert.notEqual(spec.HostConfig.PortBindings['22/tcp'][0].HostIp, '0.0.0.0');
   assert.equal(spec.HostConfig.Memory, 8192 * 1024 * 1024);
+  assert.ok(spec.HostConfig.Memory > 0);
+  assert.ok(spec.HostConfig.Binds.some((b) => b.endsWith(':/workspace')));
+  const jailDir = path.join(TEST_HOME, '.j41', 'dispatcher', 'jails', lease.id);
+  assert.ok(spec.HostConfig.Binds.includes(`${jailDir}:/workspace`));
+  assert.equal(fs.statSync(jailDir).mode & 0o777, 0o700);
+  assert.equal(spec.HostConfig.StorageOpt.size, '40G');
   assert.deepEqual(spec.HostConfig.DeviceRequests[0].DeviceIDs, ['0']);
   assert.ok(spec.HostConfig.CapDrop.includes('ALL'));
   assert.ok(spec.HostConfig.CapAdd.includes('SETUID'));
@@ -156,6 +175,48 @@ test('waitReady createContainer failure unlocks', async () => {
   const p = new HomeGpuProvider(homeCfg({ docker }));
   const lease = await p.acquire((await p.discover())[0]);
   await assert.rejects(() => p.waitReady(lease, { timeoutMs: 1000 }), /create blew up/);
+  assert.equal((await p.discover()).length, 1);
+  assert.equal(fs.existsSync(lockPath(0)), false);
+});
+
+test('waitReady requires memory_mb and disk_gb and never Memory 0', async () => {
+  const docker = stubDocker();
+  const p = new HomeGpuProvider({
+    ssh_hostname: 'gpu.example.com', ssh_tunnel_port: 2222,
+    docker, __probeSsh: async () => true,
+    // no memory_mb / disk_gb
+  });
+  const lease = await p.acquire((await p.discover())[0]);
+  await assert.rejects(() => p.waitReady(lease, { timeoutMs: 100 }), /HOME_GPU_NO_RAM|HOME_GPU_NO_DISK/);
+  assert.equal((await p.discover()).length, 1);
+  assert.equal(fs.existsSync(lockPath(0)), false);
+  assert.equal(docker.created.length, 0);
+});
+
+test('waitReady HostConfig has Memory, workspace bind, StorageOpt size', async () => {
+  const docker = stubDocker();
+  const p = new HomeGpuProvider({
+    ssh_hostname: 'gpu.example.com', ssh_tunnel_port: 2222,
+    memory_mb: 8192, disk_gb: 40, device_index: 0,
+    docker, __probeSsh: async () => true,
+  });
+  await p.waitReady(await p.acquire((await p.discover())[0]), { timeoutMs: 1000 });
+  const spec = docker.created[0];
+  assert.equal(spec.HostConfig.Memory, 8192 * 1024 * 1024);
+  assert.ok(spec.HostConfig.Binds.some((b) => b.endsWith(':/workspace')));
+  assert.equal(spec.HostConfig.StorageOpt.size, '40G');
+});
+
+test('waitReady wraps storage-opt quota errors as HOME_GPU_NO_DISK_QUOTA and unlocks', async () => {
+  const docker = stubDocker({
+    createError: new Error("--storage-opt is supported only for overlay over xfs with 'pquota' mount option"),
+  });
+  const p = new HomeGpuProvider(homeCfg({ docker }));
+  const lease = await p.acquire((await p.discover())[0]);
+  await assert.rejects(
+    () => p.waitReady(lease, { timeoutMs: 1000 }),
+    /HOME_GPU_NO_DISK_QUOTA: host docker cannot cap disk_gb \(need overlay2 size or xfs pquota\):/,
+  );
   assert.equal((await p.discover()).length, 1);
   assert.equal(fs.existsSync(lockPath(0)), false);
 });

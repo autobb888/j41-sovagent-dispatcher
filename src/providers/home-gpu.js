@@ -28,6 +28,14 @@ function assertTunnelPort(port) {
   return n;
 }
 
+function assertJailResources(cfg) {
+  const memoryMb = Number(cfg.memory_mb);
+  const diskGb = Number(cfg.disk_gb);
+  if (!Number.isFinite(memoryMb) || memoryMb < 256) throw new Error('HOME_GPU_NO_RAM: memory_mb must be >= 256');
+  if (!Number.isFinite(diskGb) || diskGb < 1) throw new Error('HOME_GPU_NO_DISK: disk_gb must be >= 1');
+  return { memoryMb, diskGb };
+}
+
 function deviceLockPath(deviceIndex) {
   return path.join(os.homedir(), '.j41', 'dispatcher', 'locks', `gpu-${deviceIndex}.lock`);
 }
@@ -178,31 +186,45 @@ class HomeGpuProvider extends ComputeProvider {
     try {
       const hostname = assertTunnelHostname(this.cfg.ssh_hostname);
       const tunnelPort = assertTunnelPort(this.cfg.ssh_tunnel_port);
-      const memoryMb = Number(this.cfg.memory_mb);
+      const { memoryMb, diskGb } = assertJailResources(this.cfg);
       const deviceId = String(this._deviceIndex());
       const password = (lease.meta && lease.meta.password) || crypto.randomBytes(16).toString('hex');
       if (lease.meta) lease.meta.password = password;
       else lease.meta = { password };
 
-      container = await this.docker.createContainer({
-        Image: this.cfg.jail_image || 'j41/gpu-jail:latest',
-        Env: [`J41_RENTER_PASSWORD=${password}`],
-        ExposedPorts: { '22/tcp': {} },
-        HostConfig: {
-          NetworkMode: 'bridge',
-          PortBindings: { '22/tcp': [{ HostIp: '127.0.0.1', HostPort: String(tunnelPort) }] },
-          Memory: Number.isFinite(memoryMb) && memoryMb > 0 ? memoryMb * 1024 * 1024 : 0,
-          PidsLimit: 1024,
-          CapDrop: ['ALL'],
-          CapAdd: ['NET_BIND_SERVICE', 'SETUID', 'SETGID', 'SYS_CHROOT', 'CHOWN', 'AUDIT_WRITE', 'KILL'],
-          SecurityOpt: ['no-new-privileges:true'],
-          DeviceRequests: [{
-            Driver: 'nvidia',
-            DeviceIDs: [deviceId],
-            Capabilities: [['gpu']],
-          }],
-        },
-      });
+      const jailDir = path.join(os.homedir(), '.j41', 'dispatcher', 'jails', String(lease.id));
+      fs.mkdirSync(jailDir, { recursive: true, mode: 0o700 });
+      fs.chmodSync(jailDir, 0o700);
+
+      try {
+        container = await this.docker.createContainer({
+          Image: this.cfg.jail_image || 'j41/gpu-jail:latest',
+          Env: [`J41_RENTER_PASSWORD=${password}`],
+          ExposedPorts: { '22/tcp': {} },
+          HostConfig: {
+            NetworkMode: 'bridge',
+            PortBindings: { '22/tcp': [{ HostIp: '127.0.0.1', HostPort: String(tunnelPort) }] },
+            Memory: memoryMb * 1024 * 1024,
+            Binds: [`${jailDir}:/workspace`],
+            StorageOpt: { size: `${diskGb}G` },
+            PidsLimit: 1024,
+            CapDrop: ['ALL'],
+            CapAdd: ['NET_BIND_SERVICE', 'SETUID', 'SETGID', 'SYS_CHROOT', 'CHOWN', 'AUDIT_WRITE', 'KILL'],
+            SecurityOpt: ['no-new-privileges:true'],
+            DeviceRequests: [{
+              Driver: 'nvidia',
+              DeviceIDs: [deviceId],
+              Capabilities: [['gpu']],
+            }],
+          },
+        });
+      } catch (err) {
+        const msg = String((err && err.message) || '');
+        if (/storage-opt|storage opt|storage option|\bquota\b/i.test(msg)) {
+          throw new Error(`HOME_GPU_NO_DISK_QUOTA: host docker cannot cap disk_gb (need overlay2 size or xfs pquota): ${err.message}`);
+        }
+        throw err;
+      }
       // Record before start so a throw cannot orphan the jail or hide the id from release.
       this._containerId = container.id;
       lease.meta.containerId = container.id;
@@ -270,4 +292,4 @@ class HomeGpuProvider extends ComputeProvider {
   }
 }
 
-module.exports = { HomeGpuProvider, assertTunnelHostname, assertTunnelPort, deviceLockPath };
+module.exports = { HomeGpuProvider, assertTunnelHostname, assertTunnelPort, assertJailResources, deviceLockPath };
