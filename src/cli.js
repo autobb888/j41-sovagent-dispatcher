@@ -3189,6 +3189,26 @@ program
       console.error(`✗ Agent directory not found: ${agentDir}`);
       process.exit(1);
     }
+
+    // Reverse slot guard: an agent that already sells gpu-rental cannot also be
+    // an api-endpoint (mixed-service _isApiEndpoint stamping). --no-register
+    // skips the network; unknown services still run the guard against [].
+    const { assertApiEligibleAgent } = require('./rental-job');
+    const { slotServicesFromAgentConfig } = require('./rental-setup');
+    let existingServices = [];
+    try {
+      const configPathEarly = path.join(agentDir, 'agent-config.json');
+      if (fs.existsSync(configPathEarly)) {
+        existingServices = slotServicesFromAgentConfig(JSON.parse(fs.readFileSync(configPathEarly, 'utf8')));
+      }
+    } catch {}
+    try {
+      assertApiEligibleAgent(existingServices);
+    } catch (e) {
+      console.error(`✗ ${e.message}`);
+      process.exit(1);
+    }
+
     if (!options.upstreamUrl) { console.error('✗ --upstream-url is required'); process.exit(1); }
     if (!options.model || options.model.length === 0) { console.error('✗ at least one --model is required'); process.exit(1); }
 
@@ -3243,6 +3263,15 @@ program
     });
     try {
       await agent.authenticate();
+      try {
+        const client = agent.client || agent._client;
+        if (client && typeof client.getAgentServices === 'function') {
+          const svcResp = await client.getAgentServices(keys.iAddress || keys.identity);
+          assertApiEligibleAgent(svcResp.data || svcResp || []);
+        }
+      } catch (e) {
+        if (e && /API_SLOT_CONFLICT/.test(e.message)) throw e;
+      }
       const svc = await agent.registerService({
         name: options.name || `${keys.identity} API Access`,
         description: options.description,
@@ -3259,6 +3288,117 @@ program
       });
       console.log(`✓ Service registered on platform (id: ${svc?.id || svc?.data?.id || '?'})`);
       console.log('Next: start the dispatcher (j41-dispatcher start) — your service is now discoverable.');
+    } catch (e) {
+      console.error(`✗ Platform registration failed: ${e.message}`);
+      console.error('  Config was still written — rerun with --no-register to skip this step, or fix auth and retry.');
+      process.exit(1);
+    } finally {
+      try { agent.stop?.(); } catch {}
+    }
+  });
+
+// Rental setup — scriptable Cat-1 gpu-rental registration. All-or-nothing
+// billing, contained SSH (never host SSH). Separate agent slot from api-endpoint.
+program
+  .command('rental-setup <agent-id>')
+  .description('Register a raw-GPU rental (Cat-1) service. All-or-nothing; contained SSH, never host SSH.')
+  .option('--price <vrsc>', 'Price per rental window (VRSC)', '0')
+  .option('--name <name>', 'Service name')
+  .option('--service-payment-terms <terms>', 'prepay|postpay', 'prepay')
+  .option('--ack-postpay-vast-risk', 'Required if payment terms are postpay AND this slot sources a Vast box (Alice eats the Vast bill if the buyer never pays)')
+  .option('--no-register', 'Skip platform registration (write agent-config only)')
+  .action(async (agentId, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
+    const agentDir = path.join(AGENTS_DIR, agentId);
+    if (!fs.existsSync(agentDir)) {
+      console.error(`✗ Agent directory not found: ${agentDir}`);
+      process.exit(1);
+    }
+
+    const {
+      assertRentalSetupAllowed,
+      rentalServiceDescription,
+      applyRentalAgentConfig,
+      slotServicesFromAgentConfig,
+    } = require('./rental-setup');
+    const { assertRentalEligibleAgent } = require('./rental-job');
+
+    const paymentTerms = String(options.servicePaymentTerms || 'prepay').toLowerCase();
+    if (paymentTerms !== 'prepay' && paymentTerms !== 'postpay') {
+      console.error('✗ --service-payment-terms must be prepay or postpay');
+      process.exit(1);
+    }
+    const price = parseFloat(options.price);
+    if (!Number.isFinite(price) || price < 0) {
+      console.error('✗ --price must be a non-negative number');
+      process.exit(1);
+    }
+
+    const configPath = path.join(agentDir, 'agent-config.json');
+    let config = {};
+    try { if (fs.existsSync(configPath)) config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch {}
+
+    let setup;
+    try {
+      setup = assertRentalSetupAllowed({
+        agentId,
+        cfg,
+        services: slotServicesFromAgentConfig(config),
+        paymentTerms,
+        ackPostpayVastRisk: !!options.ackPostpayVastRisk,
+      });
+    } catch (e) {
+      console.error(`✗ ${e.message}`);
+      process.exit(1);
+    }
+
+    config = applyRentalAgentConfig(config, { ackPostpayVastRisk: options.ackPostpayVastRisk });
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
+    try { fs.chmodSync(configPath, 0o600); } catch {}
+    console.log(`✓ Wrote ${configPath}`);
+
+    if (!options.register) {
+      console.log('Config saved. Skipping platform registration (--no-register).');
+      return;
+    }
+
+    const keysPath = path.join(agentDir, 'keys.json');
+    if (!fs.existsSync(keysPath)) { console.error(`✗ keys.json not found for ${agentId}`); process.exit(1); }
+    const keys = readKeysFile(keysPath);
+
+    const { J41Agent } = require('@junction41/sovagent-sdk');
+    const agent = new J41Agent({
+      apiUrl: cfg.platform.api_url,
+      identityName: keys.identity,
+      wif: keys.wif,
+      iAddress: keys.iAddress,
+      network: cfg.platform.network,
+    });
+    try {
+      await agent.authenticate();
+      try {
+        const client = agent.client || agent._client;
+        if (client && typeof client.getAgentServices === 'function') {
+          const svcResp = await client.getAgentServices(keys.iAddress || keys.identity);
+          assertRentalEligibleAgent(svcResp.data || svcResp || []);
+        }
+      } catch (e) {
+        if (e && /RENTAL_SLOT_CONFLICT/.test(e.message)) throw e;
+      }
+      const jobTimeoutMin = _cfg.jobTimeoutMin || 60;
+      const vastPostpayAck = !!(setup && setup.pcfg && setup.pcfg.type === 'vast' && options.ackPostpayVastRisk);
+      const svc = await agent.registerService({
+        name: options.name || `${keys.identity} GPU Rental`,
+        description: rentalServiceDescription({ jobTimeoutMin, paymentTerms, vastPostpayAck }),
+        price,
+        currency: NATIVE_COIN,
+        paymentTerms,
+        sovguard: false,
+        serviceType: 'gpu-rental',
+      });
+      console.log(`✓ Service registered on platform (id: ${svc?.id || svc?.data?.id || '?'})`);
+      console.log('Next: start the dispatcher (j41-dispatcher start) — your rental is now discoverable.');
+      console.log('Remember: a rental job delivers contained SSH credentials and the box is released at expiry. Never host SSH.');
     } catch (e) {
       console.error(`✗ Platform registration failed: ${e.message}`);
       console.error('  Config was still written — rerun with --no-register to skip this step, or fix auth and retry.');
