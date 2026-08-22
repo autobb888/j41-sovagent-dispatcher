@@ -68,3 +68,9 @@ test('dashboard offers preferAllowlist confirm, not a VDXF write', () => {
   assert.match(DASH, /Prefer allowlist even when open\?/);
   assert.match(DASH, /preferAllowlist/);
 });
+
+test('README documents sales-mode and allowlist', () => {
+  const README = fs.readFileSync(path.join(__dirname, '../README.md'), 'utf8');
+  assert.match(README, /sales-mode/);
+  assert.match(README, /allowlist/);
+});

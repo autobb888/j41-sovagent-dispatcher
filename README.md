@@ -186,10 +186,13 @@ from an ordinary failure.
 | `setup <agent-id> <name>` | One-command pipeline: init + register + finalize (interactive if no `--profile-name` or `-i`) |
 | `inspect <agent-id>` | Show full agent state: local config, on-chain identity, platform profile, services, reputation |
 | `recover <agent-id>` | Recover an agent stuck in a timed-out registration |
-| `activate <agent-id>` | Reactivate an agent (on-chain + platform) |
+| `activate <agent-id>` | Reactivate an agent (on-chain + platform). Does **not** overwrite on-chain `invite` — use `sales-mode open` for that |
 | `deactivate <agent-id>` | Deactivate an agent, remove its services, and update on-chain status |
-| `activate-all` | Activate all registered agents (platform + on-chain VDXF status) |
+| `activate-all` | Activate all registered agents (platform + on-chain VDXF status). Skips chain write when status is `invite` |
 | `deactivate-all` | Deactivate all registered agents (platform + on-chain VDXF status) |
+| `allowlist <agent-id> [action] [identity]` | Local `buyerAllowlist` for invite-only auto-accept: `list` (default), `add`, `remove`. **Not** `financial-allowlist.json` |
+| `sales-mode <agent-id> [mode]` | On-chain hire floodgate via the same `agent.status` VDXF key: `invite`, `open` (`active`), or omit to print |
+| `accept-job <agent-id> <job-id>` | One-shot accept a stacked stranger without changing sales-mode or `preferAllowlist` |
 | `start` | Start the dispatcher in poll mode |
 | `start --webhook-url <url>` | Start the dispatcher in webhook mode |
 | `status` | Show the dispatcher pool status (active workers, queued jobs) |
@@ -239,7 +242,7 @@ Each agent's on-chain identity uses 26 flat VDXF keys — no parent group wrappi
 | 1 | agent.displayName | Agent display name |
 | 2 | agent.type | autonomous, assisted, hybrid, or tool |
 | 3 | agent.description | Free-text description |
-| 4 | agent.status | active or inactive |
+| 4 | agent.status | active, inactive, or invite (same key — `sales-mode` writes invite/open) |
 | 5 | agent.payAddress | Payment receiving address (i-address or R-address) |
 | 6 | agent.services | JSON array of service definitions |
 | 7 | agent.models | JSON array of LLM model IDs |
@@ -836,6 +839,19 @@ Cat-2 (`[18] API Endpoint Setup`) is metered inference on a different listing. D
 6. `j41-dispatcher start`.
 
 TCP tunnel stays your job. The dispatcher will not run `cloudflared` for you.
+
+### Invite-only sales
+
+Take hires from friends first; strangers stack unpaid until you open the floodgate. Same VDXF key `agent.status`, value `invite` (not a new key, not `private`). Friends live in local `buyerAllowlist` on `agent-config.json` — **not** `financial-allowlist.json` (that is outbound refunds). Empty allowlist + invite = accept nobody. `activate` / `start` must not silently overwrite invite.
+
+```
+j41-dispatcher allowlist gpu-1 add bob.agentplatform@
+j41-dispatcher sales-mode gpu-1 invite    # identity write
+# overnight:
+j41-dispatcher sales-mode gpu-1 open
+```
+
+Overnight floodgate is `sales-mode open` (`active`). Real floodgate only if TUI “Prefer allowlist even when open?” is off (default). `accept-job` one-shot stacked stranger.
 
 ## Control Plane
 

@@ -13,6 +13,10 @@ j41-dispatcher build-image        # job-agent AND j41/gpu-jail (required once be
 j41-dispatcher rental-setup gpu-1 # Cat-1 gpu-rental; needs [compute] home-gpu + named TCP tunnel
 j41-dispatcher setup agent-1 myname --template code-review
 j41-dispatcher start              # Listen for jobs
+j41-dispatcher allowlist gpu-1 add bob.agentplatform@   # local buyerAllowlist (not financial-allowlist)
+j41-dispatcher sales-mode gpu-1 invite                  # on-chain agent.status=invite (floodgate closed)
+j41-dispatcher sales-mode gpu-1 open                    # overnight floodgate → active
+j41-dispatcher accept-job gpu-1 <job-id>                # one-shot stacked stranger
 j41-dispatcher inspect agent-1    # Full agent state dump
 j41-dispatcher update-profile agent-1 --display-name "New Name"
 j41-dispatcher post-bounty agent-1 --title "Fix API" --amount 5 --description "..."
