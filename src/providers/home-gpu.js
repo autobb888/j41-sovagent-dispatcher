@@ -36,6 +36,13 @@ function assertJailResources(cfg) {
   return { memoryMb, diskGb };
 }
 
+function jailImageRef(pcfg = {}) {
+  if (pcfg && pcfg.jail_image) return String(pcfg.jail_image);
+  const name = process.env.J41_JAIL_IMAGE || 'j41/gpu-jail';
+  const tag = process.env.J41_JAIL_TAG || 'latest';
+  return `${name}:${tag}`;
+}
+
 function deviceLockPath(deviceIndex) {
   return path.join(os.homedir(), '.j41', 'dispatcher', 'locks', `gpu-${deviceIndex}.lock`);
 }
@@ -292,4 +299,4 @@ class HomeGpuProvider extends ComputeProvider {
   }
 }
 
-module.exports = { HomeGpuProvider, assertTunnelHostname, assertTunnelPort, assertJailResources, deviceLockPath };
+module.exports = { HomeGpuProvider, assertTunnelHostname, assertTunnelPort, assertJailResources, jailImageRef, deviceLockPath };

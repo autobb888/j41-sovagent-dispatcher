@@ -109,3 +109,27 @@ test('compute signup copy no longer points at api-endpoint', () => {
   assert.match(cli, /rental-setup/);
   assert.match(dash, /rental-setup/);
 });
+
+test('rental-setup home-gpu host preflight refuses when injected host cannot cap disk', () => {
+  const cfg = { compute: { enabled: true, providers: { card0: {
+    type: 'home-gpu', agent_id: 'gpu-1', ssh_hostname: 'gpu.example.com',
+    ssh_tunnel_port: 2222, memory_mb: 8192, disk_gb: 40,
+  } } } };
+  assert.throws(
+    () => assertRentalSetupAllowed({
+      agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay',
+      host: {
+        execSync: () => { throw new Error('no pquota'); },
+        imageExists: () => true,
+        supportsStorageOpt: () => false,
+      },
+    }),
+    /HOME_GPU_NO_DISK_QUOTA/,
+  );
+});
+
+test('rental-setup does not silently skip host preflight in production NODE_ENV', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'rental-setup.js'), 'utf8');
+  assert.match(src, /assertHomeGpuHostReady/);
+  assert.match(src, /host \|\| \(process\.env\.NODE_ENV === 'test' \? null : \{\}\)/);
+});

@@ -9603,26 +9603,6 @@ function isGvisorAvailable() {
   }
 }
 
-let _storageOptSupported = null;
-function supportsStorageOpt() {
-  if (_storageOptSupported !== null) return _storageOptSupported;
-  try {
-    const driver = require('child_process').execSync(
-      'docker info --format "{{.Driver}}"',
-      { encoding: 'utf8', timeout: 5000 }
-    ).trim();
-    if (driver !== 'overlay2') { _storageOptSupported = false; return false; }
-    require('child_process').execSync(
-      `mount | grep pquota`,
-      { encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }
-    );
-    _storageOptSupported = true;
-  } catch {
-    _storageOptSupported = false;
-  }
-  return _storageOptSupported;
-}
-
 // Returns a write(text) fn that appends to logStream but never lets the file
 // exceed maxBytes; emits a single truncation notice when the cap is first hit.
 function makeCappedLogWriter(logStream, maxBytes) {
@@ -9826,6 +9806,7 @@ async function startJobContainer(state, job, agentInfo) {
     // M1: build HostConfig as a variable so we can patch CapDrop after the
     // bwrap spread (which returns CapDrop:[] + CapAdd:['SYS_ADMIN'] and would
     // otherwise silently wipe the 'ALL' drop).
+    const { supportsStorageOpt } = require('./docker-host');
     const hostConfig = {
       Binds: [
         // job dir must be writable for attestation artifacts (creation/deletion json)

@@ -25,7 +25,7 @@ function applyRentalAgentConfig(existing, { ackPostpayVastRisk } = {}) {
   return next;
 }
 
-function assertRentalSetupAllowed({ agentId, cfg, services, paymentTerms, ackPostpayVastRisk }) {
+function assertRentalSetupAllowed({ agentId, cfg, services, paymentTerms, ackPostpayVastRisk, host }) {
   assertRentalEligibleAgent(services);
   if (!cfg || !cfg.compute || cfg.compute.enabled !== true) {
     throw new Error('RENTAL_COMPUTE_DISABLED: set [compute] enabled=true before rental-setup');
@@ -39,6 +39,9 @@ function assertRentalSetupAllowed({ agentId, cfg, services, paymentTerms, ackPos
     assertTunnelHostname(pcfg.ssh_hostname);
     assertTunnelPort(pcfg.ssh_tunnel_port);
     assertJailResources(pcfg);
+    const { assertHomeGpuHostReady } = require('./docker-host');
+    const hostDeps = host || (process.env.NODE_ENV === 'test' ? null : {});
+    if (hostDeps) assertHomeGpuHostReady(pcfg, hostDeps);
   }
   const provider = createProvider(pcfg.type, { id: name, ...pcfg });
   assertProviderCanSsh(provider);
