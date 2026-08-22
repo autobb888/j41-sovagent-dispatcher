@@ -1602,7 +1602,7 @@ program
         } else if (otherKeys.iAddress) {
           console.error(`   ${other} already owns this identity.`);
         }
-        console.error(`   Pick a different name, or clear ${other}'s state first.`);
+        console.error(`   Pick a different name. Do not reuse a working agent name for a GPU box.`);
         process.exit(1);
       }
     }

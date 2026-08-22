@@ -27,8 +27,14 @@ const {
   kindFromIdentityName,
   leafFromIdentity,
   listingIdPrefix,
+  listingsCollide,
   KIND_BLURB,
 } = require('./listing-kind.js');
+const {
+  providerBoundToAgent,
+  homeGpuProviderPartial,
+  vastProviderPartial,
+} = require('./compute-provider-write.js');
 const { sendCommand } = require('./control.js');
 const { renderActiveJobs, runLiveScreen } = require('./tui/live-screen.js');
 const { formatUpstreamHealthTag } = require('./tui/health-tag.js');
@@ -1261,6 +1267,15 @@ async function addAgentScreen(inquirer) {
   if (!name) { console.log('\n  ❌ Name required.\n'); return; }
 
   const preview = advertisedIdentity(name, kind);
+  for (const other of agents) {
+    const otherName = other.identity || other.pendingName;
+    if (otherName && listingsCollide(otherName, name, kind)) {
+      console.log(`\n  ❌ ${preview} is already used by local listing ${other.id} (${listingKindOf(other)}).`);
+      console.log('     Pick a new name. Do not reuse a working agent name for a GPU box.\n');
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+      return;
+    }
+  }
 
   const tplDir = path.join(__dirname, '..', 'templates');
   let templates = [];
@@ -1290,7 +1305,7 @@ async function addAgentScreen(inquirer) {
   console.log(`  ID:       ${agentId}`);
   console.log(`  Identity: ${preview}`);
   if (template) console.log(`  Template: ${template}`);
-  if (kind === 'compute') console.log(`  Next:      paste [compute.providers.card0] then rental-setup`);
+  if (kind === 'compute') console.log(`  Next:      write [compute.providers.*] then rental-setup`);
   if (kind === 'model') console.log(`  Next:      attach the inference endpoint for this model`);
   if (kind === 'data') console.log(`  Next:      attach a data policy; you keep hosting the bytes`);
   console.log('');
@@ -1311,26 +1326,9 @@ async function addAgentScreen(inquirer) {
       if (kind !== 'agent') {
         if (kind === 'compute') {
           console.log('  Cat-1 GPU rental — contained SSH jail, never host SSH, never 0.0.0.0.\n');
-          console.log('  Do these in order before start:');
-          console.log('    1. Paste the home-gpu PASTE RECIPE from docs/config.toml.example');
-          console.log('       into ~/.j41/dispatcher/config.toml ([compute] enabled=true).');
-          console.log('    2. Point a named TCP tunnel at 127.0.0.1:$ssh_tunnel_port');
-          console.log('       (not the HTTP webhook / cloudflared URL).');
-          console.log('    3. j41-dispatcher rental-setup ' + agentId);
-          console.log('    4. j41-dispatcher start\n');
-          console.log('  Do not use [18] API Endpoint Setup on this listing.\n');
-          const { runRental } = await promptWithEsc(inquirer, [{
-            type: 'confirm',
-            name: 'runRental',
-            message: 'Run rental-setup now?',
-            default: false,
-          }]);
-          if (runRental) {
-            await runCommandAsync(process.execPath, [process.argv[1], 'rental-setup', agentId]);
-          } else {
-            console.log('\n  Skipped. Next is still rental-setup, not start:\n');
-            console.log('    j41-dispatcher rental-setup ' + agentId + '\n');
-          }
+          console.log('  Do not use API Endpoint Setup on this listing.\n');
+          await computeProviderScreen(inquirer, agentId);
+          await rentalSetupScreen(inquirer, agentId);
           await promptSalesMode(inquirer, agentId);
           await promptPreferAllowlist(inquirer, agentId);
           await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
@@ -1402,12 +1400,8 @@ async function configureServicesScreen(inquirer) {
 
   if (listingKindOf(keys) === 'compute') {
     console.log('  This is a compute listing. Do not attach labour or api-endpoint here.\n');
-    const { runRental } = await promptWithEsc(inquirer, [{
-      type: 'confirm', name: 'runRental',
-      message: 'Run rental-setup now?',
-      default: false,
-    }]);
-    if (runRental) await rentalSetupScreen(inquirer, agentId);
+    await computeProviderScreen(inquirer, agentId);
+    await rentalSetupScreen(inquirer, agentId);
     return;
   }
 
@@ -2067,10 +2061,93 @@ async function acceptJobScreen(inquirer, agentId) {
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
+async function computeProviderScreen(inquirer, agentId) {
+  console.clear();
+  console.log(`\n  ═══ GPU provider: ${agentId} ═══\n`);
+  console.log('  Writes [compute] enabled=true and [compute.providers.*] into');
+  console.log('  ~/.j41/dispatcher/config.toml. Does not create the TCP tunnel.');
+  console.log('  Never 0.0.0.0. Never host SSH. Vast or home-gpu only.\n');
+
+  const cfg = loadDispatcherConfig();
+  const bound = providerBoundToAgent(cfg.compute && cfg.compute.providers, agentId);
+  if (bound) {
+    console.log(`  Already bound: [${bound[0]}] type=${bound[1].type} agent_id=${bound[1].agent_id}\n`);
+    const { overwrite } = await promptWithEsc(inquirer, [{
+      type: 'confirm', name: 'overwrite',
+      message: 'Overwrite this provider table?',
+      default: false,
+    }]);
+    if (!overwrite) return;
+  }
+
+  const { ptype } = await promptWithEsc(inquirer, [{
+    type: 'list', name: 'ptype',
+    message: 'Provider:',
+    choices: [
+      { name: '  home-gpu   this box, contained SSH jail', value: 'home-gpu' },
+      { name: '  vast       sourced GPU (Cat-1, not interruptible)', value: 'vast' },
+    ],
+  }]);
+
+  try {
+    if (ptype === 'vast') {
+      const { api_key } = await promptWithEsc(inquirer, [{ type: 'password', name: 'api_key', message: 'Vast API key:', mask: '*' }]);
+      const { min_vram_gb } = await promptWithEsc(inquirer, [{ type: 'input', name: 'min_vram_gb', message: 'Min VRAM GB:', default: '24' }]);
+      const { max_usd } = await promptWithEsc(inquirer, [{ type: 'input', name: 'max_usd', message: 'Fleet max USD/hour:', default: '1' }]);
+      const { tableName, partial } = vastProviderPartial(agentId, {
+        api_key, min_vram_gb, max_usd_per_hour: max_usd,
+      }, cfg.compute && cfg.compute.providers);
+      saveDispatcherConfig(partial);
+      console.log(`\n  ✅ Wrote [compute.providers.${tableName}] type=vast interruptible=false`);
+      console.log('  Restart dispatcher after rental-setup to apply.\n');
+      return;
+    }
+
+    const { gpu } = await promptWithEsc(inquirer, [{ type: 'input', name: 'gpu', message: 'GPU name:', default: 'GPU' }]);
+    const { vram_gb } = await promptWithEsc(inquirer, [{ type: 'input', name: 'vram_gb', message: 'VRAM GB:', default: '24' }]);
+    const { memory_mb } = await promptWithEsc(inquirer, [{ type: 'input', name: 'memory_mb', message: 'Jail RAM MB (>= 256):', default: '32768' }]);
+    const { disk_gb } = await promptWithEsc(inquirer, [{ type: 'input', name: 'disk_gb', message: 'Jail disk GB (>= 1):', default: '100' }]);
+    const { device_index } = await promptWithEsc(inquirer, [{ type: 'input', name: 'device_index', message: 'NVIDIA device_index:', default: '0' }]);
+    const { ssh_hostname } = await promptWithEsc(inquirer, [{
+      type: 'input', name: 'ssh_hostname',
+      message: 'TCP tunnel hostname (not 127.0.0.1, not 0.0.0.0, not https://):',
+    }]);
+    const { ssh_tunnel_port } = await promptWithEsc(inquirer, [{
+      type: 'input', name: 'ssh_tunnel_port',
+      message: 'Jail SSH loopback port (tunnel target 127.0.0.1:this):',
+      default: '2222',
+    }]);
+    const { tableName, partial } = homeGpuProviderPartial(agentId, {
+      gpu, vram_gb, memory_mb, disk_gb, device_index, ssh_hostname, ssh_tunnel_port,
+    }, cfg.compute && cfg.compute.providers);
+    saveDispatcherConfig(partial);
+    console.log(`\n  ✅ Wrote [compute.providers.${tableName}] type=home-gpu`);
+    console.log(`  Point a named TCP tunnel at 127.0.0.1:${ssh_tunnel_port} before rental-setup.`);
+    console.log('  The TUI does not create the tunnel. Never bind 0.0.0.0.\n');
+  } catch (e) {
+    console.log(`\n  ❌ ${e.message}\n`);
+  }
+}
+
 async function rentalSetupScreen(inquirer, agentId) {
   console.clear();
   console.log(`\n  ═══ Rental-setup: ${agentId} ═══\n`);
   console.log('  Registers the Cat-1 gpu-rental service (contained SSH jail).\n');
+  const cfg = loadDispatcherConfig();
+  if (!providerBoundToAgent(cfg.compute && cfg.compute.providers, agentId)) {
+    console.log('  No [compute.providers.*] bound to this listing yet.\n');
+    const { writeNow } = await promptWithEsc(inquirer, [{
+      type: 'confirm', name: 'writeNow',
+      message: 'Write the GPU provider now?',
+      default: true,
+    }]);
+    if (writeNow) await computeProviderScreen(inquirer, agentId);
+    else {
+      console.log('\n  rental-setup will fail without a provider.\n');
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+      return;
+    }
+  }
   const { confirm } = await promptWithEsc(inquirer, [{
     type: 'confirm', name: 'confirm',
     message: 'Run rental-setup now?',

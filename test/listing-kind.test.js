@@ -71,3 +71,8 @@ test('TUI signup offers model as a live kind under agentplatform@', () => {
   assert.equal(/coming soon/i.test(DASH), false);
   assert.match(DASH, /--kind/);
 });
+
+test('TUI refuses to reuse a working agent name for a GPU box', () => {
+  assert.match(DASH, /listingsCollide/);
+  assert.match(DASH, /Do not reuse a working agent name for a GPU box/);
+});

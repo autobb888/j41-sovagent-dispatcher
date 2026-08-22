@@ -32,5 +32,6 @@ test('TUI jobs screen can accept stacked hires and respond to disputes', () => {
 test('compute Configure Services offers rental-setup instead of CLI-only copy', () => {
   const cfg = DASH.slice(DASH.indexOf('async function configureServicesScreen'), DASH.indexOf('while (true)'));
   assert.match(cfg, /listingKindOf\(keys\) === 'compute'/);
+  assert.match(cfg, /computeProviderScreen/);
   assert.match(cfg, /rentalSetupScreen/);
 });
