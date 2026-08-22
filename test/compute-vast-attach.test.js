@@ -72,3 +72,31 @@ test('attachVastLeases still provisions vast for a Cat-2 api-endpoint agent', as
   assert.ok(ctrl.getLeases().length >= 1);
   assert.equal(ctrl.getLeases()[0].state, 'ready');
 });
+
+test('attachVastLeases skips vast when on-disk agent-config is gpu-rental even if Map is empty', async () => {
+  const agentId = 'gpu-disk-1';
+  const dir = path.join(TEST_HOME, '.j41', 'dispatcher', 'agents', agentId);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(
+    path.join(dir, 'agent-config.json'),
+    JSON.stringify({ rental: true, serviceType: 'gpu-rental' }),
+    { mode: 0o600 },
+  );
+  const agentConfigs = new Map([['api-other', { serviceType: 'api-endpoint' }]]);
+  let acquired = 0;
+  const inner = happyFetch();
+  const fetchImpl = async (url, opts = {}) => {
+    const m = (opts.method || 'GET').toUpperCase();
+    if (m === 'PUT' && String(url).includes('/asks')) acquired += 1;
+    return inner(url, opts);
+  };
+  const ctrl = createSupplyController({
+    cfg: { compute: { enabled: true, max_usd_per_hour: 1, providers: {
+      cloud: { type: 'vast', agent_id: agentId, api_key: 'k', min_vram_gb: 24, fetchImpl },
+    } } },
+    agentConfigs,
+  });
+  await ctrl.attachVastLeases();
+  assert.equal(acquired, 0);
+  assert.equal(ctrl.getLeases().length, 0);
+});

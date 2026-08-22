@@ -12,9 +12,40 @@
 //   - release() failures keep the lease as 'release-pending'; the reconcile loop retries.
 //   - Boot recovery rehydrates still-active rentals instead of wiping the ledger.
 //   - reconcileTick is non-reentrant; the spend ceiling reserves headroom synchronously.
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { createProvider } = require('./providers');
 const { persistLeases, loadLeases, loadActiveJobs } = require('./config');
 const { slotServicesFromAgentConfig } = require('./rental-setup');
+
+function looksLikeGpuRentalSlot(cfg) {
+  return !!(cfg && (cfg.rental === true || cfg.serviceType === 'gpu-rental'));
+}
+
+// cli.js only puts api-endpoint agents in the live Map. Cat-1 rental flags live in
+// agent-config.json; read them when the Map entry is missing so idle Vast does not attach.
+function loadOnDiskAgentConfig(agentId) {
+  if (!agentId) return {};
+  try {
+    const configPath = path.join(os.homedir(), '.j41', 'dispatcher', 'agents', agentId, 'agent-config.json');
+    const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function resolveVastAgentSlotConfig(agentConfigs, agentId) {
+  const fromMap = (agentConfigs && typeof agentConfigs.get === 'function' && agentConfigs.get(agentId)) || {};
+  if (looksLikeGpuRentalSlot(fromMap)) return fromMap;
+  const fromDisk = loadOnDiskAgentConfig(agentId);
+  return {
+    ...fromMap,
+    rental: fromDisk.rental !== undefined ? fromDisk.rental : fromMap.rental,
+    serviceType: fromDisk.serviceType !== undefined ? fromDisk.serviceType : fromMap.serviceType,
+  };
+}
 
 function createSupplyController({ cfg, agentConfigs, now = Date.now }) {
   const leases = new Map();        // leaseId -> lease
@@ -132,7 +163,7 @@ function createSupplyController({ cfg, agentConfigs, now = Date.now }) {
     const max = Number(compute.max_usd_per_hour) || 0;
     for (const [name, pcfg] of Object.entries(provCfgs)) {
       if (pcfg.type !== 'vast') continue;
-      const agentCfg = agentConfigs.get(pcfg.agent_id) || {};
+      const agentCfg = resolveVastAgentSlotConfig(agentConfigs, pcfg.agent_id);
       const slot = slotServicesFromAgentConfig(agentCfg);
       if (slot.some((s) => s.serviceType === 'gpu-rental')) {
         console.log(`  Compute: vast "${name}" idle (gpu-rental slot — acquire on job, not at boot)`);
