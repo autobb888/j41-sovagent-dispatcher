@@ -77,3 +77,34 @@ test('vast waitReady({ readyFor: "ssh" }) succeeds without /models', async () =>
   assert.equal(service.state, 'degraded');
   assert.equal(service.ssh, null);
 });
+
+test('job-bound vast probe is SSH-ready; Cat-2 still requires /models', async () => {
+  const fetchImpl = fakeFetch([
+    {
+      method: 'GET',
+      match: (u) => u.includes('/instances'),
+      status: 200,
+      body: {
+        instances: [{
+          id: 42,
+          actual_status: 'running',
+          ssh_host: '9.9.9.9',
+          ssh_port: 22,
+          ports: { '8000/tcp': [{ HostPort: '41000' }] },
+        }],
+      },
+    },
+    { method: 'GET', match: (u) => u.includes('/models'), status: 500, body: {} },
+  ]);
+  const p = new VastProvider({ id: 'vast:t', api_key: 'k', fetchImpl });
+  const lease = {
+    id: 'vast:42', provider: 'vast', state: 'ready',
+    ssh: { host: '9.9.9.9', port: 22, user: 'root' },
+    meta: { instanceId: 42 },
+    baseUrl: 'http://9.9.9.9:41000/v1',
+  };
+  const cat1 = await p.probe({ ...lease, jobId: 'job-1' });
+  assert.equal(cat1.healthy, true, 'Cat-1 rental is healthy without /models');
+  const cat2 = await p.probe(lease);
+  assert.equal(cat2.healthy, false, 'Cat-2 attach still requires /models');
+});

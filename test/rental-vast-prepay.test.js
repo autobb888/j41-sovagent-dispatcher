@@ -123,3 +123,55 @@ test('startRentalJobWired reads rentalAckPostpayVastRisk from agent-config', () 
   assert.match(wired, /loadAgentConfig/);
   assert.match(wired, /ackPostpayVastRisk/);
 });
+
+test('reconcileTick does not release a job-bound Vast rental when /models is down', async () => {
+  const { VastProvider } = require('../src/providers/vast');
+  const { createSupplyController } = require('../src/compute-supply');
+  let deleted = 0;
+  const fetchImpl = async (url, opts = {}) => {
+    const method = (opts.method || 'GET').toUpperCase();
+    if (method === 'DELETE') {
+      deleted += 1;
+      return { status: 200, ok: true, async json() { return {}; }, async text() { return '{}'; } };
+    }
+    if (method === 'GET' && String(url).includes('/instances')) {
+      return {
+        status: 200, ok: true,
+        async json() {
+          return {
+            instances: [{
+              id: 42, actual_status: 'running', ssh_host: '9.9.9.9', ssh_port: 22,
+              ports: { '8000/tcp': [{ HostPort: '41000' }] },
+            }],
+          };
+        },
+        async text() { return ''; },
+      };
+    }
+    if (method === 'GET' && String(url).includes('/models')) {
+      return { status: 500, ok: false, async json() { return {}; }, async text() { return ''; } };
+    }
+    throw new Error(`no fake route for ${method} ${url}`);
+  };
+  const provider = new VastProvider({ id: 'vast:t', api_key: 'k', fetchImpl });
+  const lease = {
+    id: 'vast:42', provider: 'vast', state: 'ready', jobId: 'job-1',
+    usdPerHour: 0.2, ssh: { host: '9.9.9.9', port: 22, user: 'root' },
+    meta: { instanceId: 42 }, baseUrl: 'http://9.9.9.9:41000/v1',
+  };
+  const health = await provider.probe(lease);
+  assert.equal(health.healthy, true, 'running + ssh_host + /models 500 is healthy when jobId is set');
+
+  const ctrl = createSupplyController({
+    cfg: { compute: { enabled: true, max_usd_per_hour: 1, providers: {} } },
+    agentConfigs: new Map(),
+    now: () => 1000,
+  });
+  ctrl._injectBoundLease(lease, provider, 'agent-1');
+  await ctrl.reconcileTick();
+  const leases = ctrl.getLeases();
+  assert.equal(deleted, 0, 'reconcile must not DELETE a live Cat-1 rental');
+  assert.equal(leases.length, 1);
+  assert.equal(leases[0].id, 'vast:42');
+  assert.equal(leases[0].state, 'ready');
+});

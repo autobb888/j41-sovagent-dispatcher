@@ -111,7 +111,14 @@ class VastProvider extends ComputeProvider {
     if (!inst || inst.actual_status !== 'running') {
       return { healthy: false, reason: inst ? inst.actual_status : 'instance not found' };
     }
-    // A running instance whose vLLM has crashed is NOT healthy — probe the endpoint.
+    // Cat-1 rental (job-bound): SSH-ready is health. Reconcile releases job-bound
+    // unhealthy leases instead of replacing them — requiring /models here would
+    // yank a paid box the moment the buyer stops vLLM (or before vLLM ever starts).
+    if (lease.jobId) {
+      const ok = !!inst.ssh_host;
+      return { healthy: ok, reason: ok ? undefined : 'ssh not published' };
+    }
+    // Cat-2 attach: a running instance whose vLLM has crashed is NOT healthy.
     const base = lease.baseUrl || this._baseUrlFor(inst, lease);
     const up = await this._serviceUp(base);
     return { healthy: up, reason: up ? undefined : 'models endpoint not serving' };
