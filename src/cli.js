@@ -10474,6 +10474,7 @@ async function startRentalJobWired(state, job, agentInfo) {
   const agent = await getAgentSession(state, agentInfo);
   const { createLocalSigner } = require('./job-signer');
   const signer = createLocalSigner({ wif: agentInfo.wif, network: J41_NETWORK });
+  const agentCfg = loadAgentConfig(agentInfo.id);
   await startRentalJob({
     state,
     job,
@@ -10483,6 +10484,7 @@ async function startRentalJobWired(state, job, agentInfo) {
     providerName,
     client: agent.client,
     signDeliver: ({ hash }) => signer.signDeliver({ jobHash: job.jobHash, deliveryHash: hash }),
+    ackPostpayVastRisk: !!(agentCfg && agentCfg.rentalAckPostpayVastRisk),
     now: Date.now(),
   });
 }

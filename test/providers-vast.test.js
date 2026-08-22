@@ -47,3 +47,33 @@ test('capabilities: elastic + provisionable + ssh', () => {
   const p = new VastProvider({ id: 'vast:t', api_key: 'k', fetchImpl: async () => ({}) });
   assert.deepEqual(p.capabilities, { canProvision: true, canSsh: true, canScaleToZero: false, isElastic: true });
 });
+
+test('vast waitReady({ readyFor: "ssh" }) succeeds without /models', async () => {
+  const fetchImpl = fakeFetch([
+    {
+      method: 'GET',
+      match: (u) => u.includes('/instances'),
+      status: 200,
+      body: {
+        instances: [{
+          id: 42,
+          actual_status: 'running',
+          ssh_host: '9.9.9.9',
+          ssh_port: 22,
+          ports: { '8000/tcp': [{ HostPort: '41000' }] },
+        }],
+      },
+    },
+    { method: 'GET', match: (u) => u.includes('/models'), status: 500, body: {} },
+  ]);
+  const p = new VastProvider({ id: 'vast:t', api_key: 'k', fetchImpl });
+  const pending = { id: 'vast:42', provider: 'vast', state: 'pending', ssh: null, meta: { instanceId: 42 } };
+
+  const sshReady = await p.waitReady(pending, { timeoutMs: 1000, readyFor: 'ssh' });
+  assert.equal(sshReady.state, 'ready');
+  assert.equal(sshReady.ssh && sshReady.ssh.host, '9.9.9.9');
+
+  const service = await p.waitReady(pending, { timeoutMs: 20 });
+  assert.equal(service.state, 'degraded');
+  assert.equal(service.ssh, null);
+});

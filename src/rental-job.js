@@ -24,6 +24,18 @@ function assertProviderCanSsh(provider) {
   }
 }
 
+// Vast (canProvision && isElastic) starts billing Alice on acquire. Refuse until
+// the buyer payment is verified, unless she persisted rentalAckPostpayVastRisk.
+// home-gpu is canProvision true, isElastic false → skip (no outbound USD).
+function assertPaidBeforePaidProvision({ job, provider, ackPostpayVastRisk }) {
+  const paid = !!(job && job.payment && job.payment.verified);
+  const outbound = !!(provider && provider.capabilities && provider.capabilities.canProvision && provider.capabilities.isElastic);
+  if (!outbound) return;
+  if (paid) return;
+  if (ackPostpayVastRisk) return;
+  throw new Error('VAST_PREPAY_REQUIRED: refusing Vast acquire before payment_verified');
+}
+
 function formatRentalDeliverable(lease, { jobTimeoutMin } = {}) {
   return {
     ssh: lease.ssh,
@@ -36,7 +48,7 @@ function formatRentalDeliverable(lease, { jobTimeoutMin } = {}) {
 // Acquire a rental lease for a job: canSsh-gated, on-demand pinned (a Cat-1 rental
 // must not be reclaimed mid-hour), job-bound with an expiry. Returns the lease plus
 // the credentials deliverable the (owner-reviewed) worker hook will hand to the buyer.
-async function acquireRentalLease({ controller, provider, spec = {}, jobId, agentId, jobTimeoutMin = 60, providerName, now = Date.now() }) {
+async function acquireRentalLease({ controller, provider, spec = {}, jobId, agentId, jobTimeoutMin = 60, providerName, now = Date.now(), waitOpts = {} }) {
   assertProviderCanSsh(provider);
   const cands = await provider.discover({ ...spec, interruptible: false });
   if (!cands.length) throw new Error('RENTAL_NO_CAPACITY: no on-demand offer matched the spec');
@@ -44,7 +56,7 @@ async function acquireRentalLease({ controller, provider, spec = {}, jobId, agen
   // crash/timeout can't leak an untracked billing box.
   const pending = await controller.acquireUnderCeiling(provider, cands[0], { agentId, providerName, jobId });
   const expiresAt = now + jobTimeoutMin * 60000;
-  const ready = await provider.waitReady(pending, { timeoutMs: 300000 });
+  const ready = await provider.waitReady(pending, { timeoutMs: 300000, readyFor: 'ssh', ...waitOpts });
   const lease = controller.recordLease({ ...ready, jobId, expiresAt }, provider, agentId, { providerName });
   // M4 — never hand degraded / ssh:null credentials to a paying buyer. Release + fail.
   if (lease.state !== 'ready' || !lease.ssh) {
@@ -54,4 +66,4 @@ async function acquireRentalLease({ controller, provider, spec = {}, jobId, agen
   return { lease, deliverable: formatRentalDeliverable(lease, { jobTimeoutMin }) };
 }
 
-module.exports = { assertRentalEligibleAgent, assertApiEligibleAgent, assertProviderCanSsh, formatRentalDeliverable, acquireRentalLease };
+module.exports = { assertRentalEligibleAgent, assertApiEligibleAgent, assertProviderCanSsh, assertPaidBeforePaidProvision, formatRentalDeliverable, acquireRentalLease };

@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.34.0 — 2026-08-22
+
+### Cat-1 GPU rental: Vast is prepay-gated; SSH-ready is not vLLM (C4)
+
+Raw GPU rentals (`gpu-rental`) acquire through the same `startRentalJob` hook as
+home-gpu. A Vast box (`canProvision && isElastic`) is refused until
+`job.payment.verified` (`VAST_PREPAY_REQUIRED`) unless the operator persisted
+`rentalAckPostpayVastRisk` at `rental-setup --ack-postpay-vast-risk`. home-gpu
+(`isElastic: false`) is not an outbound USD bill and may acquire unpaid.
+
+Cat-1 `waitReady` is SSH-ready (`actual_status === 'running'` + `ssh_host`).
+Cat-2 attach still waits on vLLM `/models` (`readyFor` defaults to `'service'`).
+
 ## Unreleased
 
 ### sovmodel is a live listing kind; all four mint under agentplatform@ on VRSCTEST

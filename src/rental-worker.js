@@ -2,7 +2,7 @@
 // Cat-1 gpu-rental worker. Accepted rental jobs acquire a lease, seal SSH via
 // POST /v1/jobs/:id/rental-secret, and deliverJob a notice with NO host/password.
 // Never calls startJob / startJobContainer / startJobLocal / JOB_IMAGE.
-const { acquireRentalLease } = require('./rental-job');
+const { acquireRentalLease, assertPaidBeforePaidProvision } = require('./rental-job');
 const { deliverSealed } = require('./rental-delivery');
 
 function isGpuRentalJob(job, services = []) {
@@ -70,7 +70,7 @@ async function ensureComputeController(state, cfg) {
 async function startRentalJob(opts) {
   const {
     state, job, agentInfo, controller, provider, spec = {}, now = Date.now(),
-    client, signDeliver, signer, providerName,
+    client, signDeliver, signer, providerName, ackPostpayVastRisk,
     startJobContainer: _startJobContainer,
   } = opts || {};
   // Injected in tests only to prove it is not called. Never invoke.
@@ -81,6 +81,8 @@ async function startRentalJob(opts) {
   if (!client) throw new Error('RENTAL_NO_CLIENT');
   if (!job || !job.id) throw new Error('RENTAL_NO_JOB');
   if (!agentInfo || !agentInfo.id) throw new Error('RENTAL_NO_AGENT');
+
+  assertPaidBeforePaidProvision({ job, provider, ackPostpayVastRisk });
 
   const jobTimeoutMin = Number(job.timeoutMin || job.jobTimeoutMin || spec.jobTimeoutMin) || 60;
   const { lease, deliverable } = await acquireRentalLease({

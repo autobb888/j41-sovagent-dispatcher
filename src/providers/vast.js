@@ -79,19 +79,25 @@ class VastProvider extends ComputeProvider {
     return this.cfg.public_url_for ? this.cfg.public_url_for(lease) : `http://${inst.ssh_host}:${hostPort || 8000}/v1`;
   }
 
-  async waitReady(lease, { timeoutMs = 300000 } = {}) {
+  async waitReady(lease, { timeoutMs = 300000, readyFor = 'service' } = {}) {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const inst = await this._instance(lease.meta.instanceId);
       if (inst && inst.actual_status === 'running' && inst.ssh_host) {
         const baseUrl = this._baseUrlFor(inst, lease);
-        // Service-level readiness: the instance is up AND vLLM answers /models.
+        const ssh = { host: inst.ssh_host, port: inst.ssh_port, user: 'root' };
+        // Cat-1 rental: SSH-ready only. Do not wait on vLLM /models.
+        if (readyFor === 'ssh') {
+          return { ...lease, state: 'ready', baseUrl, ssh };
+        }
+        // Cat-2 attach: the instance is up AND vLLM answers /models.
         if (await this._serviceUp(baseUrl)) {
-          return { ...lease, state: 'ready', baseUrl, ssh: { host: inst.ssh_host, port: inst.ssh_port, user: 'root' } };
+          return { ...lease, state: 'ready', baseUrl, ssh };
         }
       }
-      if (Date.now() > deadline) return { ...lease, state: 'degraded' };
-      await new Promise((r) => setTimeout(r, 5000));
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return { ...lease, state: 'degraded' };
+      await new Promise((r) => setTimeout(r, Math.min(5000, remaining)));
     }
   }
 
