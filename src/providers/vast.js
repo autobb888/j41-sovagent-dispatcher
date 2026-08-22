@@ -62,6 +62,14 @@ function resolveInterruptible(candidate, spec, cfgValue) {
   return cfgValue !== false;
 }
 
+// Cat-1 (on-demand rental) defaults to a CUDA/pytorch base — Bob SSHs in and
+// runs their own stack. Cat-2 (interruptible, agent inference) keeps vLLM.
+function resolveImage({ cfgImage, interruptible }) {
+  if (cfgImage) return cfgImage;
+  if (interruptible === false) return 'pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime';
+  return 'vllm/vllm-openai:latest';
+}
+
 function instSshPassword(inst) {
   return (inst && (inst.ssh_password || inst.password || inst.ssh_pw)) || null;
 }
@@ -90,7 +98,8 @@ class VastProvider extends ComputeProvider {
     this.maxUsdPerHour = cfg.max_usd_per_hour ?? cfg.maxUsdPerHour;
     this.minGpuCount = cfg.min_gpu_count ?? cfg.minGpuCount;
     this.interruptible = cfg.interruptible !== undefined ? cfg.interruptible : true;
-    this.image = cfg.image || 'vllm/vllm-openai:latest';
+    // Explicit only — default image is chosen in acquire via resolveImage().
+    this.image = cfg.image || null;
     this.diskGb = Number(cfg.disk_gb) || 40;
     this.onstart = cfg.onstart || null; // vLLM launch command (model arg etc.)
   }
@@ -118,7 +127,10 @@ class VastProvider extends ComputeProvider {
     const interruptible = resolveInterruptible(candidate, spec, this.interruptible);
     const isRental = !!(spec && spec.jobId)
       || (candidate && candidate.meta && candidate.meta.interruptible === false);
-    const body = { disk: this.diskGb, image: this.image };
+    const body = {
+      disk: this.diskGb,
+      image: resolveImage({ cfgImage: this.image, interruptible }),
+    };
     if (this.onstart) body.onstart = this.onstart;
     // On-demand (interruptible=false) omits the bid price; a bid price makes the
     // instance interruptible and reclaimable — never for a Cat-1 rental.
@@ -232,4 +244,4 @@ class VastProvider extends ComputeProvider {
 
   get capabilities() { return { canProvision: true, canSsh: true, canScaleToZero: false, isElastic: true }; }
 }
-module.exports = { VastProvider, generateRenterSshKeyPair, resolveInterruptible };
+module.exports = { VastProvider, generateRenterSshKeyPair, resolveInterruptible, resolveImage };

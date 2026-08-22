@@ -173,6 +173,8 @@ test('rental acquire on default-interruptible Vast omits bid price and seals a r
   });
   const put = log.find((l) => l.method === 'PUT');
   assert.equal(put.body.price, undefined, 'Cat-1 rental must not bid an interruptible price');
+  assert.notEqual(put.body.image, 'vllm/vllm-openai:latest');
+  assert.match(String(put.body.image), /pytorch|cuda/i);
   assert.match(put.body.onstart, /ssh-ed25519 /, 'renter pubkey is injected on PUT /asks via onstart');
   assert.equal(lease.meta.interruptible, false);
   assert.ok(deliverable.ssh.privateKey);
