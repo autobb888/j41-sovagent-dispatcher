@@ -95,6 +95,7 @@ const { writeKeysFile, readKeysFile } = require('./keys-file.js');
 const keystore = require('./keystore.js');
 const { encryptAllKeys, decryptAllKeys, listPlaintextKeys } = require('./keys-migrate.js');
 const { preflightAllowsAccept } = require('./preflight-gate.js');
+const { isGpuRentalJob, startRentalJob, servicesForAgent, resolveRentalProvider, ensureComputeController } = require('./rental-worker.js');
 const crypto = require('crypto');
 
 /** Feature flag: route in-container signing through the host-side broker
@@ -8025,10 +8026,13 @@ async function pollForJobs(state) {
             const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
             const fullJob = await agent.client.getJob(job.id);
             if (fullJob?.jobHash && fullJob?.buyerVerusId) {
-              if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
-                console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${job.id.substring(0, 8)}, buyer not charged`);
-                state.emitEvent?.('job.declined_llm_down', { jobId: job.id, agentId: agentInfo.id });
-                continue;
+              const _rentalSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
+              if (!isGpuRentalJob(fullJob, _rentalSvcs) && !(_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
+                if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
+                  console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${job.id.substring(0, 8)}, buyer not charged`);
+                  state.emitEvent?.('job.declined_llm_down', { jobId: job.id, agentId: agentInfo.id });
+                  continue;
+                }
               }
               const timestamp = Math.floor(Date.now() / 1000);
               const acceptSig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
@@ -8091,7 +8095,7 @@ async function pollForJobs(state) {
           queueInsertByPriority(state.queue, { ...job, assignedAgent: agentInfo });
         } else {
           console.log(`   → Starting job with ${agentInfo.id} (${RUNTIME})`);
-          await startJob(state, job, agentInfo);
+          await startJobOrRental(state, job, agentInfo);
         }
       }
     } catch (e) {
@@ -8292,7 +8296,7 @@ async function pollForJobs(state) {
     const agent = state.available.pop();
     console.log(`   → Processing queued job ${queuedJob.id} with ${agent.id}`);
     try {
-      await startJob(state, queuedJob, agent);
+      await startJobOrRental(state, queuedJob, agent);
     } catch (e) {
       console.error(`   ❌ Failed to start job ${queuedJob.id}: ${e.message}`);
       // Return agent to pool and re-queue the job at the back
@@ -8346,10 +8350,13 @@ async function handleWebhookEvent(state, agentId, payload) {
         const agent = await getAgentSession(state, agentInfo);
         const fullJob = await agent.client.getJob(jobId);
         if (fullJob?.jobHash && fullJob?.buyerVerusId) {
-          if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
-            console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${jobId.substring(0, 8)}, buyer not charged`);
-            state.emitEvent?.('job.declined_llm_down', { jobId, agentId: agentInfo.id });
-            return;
+          const _rentalSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
+          if (!isGpuRentalJob(fullJob, _rentalSvcs) && !(_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
+            if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
+              console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${jobId.substring(0, 8)}, buyer not charged`);
+              state.emitEvent?.('job.declined_llm_down', { jobId, agentId: agentInfo.id });
+              return;
+            }
           }
           const timestamp = Math.floor(Date.now() / 1000);
           const sig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
@@ -8379,6 +8386,11 @@ async function handleWebhookEvent(state, agentId, payload) {
           console.log(`[Webhook] Job ${jobId.substring(0, 8)} queued (priority, ${job.amount || '?'} ${job.currency || NATIVE_COIN})`);
         } else {
           console.log(`[Webhook] Starting job ${jobId.substring(0, 8)} with ${agentInfo.id}`);
+          const _rentalSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
+          if (isGpuRentalJob(job, _rentalSvcs) || (_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
+            await startRentalJobWired(state, job, agentInfo);
+            break;
+          }
           await startJob(state, job, agentInfo);
         }
       } catch (e) {
@@ -8652,7 +8664,12 @@ async function handleWebhookEvent(state, agentId, payload) {
             // every bounty-awarded job was accepted, signed and allowlisted and then
             // never started: agent-1..9 fail isValidJobId's 8-char floor and silently
             // early-return, agent-10+ throw on undefined.
-            await startJob(state, fullJob, agentInfo);
+            const _rentalSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
+            if (isGpuRentalJob(fullJob, _rentalSvcs) || (_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
+              console.log(`[Webhook] Bounty job ${bountyJobId.substring(0, 8)} is gpu-rental — skipping startJob (bounties are LLM-only)`);
+            } else {
+              await startJob(state, fullJob, agentInfo);
+            }
           } catch (startErr) {
             console.error(`[Webhook] Bounty job start failed: ${startErr.message}`);
           }
@@ -10437,6 +10454,35 @@ async function startJob(state, job, agentInfo) {
   }
 }
 
+async function startRentalJobWired(state, job, agentInfo) {
+  const cfgNow = loadDispatcherConfig();
+  const { provider, providerName } = resolveRentalProvider(cfgNow, agentInfo.id);
+  const controller = await ensureComputeController(state, cfgNow);
+  const agent = await getAgentSession(state, agentInfo);
+  const { createLocalSigner } = require('./job-signer');
+  const signer = createLocalSigner({ wif: agentInfo.wif, network: J41_NETWORK });
+  await startRentalJob({
+    state,
+    job,
+    agentInfo,
+    controller,
+    provider,
+    providerName,
+    client: agent.client,
+    signDeliver: ({ hash }) => signer.signDeliver({ jobHash: job.jobHash, deliveryHash: hash }),
+    now: Date.now(),
+  });
+}
+
+async function startJobOrRental(state, job, agentInfo) {
+  const services = servicesForAgent(state, agentInfo, loadAgentConfig);
+  if (isGpuRentalJob(job, services) || (services || []).some((s) => s && s.serviceType === 'gpu-rental')) {
+    await startRentalJobWired(state, job, agentInfo);
+    return;
+  }
+  await startJob(state, job, agentInfo);
+}
+
 // Cleanup completed jobs — includes retry logic (F-14)
 async function cleanupCompletedJobs(state) {
   // C2/S9 — this runs on a bare 10s setInterval, and 2.23.0's L2 fix put
@@ -10460,6 +10506,7 @@ async function cleanupCompletedJobs(state) {
 
 async function _cleanupCompletedJobs(state) {
   for (const [jobId, active] of state.active) {
+    if (active && active.kind === 'gpu-rental') continue;
     if (RUNTIME === 'local') {
       // Local mode: check if child process exited
       if (active.process && active.process.exitCode !== null) {
