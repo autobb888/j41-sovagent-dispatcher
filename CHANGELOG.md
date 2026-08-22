@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+### TUI writes [compute.providers.*]; listing_kind is sticky
+- After compute signup the dashboard writes `[compute] enabled=true` and a `home-gpu` / `vast` provider table (never `local`, never `0.0.0.0`). Named TCP tunnel is still operator-side: point it at `127.0.0.1:$ssh_tunnel_port`.
+- Signup refuses a leaf that already belongs to another local listing ("Do not reuse a working agent name for a GPU box").
+
+## 2.34.0 — 2026-08-22
+
+### Cat-1 GPU rental: Vast is prepay-gated; SSH-ready is not vLLM (C4)
+
+Raw GPU rentals (`gpu-rental`) acquire through the same `startRentalJob` hook as
+home-gpu. A Vast box (`canProvision && isElastic`) is refused until
+`job.payment.verified` (`VAST_PREPAY_REQUIRED`) unless the operator persisted
+`rentalAckPostpayVastRisk` at `rental-setup --ack-postpay-vast-risk`. home-gpu
+(`isElastic: false`) is not an outbound USD bill and may acquire unpaid.
+
+Cat-1 `waitReady` is SSH-ready (`actual_status === 'running'` + `ssh_host`).
+Cat-2 attach still waits on vLLM `/models` (`readyFor` defaults to `'service'`).
+
+### Cat-1 GPU rental: SSH credentials, stable tunnel bind, lock unlink, on-demand Vast
+
+- home-gpu puts the renter `password` on `lease.ssh` (not only `meta`). Deliverable
+  / `deliverSealed` fail closed without `password` or `privateKey`.
+- Jail `22/tcp` binds `127.0.0.1:${ssh_tunnel_port}` (required 1–65535), never
+  HostPort `0` and never `0.0.0.0`.
+- `release()` always unlinks `deviceLockPath(device_index)` so a reconstructed
+  provider after crash cannot leave `HOME_GPU_BUSY`.
+- Vast Cat-1 acquire omits the bid `price` (`interruptible: false` in meta) and
+  injects a generated ed25519 pubkey via `onstart`; the private key is sealed as
+  `ssh.privateKey`. `readyFor: 'ssh'` degrades if neither password nor key is present.
+
+## Unreleased
+
+### sovmodel is a live listing kind; all four mint under agentplatform@ on VRSCTEST
+
+DeFi is off, so sov*@ cannot issue subIDs. Signup still picks agent / compute / data /
+model; the name that is actually minted is `name.agentplatform@` and `config.kind`
+carries the real kind. `sovmodel` is first-class (metered inference), not a coming-soon card.
+
+### Newcomer signup knows listing kinds (sovagent / sovcompute / sovdata)
+
+The TUI and CLI still registered everything as `name.agentplatform@` and never sent
+`kind` to `/v1/onboard`, which the backend now requires. Newcomers pick a kind
+first (agent / compute / data); `sovmodel` is shown as coming soon and is not
+mintable. `register` / `setup` / `quickstart` take `--kind` and use the identity
+the platform returns. Needs `@junction41/sovagent-sdk` 2.15.0 (onboard sends kind).
+
+### Buyer API-access revoke now kills the proxy key (H7)
+
+`proxy.access_revoked` on the generic webhook path calls `onApiAccessRevoke`. J41
+never POSTs `/j41/api-access/revoke`; that route stays for direct callers.
+
 ### A fleet that cannot sign in no longer reports healthy
 
 Observed live on 2026-08-15: **8 of 9 agents in auth backoff for hours** — 137 to

@@ -135,3 +135,71 @@ enabled = false
 
 [debug]
 chat = false                # enables [chat] event log when true (privacy-sensitive)
+
+# ── Compute-provider seam (S5). Disabled by default; enabling changes nothing
+#    until at least one [compute.providers.*] is declared. See docs/superpowers/
+#    plans/2026-08-18-s5-compute-provider-seam.md. ──
+[compute]
+enabled          = false      # master switch; false = today's behaviour exactly
+default_provider = "local"
+reconcile_ms     = 60000      # how often each lease is health-probed
+max_usd_per_hour = 0.0        # fleet spend ceiling for paid provisioning (S6/Vast). 0 = none
+
+# A GPU you already own. `agent_id` binds the lease to an existing api-endpoint agent,
+# so that agent's proxy upstream is served from this box. `allow_private_upstream` is
+# scoped to THIS provider — it does NOT disable the SSRF guard fleet-wide the way the
+# global [runtime] allow_local_upstream would.
+# [compute.providers.workshop]
+# type                   = "local"
+# agent_id               = "your-agent-id"
+# base_url               = "http://192.168.1.50:8000/v1"
+# usd_per_hour           = 0.08
+# gpu                    = "RTX 4090"
+# vram_gb                = 24
+# gpu_count              = 1
+# allow_private_upstream = true
+
+# A rented cloud GPU (Vast.ai). `max_usd_per_hour` above is the HARD fleet ceiling;
+# vast provisioning stays OFF until it is > 0. `api_key` is your Vast bearer token.
+# [compute.providers.cloud]
+# type          = "vast"
+# agent_id      = "your-agent-id"
+# api_key       = "vast-xxxxxxxx"
+# min_vram_gb   = 24
+# min_gpu_count = 1
+# interruptible = true          # Cat-2 tolerates it; Cat-1 (S7) forces false
+#
+# Cat-1 raw-GPU RENTAL (S7): a rental is sold as a JOB whose deliverable is SSH
+# credentials, bounded by [runtime] jobTimeoutMin, all-or-nothing (no pro-rata).
+# It requires an SSH-capable provider (a `local` box returns canSsh:false and is
+# refused — never rent a home LAN bare-metal). A rental service and an api-endpoint
+# service must live on SEPARATE agent slots (the dispatcher enforces this). The
+# rental lease is released automatically at expiry by the compute reconcile loop and,
+# after a crash, by boot recovery — a leaked lease is money burning.
+#
+# PASTE RECIPE — Cat-1 home GPU (whole card, one renter).
+# 1. Set enabled = true
+# 2. Uncomment the card0 stanza and set agent_id / gpu / ssh_hostname
+# 3. default_provider = "home-gpu"
+# 4. Named TCP tunnel to 127.0.0.1:$ssh_tunnel_port — NOT runtime.webhook_url
+# 5. j41-dispatcher rental-setup <agent-id>
+# Dispatcher MUST run on the GPU machine with docker.sock. Jail SSH binds 127.0.0.1 only.
+# Never 0.0.0.0. Do not set RENTAL_SECRETS_KEY on this host.
+#
+# [compute]
+# enabled          = true
+# default_provider = "home-gpu"
+#
+# [compute.providers.card0]
+# type            = "home-gpu"
+# agent_id        = "gpu-1"
+# gpu             = "RTX 5090"
+# vram_gb         = 32
+# gpu_count       = 1
+# device_index    = 0
+# memory_mb       = 32768
+# disk_gb         = 100
+# usd_per_hour    = 0
+# ssh_hostname    = "gpu.example.com"
+# ssh_tunnel_port = 2222
+# jail_image      = "j41/gpu-jail:latest"

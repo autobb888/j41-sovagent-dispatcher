@@ -159,3 +159,37 @@ test('env and runtime both set produce one violation each (no double-count)', ()
   );
   assert.equal(v.length, 2);
 });
+
+// ── P5: spend-policy integrity facts (passed in to keep the function pure) ──
+test('a clamped refund_limits key is a mainnet violation', () => {
+  const v = findMainnetSecurityViolations({}, { clampedConfigKeys: ['max_value_multiplier'] });
+  assert.equal(v.length, 1);
+  assert.match(v[0], /max_value_multiplier/);
+  assert.match(v[0], /clamped/);
+});
+
+test('an unwritable spend-ledger is a mainnet violation', () => {
+  const v = findMainnetSecurityViolations({}, { spendLedgerWritable: false });
+  assert.equal(v.length, 1);
+  assert.match(v[0], /spend-ledger/);
+});
+
+test('clean spend-policy facts add no violations', () => {
+  const v = findMainnetSecurityViolations({}, { clampedConfigKeys: [], spendLedgerWritable: true });
+  assert.deepEqual(v, []);
+});
+
+test('a writable ledger (true) and absent clamps add nothing', () => {
+  assert.deepEqual(findMainnetSecurityViolations({}, { spendLedgerWritable: true }), []);
+});
+
+test('B3: a clamped COUNT limit is NOT a mainnet violation (documented backlog workflow)', () => {
+  assert.deepEqual(findMainnetSecurityViolations({}, { clampedConfigKeys: ['max_sends_per_hour'] }), []);
+  assert.deepEqual(findMainnetSecurityViolations({}, { clampedConfigKeys: ['max_sends_per_job'] }), []);
+});
+
+test('B3: only a clamped VALUE multiplier blocks a mainnet start', () => {
+  const v = findMainnetSecurityViolations({}, { clampedConfigKeys: ['max_sends_per_hour', 'max_value_multiplier'] });
+  assert.equal(v.length, 1);
+  assert.match(v[0], /max_value_multiplier/);
+});

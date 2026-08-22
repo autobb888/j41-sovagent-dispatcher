@@ -95,6 +95,19 @@ const { writeKeysFile, readKeysFile } = require('./keys-file.js');
 const keystore = require('./keystore.js');
 const { encryptAllKeys, decryptAllKeys, listPlaintextKeys } = require('./keys-migrate.js');
 const { preflightAllowsAccept } = require('./preflight-gate.js');
+const { isGpuRentalJob, startRentalJob, stopRentalJob, shouldTeardownRental, servicesForAgent, resolveRentalProvider, ensureComputeController } = require('./rental-worker.js');
+const {
+  decideAutoAccept,
+  loadBuyerAllowlist,
+  addBuyerAllowlistEntry,
+  removeBuyerAllowlistEntry,
+  resolveAllowlistEntries,
+  readChainSalesStatus,
+  inspectChainSalesStatus,
+  hasAllowlistedRequestedSibling,
+  buyerNamesFromJob,
+  clearSalesStatusCache,
+} = require('./buyer-allowlist');
 const crypto = require('crypto');
 
 /** Feature flag: route in-container signing through the host-side broker
@@ -241,461 +254,34 @@ function printFundingInstructions(address, network, { indent = '  ', seeded = fa
 
 // Buyer-authored text rendering — shared with dashboard.js, see src/untrusted.js
 const { untrusted, untrustedField } = require('./untrusted.js');
+const {
+  parseListingKind,
+  advertisedIdentity,
+  listingsCollide,
+  listingIdPrefix,
+} = require('./listing-kind.js');
 
-// ── Financial Allowlist (Plan C) ──
-const ALLOWLIST_PATH = path.join(os.homedir(), '.j41', 'financial-allowlist.json');
-
-function loadFinancialAllowlist() {
-  try {
-    if (!fs.existsSync(ALLOWLIST_PATH)) {
-      // Create deny-all default
-      const dir = path.dirname(ALLOWLIST_PATH);
-      fs.mkdirSync(dir, { recursive: true });
-      const empty = { permanent: [], operator: [], active_jobs: [] };
-      fs.writeFileSync(ALLOWLIST_PATH, JSON.stringify(empty, null, 2));
-      return empty;
-    }
-    return JSON.parse(fs.readFileSync(ALLOWLIST_PATH, 'utf8'));
-  } catch (err) {
-    console.error(`[allowlist] Failed to load ${ALLOWLIST_PATH}: ${err.message} — deny-all mode`);
-    return { permanent: [], operator: [], active_jobs: [] };
+function requireListingKind(raw, fallback = 'agent') {
+  const kind = parseListingKind(raw) || (raw == null || raw === '' ? parseListingKind(fallback) : null);
+  if (!kind) {
+    console.error('❌ --kind must be agent, compute, data, or model');
+    process.exit(1);
   }
+  return kind;
 }
 
-function isAddressInAllowlist(allowlist, address) {
-  const all = [
-    ...allowlist.permanent.map(e => e.address),
-    ...allowlist.operator.map(e => e.address),
-    ...allowlist.active_jobs.map(e => e.address),
-  ];
-  return all.includes(address);
-}
-
-function addActiveJobToAllowlist(jobId, buyerAddress) {
-  try {
-    const list = loadFinancialAllowlist();
-    if (list.active_jobs.some(e => e.jobId === jobId)) return;
-    list.active_jobs.push({
-      address: buyerAddress,
-      jobId,
-      added: new Date().toISOString(),
-    });
-    fs.writeFileSync(ALLOWLIST_PATH, JSON.stringify(list, null, 2));
-    console.log(`[allowlist] Added buyer address ${untrusted(buyerAddress, 60)} for job ${jobId}`);
-  } catch (err) {
-    console.error(`[allowlist] Failed to add job address: ${err.message}`);
-  }
-}
-
-function removeActiveJobFromAllowlist(jobId) {
-  try {
-    const list = loadFinancialAllowlist();
-    list.active_jobs = list.active_jobs.filter(e => e.jobId !== jobId);
-    fs.writeFileSync(ALLOWLIST_PATH, JSON.stringify(list, null, 2));
-    console.log(`[allowlist] Removed buyer address for job ${jobId}`);
-  } catch (err) {
-    console.error(`[allowlist] Failed to remove job address: ${err.message}`);
-  }
-}
-
-function addToRefundAllowlist(address, jobId) {
-  try {
-    fs.mkdirSync(path.dirname(ALLOWLIST_PATH), { recursive: true });
-    const list = loadFinancialAllowlist();
-    if (!list.permanent.some(e => e.address === address)) {
-      list.permanent.push({ address, jobId, added: new Date().toISOString(), via: 'refund-approve' });
-    }
-    const tmp = `${ALLOWLIST_PATH}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(list, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, ALLOWLIST_PATH);
-    console.log(`[refund] owner-approved allowlist add ${address} for job ${jobId}`);
-  } catch (err) {
-    console.error(`[allowlist] Failed to add refund address: ${err.message}`);
-    throw err;
-  }
-}
-
-// ── Dispatcher-side outbound-money rate limiting ────────────────────────────
-//
-// M3: the README has documented "max 3 sends/job, max value = job price + 10%,
-// max 10 sends/hour, 30s cooldown" and "suspends all sends if the API is
-// unreachable for 30 min" since the security section was written. Both functions
-// below had ZERO callers — `attemptPendingRefund`, the one place VRSC leaves the
-// host, never consulted either. Nothing enforced any of it, and
-// `dispatcherFinancialSuspended` was written by the sweep and read by nobody.
-//
-// This is defence in depth, not the primary control: every send is already behind
-// an explicit operator approval, an allowlist check, an inter-process lock and a
-// durable refunded-jobs ledger. What it adds is a bound on how much damage a BUG
-// in any of those can do before a human notices — the case those four don't cover,
-// because each of them trusts the caller's arithmetic.
-//
-// PERSISTED, not in-memory. The first version kept this in process memory, which
-// quietly made all four guarantees per-process rather than fleet-wide — and the
-// operator's documented workflow is to drive the daemon out-of-band with a second
-// CLI process, so two independent 10/hour budgets was the normal case, not the
-// exotic one. Worse, the API-outage suspension is only ever SET by the daemon's
-// sweep, so a CLI `refunds approve` sent freely straight through an outage that
-// had already suspended the daemon. A restart also reset the "lifetime" per-job cap.
-//
-// The file is the shared state; the in-memory object is only a scratch buffer.
-const SEND_HISTORY_PATH = path.join(DISPATCHER_DIR, 'send-history.json');
-
-function loadSendHistory() {
-  try {
-    const raw = JSON.parse(fs.readFileSync(SEND_HISTORY_PATH, 'utf8'));
-    return {
-      global: Array.isArray(raw.global) ? raw.global : [],
-      perJob: (raw.perJob && typeof raw.perJob === 'object') ? raw.perJob : {},
-    };
-  } catch {
-    // Absent OR corrupt. Starting from empty is the right failure mode for the
-    // COUNTERS: they bound damage, they do not authorise anything, and refusing to
-    // send on an unreadable counter file would strand every owed refund.
-    return { global: [], perJob: {} };
-  }
-}
-
-// The outage suspension lives in its OWN file, deliberately. Folded into the counter
-// file, a one-byte corruption did not merely reset the counters (defensible) — it
-// also silently lifted an active kill-switch, because the fail-open default returned
-// `suspendedAt: null`. A safety flag must not inherit the failure mode of a
-// bookkeeping file. Existence IS the state, so it survives any parse failure, and an
-// operator with a dead daemon can clear it with `rm`.
-const FINANCIAL_SUSPENDED_PATH = path.join(DISPATCHER_DIR, 'financial-suspended');
-
-function isFinanciallySuspended() {
-  try { return fs.existsSync(FINANCIAL_SUSPENDED_PATH); } catch { return false; }
-}
-
-function saveSendHistory(h) {
-  try {
-    fs.mkdirSync(path.dirname(SEND_HISTORY_PATH), { recursive: true });
-    const tmp = `${SEND_HISTORY_PATH}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(h), { mode: 0o600 });
-    fs.renameSync(tmp, SEND_HISTORY_PATH);
-  } catch (e) {
-    console.warn(`[refund] could not persist send history: ${e.message}`);
-  }
-}
-
-// Cross-process mutex for the counter file. The rate check runs inside a per-JOB
-// send lock, so two DIFFERENT jobs in two processes — the daemon drain and an
-// out-of-band `refunds approve`, which is the documented operator workflow — do
-// unsynchronized read-modify-write on the same file. Interleaved, one process's
-// record is lost and the fleet-wide cap silently under-counts; the same race lets a
-// `recordDispatcherSend` whose read predated a `setFinancialSuspended(true)` clobber
-// the outage kill-switch back to null.
-//
-// O_EXCL create is the lock. Stale locks are stolen after 10s — this guards a
-// counter, so a crashed holder must never wedge refunds permanently.
-const SEND_HISTORY_LOCK = () => `${SEND_HISTORY_PATH}.lock`;
-
-/**
- * Age window for the LAST-RESORT reclaim, used only when the lock's content
- * carries no usable pid.
- *
- * It was 10s against a 5s acquire deadline, which made the path unreachable: the
- * deadline always expired first, so a lock with legacy or torn content could never
- * be reclaimed and every caller fell through to an UNSERIALIZED write. Proved by
- * `test/send-history-lock-race.test.js` — 4 concurrent recorders left 3 records.
- *
- * 2s is safe here because this branch is only reached when no pid can be parsed,
- * and a healthy holder always writes `pid:ts:seq` in a single small `writeSync`.
- * Unparseable content is therefore debris, not a live peer; the window exists only
- * to avoid racing a writer caught mid-write.
- */
-const SEND_HISTORY_LOCK_STALE_MS = 2000;
-/** Distinguishes two acquisitions by the same pid in the same millisecond. */
-let _sendHistoryLockSeq = 0;
-
-/**
- * Serialize the read-modify-write of the send-history file across processes.
- *
- * This guards the LIFETIME "max 3 sends per job" cap and the hourly global cap, so
- * a lost update here is not a cosmetic counter glitch — it under-counts sends and
- * grants an extra refund broadcast.
- *
- * Rewritten to the same discipline as `acquireSendLock`, because it had the same
- * three flaws that lock's own comments condemn:
- *
- *  1. It judged the holder by AGE. Age flips over time and misjudges a peer that is
- *     merely slow; "the holder is dead" is stable, because a dead pid stays dead.
- *  2. It stole with unlink-then-create — two contenders could both stat the same
- *     stale lock, and the second's `unlink` then deleted the FIRST's freshly created
- *     live lock, putting both inside the "exclusive" section.
- *  3. On release it unlinked `lockPath` unconditionally. If our own lock had since
- *     been stolen (we outlived the stale window), that deleted the new holder's lock.
- *
- * The steal is now an atomic rename plus a content check proving we moved the exact
- * file we judged — rename() is atomic on a PATH, not on the file you inspected — and
- * the release only removes a lock that is still ours.
- */
-function withSendHistoryLock(fn) {
-  const lockPath = SEND_HISTORY_LOCK();
-  const deadline = Date.now() + 5000;
-  const token = `${process.pid}:${Date.now()}:${++_sendHistoryLockSeq}`;
-  let held = false;
-  while (Date.now() < deadline) {
-    try {
-      fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-      const fd = fs.openSync(lockPath, 'wx');
-      fs.writeSync(fd, token);
-      fs.closeSync(fd);
-      held = true;
-      break;
-    } catch {
-      // Read the holder's bytes: they identify the specific lock we are judging,
-      // and the steal below has to prove it moved that one.
-      let holderRaw = null;
-      try { holderRaw = String(fs.readFileSync(lockPath, 'utf8')); }
-      catch { continue; } // vanished — retry the create immediately
-
-      let stealable = false;
-      const holderPid = parseInt(holderRaw.split(':')[0], 10);
-      if (Number.isInteger(holderPid) && holderPid > 0) {
-        let alive = true;
-        try { process.kill(holderPid, 0); } catch (e) { alive = (e.code === 'EPERM'); }
-        stealable = !alive;
-      } else {
-        // No usable pid (legacy or torn content). Age is all we have left.
-        try { stealable = (Date.now() - fs.statSync(lockPath).mtimeMs) > SEND_HISTORY_LOCK_STALE_MS; }
-        catch { continue; }
-      }
-
-      if (stealable) {
-        // Serialise the steal behind an O_EXCL gate, and re-check INSIDE it.
-        //
-        // The previous version renamed the lock away, compared the bytes, and
-        // renamed it back if it had grabbed the wrong file. Between that
-        // rename-away and rename-back the lock PATH IS EMPTY, so a third
-        // contender's `openSync(lockPath, 'wx')` succeeds there — and then the
-        // rename-back drops the old bytes on top of that contender's live lock.
-        // Two processes end up inside the critical section and one send record
-        // is lost, which under-counts the per-job cap and grants an extra refund.
-        //
-        // Measured, not theorised: 3 failures in 33 full-suite runs under CPU
-        // contention, every one of them this test. The diagnostic that settled
-        // it was the children's stderr — all 8 reported success, none took the
-        // deliberate unserialized fallback, and 7 records reached disk. It never
-        // reproduced standalone at 16 contenders over 30 rounds: the window is
-        // two syscalls wide and needs real preemption to land in.
-        //
-        // `acquireSendLock` has had this gate since 1306478; this sibling never
-        // got it. Same discipline, same reasons.
-        const gatePath = `${lockPath}.steal`;
-        const gateTag = `${process.pid}.${crypto.randomBytes(6).toString('hex')}`;
-        let gate = null;
-        try {
-          gate = fs.openSync(gatePath, 'wx');
-          fs.writeSync(gate, gateTag);
-        } catch (ge) {
-          if (ge.code !== 'EEXIST') { continue; }
-          // A peer is mid-steal, or crashed inside the gate. The gate is held
-          // for microseconds, so age is a sound test HERE (unlike for the lock,
-          // whose holder may legitimately be slow).
-          let gateAge = Infinity;
-          try { gateAge = Date.now() - fs.statSync(gatePath).mtimeMs; } catch { continue; }
-          if (gateAge > SEND_HISTORY_LOCK_STALE_MS) { try { fs.unlinkSync(gatePath); } catch {} }
-          continue;
-        }
-        try {
-          // Re-read the real lock now that we are alone. A peer may have
-          // completed its steal while we were getting in here.
-          let curRaw = null;
-          try { curRaw = String(fs.readFileSync(lockPath, 'utf8')); } catch { curRaw = null; }
-
-          if (curRaw === null) {
-            // The path is FREE, not stale — nothing here is ours to reclaim, and
-            // a plain acquirer may be creating a lock at it right now. Compete
-            // honestly on the next loop instead of installing over them.
-            continue;
-          }
-
-          const curPid = parseInt(curRaw.split(':')[0], 10);
-          let curStale;
-          if (Number.isInteger(curPid) && curPid > 0) {
-            let alive = true;
-            try { process.kill(curPid, 0); } catch (e) { alive = (e.code === 'EPERM'); }
-            curStale = !alive;
-          } else {
-            try { curStale = (Date.now() - fs.statSync(lockPath).mtimeMs) > SEND_HISTORY_LOCK_STALE_MS; }
-            catch { curStale = false; }
-          }
-          if (!curStale) continue; // a live holder arrived; stand down
-
-          // Replace by rename, never unlink-then-create: rename is atomic and
-          // leaves no window in which the path is empty. Safe because the file
-          // we are replacing belongs to a DEAD holder, so nobody live can pull
-          // it out from under us.
-          const tmp = `${lockPath}.new.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
-          fs.writeFileSync(tmp, token, { mode: 0o600 });
-          fs.renameSync(tmp, lockPath);
-          // Prove we own what is actually at the path before claiming the lock.
-          let back = null;
-          try { back = String(fs.readFileSync(lockPath, 'utf8')); } catch { back = null; }
-          if (back === token) { held = true; }
-        } finally {
-          try { fs.closeSync(gate); } catch {}
-          try { fs.unlinkSync(gatePath); } catch {}
-        }
-        if (held) break;
-        continue;
-      }
-
-      // Spin briefly. This is a sub-millisecond critical section in practice.
-      const until = Date.now() + 25;
-      while (Date.now() < until) { /* busy-wait */ }
-    }
-  }
-  if (!held) {
-    // We still run `fn`, and that is deliberate: it RECORDS a send that has already
-    // been broadcast, so dropping it would under-count the cap in exactly the
-    // direction that permits an extra refund. But an unserialized read-modify-write
-    // on a money cap must never be silent — a concurrent writer can still lose this
-    // record, and the operator needs to know a cap reading may be low.
-    console.error('[refund] send-history lock not acquired within 5s — recording UNSERIALIZED. ' +
-      'A concurrent write could drop this record and under-count the per-job send cap.');
-  }
-  try {
-    return fn();
-  } finally {
-    if (held) {
-      // Only remove a lock that is still OURS. Not atomic, but the failure mode
-      // inverts from "delete a live peer's lock" to "leave a lock that ages out".
-      let cur = null;
-      try { cur = String(fs.readFileSync(lockPath, 'utf8')); } catch { cur = null; }
-      if (cur === token) { try { fs.unlinkSync(lockPath); } catch { /* already gone */ } }
-    }
-  }
-}
-
-/** Set/clear the fleet-wide financial suspension. Written by the daemon's sweep,
- *  read by EVERY process — including a one-shot CLI approve. */
-function setFinancialSuspended(on, now = Date.now()) {
-  try {
-    if (on) {
-      if (isFinanciallySuspended()) return;
-      fs.mkdirSync(path.dirname(FINANCIAL_SUSPENDED_PATH), { recursive: true });
-      fs.writeFileSync(FINANCIAL_SUSPENDED_PATH, JSON.stringify({ since: new Date(now).toISOString() }), { mode: 0o600 });
-    } else {
-      try { fs.unlinkSync(FINANCIAL_SUSPENDED_PATH); } catch { /* already clear */ }
-    }
-  } catch (e) {
-    console.error(`[refund] could not ${on ? 'set' : 'clear'} the financial suspension flag: ${e.message}`);
-  }
-}
-
-function dispatcherRateLimits() {
-  try {
-    const l = loadDispatcherConfig().refund_limits || {};
-    return {
-      maxSendsPerJob: Number.isFinite(l.max_sends_per_job) ? l.max_sends_per_job : 3,
-      maxValueMultiplier: Number.isFinite(l.max_value_multiplier) ? l.max_value_multiplier : 1.1,
-      maxSendsPerHour: Number.isFinite(l.max_sends_per_hour) ? l.max_sends_per_hour : 10,
-      cooldownMs: Number.isFinite(l.cooldown_ms) ? l.cooldown_ms : 30_000,
-    };
-  } catch {
-    // A broken config must not disable the limiter — fall back to the documented
-    // defaults rather than to "no limit".
-    return { maxSendsPerJob: 3, maxValueMultiplier: 1.1, maxSendsPerHour: 10, cooldownMs: 30_000 };
-  }
-}
-
-/**
- * @returns {{allowed: boolean, reason?: string, retryable?: boolean}}
- *   `retryable` distinguishes "wait and this will pass" (cooldown, hourly cap,
- *   outage suspension) from "this will never pass without operator action"
- *   (per-job cap, value ceiling). Callers must not drop a retryable refund.
- */
-function checkDispatcherRateLimit(jobId, amount, jobPrice, now = Date.now()) {
-  const LIM = dispatcherRateLimits();
-  if (isFinanciallySuspended()) {
-    return {
-      allowed: false,
-      retryable: true,
-      reason: `Financial operations suspended (API outage). Clears automatically when the platform ` +
-        `responds; if the daemon is not running, remove ${FINANCIAL_SUSPENDED_PATH}`,
-    };
-  }
-  const H = loadSendHistory();
-  const jobHistory = H.perJob[jobId] || [];
-
-  if (jobHistory.length >= LIM.maxSendsPerJob) {
-    return { allowed: false, retryable: false, reason: `Max sends per job (${LIM.maxSendsPerJob})` };
-  }
-
-  // A missing/garbage price must not silently disable the value ceiling. The old
-  // code computed `undefined * 1.1` → NaN, and every `> NaN` comparison is false,
-  // so the check passed for exactly the malformed entries it should have caught.
-  // Fall back to the amount itself: one send of this size is allowed, a second is
-  // then caught by the per-job cap.
-  const price = Number.isFinite(jobPrice) && jobPrice > 0 ? jobPrice : amount;
-  const maxValue = price * LIM.maxValueMultiplier;
-  const totalSent = jobHistory.reduce((s, r) => s + r.amount, 0);
-  if (totalSent + amount > maxValue) {
-    return {
-      allowed: false,
-      retryable: false,
-      reason: `Total value ${(totalSent + amount).toFixed(8)} exceeds job price + ` +
-        `${Math.round((LIM.maxValueMultiplier - 1) * 100)}% (${maxValue.toFixed(8)})`,
-    };
-  }
-
-  const oneHourAgo = now - 3_600_000;
-  const recentGlobal = H.global.filter(r => r.timestamp > oneHourAgo);
-  if (recentGlobal.length >= LIM.maxSendsPerHour) {
-    return { allowed: false, retryable: true, reason: `Hourly global limit (${LIM.maxSendsPerHour})` };
-  }
-
-  if (jobHistory.length > 0) {
-    const last = jobHistory[jobHistory.length - 1];
-    if (now - last.timestamp < LIM.cooldownMs) {
-      return { allowed: false, retryable: true, reason: 'Cooldown active' };
-    }
-  }
-
-  return { allowed: true };
-}
-
-function recordDispatcherSend(jobId, amount, now = Date.now()) {
-  return withSendHistoryLock(() => _recordDispatcherSendLocked(jobId, amount, now));
-}
-
-function _recordDispatcherSendLocked(jobId, amount, now) {
-  const H = loadSendHistory();
-  const record = { timestamp: now, amount };
-  if (!H.perJob[jobId]) H.perJob[jobId] = [];
-  H.perJob[jobId].push(record);
-  H.global.push(record);
-
-  // Prune the GLOBAL list only — it backs the hourly window, so anything older is
-  // dead weight. `perJob` is deliberately NOT pruned: "max 3 sends per job" is a
-  // lifetime cap, and expiring it after an hour would quietly grant a fourth send
-  // to a job that has already been paid three times. It grows by one small record
-  // per refund per process lifetime, which is tens of entries in practice.
-  const oneHourAgo = now - 3_600_000;
-  H.global = H.global.filter(r => r.timestamp > oneHourAgo);
-  // Bound perJob so a very long-lived install cannot grow it without limit. Keep
-  // the most recent 5000 jobs — far beyond any real refund volume, so the lifetime
-  // per-job cap holds in practice while the file stays small.
-  const jobIds = Object.keys(H.perJob);
-  if (jobIds.length > 5000) {
-    const keep = jobIds.slice(-5000);
-    const trimmed = {};
-    for (const id of keep) trimmed[id] = H.perJob[id];
-    H.perJob = trimmed;
-  }
-  saveSendHistory(H);
-}
-
-/** Test hook: the limiter is process-global in-memory state, so a suite that
- *  exercises it has to be able to start from a known point and to simulate the
- *  API-outage suspension the sweep sets. Not used in production paths. */
-function _resetDispatcherRateLimit(suspended = false) {
-  saveSendHistory({ global: [], perJob: {} });
-  setFinancialSuspended(suspended);
-}
+// ── Spend policy (allowlist + rate limiter + kill switch) ──
+// Extracted to src/spend-policy.js (P1). Re-imported + re-exported so existing
+// call sites and the test-mode module.exports keep resolving these names here.
+const _spendPolicy = require('./spend-policy.js');
+const {
+  loadFinancialAllowlist, isAddressInAllowlist, addActiveJobToAllowlist,
+  removeActiveJobFromAllowlist, addToRefundAllowlist,
+  SEND_HISTORY_PATH, loadSendHistory,
+  FINANCIAL_SUSPENDED_PATH, isFinanciallySuspended, setFinancialSuspended,
+  checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit,
+  gateExternalSend, recordSendOutcome,
+} = _spendPolicy;
 
 // ── Dispatcher-side allowlist sweep timer ──
 let dispatcherApiOutageSince = null;
@@ -1012,7 +598,7 @@ function parseJsonArray(val) {
 /**
  * Build a full agent profile from CLI options, including session and platform keys.
  */
-function buildFullProfile(options) {
+function buildFullProfile(options, keys) {
   const profile = {
     name: options.profileName,
     type: options.profileType || 'autonomous',
@@ -1033,6 +619,7 @@ function buildFullProfile(options) {
       datapolicy: options.dataPolicy,
       trustlevel: options.trustLevel,
       disputeresolution: options.disputeResolution,
+      kind: parseListingKind(options.kind) || parseListingKind(keys?.kind) || undefined,
     },
   };
 
@@ -1291,7 +878,7 @@ async function interactiveProfileSetup(keys, soulContent) {
     models,
     markup,
     session: { duration, tokenLimit, messageLimit, maxFileSize },
-    platformConfig: { datapolicy, trustlevel, disputeresolution },
+    platformConfig: { datapolicy, trustlevel, disputeresolution, kind: parseListingKind(keys.kind) || undefined },
     ...(workspaceCapability ? { workspaceCapability } : {}),
   };
 
@@ -1763,7 +1350,7 @@ program
 // Init command — create N agent identities
 program
   .command('quickstart')
-  .description('Guided first-run setup — creates agent, picks template, configures LLM')
+  .description('Guided first-run setup — pick a listing kind, register, configure')
   .action(async () => {
     ensureDirs();
     const readline = require('readline');
@@ -1777,53 +1364,75 @@ program
     console.log('║     J41 Dispatcher — Quick Start         ║');
     console.log('╚══════════════════════════════════════════╝\n');
 
-    // 1. Identity name
-    const name = await ask('Choose a name for your agent (lowercase, no spaces)', '');
+    console.log('What are you listing?\n');
+    console.log(`  DeFi is off on ${NATIVE_COIN} — every kind mints as name.agentplatform@.`);
+    console.log('  Kind is stored on the identity (config.kind).\n');
+    console.log('  agent    An AI you hire to do a task');
+    console.log('  compute  A GPU / SSH box buyers can rent');
+    console.log('  data     A dataset agents can query (you host the bytes)');
+    console.log('  model    Talk to a specific model that is for sale\n');
+    const kindRaw = await ask('Kind', 'agent');
+    const kind = parseListingKind(kindRaw);
+    if (!kind) {
+      console.error('❌ Kind must be agent, compute, data, or model');
+      rl.close();
+      process.exit(1);
+    }
+
+    const name = await ask(`Choose a name (lowercase, no spaces — becomes ${advertisedIdentity('<name>', kind)})`, '');
     if (!name) { console.error('❌ Name required'); rl.close(); process.exit(1); }
 
-    // 2. Template
-    const tplDir = path.join(__dirname, '..', 'templates');
-    const templates = fs.readdirSync(tplDir).filter(d => fs.existsSync(path.join(tplDir, d, 'config.json')));
-    console.log(`\nAvailable templates: ${templates.join(', ')}`);
-    const template = await ask('Choose a template', 'general-assistant');
-
-    // 3. LLM provider
-    // F3 — "claude" is not a preset. The real ones are claude-opus / claude-sonnet /
-    // claude-haiku (they route via OpenRouter, because Anthropic's native API uses
-    // /messages rather than /chat/completions). Offering a name that does not resolve
-    // sent the operator straight to a fleet that declines every job.
-    console.log('\nPopular LLM providers: openai, claude-sonnet, groq, deepseek, ollama');
-    const { LLM_PRESETS: _PRESETS } = require('./executors/local-llm.js');
-    let provider = await ask('LLM provider', 'openai');
-    while (provider && !_PRESETS[provider]) {
-      console.log(`  ✗ "${provider}" is not a known provider. Valid: ${Object.keys(_PRESETS).join(', ')}`);
-      provider = await ask('LLM provider', 'openai');
-    }
-
-    // 4. API key
+    let template = '';
+    let provider = '';
     let apiKey = '';
-    if (provider !== 'ollama' && provider !== 'lmstudio' && provider !== 'vllm') {
-      apiKey = await ask(`API key for ${provider}`, '');
-      if (!apiKey) {
-        // NOT an environment variable — host env vars are deliberately never
-        // read for provider keys; they are forwarded per-job into containers
-        // from config.toml. The old advice here told users to do the one thing
-        // that does not work, and the comment below records the result: a fleet
-        // that declined every job.
-        console.log('  (Add it later under [provider_keys] in ~/.j41/dispatcher/config.toml,');
-        console.log('   or re-run: j41-dispatcher quickstart — an agent with no key declines every job.)');
+    if (kind === 'agent') {
+      const tplDir = path.join(__dirname, '..', 'templates');
+      const templates = fs.readdirSync(tplDir).filter(d => fs.existsSync(path.join(tplDir, d, 'config.json')));
+      console.log(`\nAvailable templates: ${templates.join(', ')}`);
+      template = await ask('Choose a template', 'general-assistant');
+
+      // F3 — "claude" is not a preset. The real ones are claude-opus / claude-sonnet /
+      // claude-haiku (they route via OpenRouter, because Anthropic's native API uses
+      // /messages rather than /chat/completions). Offering a name that does not resolve
+      // sent the operator straight to a fleet that declines every job.
+      console.log('\nPopular LLM providers: openai, claude-sonnet, groq, deepseek, ollama');
+      const { LLM_PRESETS: _PRESETS } = require('./executors/local-llm.js');
+      provider = await ask('LLM provider', 'openai');
+      while (provider && !_PRESETS[provider]) {
+        console.log(`  ✗ "${provider}" is not a known provider. Valid: ${Object.keys(_PRESETS).join(', ')}`);
+        provider = await ask('LLM provider', 'openai');
       }
+
+      if (provider !== 'ollama' && provider !== 'lmstudio' && provider !== 'vllm') {
+        apiKey = await ask(`API key for ${provider}`, '');
+        if (!apiKey) {
+          console.log('  (Add it later under [provider_keys] in ~/.j41/dispatcher/config.toml,');
+          console.log('   or re-run: j41-dispatcher quickstart — an agent with no key declines every job.)');
+        }
+      }
+    } else if (kind === 'compute') {
+      console.log('\nAfter registration, declare the card in [compute.providers.*] (type = home-gpu or vast)');
+      console.log('and run: j41-dispatcher rental-setup ' + '<this-id>');
+      console.log('Do not attach an api-endpoint to this slot — that is Cat-2 inference on a different listing.');
+    } else if (kind === 'model') {
+      console.log('\nAfter registration, attach the inference endpoint for this model');
+      console.log('(same metered api-endpoint rail as compute).');
+    } else {
+      console.log('\nAfter registration, attach a data policy and an endpoint you host.');
+      console.log('Junction41 never stores the dataset bytes.');
     }
 
-    // 5. Runtime
     const runtime = await ask('Runtime mode (docker or local)', 'docker');
 
     rl.close();
 
+    const preview = advertisedIdentity(name, kind);
+    const localId = `${listingIdPrefix(kind)}-1`;
     console.log('\n─── Configuration ───');
-    console.log(`  Agent:    ${name}.agentplatform@`);
-    console.log(`  Template: ${template}`);
-    console.log(`  LLM:      ${provider}`);
+    console.log(`  Kind:     ${kind}`);
+    console.log(`  Identity: ${preview}`);
+    if (template) console.log(`  Template: ${template}`);
+    if (provider) console.log(`  LLM:      ${provider}`);
     console.log(`  Runtime:  ${runtime}`);
     console.log('');
 
@@ -1837,20 +1446,25 @@ program
     // from config.toml's [provider_keys] (cli.js:7952), deliberately never from the
     // dispatcher's own environment. Following the printed instructions exactly produced
     // a fleet that declined every job. Persist it where the dispatcher actually looks.
-    try {
-      const { saveDispatcherConfig } = require('./config-loader.js');
-      const partial = { llm: { provider } };
-      if (apiKey) partial.provider_keys = { [provider]: apiKey };
-      saveDispatcherConfig(partial);
-      console.log(`\n  ✅ Saved provider${apiKey ? ' + API key' : ''} to ~/.j41/dispatcher/config.toml`);
-    } catch (e) {
-      console.log(`\n  ⚠️  Could not write config.toml (${e.message}).`);
-      console.log(`     Set it by hand: [provider_keys] ${provider} = "<your key>"`);
+    if (kind === 'agent' && provider) {
+      try {
+        const { saveDispatcherConfig } = require('./config-loader.js');
+        const partial = { llm: { provider } };
+        if (apiKey) partial.provider_keys = { [provider]: apiKey };
+        saveDispatcherConfig(partial);
+        console.log(`\n  ✅ Saved provider${apiKey ? ' + API key' : ''} to ~/.j41/dispatcher/config.toml`);
+      } catch (e) {
+        console.log(`\n  ⚠️  Could not write config.toml (${e.message}).`);
+        console.log(`     Set it by hand: [provider_keys] ${provider} = "<your key>"`);
+      }
     }
 
     console.log('\nNext steps:\n');
-    console.log(`  1. Set up your agent:`);
-    console.log(`     j41-dispatcher setup agent-1 ${name} --template ${template}`);
+    console.log(`  1. Set up your listing:`);
+    const setupCmd = template
+      ? `j41-dispatcher setup ${localId} ${name} --kind ${kind} --template ${template}`
+      : `j41-dispatcher setup ${localId} ${name} --kind ${kind}`;
+    console.log(`     ${setupCmd}`);
     console.log(`\n  2. Start the dispatcher:`);
     console.log(`     j41-dispatcher start`);
     console.log('');
@@ -1928,7 +1542,8 @@ program
 // Register command — register an agent identity on-chain
 program
   .command('register <agent-id> <identity-name>')
-  .description('Register an agent identity on J41 platform')
+  .description('Register a listing identity on J41 (agent | compute | data | model)')
+  .option('--kind <kind>', 'Listing kind: agent | compute | data | model', 'agent')
   .option('--finalize', 'Run onboarding finalization after identity registration')
   .option('--interactive', 'Interactive finalize mode (prompts for profile/service)')
   .option('--profile-name <name>', 'Profile display name for headless finalize')
@@ -1971,15 +1586,15 @@ program
       process.exit(1);
     }
 
-    // Check if any other local agent already has this name (prevent duplicates)
-    const fullName = identityName.includes('@') ? identityName : identityName + '.agentplatform@';
+    const kind = requireListingKind(options.kind);
+    const preview = advertisedIdentity(identityName, kind);
     const allAgents = listRegisteredAgents();
     for (const other of allAgents) {
       if (other === agentId) continue;
       const otherKeys = loadAgentKeys(other);
       if (!otherKeys) continue;
       const otherName = otherKeys.identity || otherKeys.pendingName;
-      if (otherName && (otherName === fullName || otherName === identityName || otherName.replace('.agentplatform@', '') === identityName)) {
+      if (otherName && listingsCollide(otherName, identityName, kind)) {
         const status = otherKeys.registrationStatus || (otherKeys.iAddress ? 'registered' : 'pending');
         console.error(`❌ Name "${identityName}" is already ${status} on ${other}.`);
         if (status === 'timeout') {
@@ -1987,12 +1602,12 @@ program
         } else if (otherKeys.iAddress) {
           console.error(`   ${other} already owns this identity.`);
         }
-        console.error(`   Pick a different name, or clear ${other}'s state first.`);
+        console.error(`   Pick a different name. Do not reuse a working agent name for a GPU box.`);
         process.exit(1);
       }
     }
 
-    console.log(`\n→ Registering ${agentId} as ${identityName}.agentplatform@...`);
+    console.log(`\n→ Registering ${agentId} as ${preview} (kind=${kind})...`);
     console.log(`   Address: ${keys.address}`);
 
     const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
@@ -2002,11 +1617,12 @@ program
     });
 
     try {
-      const result = await agent.register(identityName, J41_NETWORK);
+      const result = await agent.register(identityName, J41_NETWORK, { kind });
 
       // Save identity to keys file
       keys.identity = result.identity;
       keys.iAddress = result.iAddress;
+      keys.kind = result.kind || kind;
       writeKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json'), keys);
 
       console.log(`\n✅ ${agentId} identity registered on-chain!`);
@@ -2023,7 +1639,7 @@ program
 
       if (options.profileName) {
         // Headless mode — use CLI flags
-        profileData = buildFullProfile(options);
+        profileData = buildFullProfile(options, keys);
         serviceData = buildServiceFromOptions(options, profileData.description);
       } else {
         // Interactive walkthrough — prompt for every VDXF field
@@ -2069,7 +1685,7 @@ program
         const profile = options.interactive
           ? undefined
           : (options.profileName && options.profileDescription
-            ? buildFullProfile(options)
+            ? buildFullProfile(options, keys)
             : undefined);
 
         const services = buildServiceFromOptions(options, options.profileDescription);
@@ -2091,7 +1707,8 @@ program
 
       // Save partial state on timeout so the user can recover
       if (e.name === 'RegistrationTimeoutError' || (e.message && e.message.includes('timed out'))) {
-        keys.identity = e.identityName || (identityName + '.agentplatform@');
+        keys.identity = e.identityName || advertisedIdentity(identityName, kind);
+        keys.kind = kind;
         keys.registrationStatus = 'timeout';
         keys.registrationTimestamp = new Date().toISOString();
         if (e.onboardId) keys.onboardId = e.onboardId;
@@ -2169,7 +1786,7 @@ program
     const profile = options.interactive
       ? undefined
       : (options.profileName && options.profileDescription
-        ? buildFullProfile(options)
+        ? buildFullProfile(options, keys)
         : undefined);
 
     const services = buildServiceFromOptions(options, options.profileDescription);
@@ -2635,7 +2252,25 @@ program
     });
 
     try {
-      const result = await agent.activate({ onChain: !options.platformOnly });
+      let onChain = !options.platformOnly;
+      if (onChain) {
+        try {
+          await agent.authenticate();
+          const raw = await agent.client.getIdentityRaw();
+          const inspect = inspectChainSalesStatus(raw && (raw.data || raw));
+          if (inspect.unread || inspect.unparseable) {
+            onChain = false;
+            console.warn(`   Could not read on-chain status — skipping chain write.`);
+          } else if (!shouldWriteChainActiveOnActivate(inspect.status)) {
+            onChain = false;
+            console.log(`   On-chain status is invite — skipping chain write. \`sales-mode open\` is the floodgate.`);
+          }
+        } catch {
+          onChain = false;
+          console.warn(`   Could not read on-chain status — skipping chain write.`);
+        }
+      }
+      const result = await agent.activate({ onChain });
 
       // Re-activate services
       let svcCount = 0;
@@ -2667,7 +2302,7 @@ program
         state.stage = 'ready';
         delete state.deactivatedAt;
         state.notes = state.notes || [];
-        state.notes.push(`${new Date().toISOString()} Agent reactivated (on-chain: ${!options.platformOnly})`);
+        state.notes.push(`${new Date().toISOString()} Agent reactivated (on-chain: ${onChain})`);
         fs.writeFileSync(finalizePath, JSON.stringify(state, null, 2));
       }
 
@@ -2715,7 +2350,25 @@ program
           identityName: keys.identity,
           iAddress: keys.iAddress,
         });
-        const result = await agent.activate({ onChain: !options.platformOnly });
+        let onChain = !options.platformOnly;
+        if (onChain) {
+          try {
+            await agent.authenticate();
+            const raw = await agent.client.getIdentityRaw();
+            const inspect = inspectChainSalesStatus(raw && (raw.data || raw));
+            if (inspect.unread || inspect.unparseable) {
+              onChain = false;
+              console.warn(`   ${agentId}: could not read on-chain status — skipping chain write.`);
+            } else if (!shouldWriteChainActiveOnActivate(inspect.status)) {
+              onChain = false;
+              console.log(`   ${agentId}: on-chain status is invite — skipping chain write. \`sales-mode open\` is the floodgate.`);
+            }
+          } catch {
+            onChain = false;
+            console.warn(`   ${agentId}: could not read on-chain status — skipping chain write.`);
+          }
+        }
+        const result = await agent.activate({ onChain });
         // Re-activate services
         try {
           const svcResp = await agent._client.getMyServices();
@@ -2733,7 +2386,7 @@ program
           state.stage = 'ready';
           delete state.deactivatedAt;
           state.notes = state.notes || [];
-          state.notes.push(`${new Date().toISOString()} Batch activated (on-chain: ${!options.platformOnly})`);
+          state.notes.push(`${new Date().toISOString()} Batch activated (on-chain: ${onChain})`);
           fs.writeFileSync(finalizePath, JSON.stringify(state, null, 2));
         }
         succeeded++;
@@ -2818,6 +2471,187 @@ program
     }
 
     console.log(`\n✅ Done: ${succeeded} deactivated, ${failed} failed`);
+  });
+
+program
+  .command('allowlist <agent-id> [action] [identity]')
+  .description('List, add, or remove buyer identities this listing will auto-accept when sales-mode is invite')
+  .action(async (agentId, action, identity) => {
+    await ensureKeystoreUnlockedIfEncrypted();
+    ensureDirs();
+
+    const keys = loadAgentKeys(agentId);
+    if (!keys) {
+      console.error(`❌ Agent ${agentId} not found.`);
+      process.exit(1);
+    }
+
+    const configPath = path.join(AGENTS_DIR, agentId, 'agent-config.json');
+    let cfg = {};
+    try {
+      if (fs.existsSync(configPath)) cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    } catch {}
+
+    const act = String(action || 'list').trim().toLowerCase();
+    if (!action || act === 'list') {
+      const list = loadBuyerAllowlist(cfg);
+      if (list.length === 0) {
+        console.log(`Allowlist for ${agentId}: (empty)`);
+      } else {
+        console.log(`Allowlist for ${agentId}:`);
+        for (const e of list) console.log(`  ${e}`);
+      }
+      return;
+    }
+    if (act !== 'add' && act !== 'remove') {
+      console.error('❌ Action must be add, remove, or omitted (list)');
+      process.exit(1);
+    }
+    if (!identity) {
+      console.error(`❌ Usage: allowlist <agent-id> ${act} <identity>`);
+      process.exit(1);
+    }
+    if (act === 'add') {
+      const pasted = String(identity).trim();
+      cfg = addBuyerAllowlistEntry(cfg, pasted);
+      const alreadyIAddr = /^i[1-9A-HJ-NP-Za-km-z]{25,}$/.test(pasted);
+      if (!alreadyIAddr) {
+        try {
+          const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+          const agent = new J41Agent({
+            apiUrl: J41_API_URL,
+            wif: keys.wif,
+            identityName: keys.identity,
+            iAddress: keys.iAddress,
+          });
+          if (keys.wif && keys.identity) await agent.authenticate();
+          const resolved = await resolveAllowlistEntries(
+            [pasted],
+            (id) => agent.client.getIdentityKeys(id).then(k => ({ identityaddress: k.iaddress, iAddress: k.iaddress, iaddress: k.iaddress })),
+            (id) => agent.client.getAgent(id),
+          );
+          if (resolved[0]) {
+            cfg = addBuyerAllowlistEntry(cfg, resolved[0]);
+            console.log(`   resolved ${pasted} → ${resolved[0]}`);
+          } else {
+            console.warn(`⚠️  Could not resolve ${pasted} to an i-address. Auto-accept will not match buyerVerusId until it resolves. Re-run allowlist add after the name is listed, or add the i-address directly.`);
+          }
+        } catch (e) {
+          console.warn(`⚠️  Could not resolve ${pasted} to an i-address (${e.message}). Auto-accept will not match buyerVerusId until it resolves.`);
+        }
+      }
+    } else {
+      cfg = removeBuyerAllowlistEntry(cfg, identity);
+    }
+    fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + '\n');
+    fs.chmodSync(configPath, 0o600);
+    console.log(`✅ ${act === 'add' ? 'Added' : 'Removed'} ${identity} ${act === 'add' ? 'to' : 'from'} ${agentId} allowlist`);
+  });
+
+// NOT gated: do not run while an inbox identity tx for this agent is unconfirmed
+// (see /health pendingWrites). Same hazard as update-profile.
+program
+  .command('sales-mode <agent-id> [mode]')
+  .description('On-chain floodgate: invite (allowlist) or open (active). Writes agent.status VDXF. Do not run while the dispatcher has an unconfirmed identity write for this agent.')
+  .action(async (agentId, mode) => {
+    await ensureKeystoreUnlockedIfEncrypted();
+    ensureDirs();
+
+    const keys = loadAgentKeys(agentId);
+    if (!keys) {
+      console.error(`❌ Agent ${agentId} not found.`);
+      process.exit(1);
+    }
+    if (!keys.identity || !keys.iAddress || !keys.wif) {
+      console.error(`❌ Agent ${agentId} is not registered on-chain. Register first.`);
+      process.exit(1);
+    }
+
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+    const agent = new J41Agent({
+      apiUrl: J41_API_URL,
+      wif: keys.wif,
+      identityName: keys.identity,
+      iAddress: keys.iAddress,
+    });
+
+    try {
+      await agent.authenticate();
+      const raw = await agent.client.getIdentityRaw();
+      const current = readChainSalesStatus(raw && (raw.data || raw));
+      const m = String(mode || '').trim().toLowerCase();
+      if (!m || m === 'status') {
+        const label = current === 'active' ? 'open (on-chain active)' : (current || '(unset)');
+        console.log(`Sales mode for ${agentId}: ${label}`);
+        return;
+      }
+      if (m !== 'invite' && m !== 'open') {
+        console.error('❌ Mode must be invite, open, or omitted (print current)');
+        process.exit(1);
+      }
+
+      console.warn('⚠️  Do not run sales-mode while the dispatcher has an unconfirmed identity write for this agent (see /health pendingWrites).');
+
+      let txid;
+      if (m === 'open') {
+        txid = await agent.setOnChainStatus('active');
+      } else {
+        txid = await agent.setOnChainStatus('invite');
+      }
+      clearSalesStatusCache();
+      try { await agent.client.refreshAgent(keys.iAddress); } catch {}
+      console.log(`✅ Sales mode → ${m} (on-chain ${m === 'open' ? 'active' : 'invite'})${txid ? ' tx:' + String(txid).substring(0, 12) + '...' : ''}`);
+    } catch (e) {
+      console.error(`❌ ${e.message}`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('accept-job <agent-id> <job-id>')
+  .description('One-shot accept a stacked hire without changing sales-mode or preferAllowlist')
+  .action(async (agentId, jobId) => {
+    await ensureKeystoreUnlockedIfEncrypted();
+    ensureDirs();
+
+    const keys = loadAgentKeys(agentId);
+    if (!keys) {
+      console.error(`❌ Agent ${agentId} not found.`);
+      process.exit(1);
+    }
+    if (!keys.identity || !keys.wif || !keys.address) {
+      console.error(`❌ Agent ${agentId} is not registered.`);
+      process.exit(1);
+    }
+
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+    const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
+    const agent = new J41Agent({
+      apiUrl: J41_API_URL,
+      wif: keys.wif,
+      identityName: keys.identity,
+      iAddress: keys.iAddress,
+    });
+
+    try {
+      await agent.authenticate();
+      const fullJob = await agent.client.getJob(jobId);
+      if (!fullJob?.jobHash || !fullJob?.buyerVerusId) {
+        console.error('❌ Job is missing jobHash or buyerVerusId — cannot sign accept');
+        process.exit(1);
+      }
+      const timestamp = Math.floor(Date.now() / 1000);
+      const sig = signMessage(keys.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
+      await agent.client.acceptJob(jobId, sig, timestamp, keys.address);
+      const buyerPayAddr = fullJob.buyerPayAddress || fullJob.buyer?.payAddress;
+      if (buyerPayAddr) {
+        addActiveJobToAllowlist(jobId, buyerPayAddr);
+      }
+      console.log(`✅ Job ${jobId} accepted (signed, pay→${keys.address.slice(0, 8)}...) — awaiting buyer payment`);
+    } catch (e) {
+      console.error(`❌ ${e.message}`);
+      process.exit(1);
+    }
   });
 
 /**
@@ -3241,6 +3075,7 @@ program
 program
   .command('setup <agent-id> <identity-name>')
   .description('One-command setup: init keys + register on-chain + finalize with profile & service')
+  .option('--kind <kind>', 'Listing kind: agent | compute | data | model', 'agent')
   .option('--template <name>', 'Use a template (code-review, general-assistant, data-analyst, character-roleplay, workspace-reviewer)')
   .option('--yes', 'Skip the funding pause and register immediately (the address must already hold funds)')
   .option('--profile-name <name>', 'Profile display name')
@@ -3375,15 +3210,15 @@ program
     if (keys.identity && keys.iAddress && keys.registrationStatus !== 'timeout') {
       console.log(`  ✓ Already registered: ${keys.identity}`);
     } else {
-      // Check for duplicate name across local agents
-      const setupFullName = identityName + '.agentplatform@';
+      const kind = requireListingKind(options.kind, keys.kind || 'agent');
+      const setupPreview = advertisedIdentity(identityName, kind);
       const setupAllAgents = listRegisteredAgents();
       for (const other of setupAllAgents) {
         if (other === agentId) continue;
         const otherKeys = loadAgentKeys(other);
         if (!otherKeys) continue;
         const otherName = otherKeys.identity || otherKeys.pendingName;
-        if (otherName && (otherName === setupFullName || otherName.replace('.agentplatform@', '') === identityName)) {
+        if (otherName && listingsCollide(otherName, identityName, kind)) {
           console.error(`  ❌ Name "${identityName}" is already claimed by ${other}.`);
           console.error(`     Pick a different name, or clear ${other}'s state first.`);
           process.exit(1);
@@ -3395,22 +3230,24 @@ program
       });
 
       try {
-        console.log(`  → Registering ${identityName}.agentplatform@ (this may take several minutes)...`);
-        const regResult = await agent.register(identityName, J41_NETWORK);
+        console.log(`  → Registering ${setupPreview} (kind=${kind}, this may take several minutes)...`);
+        const regResult = await agent.register(identityName, J41_NETWORK, { kind });
         keys.identity = regResult.identity;
         keys.iAddress = regResult.iAddress;
+        keys.kind = regResult.kind || kind;
         delete keys.registrationStatus;
         delete keys.onboardId;
         writeKeysFile(path.join(agentDir, 'keys.json'), keys);
         console.log(`  ✓ Registered: ${regResult.identity} (${regResult.iAddress})`);
       } catch (e) {
         if (e.name === 'RegistrationTimeoutError' || (e.message && e.message.includes('timed out'))) {
-          keys.identity = e.identityName || (identityName + '.agentplatform@');
+          keys.identity = e.identityName || setupPreview;
+          keys.kind = kind;
           keys.registrationStatus = 'timeout';
           if (e.onboardId) keys.onboardId = e.onboardId;
           writeKeysFile(path.join(agentDir, 'keys.json'), keys);
           console.error(`  ⚠️  Registration timed out. Run: j41-dispatcher recover ${agentId}`);
-          console.error(`     Then re-run: j41-dispatcher setup ${agentId} ${identityName} [flags...]`);
+          console.error(`     Then re-run: j41-dispatcher setup ${agentId} ${identityName} --kind ${kind} [flags...]`);
           process.exit(1);
         }
         console.error(`  ❌ ${e.message}`);
@@ -3441,7 +3278,7 @@ program
       disputePolicyData = result.disputePolicy;
     } else {
       // Headless mode — use CLI flags
-      profileData = buildFullProfile(options);
+      profileData = buildFullProfile(options, keys);
       services = buildServiceFromOptions(options, profileData.description);
     }
 
@@ -3583,6 +3420,26 @@ program
       console.error(`✗ Agent directory not found: ${agentDir}`);
       process.exit(1);
     }
+
+    // Reverse slot guard: an agent that already sells gpu-rental cannot also be
+    // an api-endpoint (mixed-service _isApiEndpoint stamping). --no-register
+    // skips the network; unknown services still run the guard against [].
+    const { assertApiEligibleAgent } = require('./rental-job');
+    const { slotServicesFromAgentConfig } = require('./rental-setup');
+    let existingServices = [];
+    try {
+      const configPathEarly = path.join(agentDir, 'agent-config.json');
+      if (fs.existsSync(configPathEarly)) {
+        existingServices = slotServicesFromAgentConfig(JSON.parse(fs.readFileSync(configPathEarly, 'utf8')));
+      }
+    } catch {}
+    try {
+      assertApiEligibleAgent(existingServices);
+    } catch (e) {
+      console.error(`✗ ${e.message}`);
+      process.exit(1);
+    }
+
     if (!options.upstreamUrl) { console.error('✗ --upstream-url is required'); process.exit(1); }
     if (!options.model || options.model.length === 0) { console.error('✗ at least one --model is required'); process.exit(1); }
 
@@ -3637,6 +3494,15 @@ program
     });
     try {
       await agent.authenticate();
+      try {
+        const client = agent.client || agent._client;
+        if (client && typeof client.getAgentServices === 'function') {
+          const svcResp = await client.getAgentServices(keys.iAddress || keys.identity);
+          assertApiEligibleAgent(svcResp.data || svcResp || []);
+        }
+      } catch (e) {
+        if (e && /API_SLOT_CONFLICT/.test(e.message)) throw e;
+      }
       const svc = await agent.registerService({
         name: options.name || `${keys.identity} API Access`,
         description: options.description,
@@ -3662,6 +3528,121 @@ program
     }
   });
 
+// Rental setup — scriptable Cat-1 gpu-rental registration. All-or-nothing
+// billing, contained SSH (never host SSH). Separate agent slot from api-endpoint.
+program
+  .command('rental-setup <agent-id>')
+  .description('Register a raw-GPU rental (Cat-1) service. All-or-nothing; contained SSH, never host SSH.')
+  .option('--price <vrsc>', 'Price per rental window (VRSC)', '0')
+  .option('--name <name>', 'Service name')
+  .option('--service-payment-terms <terms>', 'prepay|postpay', 'prepay')
+  .option('--ack-postpay-vast-risk', 'Required if payment terms are postpay AND this slot sources a Vast box (Alice eats the Vast bill if the buyer never pays)')
+  .option('--no-register', 'Skip platform registration (write agent-config only)')
+  .action(async (agentId, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
+    const agentDir = path.join(AGENTS_DIR, agentId);
+    if (!fs.existsSync(agentDir)) {
+      console.error(`✗ Agent directory not found: ${agentDir}`);
+      process.exit(1);
+    }
+
+    const {
+      assertRentalSetupAllowed,
+      rentalServiceDescription,
+      applyRentalAgentConfig,
+      slotServicesFromAgentConfig,
+    } = require('./rental-setup');
+    const { assertRentalEligibleAgent } = require('./rental-job');
+
+    const paymentTerms = String(options.servicePaymentTerms || 'prepay').toLowerCase();
+    if (paymentTerms !== 'prepay' && paymentTerms !== 'postpay') {
+      console.error('✗ --service-payment-terms must be prepay or postpay');
+      process.exit(1);
+    }
+    const price = parseFloat(options.price);
+    if (!Number.isFinite(price) || price < 0) {
+      console.error('✗ --price must be a non-negative number');
+      process.exit(1);
+    }
+
+    const configPath = path.join(agentDir, 'agent-config.json');
+    let config = {};
+    try { if (fs.existsSync(configPath)) config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch {}
+
+    let setup;
+    try {
+      setup = assertRentalSetupAllowed({
+        agentId,
+        cfg,
+        services: slotServicesFromAgentConfig(config),
+        paymentTerms,
+        ackPostpayVastRisk: !!options.ackPostpayVastRisk,
+      });
+    } catch (e) {
+      console.error(`✗ ${e.message}`);
+      process.exit(1);
+    }
+
+    config = applyRentalAgentConfig(config, { ackPostpayVastRisk: options.ackPostpayVastRisk });
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
+    try { fs.chmodSync(configPath, 0o600); } catch {}
+    console.log(`✓ Wrote ${configPath}`);
+
+    if (!options.register) {
+      console.log('Config saved. Skipping platform registration (--no-register).');
+      return;
+    }
+
+    const keysPath = path.join(agentDir, 'keys.json');
+    if (!fs.existsSync(keysPath)) { console.error(`✗ keys.json not found for ${agentId}`); process.exit(1); }
+    const keys = readKeysFile(keysPath);
+
+    const { J41Agent } = require('@junction41/sovagent-sdk');
+    const agent = new J41Agent({
+      apiUrl: cfg.platform.api_url,
+      identityName: keys.identity,
+      wif: keys.wif,
+      iAddress: keys.iAddress,
+      network: cfg.platform.network,
+    });
+    try {
+      await agent.authenticate();
+      try {
+        const client = agent.client || agent._client;
+        if (client && typeof client.getAgentServices === 'function') {
+          const svcResp = await client.getAgentServices(keys.iAddress || keys.identity);
+          assertRentalEligibleAgent(svcResp.data || svcResp || []);
+        }
+      } catch (e) {
+        if (e && /RENTAL_SLOT_CONFLICT/.test(e.message)) throw e;
+      }
+      const jobTimeoutMin = _cfg.jobTimeoutMin || 60;
+      const vastPostpayAck = !!(setup && setup.pcfg && setup.pcfg.type === 'vast' && options.ackPostpayVastRisk);
+      const svc = await agent.registerService({
+        name: options.name || `${keys.identity} GPU Rental`,
+        description: rentalServiceDescription({ jobTimeoutMin, paymentTerms, vastPostpayAck }),
+        price,
+        currency: NATIVE_COIN,
+        paymentTerms,
+        sovguard: false,
+        serviceType: 'gpu-rental',
+      });
+      console.log(`✓ Service registered on platform (id: ${svc?.id || svc?.data?.id || '?'})`);
+      console.log('Next: start the dispatcher (j41-dispatcher start) — your rental is now discoverable.');
+      console.log('Remember: a rental job delivers contained SSH credentials and the box is released at expiry. Never host SSH.');
+    } catch (e) {
+      console.error(`✗ Platform registration failed: ${e.message}`);
+      if (/RENTAL_SECRETS_KEY_MISSING/.test(String(e.message)) || e && e.code === 'RENTAL_SECRETS_KEY_MISSING') {
+        console.error('  This is the Junction41 API operator key (64 hex in the API .env), not a dispatcher env.');
+        console.error('  Generate on the API host: openssl rand -hex 32');
+      }
+      console.error('  Config was still written — rerun with --no-register to skip this step, or fix auth and retry.');
+      process.exit(1);
+    } finally {
+      try { agent.stop?.(); } catch {}
+    }
+  });
+
 // Dashboard command — launch interactive TUI
 program
   .command('dashboard')
@@ -3671,6 +3652,9 @@ program
 // ── The job-agent image ─────────────────────────────────────────────────────
 
 const JOB_IMAGE = `${process.env.J41_JOB_IMAGE || 'j41/job-agent'}:${process.env.J41_JOB_TAG || 'latest'}`;
+const { jailImageRef } = require('./providers/home-gpu');
+const { dockerImageExists, assertHomeGpuHostReady } = require('./docker-host');
+const JAIL_IMAGE = jailImageRef({});
 
 /** True if the pre-baked job image is present locally. Never throws. */
 function jobImageExists() {
@@ -3681,6 +3665,11 @@ function jobImageExists() {
     );
     return true;
   } catch { return false; }
+}
+
+/** True if the pre-baked gpu-jail image is present locally. Never throws. */
+function jailImageExists(image) {
+  return dockerImageExists(image || JAIL_IMAGE);
 }
 
 /**
@@ -3695,9 +3684,30 @@ function buildImageScriptPath() {
   return path.join(__dirname, '..', 'scripts', 'build-image.sh');
 }
 
+function buildJailImageScriptPath() {
+  return path.join(__dirname, '..', 'scripts', 'build-jail-image.sh');
+}
+
+function spawnImageBuildScript(script) {
+  return new Promise((resolve) => {
+    const child = require('child_process').spawn('bash', [script], {
+      cwd: path.dirname(path.dirname(script)),
+      stdio: 'inherit',
+    });
+    const onSigint = () => { child.kill('SIGTERM'); };
+    process.on('SIGINT', onSigint);
+    child.on('close', (c) => { process.removeListener('SIGINT', onSigint); resolve(c); });
+    child.on('error', (e) => {
+      process.removeListener('SIGINT', onSigint);
+      console.error(`\n❌ Could not run the build script: ${e.message}`);
+      resolve(1);
+    });
+  });
+}
+
 program
   .command('build-image')
-  .description('Build the pre-baked job-agent Docker image (required before running jobs)')
+  .description('Build the pre-baked job-agent and gpu-jail Docker images (required before running jobs)')
   .option('--force', 'Rebuild even if the image already exists')
   .action(async (options) => {
     const script = buildImageScriptPath();
@@ -3706,32 +3716,40 @@ program
       console.error('   This install looks incomplete — try reinstalling the package.');
       process.exit(1);
     }
-    if (!options.force && jobImageExists()) {
-      console.log(`✓ ${JOB_IMAGE} already exists. Nothing to do.`);
-      console.log('  Rebuild it with: j41-dispatcher build-image --force');
-      return;
-    }
-    console.log(`Building ${JOB_IMAGE} — this takes a few minutes on first run.\n`);
-    const code = await new Promise((resolve) => {
-      const child = require('child_process').spawn('bash', [script], {
-        cwd: path.dirname(path.dirname(script)),
-        stdio: 'inherit',
-      });
-      const onSigint = () => { child.kill('SIGTERM'); };
-      process.on('SIGINT', onSigint);
-      child.on('close', (c) => { process.removeListener('SIGINT', onSigint); resolve(c); });
-      child.on('error', (e) => {
-        process.removeListener('SIGINT', onSigint);
-        console.error(`\n❌ Could not run the build script: ${e.message}`);
-        resolve(1);
-      });
-    });
-    if (code !== 0) {
-      console.error(`\n❌ Image build failed (exit ${code}).`);
-      console.error('   Docker must be installed and running, and your user able to reach it.');
+    const jailScript = buildJailImageScriptPath();
+    if (!fs.existsSync(jailScript)) {
+      console.error(`❌ Jail build script not found at ${jailScript}`);
+      console.error('   This install looks incomplete — try reinstalling the package.');
       process.exit(1);
     }
-    console.log(`\n✅ ${JOB_IMAGE} is ready. Next: j41-dispatcher start`);
+    // Job-agent already present: skip that rebuild, then still build the jail.
+    // Alice who already has j41/job-agent must get j41/gpu-jail from one command.
+    if (!options.force && jobImageExists()) {
+      console.log(`✓ ${JOB_IMAGE} already exists. Skipping job-agent rebuild.`);
+      console.log('  Rebuild it with: j41-dispatcher build-image --force');
+    } else {
+      console.log(`Building ${JOB_IMAGE} — this takes a few minutes on first run.\n`);
+      const code = await spawnImageBuildScript(script);
+      if (code !== 0) {
+        console.error(`\n❌ Image build failed (exit ${code}).`);
+        console.error('   Docker must be installed and running, and your user able to reach it.');
+        process.exit(1);
+      }
+    }
+    if (!options.force && jailImageExists()) {
+      console.log(`✓ ${JAIL_IMAGE} already exists. Skipping gpu-jail rebuild.`);
+      console.log('  Rebuild it with: j41-dispatcher build-image --force');
+    } else {
+      console.log(`Building ${JAIL_IMAGE} — this takes a few minutes on first run.\n`);
+      const jailCode = await spawnImageBuildScript(jailScript);
+      if (jailCode !== 0) {
+        console.error(`\n❌ Jail image build failed (exit ${jailCode}).`);
+        console.error('   Docker must be installed and running, and your user able to reach it.');
+        process.exit(1);
+      }
+    }
+    console.log(`\n✅ ${JOB_IMAGE} is ready.`);
+    console.log(`✅ ${JAIL_IMAGE} is ready. Next: j41-dispatcher start`);
   });
 
 // Start command — run the dispatcher (listen for jobs)
@@ -3747,10 +3765,29 @@ program
   .action(async (options) => {
     ensureDirs();
 
+    // Spend-policy approval mode (P6): "always" is the only supported value — every
+    // external send is owner-approved. There is deliberately no auto-approve path, so
+    // any OTHER value is a misconfiguration that would silently promise automation we
+    // do not implement. Refuse to start (fail-closed) rather than run under a false
+    // belief about how money leaves the host.
+    const _approval = (loadDispatcherConfig().spend_policy || {}).approval;
+    if (_approval !== 'always') {
+      console.error(`[spend-policy] spend_policy.approval="${_approval}" is not supported — only "always" exists ` +
+        '(every external send is owner-approved; there is no auto-approve path). Set it to "always" or remove it.');
+      process.exit(1);
+    }
+
     // Mainnet security gate (fail-closed): on network=verus, refuse to start
     // if any insecure escape hatch is set. IS_MAINNET comes from config, not env.
     if (IS_MAINNET) {
-      const violations = findMainnetSecurityViolations(process.env, { devUnsafe: !!options.devUnsafe }, cfg.runtime);
+      // Force a clamp evaluation against the live config so _clampedKeys() reflects
+      // any refund_limits value edited above the compiled ceiling (P5).
+      _spendPolicy.effectiveLimits();
+      const violations = findMainnetSecurityViolations(process.env, {
+        devUnsafe: !!options.devUnsafe,
+        clampedConfigKeys: _spendPolicy._clampedKeys(),
+        spendLedgerWritable: _spendPolicy.spendLedgerWritable(),
+      }, cfg.runtime);
       if (violations.length) {
         console.error('');
         console.error('  ══════════════════════════════════════════════════');
@@ -3904,6 +3941,32 @@ program
       console.error('   Every job runs in a fresh container from this image, so there is no');
       console.error('   partial mode that works without it.');
       process.exit(1);
+    }
+
+    // Home-gpu rentals need the jail image the same way jobs need job-agent:
+    // find out before anyone pays. Vast-only / compute-off fleets do not.
+    // Gate the same jailImageRef(pcfg) waitReady will create, plus host preflight.
+    const { homeGpuConfigured } = require('./rental-setup');
+    const startCfg = loadDispatcherConfig();
+    if (process.env.NODE_ENV !== 'test' && RUNTIME !== 'local' && homeGpuConfigured(startCfg)) {
+      const tables = (startCfg.compute && startCfg.compute.providers) || {};
+      for (const pcfg of Object.values(tables)) {
+        if (!pcfg || pcfg.type !== 'home-gpu') continue;
+        const image = jailImageRef(pcfg);
+        try {
+          assertHomeGpuHostReady(pcfg, {
+            imageExists: (img) => dockerImageExists(img),
+          });
+        } catch (e) {
+          console.error(`\n❌ Refusing to start: the jail image ${image} — ${e.message}`);
+          console.error('   Nothing was accepted and no buyer can pay into this fleet.');
+          console.error('');
+          console.error('   Build the jail image (if missing):');
+          console.error('     j41-dispatcher build-image');
+          console.error('');
+          process.exit(1);
+        }
+      }
     }
 
     // Local mode warning timer
@@ -4377,6 +4440,17 @@ program
       options.webhookUrl = cfg.runtime.webhook_url;
       console.log(`  Webhook mode from config.toml: ${options.webhookUrl}`);
     }
+    // H5 — money-safety backstop that runs in BOTH webhook and poll modes and with ZERO
+    // api-endpoint agents: release any orphaned PAID compute lease left by a prior boot,
+    // so a rented box can never keep billing just because this boot has no proxy path. The
+    // full reconcile/attach still runs later (webhook mode) with the live proxy Map.
+    if (cfg.compute && cfg.compute.enabled) {
+      try {
+        const { createSupplyController } = require('./compute-supply');
+        await createSupplyController({ cfg, agentConfigs: new Map() }).releaseOrphansOnBoot();
+      } catch (e) { console.error('  Compute: boot orphan-recovery failed:', e.message); }
+    }
+
     if (options.webhookUrl) {
       // ── WEBHOOK MODE ──
       const webhookPort = parseInt(options.webhookPort) || 9841;
@@ -4664,6 +4738,19 @@ program
         startHealthPoller(agentConfigs, undefined, cfgForHealth.proxy.circuit_threshold);
         console.log(`  Upstream health: polling every 60s (circuit threshold=${cfgForHealth.proxy.circuit_threshold})`);
 
+        // S5 — compute-supply owns lease lifecycle and mutates agentConfigs upstreams at
+        // runtime (a lease's baseUrl becomes an agent's proxy upstream). No-op unless
+        // [compute] enabled=true, so default behaviour is byte-for-byte unchanged.
+        try {
+          const { maybeStartComputeSupply } = require('./compute-supply');
+          proxyContext.computeSupply = await maybeStartComputeSupply({ cfg: cfgForHealth, agentConfigs });
+          if (proxyContext.computeSupply) {
+            const n = proxyContext.computeSupply.getLeases().length;
+            const secs = Math.round((cfgForHealth.compute.reconcile_ms || 60000) / 1000);
+            console.log(`  Compute supply: ${n} lease(s) active (reconcile every ${secs}s)`);
+          }
+        } catch (e) { console.error('compute-supply start failed:', e.message); }
+
         // Backend feature-flag check (soft-required: signing.canonical-v1).
         // Matches the rollout pattern from auth.rpc-unavailable-code. Warn at startup if backend
         // hasn't yet advertised canonical-v1; dispatcher still accepts v1 and continues.
@@ -4688,6 +4775,11 @@ program
 
       // Start webhook HTTP server (with proxy context if api-endpoint agents exist)
       const { startWebhookServer } = require('./webhook-server');
+      // H7 — handleWebhookEvent must be able to call onApiAccessRevoke when the
+      // platform delivers proxy.access_revoked on the generic /webhook/:agentId
+      // path. J41 never POSTs /j41/api-access/revoke (that route stays for
+      // direct callers); the signed platform event is the real channel.
+      state.proxyContext = proxyContext;
       startWebhookServer(webhookPort, agentWebhooks, async (agentId, payload) => {
         await handleWebhookEvent(state, agentId, payload);
       }, proxyContext);
@@ -6452,6 +6544,8 @@ function planAgentActivation(agentInfo, opts = {}) {
   // `unknown` is NOT a repair trigger: we could not read it, and writing on-chain
   // on a guess costs a fee and risks a collision.
   const chainNeedsRepair = chain === 'inactive';
+  // Spec §0.10: start must not rewrite invite → active, even with the on-chain toggle.
+  const writeOnChain = toggleOnChain && chain !== 'invite';
 
   if (platform === 'active' && !chainNeedsRepair && !toggleOnChain) {
     // Both axes already good (or the chain axis unreadable) and we are not being
@@ -6461,13 +6555,18 @@ function planAgentActivation(agentInfo, opts = {}) {
   }
   return {
     skip: false,
-    onChain: toggleOnChain,
+    onChain: writeOnChain,
     // Do not repair separately when the activate itself is already writing
     // on-chain — that would be two identity writes for one agent in one pass,
     // which is the double-spend this whole release exists to remove.
     repairChain: chainNeedsRepair && !toggleOnChain,
     reason: chainNeedsRepair ? 'chain axis inactive — needs repair' : 'platform axis needs a write',
   };
+}
+
+/** False when the VDXF is already `invite` — `sales-mode open` is the floodgate, not activate. */
+function shouldWriteChainActiveOnActivate(chainStatus) {
+  return String(chainStatus || '').trim().toLowerCase() !== 'invite';
 }
 
 // ── Shutdown/start fleet-state handoff ───────────────────────────────────────
@@ -7178,34 +7277,32 @@ async function attemptPendingRefund(state, jobId, entry, ledgerPath = PENDING_RE
 
     const agent = await getAgentSession(state, agentInfo);
 
-    // ── Allowlist check before refund ──
-    const allowlist = loadFinancialAllowlist();
-    if (!isAddressInAllowlist(allowlist, buyerAddress)) {
-      console.error(`  [refund] ❌ BLOCKED: Refund address ${untrusted(buyerAddress, 60)} not in allowlist — skipping refund for ${jobId.substring(0, 8)}`);
-      // Drop this entry permanently (allowlist block is not a transient failure).
-      return true;
-    }
-
-    // ── Rate limit before the broadcast (M3) ──
-    // The last gate before an irreversible send, and the only one that bounds the
-    // BLAST RADIUS of a bug in the gates above it: the allowlist checks WHO, the
-    // ledger checks WHETHER-ALREADY, the lock checks WHO-ELSE-IS-SENDING — none of
-    // them checks how much, how often, or whether the platform is even reachable.
+    // ── Spend-policy gate before the broadcast (P1) ──
+    // One funnel: counterparty (allowlist) + the rate family (per-job cap, value
+    // ceiling, hourly cap, cooldown, outage suspension). The last gate before an
+    // irreversible send, bounding the blast radius of a bug in any gate above it.
+    // The gate decision is recorded (ledger, P3) here — BEFORE the inflight marker
+    // below — so a denied send leaves nothing behind (C3).
     const _jobPrice = Number(orphan?.jobAmount ?? orphan?.amount);
-    const _rl = checkDispatcherRateLimit(jobId, refundAmount, _jobPrice);
-    if (!_rl.allowed) {
-      if (_rl.retryable) {
-        // Cooldown / hourly cap / outage suspension: the entry STAYS in the ledger
-        // and the next drain retries it. An operator with a large approved backlog
-        // raises refund_limits.max_sends_per_hour rather than waiting it out.
-        console.log(`  [refund] ⏸  ${jobId.substring(0, 8)}: ${_rl.reason} — deferring to the next drain`);
-      } else {
-        // Per-job cap or value ceiling. Retrying cannot help, and dropping the entry
-        // would hide it — leave it queued and say plainly that a human must look.
-        console.error(`  [refund] ⛔ ${jobId.substring(0, 8)}: BLOCKED by rate limit — ${_rl.reason}`);
-        console.error('  [refund]    This job has already been paid up to its limit. Nothing was sent.');
-        console.error(`  [refund]    Inspect it, then drop it with:  j41-dispatcher refunds reject ${jobId}`);
+    const _gate = gateExternalSend({ jobId, toAddress: buyerAddress, amount: refundAmount, jobPrice: _jobPrice, kind: 'refund' });
+    if (!_gate.allowed) {
+      if (_gate.retryable) {
+        // Cooldown / hourly cap / outage suspension: the entry STAYS in the ledger and
+        // the next drain retries it. An operator with a large approved backlog raises
+        // refund_limits.max_sends_per_hour (up to the compiled ceiling of 100/hr) rather
+        // than waiting it out.
+        console.log(`  [refund] ⏸  ${jobId.substring(0, 8)}: ${_gate.reason} — deferring to the next drain`);
+        return false;
       }
+      // Terminal. Preserve the historical differential: an allowlist block DROPS the
+      // entry (it will never pass), a rate/value block KEEPS it for operator review.
+      if (_gate.checks.counterparty === 'fail') {
+        console.error(`  [refund] ❌ BLOCKED: Refund address ${untrusted(buyerAddress, 60)} not in allowlist — skipping refund for ${jobId.substring(0, 8)}`);
+        return true;
+      }
+      console.error(`  [refund] ⛔ ${jobId.substring(0, 8)}: BLOCKED — ${_gate.reason}. Nothing was sent.`);
+      console.error('  [refund]    A human must review this before it can be paid (it will not retry on its own).');
+      console.error(`  [refund]    Inspect it, then drop it with:  j41-dispatcher refunds reject ${jobId}`);
       return false;
     }
 
@@ -7226,8 +7323,9 @@ async function attemptPendingRefund(state, jobId, entry, ledgerPath = PENDING_RE
     markJobRefunded(jobId);
     clearRefundInflight(jobId); // the send is now recorded; intent resolved
     // Count it AFTER the broadcast, not before: a send that failed to build never
-    // left the host and must not consume the buyer's hourly budget.
-    recordDispatcherSend(jobId, refundAmount);
+    // left the host and must not consume the buyer's hourly budget. recordSendOutcome
+    // both counts against the limiter and (P3) appends the broadcast-outcome ledger line.
+    recordSendOutcome({ kind: 'refund', jobId, toAddress: buyerAddress, amount: refundAmount, txid });
     console.log(`  [refund] ✅ Refund TX: ${txid}`);
 
     // Persist txid to the ledger BEFORE the platform call that follows, so a crash
@@ -8231,9 +8329,61 @@ async function pollForJobs(state) {
             const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
             const fullJob = await agent.client.getJob(job.id);
             if (fullJob?.jobHash && fullJob?.buyerVerusId) {
-              if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
-                console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${job.id.substring(0, 8)}, buyer not charged`);
-                state.emitEvent?.('job.declined_llm_down', { jobId: job.id, agentId: agentInfo.id });
+              const _rentalSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
+              if (!isGpuRentalJob(fullJob, _rentalSvcs) && !(_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
+                if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
+                  console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${job.id.substring(0, 8)}, buyer not charged`);
+                  state.emitEvent?.('job.declined_llm_down', { jobId: job.id, agentId: agentInfo.id });
+                  continue;
+                }
+              }
+              if (!state._inviteHeld) state._inviteHeld = new Set();
+              const agentCfg = loadAgentConfig(agentInfo.id);
+              let inspect;
+              try {
+                const raw = await agent.client.getIdentityRaw(agentInfo.iAddress || agentInfo.identity);
+                inspect = inspectChainSalesStatus(raw && (raw.data || raw));
+              } catch {
+                inspect = { status: null, present: false, unparseable: false, unread: true };
+              }
+              const statusHold = inspect.unread ? 'status unread' : (inspect.unparseable ? 'status unparseable' : null);
+              if (statusHold) {
+                const holdKey = `${statusHold}:${agentInfo.id}`;
+                if (!state._inviteHeld.has(holdKey)) {
+                  state._inviteHeld.add(holdKey);
+                  console.warn(`[INVITE] ${agentInfo.id} on-chain ${statusHold} — holding jobs`);
+                }
+                continue;
+              }
+              const chainStatus = inspect.status;
+              const prefer = agentCfg.preferAllowlist === true;
+              const allowlist = loadBuyerAllowlist(agentCfg);
+              const resolved = await resolveAllowlistEntries(
+                allowlist,
+                (id) => agent.client.getIdentityKeys(id).then(k => ({ identityaddress: k.iaddress, iAddress: k.iaddress, iaddress: k.iaddress })),
+                (id) => agent.client.getAgent(id),
+              );
+              const decision = decideAutoAccept({
+                chainStatus,
+                allowlist: [...allowlist, ...resolved],
+                preferAllowlist: prefer,
+                buyerVerusId: fullJob.buyerVerusId,
+                names: buyerNamesFromJob(fullJob),
+                resolved: [],
+                hasAllowlistedSibling: hasAllowlistedRequestedSibling(jobs, job.id, [...allowlist, ...resolved]),
+              });
+              if (decision.action !== 'accept') {
+                if (decision.reason === 'empty allowlist') {
+                  const emptyKey = `empty:${agentInfo.id}`;
+                  if (!state._inviteHeld.has(emptyKey)) {
+                    state._inviteHeld.add(emptyKey);
+                    console.log(`[INVITE] ${agentInfo.id} is invite-only with an empty allowlist — accepting nobody`);
+                  }
+                } else if (!state._inviteHeld.has(job.id)) {
+                  state._inviteHeld.add(job.id);
+                  const verb = decision.action === 'defer' ? 'deferring' : 'holding';
+                  console.log(`[INVITE] ${verb} job ${String(job.id).substring(0, 8)} for ${agentInfo.id} (${decision.reason})`);
+                }
                 continue;
               }
               const timestamp = Math.floor(Date.now() / 1000);
@@ -8297,7 +8447,7 @@ async function pollForJobs(state) {
           queueInsertByPriority(state.queue, { ...job, assignedAgent: agentInfo });
         } else {
           console.log(`   → Starting job with ${agentInfo.id} (${RUNTIME})`);
-          await startJob(state, job, agentInfo);
+          await startJobOrRental(state, job, agentInfo);
         }
       }
     } catch (e) {
@@ -8498,7 +8648,7 @@ async function pollForJobs(state) {
     const agent = state.available.pop();
     console.log(`   → Processing queued job ${queuedJob.id} with ${agent.id}`);
     try {
-      await startJob(state, queuedJob, agent);
+      await startJobOrRental(state, queuedJob, agent);
     } catch (e) {
       console.error(`   ❌ Failed to start job ${queuedJob.id}: ${e.message}`);
       // Return agent to pool and re-queue the job at the back
@@ -8552,9 +8702,62 @@ async function handleWebhookEvent(state, agentId, payload) {
         const agent = await getAgentSession(state, agentInfo);
         const fullJob = await agent.client.getJob(jobId);
         if (fullJob?.jobHash && fullJob?.buyerVerusId) {
-          if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
-            console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${jobId.substring(0, 8)}, buyer not charged`);
-            state.emitEvent?.('job.declined_llm_down', { jobId, agentId: agentInfo.id });
+          const _rentalSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
+          if (!isGpuRentalJob(fullJob, _rentalSvcs) && !(_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
+            if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
+              console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${jobId.substring(0, 8)}, buyer not charged`);
+              state.emitEvent?.('job.declined_llm_down', { jobId, agentId: agentInfo.id });
+              return;
+            }
+          }
+          if (!state._inviteHeld) state._inviteHeld = new Set();
+          const agentCfg = loadAgentConfig(agentInfo.id);
+          let inspect;
+          try {
+            const raw = await agent.client.getIdentityRaw(agentInfo.iAddress || agentInfo.identity);
+            inspect = inspectChainSalesStatus(raw && (raw.data || raw));
+          } catch {
+            inspect = { status: null, present: false, unparseable: false, unread: true };
+          }
+          const statusHold = inspect.unread ? 'status unread' : (inspect.unparseable ? 'status unparseable' : null);
+          if (statusHold) {
+            const holdKey = `${statusHold}:${agentInfo.id}`;
+            if (!state._inviteHeld.has(holdKey)) {
+              state._inviteHeld.add(holdKey);
+              console.warn(`[INVITE] ${agentInfo.id} on-chain ${statusHold} — holding jobs`);
+            }
+            return;
+          }
+          const chainStatus = inspect.status;
+          const prefer = agentCfg.preferAllowlist === true;
+          const allowlist = loadBuyerAllowlist(agentCfg);
+          const resolved = await resolveAllowlistEntries(
+            allowlist,
+            (id) => agent.client.getIdentityKeys(id).then(k => ({ identityaddress: k.iaddress, iAddress: k.iaddress, iaddress: k.iaddress })),
+            (id) => agent.client.getAgent(id),
+          );
+          const decision = decideAutoAccept({
+            chainStatus,
+            allowlist: [...allowlist, ...resolved],
+            preferAllowlist: prefer,
+            buyerVerusId: fullJob.buyerVerusId,
+            names: buyerNamesFromJob(fullJob),
+            resolved: [],
+            // webhook: unknown siblings → defer unmatched strangers to poll
+            hasAllowlistedSibling: prefer,
+          });
+          if (decision.action !== 'accept') {
+            if (decision.reason === 'empty allowlist') {
+              const emptyKey = `empty:${agentInfo.id}`;
+              if (!state._inviteHeld.has(emptyKey)) {
+                state._inviteHeld.add(emptyKey);
+                console.log(`[INVITE] ${agentInfo.id} is invite-only with an empty allowlist — accepting nobody`);
+              }
+            } else if (!state._inviteHeld.has(jobId)) {
+              state._inviteHeld.add(jobId);
+              const verb = decision.action === 'defer' ? 'deferring' : 'holding';
+              console.log(`[INVITE] ${verb} job ${String(jobId).substring(0, 8)} for ${agentInfo.id} (${decision.reason})`);
+            }
             return;
           }
           const timestamp = Math.floor(Date.now() / 1000);
@@ -8585,6 +8788,11 @@ async function handleWebhookEvent(state, agentId, payload) {
           console.log(`[Webhook] Job ${jobId.substring(0, 8)} queued (priority, ${job.amount || '?'} ${job.currency || NATIVE_COIN})`);
         } else {
           console.log(`[Webhook] Starting job ${jobId.substring(0, 8)} with ${agentInfo.id}`);
+          const _rentalSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
+          if (isGpuRentalJob(job, _rentalSvcs) || (_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
+            await startRentalJobWired(state, job, agentInfo);
+            break;
+          }
           await startJob(state, job, agentInfo);
         }
       } catch (e) {
@@ -8633,7 +8841,10 @@ async function handleWebhookEvent(state, agentId, payload) {
         // default 'errors' retention (deterministic + symmetric with local).
         const cancelActive = state.active.get(jobId);
         if (cancelActive) cancelActive._killed = true;
-        if (RUNTIME === 'docker') {
+        if (cancelActive && cancelActive.kind === 'gpu-rental') {
+          await stopRentalJob(state, jobId);
+          removeActiveJobFromAllowlist(jobId);
+        } else if (RUNTIME === 'docker') {
           await stopJobContainer(state, jobId);
         } else {
           await stopJobLocal(state, jobId);
@@ -8858,7 +9069,12 @@ async function handleWebhookEvent(state, agentId, payload) {
             // every bounty-awarded job was accepted, signed and allowlisted and then
             // never started: agent-1..9 fail isValidJobId's 8-char floor and silently
             // early-return, agent-10+ throw on undefined.
-            await startJob(state, fullJob, agentInfo);
+            const _rentalSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
+            if (isGpuRentalJob(fullJob, _rentalSvcs) || (_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
+              console.log(`[Webhook] Bounty job ${bountyJobId.substring(0, 8)} is gpu-rental — skipping startJob (bounties are LLM-only)`);
+            } else {
+              await startJob(state, fullJob, agentInfo);
+            }
           } catch (startErr) {
             console.error(`[Webhook] Bounty job start failed: ${startErr.message}`);
           }
@@ -8890,6 +9106,33 @@ async function handleWebhookEvent(state, agentId, payload) {
     case 'job.extension_rejected': {
       console.log(`[Webhook] ❌ Extension rejected for job ${jobId?.substring(0, 8)}`);
       // Job-agent continues with remaining budget
+      break;
+    }
+
+    case 'proxy.access_revoked': {
+      // Platform DELETE /v1/me/api-access/:grantId emits this on the seller's
+      // registered webhook URL. The dedicated POST /j41/api-access/revoke route
+      // is never called from J41 — without this case the minted proxy key
+      // stays live after the buyer revoked.
+      const buyerVerusId = data?.buyerVerusId;
+      if (!buyerVerusId) {
+        console.error('[Webhook] proxy.access_revoked missing buyerVerusId — ignoring');
+        break;
+      }
+      const revoke = state.proxyContext?.onApiAccessRevoke;
+      if (typeof revoke !== 'function') {
+        console.warn(`[Webhook] proxy.access_revoked for ${agentInfo.id} — no proxy context (no api-endpoint agents)`);
+        break;
+      }
+      try {
+        const result = await revoke({
+          sellerVerusId: agentInfo.iAddress || agentInfo.identity,
+          buyerVerusId,
+        });
+        console.log(`[Webhook] API access revoked for buyer ${untrusted(buyerVerusId, 60)} on ${agentInfo.id}: ${result?.revoked ?? 0} key(s)`);
+      } catch (e) {
+        console.error(`[Webhook] API access revoke failed: ${e.message}`);
+      }
       break;
     }
 
@@ -9291,6 +9534,7 @@ async function checkFeeTanks(state) {
         });
 
         if (res.swept) {
+          recordSendOutcome({ kind: 'fee_sweep', jobId: agentInfo.id, toAddress: rAddress, amountSats: plan.amountSats, txid: res.txid });
           state._feeSweepPending.set(agentInfo.id, { txid: res.txid, at: now });
           const after = writesAffordable(s.feeSats + plan.amountSats);
           console.log(`[FeeTank] ✅ ${agentInfo.id}: swept in ${res.txid.substring(0, 12)} — ~${after} writes once confirmed`);
@@ -9705,26 +9949,6 @@ function isGvisorAvailable() {
   }
 }
 
-let _storageOptSupported = null;
-function supportsStorageOpt() {
-  if (_storageOptSupported !== null) return _storageOptSupported;
-  try {
-    const driver = require('child_process').execSync(
-      'docker info --format "{{.Driver}}"',
-      { encoding: 'utf8', timeout: 5000 }
-    ).trim();
-    if (driver !== 'overlay2') { _storageOptSupported = false; return false; }
-    require('child_process').execSync(
-      `mount | grep pquota`,
-      { encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }
-    );
-    _storageOptSupported = true;
-  } catch {
-    _storageOptSupported = false;
-  }
-  return _storageOptSupported;
-}
-
 // Returns a write(text) fn that appends to logStream but never lets the file
 // exceed maxBytes; emits a single truncation notice when the cap is first hit.
 function makeCappedLogWriter(logStream, maxBytes) {
@@ -9928,6 +10152,7 @@ async function startJobContainer(state, job, agentInfo) {
     // M1: build HostConfig as a variable so we can patch CapDrop after the
     // bwrap spread (which returns CapDrop:[] + CapAdd:['SYS_ADMIN'] and would
     // otherwise silently wipe the 'ALL' drop).
+    const { supportsStorageOpt } = require('./docker-host');
     const hostConfig = {
       Binds: [
         // job dir must be writable for attestation artifacts (creation/deletion json)
@@ -10230,6 +10455,11 @@ function pruneExtensionChecks(state, jobId) {
 async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   const active = state.active.get(jobId);
   if (!active) return;
+  if (active.kind === 'gpu-rental') {
+    await stopRentalJob(state, jobId, { skipReturnAgent });
+    removeActiveJobFromAllowlist(jobId);
+    return;
+  }
   if (active._stopping) return;
   active._stopping = true;
 
@@ -10533,6 +10763,11 @@ async function startJobLocal(state, job, agentInfo) {
 async function stopJobLocal(state, jobId, skipReturnAgent = false) {
   const active = state.active.get(jobId);
   if (!active) return;
+  if (active.kind === 'gpu-rental') {
+    await stopRentalJob(state, jobId, { skipReturnAgent });
+    removeActiveJobFromAllowlist(jobId);
+    return;
+  }
   if (active._stopping) return;
   active._stopping = true;
 
@@ -10615,6 +10850,37 @@ async function startJob(state, job, agentInfo) {
   }
 }
 
+async function startRentalJobWired(state, job, agentInfo) {
+  const cfgNow = loadDispatcherConfig();
+  const { provider, providerName } = resolveRentalProvider(cfgNow, agentInfo.id);
+  const controller = await ensureComputeController(state, cfgNow);
+  const agent = await getAgentSession(state, agentInfo);
+  const { createLocalSigner } = require('./job-signer');
+  const signer = createLocalSigner({ wif: agentInfo.wif, network: J41_NETWORK });
+  const agentCfg = loadAgentConfig(agentInfo.id);
+  await startRentalJob({
+    state,
+    job,
+    agentInfo,
+    controller,
+    provider,
+    providerName,
+    client: agent.client,
+    signDeliver: ({ hash }) => signer.signDeliver({ jobHash: job.jobHash, deliveryHash: hash }),
+    ackPostpayVastRisk: !!(agentCfg && agentCfg.rentalAckPostpayVastRisk),
+    now: Date.now(),
+  });
+}
+
+async function startJobOrRental(state, job, agentInfo) {
+  const services = servicesForAgent(state, agentInfo, loadAgentConfig);
+  if (isGpuRentalJob(job, services) || (services || []).some((s) => s && s.serviceType === 'gpu-rental')) {
+    await startRentalJobWired(state, job, agentInfo);
+    return;
+  }
+  await startJob(state, job, agentInfo);
+}
+
 // Cleanup completed jobs — includes retry logic (F-14)
 async function cleanupCompletedJobs(state) {
   // C2/S9 — this runs on a bare 10s setInterval, and 2.23.0's L2 fix put
@@ -10638,6 +10904,18 @@ async function cleanupCompletedJobs(state) {
 
 async function _cleanupCompletedJobs(state) {
   for (const [jobId, active] of state.active) {
+    if (active && active.kind === 'gpu-rental') {
+      let job = null;
+      try {
+        const session = await getAgentSession(state, active.agentInfo);
+        job = await session.client.getJob(jobId);
+      } catch { /* fall through to lease expiry / gone */ }
+      if (shouldTeardownRental({ state, jobId, active, job })) {
+        await stopRentalJob(state, jobId);
+        removeActiveJobFromAllowlist(jobId);
+      }
+      continue;
+    }
     if (RUNTIME === 'local') {
       // Local mode: check if child process exited
       if (active.process && active.process.exitCode !== null) {
@@ -10918,7 +11196,7 @@ program
 // ── Control Plane Client ──
 program
   .command('ctl <command>')
-  .description('Send command to running dispatcher: status, jobs, agents, resources, earnings, history, providers, inbox, inbox-redrive, deposits, shutdown, canary')
+  .description('Send command to running dispatcher: status, jobs, agents, resources, earnings, history, providers, inbox, inbox-redrive, deposits, leases, shutdown, canary')
   .option('--agent <id>', 'Agent ID (for canary command)')
   .option('--item <id>', 'Inbox item ID (for inbox-redrive)')
   .option('--all', 'inbox-redrive: redrive EVERY dead letter (destructive — hands fresh budgets to poisoned items)')
@@ -11044,6 +11322,21 @@ program
             console.log(`Available: ${(result.available || []).join(', ')}\n`);
           }
           break;
+
+        case 'leases': {
+          const leases = result.leases || [];
+          if (leases.length === 0) {
+            console.log('\nNo compute leases ([compute] disabled or none active).\n');
+          } else {
+            console.log(`\nCompute leases (${leases.length}):\n`);
+            for (const l of leases) {
+              const gpu = l.gpu?.name ? `${l.gpu.name}${l.gpu.count > 1 ? `×${l.gpu.count}` : ''}` : '?';
+              console.log(`  ${l.id.padEnd(20)} ${String(l.state).padEnd(9)} ${gpu.padEnd(14)} $${l.usdPerHour}/h  → ${l.baseUrl || '(no upstream)'}${l.private ? '  [private]' : ''}`);
+            }
+            console.log('');
+          }
+          break;
+        }
 
         case 'earnings':
           console.log('\n╔══════════════════════════════════════════╗');
@@ -11247,16 +11540,21 @@ async function mainMenu() {
       return;
     }
 
-    const name = await ask('  Identity name (without .agentplatform@): ');
+    const kindRaw = await ask('  Kind (agent | compute | data | model) [agent]: ');
+    const kind = parseListingKind(kindRaw || 'agent');
+    if (!kind) { console.error('  Kind must be agent, compute, or data\n'); return; }
+    const name = await ask(`  Identity name (without parent — becomes ${advertisedIdentity('<name>', kind)}): `);
     if (!name) return;
 
-    console.log(`  Registering ${name}.agentplatform@... (this may take several minutes)`);
+    const preview = advertisedIdentity(name, kind);
+    console.log(`  Registering ${preview} (kind=${kind})... (this may take several minutes)`);
     try {
       const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
       const a = new J41Agent({ apiUrl: J41_API_URL, wif: keys.wif });
-      const result = await a.register(name, J41_NETWORK);
+      const result = await a.register(name, J41_NETWORK, { kind });
       keys.identity = result.identity;
       keys.iAddress = result.iAddress;
+      keys.kind = result.kind || kind;
       writeKeysFile(keysPath, keys);
       console.log(`  Done: ${result.identity} (${result.iAddress})\n`);
     } catch (e) {
@@ -12136,6 +12434,7 @@ async function walletSweepOne(state, agentInfo, opts = {}) {
 
     out.swept = true;
     out.txid = res.txid;
+    recordSendOutcome({ kind: 'fee_sweep', jobId: id, toAddress: rAddress, amountSats: plan.amountSats, txid: res.txid });
     try {
       saveWalletPending(id, { txid: res.txid, at: Date.now(), kind: 'sweep' });
     } catch (e) {
@@ -12406,6 +12705,9 @@ async function walletSend(state, fromId, toId, amountStr, opts = {}) {
 
   out.sent = true;
   out.txid = res.txid;
+  // Ledger the self-directed transfer (P4). No suspension/allowlist gate — it moves
+  // only to a fleet agent's own R-address; the advisory absolute cap warns, never blocks.
+  recordSendOutcome({ kind: 'fleet_transfer', jobId: null, toAddress: to.address, amountSats: plan.sendSats, txid: res.txid });
   try {
     saveWalletPending(from.id, { txid: res.txid, at: Date.now(), kind: 'send' });
   } catch (e) {
@@ -12931,7 +13233,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState, untrusted, untrustedField, requireInteractiveConfirm, printFundingInstructions, jobImageExists, JOB_IMAGE, NATIVE_COIN,
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, shouldWriteChainActiveOnActivate, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState, untrusted, untrustedField, requireInteractiveConfirm, printFundingInstructions, handleWebhookEvent, stopJobContainer, stopJobLocal, _cleanupCompletedJobs, jobImageExists, JOB_IMAGE, jailImageExists, JAIL_IMAGE, NATIVE_COIN,
     // Execution-harness seam: `program` so a test can drive the REAL `start`
     // action through commander, and `__getState` so it can then assert on what
     // that action actually did. See test/helpers/dispatcher-harness.js.

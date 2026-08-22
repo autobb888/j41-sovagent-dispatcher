@@ -1,0 +1,135 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const path = require('path');
+const { assertRentalEligibleAgent } = require('../src/rental-job');
+
+// Extracted setup-time checks live next to the command. Prefer a small
+// src/rental-setup.js so cli.js stays glue.
+const { assertRentalSetupAllowed } = require('../src/rental-setup');
+
+test('rental-setup refuses api-endpoint mix', () => {
+  assert.throws(() => assertRentalEligibleAgent([{ serviceType: 'api-endpoint' }]), /RENTAL_SLOT_CONFLICT/);
+});
+
+test('rental-setup refuses when [compute] enabled=false', () => {
+  const cfg = { compute: { enabled: false, providers: { card0: { type: 'home-gpu', agent_id: 'gpu-1', ssh_hostname: 'gpu.example.com', ssh_tunnel_port: 2222, memory_mb: 8192, disk_gb: 40 } } } };
+  assert.throws(() => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay' }), /RENTAL_COMPUTE_DISABLED/);
+});
+
+test('rental-setup refuses home-gpu without ssh_tunnel_port or memory_mb', () => {
+  const base = { type: 'home-gpu', agent_id: 'gpu-1', ssh_hostname: 'gpu.example.com' };
+  const on = (p) => ({ compute: { enabled: true, providers: { card0: p } } });
+  assert.throws(() => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg: on({ ...base, memory_mb: 8192, disk_gb: 40 }), services: [], paymentTerms: 'prepay' }), /HOME_GPU_NO_TUNNEL/);
+  assert.throws(() => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg: on({ ...base, ssh_tunnel_port: 2222, disk_gb: 40 }), services: [], paymentTerms: 'prepay' }), /HOME_GPU_NO_RAM/);
+});
+
+test('rental-setup fails closed without a TCP-tunnel hostname on home-gpu', () => {
+  const cfg = { compute: { enabled: true, providers: { card0: { type: 'home-gpu', agent_id: 'gpu-1' } } } };
+  assert.throws(() => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay' }), /HOME_GPU_NO_TUNNEL/);
+});
+
+test('rental-setup refuses local provider (canSsh false)', () => {
+  const cfg = { compute: { enabled: true, providers: { w: { type: 'local', agent_id: 'gpu-1', base_url: 'http://127.0.0.1:8000/v1' } } } };
+  assert.throws(() => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay' }), /RENTAL_NO_SSH/);
+});
+
+test('vast + postpay without ack fails closed', () => {
+  const cfg = { compute: { enabled: true, max_usd_per_hour: 1, providers: { cloud: { type: 'vast', agent_id: 'gpu-1', api_key: 'k' } } } };
+  assert.throws(
+    () => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg, services: [], paymentTerms: 'postpay', ackPostpayVastRisk: false }),
+    /VAST_POSTPAY_UNACKED/,
+  );
+});
+
+test('vast + postpay with ack is allowed (disclosed Alice risk)', () => {
+  const cfg = { compute: { enabled: true, max_usd_per_hour: 1, providers: { cloud: { type: 'vast', agent_id: 'gpu-1', api_key: 'k' } } } };
+  assert.doesNotThrow(() => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg, services: [], paymentTerms: 'postpay', ackPostpayVastRisk: true }));
+});
+
+const {
+  rentalServiceDescription,
+  applyRentalAgentConfig,
+  slotServicesFromAgentConfig,
+} = require('../src/rental-setup');
+
+test('rental-setup fails closed without a provider bound to this agent', () => {
+  const cfg = { compute: { enabled: true, providers: {} } };
+  assert.throws(
+    () => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay' }),
+    /RENTAL_NO_PROVIDER/,
+  );
+});
+
+test('rentalServiceDescription is all-or-nothing and discloses Vast postpay risk only when acked', () => {
+  const d = rentalServiceDescription({ jobTimeoutMin: 60, paymentTerms: 'prepay' });
+  assert.match(d, /all-or-nothing/);
+  assert.match(d, /60 minutes/);
+  assert.equal(/Vast/i.test(d), false);
+  const v = rentalServiceDescription({ jobTimeoutMin: 45, paymentTerms: 'postpay', vastPostpayAck: true });
+  assert.match(v, /45 minutes/);
+  assert.match(v, /Vast\.ai/);
+});
+
+test('applyRentalAgentConfig persists rentalAckPostpayVastRisk when the ack flag is passed', () => {
+  const patched = applyRentalAgentConfig({ foo: 1 }, { ackPostpayVastRisk: true });
+  assert.equal(patched.rental, true);
+  assert.equal(patched.serviceType, 'gpu-rental');
+  assert.equal(patched.rentalAckPostpayVastRisk, true);
+  assert.equal(patched.foo, 1);
+  const noAck = applyRentalAgentConfig({}, { ackPostpayVastRisk: false });
+  assert.equal(noAck.rentalAckPostpayVastRisk, undefined);
+});
+
+test('slotServicesFromAgentConfig reconstructs the slot-guard input', () => {
+  assert.deepEqual(slotServicesFromAgentConfig({ serviceType: 'gpu-rental' }), [{ serviceType: 'gpu-rental' }]);
+  assert.deepEqual(slotServicesFromAgentConfig({ rental: true }), [{ serviceType: 'gpu-rental' }]);
+  assert.deepEqual(slotServicesFromAgentConfig({ apiEndpointUrl: 'http://127.0.0.1:11434/v1' }), [{ serviceType: 'api-endpoint' }]);
+  assert.deepEqual(slotServicesFromAgentConfig({}), []);
+});
+
+test('cli.js registers rental-setup and wires the reverse api-setup guard', () => {
+  const cli = fs.readFileSync(path.join(__dirname, '..', 'src', 'cli.js'), 'utf8');
+  const setupSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'rental-setup.js'), 'utf8');
+  assert.match(cli, /\.command\('rental-setup <agent-id>'\)/);
+  assert.match(cli, /serviceType:\s*'gpu-rental'/);
+  assert.match(cli, /--ack-postpay-vast-risk/);
+  assert.match(setupSrc, /rentalAckPostpayVastRisk/);
+  const apiStart = cli.indexOf(".command('api-setup <agent-id>')");
+  const apiEnd = cli.indexOf('\n  .command(', apiStart + 1);
+  const apiBlock = cli.slice(apiStart, apiEnd === -1 ? apiStart + 4000 : apiEnd);
+  assert.match(apiBlock, /assertApiEligibleAgent/);
+});
+
+test('compute signup copy no longer points at api-endpoint', () => {
+  const cli = fs.readFileSync(require('path').join(__dirname, '../src/cli.js'), 'utf8');
+  const dash = fs.readFileSync(require('path').join(__dirname, '../src/dashboard.js'), 'utf8');
+  // the compute branch (kind === 'compute') must mention rental-setup, not api-endpoint
+  assert.match(cli, /rental-setup/);
+  assert.match(dash, /rental-setup/);
+});
+
+test('rental-setup home-gpu host preflight refuses when injected host cannot cap disk', () => {
+  const cfg = { compute: { enabled: true, providers: { card0: {
+    type: 'home-gpu', agent_id: 'gpu-1', ssh_hostname: 'gpu.example.com',
+    ssh_tunnel_port: 2222, memory_mb: 8192, disk_gb: 40,
+  } } } };
+  assert.throws(
+    () => assertRentalSetupAllowed({
+      agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay',
+      host: {
+        execSync: () => { throw new Error('no pquota'); },
+        imageExists: () => true,
+        supportsStorageOpt: () => false,
+      },
+    }),
+    /HOME_GPU_NO_DISK_QUOTA/,
+  );
+});
+
+test('rental-setup does not silently skip host preflight in production NODE_ENV', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'rental-setup.js'), 'utf8');
+  assert.match(src, /assertHomeGpuHostReady/);
+  assert.match(src, /host \|\| \(process\.env\.NODE_ENV === 'test' \? null : \{\}\)/);
+});

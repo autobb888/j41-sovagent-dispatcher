@@ -275,3 +275,10 @@ test('explicit J41_PLATFORM_SIGNER env wins over [platform] signer', withTmpHome
     delete process.env.J41_PLATFORM_SIGNER;
   }
 }));
+
+// ── P6: spend-policy approval mode is formalized (default = always) ──
+test('spend_policy.approval defaults to "always" (every external send is owner-approved)', withTmpHome(async () => {
+  const { loadDispatcherConfig } = require('../src/config-loader.js');
+  const cfg = loadDispatcherConfig({ skipMigration: true });
+  assert.strictEqual(cfg.spend_policy.approval, 'always');
+}));

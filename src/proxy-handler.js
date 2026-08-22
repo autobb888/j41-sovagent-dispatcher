@@ -183,8 +183,11 @@ function isPrivateIp(ip) {
  * When the hostname is already a bare IP literal we skip dns.lookup and
  * return the literal as resolvedIp.
  */
-async function checkUpstreamHostSafe(hostname, cfg) {
-  if (cfg.runtime.allow_local_upstream) return { safe: true, resolvedIp: null };
+async function checkUpstreamHostSafe(hostname, cfg, allowPrivate = false) {
+  // allowPrivate is a PER-LEASE allowance (compute-supply sets config.allowPrivate on
+  // a home-GPU lease) — it opens the guard for this one upstream WITHOUT the global
+  // runtime.allow_local_upstream, which would disarm SSRF protection fleet-wide.
+  if (cfg.runtime.allow_local_upstream || allowPrivate) return { safe: true, resolvedIp: null };
   const lc = hostname.toLowerCase();
   if (lc === 'localhost' || lc.endsWith('.localhost') || lc.endsWith('.local') || lc.endsWith('.internal')) {
     return { safe: false, reason: `hostname "${hostname}" is a local/internal name` };
@@ -397,7 +400,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   }
 
   // SSRF hardening: block private IPs unless J41_ALLOW_LOCAL_UPSTREAM=1 (dev)
-  const safety = await checkUpstreamHostSafe(upstreamUrl.hostname, cfg);
+  const safety = await checkUpstreamHostSafe(upstreamUrl.hostname, cfg, config.allowPrivate === true);
   if (!safety.safe) {
     refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
     releaseOnce();
@@ -723,4 +726,4 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   proxyReq.end();
 }
 
-module.exports = { handleProxyRequest, maybeNotifyCreditLow, resolveCreditLowThreshold, isPrivateIp };
+module.exports = { handleProxyRequest, maybeNotifyCreditLow, resolveCreditLowThreshold, isPrivateIp, checkUpstreamHostSafe };

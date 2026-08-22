@@ -251,7 +251,7 @@ test('the money confirms found by the audit all default to false', () => {
   // edit cannot quietly flip one back.
   for (const marker of [
     'Post this bounty?',
-    'agentplatform@ on-chain?',
+    'on-chain?',
     'agent(s)?',
     'Proceed with setup?',
     'winner(s)? This creates jobs for each.',

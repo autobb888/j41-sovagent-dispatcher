@@ -108,10 +108,9 @@
   resolved "https://registry.yarnpkg.com/@junction41/secure-setup/-/secure-setup-0.3.0.tgz#3c7ddd9601ae3ec4a7c032b75ff6421ca0c613c1"
   integrity sha512-M3bX0lxx5gg0PIsVYUH98cK8sdQcfbqzXm8kgEs8t+Z/st7glNbRqfVtiXEGDvurUGkgiJEs3x9its+JIG1syQ==
 
-"@junction41/sovagent-sdk@2.14.2":
-  version "2.14.2"
-  resolved "https://registry.yarnpkg.com/@junction41/sovagent-sdk/-/sovagent-sdk-2.14.2.tgz#418daa8b801032b554f0963dd8083e5812de3aef"
-  integrity sha512-vB5TV7penIfpJh9rqPM3/hRleWIO/sDtHgXD89wJ3xcOFpwT36CvJ5JtJjhQTf3Lap3lrr2QyreY47izsQBU1A==
+"@junction41/sovagent-sdk@github:autobb888/j41-sovagent-sdk#main":
+  version "2.16.0"
+  resolved "https://codeload.github.com/autobb888/j41-sovagent-sdk/tar.gz/1837944d32c0232dc573a6bfb7fe23bfd50dc377"
   dependencies:
     "@bitgo/utxo-lib" "github:VerusCoin/BitGoJS#5e82f4fda2975ca1af7f2b01590093b4a1439dc9"
     bn.js "^5.2.0"
@@ -241,9 +240,9 @@ available-typed-arrays@^1.0.7:
     possible-typed-array-names "^1.0.0"
 
 b4a@^1.0.1:
-  version "1.8.0"
-  resolved "https://registry.yarnpkg.com/b4a/-/b4a-1.8.0.tgz#1ca3ba0edc9469aaabef5647e769a83d50180b1a"
-  integrity sha512-qRuSmNSkGQaHwNbM7J78Wwy+ghLEYF1zNrSeMxj4Kgw6y33O3mXcQ6Ie9fRvfU/YnxWkOchPXbaLb73TkIsfdg==
+  version "1.8.1"
+  resolved "https://registry.yarnpkg.com/b4a/-/b4a-1.8.1.tgz#7f16334ca80127aeb26064a28841acbf174840a4"
+  integrity sha512-aiqre1Nr0B/6DgE2N5vwTc+2/oQZ4Wh1t4NznYY4E00y8LCt6NqdRv81so00oo27D8MVKTpUa/MwUUtBLXCoDw==
 
 base-x@^1.1.0:
   version "1.1.0"
@@ -311,7 +310,12 @@ bip66@1.1.0:
   resolved "https://registry.yarnpkg.com/bip66/-/bip66-1.1.0.tgz#c5551d49d1696d78211be047e997fe7aac8820c5"
   integrity sha512-dBoAPJYg6HaaQeJGr4cNiqat1meGzlrv2qX+EJcW5q0zEdryMSLKlQKdTaCtDnrzEUPkwmlYqsD7ANaye4BEfg==
 
-bitcoin-ops@^1.3.0, "bitcoin-ops@git+https://github.com/VerusCoin/bitcoin-ops":
+bitcoin-ops@^1.3.0:
+  version "1.4.1"
+  resolved "https://registry.yarnpkg.com/bitcoin-ops/-/bitcoin-ops-1.4.1.tgz#e45de620398e22fd4ca6023de43974ff42240278"
+  integrity sha512-pef6gxZFztEhaE9RY9HmWVmiIHqCb2OyS4HPKkpc6CIiiOa3Qmuoylxc5P2EkU3w+5eTSifI9SEZC88idAIGow==
+
+"bitcoin-ops@git+https://github.com/VerusCoin/bitcoin-ops":
   version "1.4.1"
   resolved "git+https://github.com/VerusCoin/bitcoin-ops#a5f8f56e658301bc39881d41740b3a0010530efd"
 
@@ -339,10 +343,15 @@ blake2b-wasm@^2.4.0:
     blake2b-wasm "^2.4.0"
     nanoassert "^2.0.0"
 
-bn.js@5.2.3, bn.js@^5.2.0:
+bn.js@5.2.3:
   version "5.2.3"
   resolved "https://registry.yarnpkg.com/bn.js/-/bn.js-5.2.3.tgz#16a9e409616b23fef3ccbedb8d42f13bff80295e"
   integrity sha512-EAcmnPkxpntVL+DS7bO1zhcZNvCkxqtkd0ZY53h06GNQ3DEkkGZ/gKgmDv6DdZQGj9BgfSPKtJJ7Dp1GPP8f7w==
+
+bn.js@^5.2.0:
+  version "5.2.5"
+  resolved "https://registry.yarnpkg.com/bn.js/-/bn.js-5.2.5.tgz#e81ce41cf25e6f0cd1e05f20a9db8c18405e375f"
+  integrity sha512-Vq886eXykuP5E6HcKSSStP3bJgrE6In5WKxVUvJ8XGpWWYs2xZHWqUwzCtGgEtBcxyd57KBFDPFoUfNzdaHCNg==
 
 bs58@^3.1.0:
   version "3.1.0"
@@ -396,7 +405,7 @@ buildcheck@~0.0.6:
   resolved "https://registry.yarnpkg.com/buildcheck/-/buildcheck-0.0.7.tgz#07a5e76c10ead8fa67d9e4c587b68f49e8f29d61"
   integrity sha512-lHblz4ahamxpTmnsk+MNTRWsjYKv965MwOrSJyeD588rR3Jcu7swE+0wN5F+PbL5cjgu/9ObkhfzEPuofEMwLA==
 
-call-bind-apply-helpers@^1.0.0, call-bind-apply-helpers@^1.0.1, call-bind-apply-helpers@^1.0.2:
+call-bind-apply-helpers@^1.0.1, call-bind-apply-helpers@^1.0.2:
   version "1.0.2"
   resolved "https://registry.yarnpkg.com/call-bind-apply-helpers/-/call-bind-apply-helpers-1.0.2.tgz#4b5428c222be985d79c3d82657479dbe0b59b2d6"
   integrity sha512-Sp1ablJ0ivDkSzjcaJdxEunN5/XvksFJ2sMBFfq6x0ryhQV/2b/KwFe21cMpmHtPOSij8K99/wSfoEuTObmuMQ==
@@ -404,14 +413,14 @@ call-bind-apply-helpers@^1.0.0, call-bind-apply-helpers@^1.0.1, call-bind-apply-
     es-errors "^1.3.0"
     function-bind "^1.1.2"
 
-call-bind@^1.0.8:
-  version "1.0.8"
-  resolved "https://registry.yarnpkg.com/call-bind/-/call-bind-1.0.8.tgz#0736a9660f537e3388826f440d5ec45f744eaa4c"
-  integrity sha512-oKlSFMcMwpUg2ednkhQ454wfWiU/ul3CkJe/PEHcTKuiX6RpbehUiFMXu13HalGZxfUwCQzZG747YXBn1im9ww==
+call-bind@^1.0.9:
+  version "1.0.9"
+  resolved "https://registry.yarnpkg.com/call-bind/-/call-bind-1.0.9.tgz#39a644700c80bc7d0ca9102fc6d1d43b2fd7eee7"
+  integrity sha512-a/hy+pNsFUTR+Iz8TCJvXudKVLAnz/DyeSUo10I5yvFDQJBFU2s9uqQpoSrJlroHUKoKqzg+epxyP9lqFdzfBQ==
   dependencies:
-    call-bind-apply-helpers "^1.0.0"
-    es-define-property "^1.0.0"
-    get-intrinsic "^1.2.4"
+    call-bind-apply-helpers "^1.0.2"
+    es-define-property "^1.0.1"
+    get-intrinsic "^1.3.0"
     set-function-length "^1.2.2"
 
 call-bound@^1.0.3, call-bound@^1.0.4:
@@ -631,14 +640,14 @@ end-of-stream@^1.1.0, end-of-stream@^1.4.1:
     once "^1.4.0"
 
 engine.io-client@~6.6.1:
-  version "6.6.4"
-  resolved "https://registry.yarnpkg.com/engine.io-client/-/engine.io-client-6.6.4.tgz#a04998787dd342b543eec5d4452da7bb540e7ff8"
-  integrity sha512-+kjUJnZGwzewFDw951CDWcwj35vMNf2fcj7xQWOctq1F2i1jkDdVvdFG9kM/BEChymCH36KgjnW0NsL58JYRxw==
+  version "6.6.6"
+  resolved "https://registry.yarnpkg.com/engine.io-client/-/engine.io-client-6.6.6.tgz#8a8f1e451b1f6d4acf413305445e42133d1cbe9a"
+  integrity sha512-iY6QdftLQ9pyiPoX082bpf/u1UewnOaJrtJIF9T0++QB34lZrj0uP+Q/bj8AlUsAxqhnkTV2BS8SBZSxOmoV5Q==
   dependencies:
     "@socket.io/component-emitter" "~3.1.0"
     debug "~4.4.1"
     engine.io-parser "~5.2.1"
-    ws "~8.18.3"
+    ws "~8.21.0"
     xmlhttprequest-ssl "~2.1.1"
 
 engine.io-parser@~5.2.1:
@@ -657,9 +666,9 @@ es-errors@^1.3.0:
   integrity sha512-Zf5H2Kxt2xjTvbJvP2ZWLEICxA6j+hAmMzIlypy4xcBg1vKVnx89Wy0GbS+kf5cwCVFFzdCFh2XSCFNULS6csw==
 
 es-object-atoms@^1.0.0, es-object-atoms@^1.1.1:
-  version "1.1.1"
-  resolved "https://registry.yarnpkg.com/es-object-atoms/-/es-object-atoms-1.1.1.tgz#1c4f2c4837327597ce69d2ca190a7fdd172338c1"
-  integrity sha512-FGgH2h8zKNim9ljj7dankFPcICIK9Cp5bm+c2gQSYePhpaG5+esrLODihIorn+Pe6FGJzWhXQotPv73jTaldXA==
+  version "1.1.2"
+  resolved "https://registry.yarnpkg.com/es-object-atoms/-/es-object-atoms-1.1.2.tgz#a2d0b373205724dfa525d23b0c3e1b1ca582c99b"
+  integrity sha512-HWcBoN6NileqtSydK2FqHbS/LoDd2pqrnQHLyJzBj4kOp/ky2MWMN694xOfkK8/SnUsW2DH7EfyVlydKCsm1Zw==
   dependencies:
     es-errors "^1.3.0"
 
@@ -754,9 +763,9 @@ hash-base@^3.0.0, hash-base@^3.1.2:
     to-buffer "^1.2.1"
 
 hasown@^2.0.2:
-  version "2.0.2"
-  resolved "https://registry.yarnpkg.com/hasown/-/hasown-2.0.2.tgz#003eaf91be7adc372e84ec59dc37252cedb80003"
-  integrity sha512-0hJU9SCPvmMzIBdZFqNPXWa6dqh7WdH0cII9y+CyS8rG3nL48Bclra9HmKhVVUHyPWNH5Y7xDwAB7bfgSjkUMQ==
+  version "2.0.4"
+  resolved "https://registry.yarnpkg.com/hasown/-/hasown-2.0.4.tgz#8c62d8cb90beb2aad5d0a5b67581ad9854c3f003"
+  integrity sha512-T2UbfbBEF32wiepXIsMlTW9+dDYC6wMh/t/vYA4tuOMKqWz/n3vr1NFSxQiyP+zk2mXsoMA/i/7qV6LKut1t1A==
   dependencies:
     function-bind "^1.1.2"
 
@@ -1258,7 +1267,7 @@ varuint-bitcoin@1.0.4:
 
 "verus-typescript-primitives@git+https://github.com/VerusCoin/verus-typescript-primitives.git":
   version "1.0.0"
-  resolved "git+https://github.com/VerusCoin/verus-typescript-primitives.git#38afb27212617866d3cb0945f6b63d08cfeb3da1"
+  resolved "git+https://github.com/VerusCoin/verus-typescript-primitives.git#30c951804228a285546a45457be57ead39d90888"
   dependencies:
     base64url "3.0.1"
     bech32 "2.0.0"
@@ -1286,12 +1295,12 @@ wcwidth@^1.0.1:
     defaults "^1.0.3"
 
 which-typed-array@^1.1.16:
-  version "1.1.20"
-  resolved "https://registry.yarnpkg.com/which-typed-array/-/which-typed-array-1.1.20.tgz#3fdb7adfafe0ea69157b1509f3a1cd892bd1d122"
-  integrity sha512-LYfpUkmqwl0h9A2HL09Mms427Q1RZWuOHsukfVcKRq9q95iQxdw0ix1JQrqbcDR9PH1QDwf5Qo8OZb5lksZ8Xg==
+  version "1.1.22"
+  resolved "https://registry.yarnpkg.com/which-typed-array/-/which-typed-array-1.1.22.tgz#8f3cc78aefb40b437346dd40a1dbfa5d1da43fe9"
+  integrity sha512-fvO4ExWMFsqyhG3AiPAObMuY1lxaqgYcxbc49CNdWDDECOJNgQyvsOWVwbZc+qf3rzRtxojBK+CMEv0Ld5CYpw==
   dependencies:
     available-typed-arrays "^1.0.7"
-    call-bind "^1.0.8"
+    call-bind "^1.0.9"
     call-bound "^1.0.4"
     for-each "^0.3.5"
     get-proto "^1.0.1"
@@ -1335,10 +1344,10 @@ wrappy@1:
   resolved "https://registry.yarnpkg.com/wrappy/-/wrappy-1.0.2.tgz#b5243d8f3ec1aa35f1364605bc0d1036e30ab69f"
   integrity sha512-l4Sp/DRseor9wL6EvV2+TuQn63dMkPjZ/sp9XkghTEbV9KlPS1xUsZ3u7/IQO4wxtcFB4bgpQPRcR3QCvezPcQ==
 
-ws@~8.18.3:
-  version "8.18.3"
-  resolved "https://registry.yarnpkg.com/ws/-/ws-8.18.3.tgz#b56b88abffde62791c639170400c93dcb0c95472"
-  integrity sha512-PEIGCY5tSlUt50cqyMXfCzX+oOPqN0vuGqWzbcJ2xvnkzkq46oOpz7dQaTDBdfICb4N14+GARUDw2XV2N4tvzg==
+ws@~8.21.0:
+  version "8.21.3"
+  resolved "https://registry.yarnpkg.com/ws/-/ws-8.21.3.tgz#660b4faddb6a3e575c86e078126919961f4de4fc"
+  integrity sha512-201TZ/kPWxoPr/OKWjquZR1SWKXcvxdH+e1xrx89b3YbmzLMFCLfnaG1HFIgWzJOEWZ7MvpK++odZufgYR50Rw==
 
 xmlhttprequest-ssl@~2.1.1:
   version "2.1.2"

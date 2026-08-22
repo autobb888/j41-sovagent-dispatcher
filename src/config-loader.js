@@ -83,6 +83,12 @@ const DEFAULTS = Object.freeze({
     max_sends_per_hour: 10,      // fleet-wide; a pause, not a refusal — see attemptPendingRefund
     cooldown_ms: 30000,          // between two sends for the SAME job
   },
+  // P6 — external-send approval mode. "always" (the default and today's behaviour)
+  // means EVERY external send (a buyer refund) is owner-approved before it drains:
+  // entries enter the refund ledger as pending_approval and only `approved` sends.
+  // Formalization only — there is deliberately NO auto-approve path here; adding one
+  // would introduce a new unattended send into the money path.
+  spend_policy: { approval: 'always' },
   health: { poll_interval_ms: 60000 },
   webhook: { max_body_bytes: 1048576 },
   retry: { rate_limit_backoff_multiplier: 3 },
@@ -106,6 +112,12 @@ const DEFAULTS = Object.freeze({
   // opts back in with JAILBOX_ENABLED=1. The audit-log / attestation machinery
   // is retained intact regardless of this flag.
   jailbox: { enabled: false },
+  // S5 — compute-provider seam. enabled=false ⇒ byte-for-byte current behaviour.
+  // `providers` is a passthrough map of [compute.providers.<name>] tables (deepMerge
+  // carries the dynamic keys through), validated by compute-supply, not here — so an
+  // operator adds a provider without a code change. max_usd_per_hour is the fleet
+  // spend ceiling for paid provisioning (S6/Vast); 0 = no paid provisioning.
+  compute: { enabled: false, default_provider: 'local', reconcile_ms: 60000, max_usd_per_hour: 0, providers: {} },
 });
 
 function deepClone(o) { return JSON.parse(JSON.stringify(o)); }
@@ -152,6 +164,9 @@ const ENV_OVERRIDES = [
   ['J41_REFUND_MAX_VALUE_MULT',     'refund_limits.max_value_multiplier','float'],
   ['J41_REFUND_MAX_SENDS_PER_HOUR', 'refund_limits.max_sends_per_hour',  'int'],
   ['J41_REFUND_COOLDOWN_MS',        'refund_limits.cooldown_ms',         'int'],
+  ['J41_COMPUTE_ENABLED',          'compute.enabled',          'bool'],
+  ['J41_COMPUTE_MAX_USD_PER_HOUR', 'compute.max_usd_per_hour', 'float'],
+  ['J41_COMPUTE_RECONCILE_MS',     'compute.reconcile_ms',     'int'],
   // `bool` (not bool1) deliberately: this is default-ON, so J41_FEE_SWEEP=true
   // must not silently mean "disabled". See applyEnvOverrides.
   ['J41_FEE_SWEEP',            'fee_sweep.enabled',        'bool'],

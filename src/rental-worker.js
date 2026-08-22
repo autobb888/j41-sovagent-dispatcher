@@ -1,0 +1,218 @@
+'use strict';
+// Cat-1 gpu-rental worker. Accepted rental jobs acquire a lease, seal SSH via
+// POST /v1/jobs/:id/rental-secret, and deliverJob a notice with NO host/password.
+// Never calls startJob / startJobContainer / startJobLocal / JOB_IMAGE.
+const { acquireRentalLease, assertPaidBeforePaidProvision } = require('./rental-job');
+const { deliverSealed } = require('./rental-delivery');
+
+function isGpuRentalJob(job, services = []) {
+  if (job && job.serviceType === 'gpu-rental') return true;
+  if (!job || !job.serviceId) return false;
+  const svc = (services || []).find((s) => s && (s.id === job.serviceId || s.serviceId === job.serviceId));
+  return !!(svc && svc.serviceType === 'gpu-rental');
+}
+
+function servicesForAgent(state, agentInfo, loadAgentConfigFn) {
+  const id = agentInfo && agentInfo.id;
+  const cap = state && state.capabilities && typeof state.capabilities.get === 'function' && id
+    ? state.capabilities.get(id)
+    : null;
+  if (cap && Array.isArray(cap.services) && cap.services.length) return cap.services;
+  if (typeof loadAgentConfigFn === 'function' && id) {
+    try {
+      const { slotServicesFromAgentConfig } = require('./rental-setup');
+      return slotServicesFromAgentConfig(loadAgentConfigFn(id)) || [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function agentIsRentalSlot(services = []) {
+  const list = services || [];
+  return list.some((s) => s && s.serviceType === 'gpu-rental')
+    && !list.some((s) => s && s.serviceType && s.serviceType !== 'gpu-rental');
+}
+
+function resolveRentalProvider(cfg, agentId) {
+  const { providerCfgForAgent } = require('./rental-setup');
+  const { createProvider } = require('./providers');
+  const found = providerCfgForAgent(cfg, agentId);
+  if (!found) throw new Error('RENTAL_NO_PROVIDER: declare [compute.providers.*] with agent_id=' + agentId);
+  const [name, pcfg] = found;
+  const provider = createProvider(pcfg.type, { id: name, ...pcfg });
+  return { providerName: name, pcfg, provider };
+}
+
+async function ensureComputeController(state, cfg) {
+  if (state && state.computeSupply) return state.computeSupply;
+  if (state && state.proxyContext && state.proxyContext.computeSupply) {
+    state.computeSupply = state.proxyContext.computeSupply;
+    return state.computeSupply;
+  }
+  const { getCurrentController, maybeStartComputeSupply } = require('./compute-supply');
+  const cur = getCurrentController();
+  if (cur) {
+    if (state) state.computeSupply = cur;
+    return cur;
+  }
+  const agentConfigs = (state && state.proxyContext && state.proxyContext.agentConfigs) || new Map();
+  const ctrl = await maybeStartComputeSupply({ cfg, agentConfigs });
+  if (!ctrl) throw new Error('RENTAL_NO_CONTROLLER: [compute] enabled=true is required for gpu-rental');
+  if (state) {
+    state.computeSupply = ctrl;
+    if (state.proxyContext) state.proxyContext.computeSupply = ctrl;
+  }
+  return ctrl;
+}
+
+async function startRentalJob(opts) {
+  const {
+    state, job, agentInfo, controller, provider, spec = {}, now = Date.now(),
+    client, signDeliver, signer, providerName, ackPostpayVastRisk,
+    startJobContainer: _startJobContainer,
+  } = opts || {};
+  // Injected in tests only to prove it is not called. Never invoke.
+  void _startJobContainer;
+
+  if (!controller) throw new Error('RENTAL_NO_CONTROLLER');
+  if (!provider) throw new Error('RENTAL_NO_PROVIDER');
+  if (!client) throw new Error('RENTAL_NO_CLIENT');
+  if (!job || !job.id) throw new Error('RENTAL_NO_JOB');
+  if (!agentInfo || !agentInfo.id) throw new Error('RENTAL_NO_AGENT');
+
+  assertPaidBeforePaidProvision({ job, provider, ackPostpayVastRisk });
+
+  const jobTimeoutMin = Number(job.timeoutMin || job.jobTimeoutMin || spec.jobTimeoutMin) || 60;
+  const { lease, deliverable } = await acquireRentalLease({
+    controller,
+    provider,
+    spec,
+    jobId: job.id,
+    agentId: agentInfo.id,
+    jobTimeoutMin,
+    providerName,
+    now,
+  });
+
+  try {
+    if (typeof client.confirmWorkerAttached === 'function') {
+      await client.confirmWorkerAttached(job.id);
+    }
+  } catch (e) {
+    console.warn(`[Rental] confirmWorkerAttached failed for ${job.id}: ${e && e.message}`);
+  }
+
+  try {
+    await deliverSealed({ client, signDeliver, signer, job, deliverable });
+  } catch (e) {
+    try { await controller.releaseLease(lease); } catch (relErr) {
+      console.error(`[Rental] release after deliver failure: ${relErr && relErr.message}`);
+    }
+    throw e;
+  }
+
+  const rec = {
+    kind: 'gpu-rental',
+    leaseId: lease.id,
+    agentId: agentInfo.id,
+    agentInfo,
+    agentInfoId: agentInfo.id,
+    startedAt: now,
+    jobAmount: job.amount || null,
+    buyerPayAddress: job.buyerPayAddress || (job.buyer && job.buyer.payAddress) || null,
+    currency: job.currency || null,
+  };
+  state.active.set(job.id, rec);
+  if (Array.isArray(state.available)) {
+    state.available = state.available.filter((a) => a.id !== agentInfo.id);
+  }
+  if (state.seen && typeof state.seen.set === 'function') {
+    state.seen.set(job.id, now);
+  }
+  try { require('./config').persistActiveJobs(state.active); } catch { /* crash-recovery best-effort */ }
+  state.emitEvent?.('job.started', { jobId: job.id, agentId: agentInfo.id, kind: 'gpu-rental', leaseId: lease.id });
+  return { lease, deliverable };
+}
+
+// Delivered/completed is NOT a yank — Cat-1 credentials delivered means the buyer
+// still owns the box until expiresAt. Compute-supply reconcile releases on expiry.
+const YANK_RENTAL_STATUSES = Object.freeze([
+  'cancelled', 'resolved', 'resolved_rejected',
+]);
+
+function resolveComputeController(state) {
+  if (!state) return null;
+  return state.computeSupply || (state.proxyContext && state.proxyContext.computeSupply) || null;
+}
+
+function findRentalLease(controller, active, jobId) {
+  if (!controller || typeof controller.getLeases !== 'function') return null;
+  const leases = controller.getLeases() || [];
+  if (active && active.leaseId) {
+    const byId = leases.find((l) => l && l.id === active.leaseId);
+    if (byId) return byId;
+  }
+  return leases.find((l) => l && l.jobId === jobId) || null;
+}
+
+function rentalLeaseGoneOrExpired(lease, now = Date.now()) {
+  if (!lease) return true;
+  if (lease.state === 'released') return true;
+  if (lease.expiresAt != null && Number(lease.expiresAt) <= now) return true;
+  return false;
+}
+
+function shouldTeardownRental({ state, jobId, active, job, now = Date.now() }) {
+  if (job && YANK_RENTAL_STATUSES.includes(job.status)) return true;
+  const ctrl = resolveComputeController(state);
+  const lease = findRentalLease(ctrl, active, jobId);
+  return rentalLeaseGoneOrExpired(lease, now);
+}
+
+async function stopRentalJob(state, jobId, { skipReturnAgent = false } = {}) {
+  const active = state && state.active && state.active.get(jobId);
+  if (!active || active.kind !== 'gpu-rental') return false;
+  if (active._stopping) return false;
+  active._stopping = true;
+
+  const ctrl = resolveComputeController(state);
+  const lease = findRentalLease(ctrl, active, jobId);
+  if (ctrl && typeof ctrl.releaseLease === 'function' && lease && lease.state !== 'released') {
+    try {
+      await ctrl.releaseLease(lease);
+    } catch (e) {
+      console.error(`[Rental] releaseLease failed for ${jobId}: ${e && e.message}`);
+    }
+  }
+
+  if (!skipReturnAgent && !active.paused) {
+    const agentInfo = active.agentInfo;
+    if (Array.isArray(state.available) && agentInfo && agentInfo.id) {
+      if (!state.available.some((a) => a && a.id === agentInfo.id)) state.available.push(agentInfo);
+    }
+  }
+  if (state.retries && typeof state.retries.delete === 'function') state.retries.delete(jobId);
+  if (active._timeoutTimer) clearTimeout(active._timeoutTimer);
+
+  state.active.delete(jobId);
+  try { require('./config').persistActiveJobs(state.active); } catch { /* best-effort */ }
+  if (state._lastSentStatus && typeof state._lastSentStatus.delete === 'function') state._lastSentStatus.delete(jobId);
+  if (state._pendingWorkspace && typeof state._pendingWorkspace.delete === 'function') state._pendingWorkspace.delete(jobId);
+  if (state.pendingPayment && typeof state.pendingPayment.delete === 'function') state.pendingPayment.delete(jobId);
+  state.emitEvent?.('job.stopped', { jobId, agentId: active.agentId, kind: 'gpu-rental' });
+  return true;
+}
+
+module.exports = {
+  isGpuRentalJob,
+  startRentalJob,
+  stopRentalJob,
+  shouldTeardownRental,
+  servicesForAgent,
+  agentIsRentalSlot,
+  resolveRentalProvider,
+  ensureComputeController,
+  YANK_RENTAL_STATUSES,
+};

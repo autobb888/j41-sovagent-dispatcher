@@ -24,6 +24,20 @@ const { writeKeysFile, readKeysFile } = require('./keys-file.js');
 const keystore = require('./keystore.js');
 const MASTER_KEY_PATH = path.join(DISPATCHER_DIR, 'master-key.json');
 keystore.setMasterKeyPath(MASTER_KEY_PATH);
+const {
+  parseListingKind,
+  advertisedIdentity,
+  kindFromIdentityName,
+  leafFromIdentity,
+  listingIdPrefix,
+  listingsCollide,
+  KIND_BLURB,
+} = require('./listing-kind.js');
+const {
+  providerBoundToAgent,
+  homeGpuProviderPartial,
+  vastProviderPartial,
+} = require('./compute-provider-write.js');
 const { sendCommand } = require('./control.js');
 const { renderActiveJobs, runLiveScreen } = require('./tui/live-screen.js');
 const { formatUpstreamHealthTag } = require('./tui/health-tag.js');
@@ -61,6 +75,10 @@ const VDXF_KEY_NAMES = {
 
 function loadConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { return {}; }
+}
+
+function listingKindOf(agent) {
+  return parseListingKind(agent && agent.kind) || kindFromIdentityName(agent && agent.identity) || 'agent';
 }
 
 function getAgents() {
@@ -285,8 +303,8 @@ async function mainMenu(inquirer) {
     name: 'choice',
     message: 'What would you like to do?',
     choices: [
-      { name: `[1]  View Agents (${agents.length} registered)`, value: 'agents' },
-      { name: '[2]  Add New Agent', value: 'add' },
+      { name: `[1]  View listings (${agents.length} registered)`, value: 'agents' },
+      { name: '[2]  Sign up — register a listing', value: 'add' },
       { name: '[3]  Configure Agent Executor', value: 'executor' },
       { name: '[4]  Configure Global LLM Default', value: 'llm' },
       { name: '[5]  Configure Services', value: 'services' },
@@ -302,6 +320,7 @@ async function mainMenu(inquirer) {
       { name: '[12] Check Inbox', value: 'inbox' },
       { name: '[13] Earnings Summary', value: 'earnings' },
       { name: '[14] Docker Containers', value: 'docker' },
+      { name: '     Build job-agent + gpu-jail images', value: 'build_image' },
       new inquirer.Separator('  ── Agents ──'),
       { name: '[15] Activate All Agents', value: 'activate_all' },
       { name: '[16] Deactivate All Agents', value: 'deactivate_all' },
@@ -404,6 +423,15 @@ async function agentDetailScreen(inquirer, agentId) {
   if (!needsRegister && !needsFinalize && !finalizeIncomplete) {
     choices.push(new inquirer.Separator('  ── Edit ──'));
     choices.push({ name: '  Update Profile (change on-chain VDXF fields)', value: 'update_profile' });
+    choices.push({ name: '  Buyer allowlist', value: 'allowlist' });
+    choices.push({ name: '  Sales mode (invite / open)', value: 'sales_mode' });
+    choices.push({ name: '  Accept stacked job', value: 'accept_job' });
+    choices.push({ name: '  Prefer allowlist even when open?', value: 'prefer_allowlist' });
+    if (listingKindOf(keys) === 'compute') {
+      choices.push({ name: '  Rental-setup (Cat-1 jail)', value: 'rental_setup' });
+    }
+    choices.push({ name: '  Activate this listing', value: 'activate_one' });
+    choices.push({ name: '  Deactivate this listing', value: 'deactivate_one' });
   }
 
   // Add retry/register/finalize options for incomplete agents
@@ -441,6 +469,13 @@ async function agentDetailScreen(inquirer, agentId) {
       break;
     }
     case 'soul': await soulScreen(inquirer, agentDir); break;
+    case 'allowlist': await allowlistScreen(inquirer, agentId); break;
+    case 'sales_mode': await salesModeScreen(inquirer, agentId); break;
+    case 'accept_job': await acceptJobScreen(inquirer, agentId); break;
+    case 'prefer_allowlist': await preferAllowlistScreen(inquirer, agentId); break;
+    case 'rental_setup': await rentalSetupScreen(inquirer, agentId); break;
+    case 'activate_one': await activateOneScreen(inquirer, agentId, true); break;
+    case 'deactivate_one': await activateOneScreen(inquirer, agentId, false); break;
     case 'retry_register': await retryRegisterScreen(inquirer, agentId, keys); break;
     case 'retry_finalize': await retryFinalizeScreen(inquirer, agentId); break;
     case '__back': return;
@@ -780,7 +815,7 @@ async function soulScreen(inquirer, agentDir) {
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
-async function jobsScreen(inquirer, keys) {
+async function jobsScreen(inquirer, keys, agentId) {
   console.clear();
   console.log(`\n  ═══ Recent Jobs: ${keys.identity} ═══\n`);
 
@@ -806,7 +841,17 @@ async function jobsScreen(inquirer, keys) {
   }
 
   console.log('');
-  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+  const { action } = await promptWithEsc(inquirer, [{
+    type: 'list', name: 'action', message: 'Jobs:',
+    choices: [
+      { name: '  Accept stacked job', value: 'accept' },
+      { name: '  Respond to a dispute', value: 'dispute' },
+      new inquirer.Separator(),
+      { name: '  ← Back', value: '__back' },
+    ],
+  }]);
+  if (action === 'accept') await acceptJobScreen(inquirer, agentId);
+  if (action === 'dispute') await respondDisputeScreen(inquirer, agentId);
 }
 
 // Fetch the per-agent upstream-health map from the running dispatcher.
@@ -1201,63 +1246,114 @@ async function createCustomTemplate(inquirer, tplDir) {
 
 async function addAgentScreen(inquirer) {
   console.clear();
-  console.log('\n  ═══ Add New Agent ═══\n');
+  console.log('\n  ═══ Sign up — register a listing ═══\n');
+  console.log('  What are you listing?');
+  console.log(`  DeFi is off on ${NATIVE_COIN} — every kind mints as name.agentplatform@.`);
+  console.log('  Kind is stored on the identity (config.kind).\n');
+
+  const { kindChoice } = await promptWithEsc(inquirer, [{
+    type: 'list', pageSize: 10, name: 'kindChoice',
+    message: 'Kind:',
+    choices: [
+      { name: `  agent     ${KIND_BLURB.agent}`, value: 'agent' },
+      { name: `  compute   ${KIND_BLURB.compute}`, value: 'compute' },
+      { name: `  data      ${KIND_BLURB.data}`, value: 'data' },
+      { name: `  model     ${KIND_BLURB.model}`, value: 'model' },
+    ],
+  }]);
+  const kind = parseListingKind(kindChoice);
+  if (!kind) return;
 
   const agents = getAgents();
-  const nextNum = agents.length + 1;
-  const defaultId = `agent-${nextNum}`;
+  const sameKind = agents.filter(a => (a.kind || 'agent') === kind).length;
+  const defaultId = `${listingIdPrefix(kind)}-${sameKind + 1}`;
 
-  const { agentId } = await promptWithEsc(inquirer, [{ type: 'input', name: 'agentId', message: 'Agent ID (local identifier):', default: defaultId }]);
+  const { agentId } = await promptWithEsc(inquirer, [{ type: 'input', name: 'agentId', message: 'Local ID (folder name on this machine):', default: defaultId }]);
   if (fs.existsSync(path.join(AGENTS_DIR, agentId, 'keys.json'))) {
-    console.log(`\n  ❌ Agent ${agentId} already exists.\n`);
+    console.log(`\n  ❌ ${agentId} already exists.\n`);
     await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
     return;
   }
 
-  const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'Identity name (lowercase, no spaces — becomes <name>.agentplatform@):' }]);
+  const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: `Identity name (lowercase, no spaces — becomes ${advertisedIdentity('<name>', kind)}):` }]);
   if (!name) { console.log('\n  ❌ Name required.\n'); return; }
 
-  // Check available templates
+  const preview = advertisedIdentity(name, kind);
+  for (const other of agents) {
+    const otherName = other.identity || other.pendingName;
+    if (otherName && listingsCollide(otherName, name, kind)) {
+      console.log(`\n  ❌ ${preview} is already used by local listing ${other.id} (${listingKindOf(other)}).`);
+      console.log('     Pick a new name. Do not reuse a working agent name for a GPU box.\n');
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+      return;
+    }
+  }
+
   const tplDir = path.join(__dirname, '..', 'templates');
   let templates = [];
   try { templates = fs.readdirSync(tplDir).filter(d => fs.existsSync(path.join(tplDir, d, 'config.json'))); } catch {}
 
-  const { tpl } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'tpl', message: 'Select template:', choices: [
-    ...templates.map(t => {
-      try {
-        const cfg = JSON.parse(fs.readFileSync(path.join(tplDir, t, 'config.json'), 'utf8'));
-        return { name: `  ${t.padEnd(22)} ${cfg.profile?.description?.substring(0, 50) || ''}`, value: t };
-      } catch { return { name: `  ${t}`, value: t }; }
-    }),
-    new inquirer.Separator(),
-    { name: '  + Create Custom Template', value: '__custom' },
-  ]}]);
-
-  let template = tpl;
-
-  if (template === '__custom') {
-    template = await createCustomTemplate(inquirer, tplDir);
-    if (!template) return;
+  let template = '';
+  if (kind === 'agent') {
+    const { tpl } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'tpl', message: 'Select template:', choices: [
+      ...templates.map(t => {
+        try {
+          const cfg = JSON.parse(fs.readFileSync(path.join(tplDir, t, 'config.json'), 'utf8'));
+          return { name: `  ${t.padEnd(22)} ${cfg.profile?.description?.substring(0, 50) || ''}`, value: t };
+        } catch { return { name: `  ${t}`, value: t }; }
+      }),
+      new inquirer.Separator(),
+      { name: '  + Create Custom Template', value: '__custom' },
+    ]}]);
+    template = tpl;
+    if (template === '__custom') {
+      template = await createCustomTemplate(inquirer, tplDir);
+      if (!template) return;
+    }
   }
 
-  console.log(`\n  ─── Creating Agent ───`);
+  console.log(`\n  ─── Creating listing ───`);
+  console.log(`  Kind:     ${kind}`);
   console.log(`  ID:       ${agentId}`);
-  console.log(`  Identity: ${name}.agentplatform@`);
-  console.log(`  Template: ${template}\n`);
+  console.log(`  Identity: ${preview}`);
+  if (template) console.log(`  Template: ${template}`);
+  if (kind === 'compute') console.log(`  Next:      write [compute.providers.*] then rental-setup`);
+  if (kind === 'model') console.log(`  Next:      attach the inference endpoint for this model`);
+  if (kind === 'data') console.log(`  Next:      attach a data policy; you keep hosting the bytes`);
+  console.log('');
 
   const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Proceed with setup?', default: false }]);
   if (!confirm) return;
 
-  // Run the setup command (async — registration can take 20+ minutes for block confirmations)
   try {
     console.log('');
     console.log('  ℹ️  Registration waits for block confirmations (can take 5-20 min).');
     console.log('  Press Ctrl+C to return to menu — registration continues on the platform.\n');
-    const exitCode = await runCommandAsync(process.execPath, [process.argv[1], 'setup', agentId, name, '--template', template]);
+    const setupArgs = [process.argv[1], 'setup', agentId, name, '--kind', kind];
+    if (template) setupArgs.push('--template', template);
+    const exitCode = await runCommandAsync(process.execPath, setupArgs);
     if (exitCode === 0) {
-      console.log('\n  ✅ Agent created successfully.\n');
+      console.log('\n  ✅ Listing created successfully.\n');
 
-      // Offer immediate executor configuration
+      if (kind !== 'agent') {
+        if (kind === 'compute') {
+          console.log('  Cat-1 GPU rental — contained SSH jail, never host SSH, never 0.0.0.0.\n');
+          console.log('  Do not use API Endpoint Setup on this listing.\n');
+          await computeProviderScreen(inquirer, agentId);
+          await rentalSetupScreen(inquirer, agentId);
+          await promptSalesMode(inquirer, agentId);
+          await promptPreferAllowlist(inquirer, agentId);
+          await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+          return;
+        }
+        const next = kind === 'data'
+          ? '  Use [5] Configure Services to attach the data policy and endpoint you host.\n'
+          : '  Use [5] Configure Services / API endpoint so buyers can talk to this model.\n';
+        console.log(next);
+        await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+        return;
+      }
+
       const { configNow } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'configNow', message: 'Configure executor for this agent now?', default: true }]);
       if (configNow) {
         const execConfig = { executor: 'local-llm' };
@@ -1313,6 +1409,13 @@ async function configureServicesScreen(inquirer) {
   const { agentId } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 20, name: 'agentId', message: 'Select agent to manage services:', choices: agents.map(a => ({ name: `  ${a.id.padEnd(10)} ${a.identity}`, value: a.id })) }]);
   if (!agents.find(a => a.id === agentId)) return;
   const keys = { id: agentId, ...readKeysFile(path.join(AGENTS_DIR, agentId, 'keys.json')) };
+
+  if (listingKindOf(keys) === 'compute') {
+    console.log('  This is a compute listing. Do not attach labour or api-endpoint here.\n');
+    await computeProviderScreen(inquirer, agentId);
+    await rentalSetupScreen(inquirer, agentId);
+    return;
+  }
 
   while (true) {
     console.clear();
@@ -1836,6 +1939,426 @@ function saveAgentConfig(agentId, config) {
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
 }
 
+async function promptPreferAllowlist(inquirer, agentId) {
+  const cfg = loadAgentConfig(agentId);
+  const { prefer } = await promptWithEsc(inquirer, [{
+    type: 'confirm',
+    name: 'prefer',
+    message: 'Prefer allowlist even when open?',
+    default: false,
+  }]);
+  cfg.preferAllowlist = prefer === true;
+  saveAgentConfig(agentId, cfg);
+}
+
+async function preferAllowlistScreen(inquirer, agentId) {
+  await promptPreferAllowlist(inquirer, agentId);
+  const cfg = loadAgentConfig(agentId);
+  console.log(cfg.preferAllowlist
+    ? '\n  preferAllowlist on — friends first when sales-mode is open.\n'
+    : '\n  preferAllowlist off — sales-mode open is a real floodgate.\n');
+}
+
+function runDispatcherCli(args) {
+  return runCommandAsync(process.execPath, [process.argv[1], ...args]);
+}
+
+async function allowlistScreen(inquirer, agentId) {
+  const { loadBuyerAllowlist } = require('./buyer-allowlist');
+  for (;;) {
+    console.clear();
+    console.log(`\n  ═══ Buyer allowlist: ${agentId} ═══\n`);
+    const cfg = loadAgentConfig(agentId);
+    const list = loadBuyerAllowlist(cfg);
+    if (list.length === 0) {
+      console.log('  (empty — invite-only will accept nobody)\n');
+    } else {
+      for (const e of list) console.log(`  ${e}`);
+      console.log('');
+    }
+    const { action } = await promptWithEsc(inquirer, [{
+      type: 'list', pageSize: 12, name: 'action',
+      message: 'Allowlist:',
+      choices: [
+        { name: '  Add identity (name or i-address)', value: 'add' },
+        { name: '  Remove identity', value: 'remove' },
+        new inquirer.Separator(),
+        { name: '  ← Back', value: '__back' },
+      ],
+    }]);
+    if (action === '__back') return;
+    if (action === 'add') {
+      const { identity } = await promptWithEsc(inquirer, [{
+        type: 'input', name: 'identity',
+        message: 'Friend VerusID name or i-address:',
+      }]);
+      const id = String(identity || '').trim();
+      if (!id) continue;
+      console.log('');
+      await runDispatcherCli(['allowlist', agentId, 'add', id]);
+    } else if (action === 'remove') {
+      if (list.length === 0) {
+        console.log('\n  Nothing to remove.\n');
+      } else {
+        const { victim } = await promptWithEsc(inquirer, [{
+          type: 'list', pageSize: 16, name: 'victim',
+          message: 'Remove:',
+          choices: [
+            ...list.map((e) => ({ name: `  ${e}`, value: e })),
+            new inquirer.Separator(),
+            { name: '  ← Cancel', value: '__back' },
+          ],
+        }]);
+        if (victim && victim !== '__back') {
+          console.log('');
+          await runDispatcherCli(['allowlist', agentId, 'remove', victim]);
+        }
+      }
+    }
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to continue' }]);
+  }
+}
+
+async function promptSalesMode(inquirer, agentId) {
+  const { mode } = await promptWithEsc(inquirer, [{
+    type: 'list', name: 'mode',
+    message: 'Sales mode (on-chain floodgate)?',
+    default: 'keep',
+    choices: [
+      { name: '  Keep / skip (new listings stay open unless you already set invite)', value: 'keep' },
+      { name: '  Invite-only — auto-accept allowlist only (identity write)', value: 'invite' },
+      { name: '  Open — auto-accept everyone (identity write)', value: 'open' },
+    ],
+  }]);
+  if (mode === 'keep') return;
+  console.log('\n  ⚠️  Writes agent.status on-chain. Do not run with a pending identity tx.\n');
+  const { confirm } = await promptWithEsc(inquirer, [{
+    type: 'confirm', name: 'confirm',
+    message: `Write sales-mode ${mode} now?`,
+    default: false,
+  }]);
+  if (!confirm) return;
+  console.log('');
+  await runDispatcherCli(['sales-mode', agentId, mode]);
+}
+
+async function salesModeScreen(inquirer, agentId) {
+  console.clear();
+  console.log(`\n  ═══ Sales mode: ${agentId} ═══\n`);
+  console.log('  Current on-chain status:\n');
+  await runDispatcherCli(['sales-mode', agentId]);
+  console.log('');
+  await promptSalesMode(inquirer, agentId);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
+async function acceptJobScreen(inquirer, agentId) {
+  console.clear();
+  console.log(`\n  ═══ Accept stacked job: ${agentId} ═══\n`);
+  console.log('  One-shot accept. Does not change sales-mode or preferAllowlist.\n');
+  const { jobId } = await promptWithEsc(inquirer, [{
+    type: 'input', name: 'jobId',
+    message: 'Job id to accept:',
+  }]);
+  const id = String(jobId || '').trim();
+  if (!id) return;
+  const { confirm } = await promptWithEsc(inquirer, [{
+    type: 'confirm', name: 'confirm',
+    message: `Accept job ${id} now?`,
+    default: false,
+  }]);
+  if (!confirm) return;
+  console.log('');
+  await runDispatcherCli(['accept-job', agentId, id]);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
+async function computeProviderScreen(inquirer, agentId) {
+  console.clear();
+  console.log(`\n  ═══ GPU provider: ${agentId} ═══\n`);
+  console.log('  Writes [compute] enabled=true and [compute.providers.*] into');
+  console.log('  ~/.j41/dispatcher/config.toml. Does not create the TCP tunnel.');
+  console.log('  Never 0.0.0.0. Never host SSH. Vast or home-gpu only.\n');
+
+  const cfg = loadDispatcherConfig();
+  const bound = providerBoundToAgent(cfg.compute && cfg.compute.providers, agentId);
+  if (bound) {
+    console.log(`  Already bound: [${bound[0]}] type=${bound[1].type} agent_id=${bound[1].agent_id}\n`);
+    const { overwrite } = await promptWithEsc(inquirer, [{
+      type: 'confirm', name: 'overwrite',
+      message: 'Overwrite this provider table?',
+      default: false,
+    }]);
+    if (!overwrite) return;
+  }
+
+  const { ptype } = await promptWithEsc(inquirer, [{
+    type: 'list', name: 'ptype',
+    message: 'Provider:',
+    choices: [
+      { name: '  home-gpu   this box, contained SSH jail', value: 'home-gpu' },
+      { name: '  vast       sourced GPU (Cat-1, not interruptible)', value: 'vast' },
+    ],
+  }]);
+
+  try {
+    if (ptype === 'vast') {
+      const { api_key } = await promptWithEsc(inquirer, [{ type: 'password', name: 'api_key', message: 'Vast API key:', mask: '*' }]);
+      const { min_vram_gb } = await promptWithEsc(inquirer, [{ type: 'input', name: 'min_vram_gb', message: 'Min VRAM GB:', default: '24' }]);
+      const { max_usd } = await promptWithEsc(inquirer, [{ type: 'input', name: 'max_usd', message: 'Fleet max USD/hour:', default: '1' }]);
+      const { tableName, partial } = vastProviderPartial(agentId, {
+        api_key, min_vram_gb, max_usd_per_hour: max_usd,
+      }, cfg.compute && cfg.compute.providers);
+      saveDispatcherConfig(partial);
+      console.log(`\n  ✅ Wrote [compute.providers.${tableName}] type=vast interruptible=false`);
+      console.log('  Restart dispatcher after rental-setup to apply.\n');
+      return;
+    }
+
+    const { gpu } = await promptWithEsc(inquirer, [{ type: 'input', name: 'gpu', message: 'GPU name:', default: 'GPU' }]);
+    const { vram_gb } = await promptWithEsc(inquirer, [{ type: 'input', name: 'vram_gb', message: 'VRAM GB:', default: '24' }]);
+    const { memory_mb } = await promptWithEsc(inquirer, [{ type: 'input', name: 'memory_mb', message: 'Jail RAM MB (>= 256):', default: '32768' }]);
+    const { disk_gb } = await promptWithEsc(inquirer, [{ type: 'input', name: 'disk_gb', message: 'Jail disk GB (>= 1):', default: '100' }]);
+    const { device_index } = await promptWithEsc(inquirer, [{ type: 'input', name: 'device_index', message: 'NVIDIA device_index:', default: '0' }]);
+    const { ssh_hostname } = await promptWithEsc(inquirer, [{
+      type: 'input', name: 'ssh_hostname',
+      message: 'TCP tunnel hostname (not 127.0.0.1, not 0.0.0.0, not https://):',
+    }]);
+    const { ssh_tunnel_port } = await promptWithEsc(inquirer, [{
+      type: 'input', name: 'ssh_tunnel_port',
+      message: 'Jail SSH loopback port (tunnel target 127.0.0.1:this):',
+      default: '2222',
+    }]);
+    const { tableName, partial } = homeGpuProviderPartial(agentId, {
+      gpu, vram_gb, memory_mb, disk_gb, device_index, ssh_hostname, ssh_tunnel_port,
+    }, cfg.compute && cfg.compute.providers);
+    saveDispatcherConfig(partial);
+    console.log(`\n  ✅ Wrote [compute.providers.${tableName}] type=home-gpu`);
+    console.log(`  Point a named TCP tunnel at 127.0.0.1:${ssh_tunnel_port} before rental-setup.`);
+    console.log('  The TUI does not create the tunnel. Never bind 0.0.0.0.\n');
+  } catch (e) {
+    console.log(`\n  ❌ ${e.message}\n`);
+  }
+}
+
+async function rentalSetupScreen(inquirer, agentId) {
+  console.clear();
+  console.log(`\n  ═══ Rental-setup: ${agentId} ═══\n`);
+  console.log('  Registers the Cat-1 gpu-rental service (contained SSH jail).\n');
+  const cfg = loadDispatcherConfig();
+  if (!providerBoundToAgent(cfg.compute && cfg.compute.providers, agentId)) {
+    console.log('  No [compute.providers.*] bound to this listing yet.\n');
+    const { writeNow } = await promptWithEsc(inquirer, [{
+      type: 'confirm', name: 'writeNow',
+      message: 'Write the GPU provider now?',
+      default: true,
+    }]);
+    if (writeNow) await computeProviderScreen(inquirer, agentId);
+    else {
+      console.log('\n  rental-setup will fail without a provider.\n');
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+      return;
+    }
+  }
+  const { confirm } = await promptWithEsc(inquirer, [{
+    type: 'confirm', name: 'confirm',
+    message: 'Run rental-setup now?',
+    default: false,
+  }]);
+  if (!confirm) return;
+  console.log('');
+  await runDispatcherCli(['rental-setup', agentId]);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
+async function activateOneScreen(inquirer, agentId, activate) {
+  const verb = activate ? 'activate' : 'deactivate';
+  console.clear();
+  console.log(`\n  ═══ ${activate ? 'Activate' : 'Deactivate'}: ${agentId} ═══\n`);
+  if (activate) {
+    console.log('  Does not overwrite on-chain invite — use Sales mode → Open for the floodgate.\n');
+  }
+  const { confirm } = await promptWithEsc(inquirer, [{
+    type: 'confirm', name: 'confirm',
+    message: `${activate ? 'Activate' : 'Deactivate'} ${agentId}?`,
+    default: false,
+  }]);
+  if (!confirm) return;
+  console.log('');
+  await runDispatcherCli([verb, agentId, '--platform-only']);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
+async function buildImageScreen(inquirer) {
+  console.clear();
+  console.log('\n  ═══ Build Docker images ═══\n');
+  console.log('  Builds j41/job-agent and j41/gpu-jail. Required once before start / rental-setup.\n');
+  const { force } = await promptWithEsc(inquirer, [{
+    type: 'confirm', name: 'force',
+    message: 'Rebuild even if images already exist?',
+    default: false,
+  }]);
+  const args = ['build-image'];
+  if (force) args.push('--force');
+  console.log('');
+  await runDispatcherCli(args);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
+async function pickAgentId(inquirer, message) {
+  const agents = getAgents();
+  if (agents.length === 0) {
+    console.log('\n  No agents.\n');
+    return null;
+  }
+  const { id } = await promptWithEsc(inquirer, [{
+    type: 'list', pageSize: 20, name: 'id', message,
+    choices: [
+      ...agents.map((a) => ({ name: `  ${a.id.padEnd(10)} ${a.identity || ''}`, value: a.id })),
+      new inquirer.Separator(),
+      { name: '  ← Back', value: '__back' },
+    ],
+  }]);
+  return id === '__back' ? null : id;
+}
+
+async function walletScreen(inquirer) {
+  for (;;) {
+    console.clear();
+    console.log('\n  ═══ Wallet & Fee Tanks ═══\n');
+    await runDispatcherCli(['wallet']);
+    console.log('');
+    const { action } = await promptWithEsc(inquirer, [{
+      type: 'list', name: 'action', message: 'Wallet:',
+      choices: [
+        { name: '  Show one agent', value: 'show' },
+        { name: '  Sweep earnings → fee tank', value: 'sweep' },
+        { name: '  Send between agents', value: 'send' },
+        new inquirer.Separator(),
+        { name: '  ← Back', value: '__back' },
+      ],
+    }]);
+    if (action === '__back') return;
+    if (action === 'show') {
+      const id = await pickAgentId(inquirer, 'Show wallet for:');
+      if (id) { console.log(''); await runDispatcherCli(['wallet', 'show', id]); }
+    } else if (action === 'sweep') {
+      const id = await pickAgentId(inquirer, 'Sweep:');
+      if (!id) continue;
+      const { confirm } = await promptWithEsc(inquirer, [{
+        type: 'confirm', name: 'confirm', message: `Sweep ${id}?`, default: false,
+      }]);
+      if (confirm) { console.log(''); await runDispatcherCli(['wallet', 'sweep', id]); }
+    } else if (action === 'send') {
+      const from = await pickAgentId(inquirer, 'Send FROM:');
+      if (!from) continue;
+      const to = await pickAgentId(inquirer, 'Send TO:');
+      if (!to) continue;
+      const { amount } = await promptWithEsc(inquirer, [{ type: 'input', name: 'amount', message: 'Amount:' }]);
+      const amt = String(amount || '').trim();
+      if (!amt) continue;
+      const { confirm } = await promptWithEsc(inquirer, [{
+        type: 'confirm', name: 'confirm',
+        message: `Send ${amt} from ${from} to ${to}?`,
+        default: false,
+      }]);
+      if (confirm) { console.log(''); await runDispatcherCli(['wallet', 'send', from, to, amt]); }
+    }
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to continue' }]);
+  }
+}
+
+async function refundsScreen(inquirer) {
+  for (;;) {
+    console.clear();
+    console.log('\n  ═══ Refunds Queue ═══\n');
+    await runDispatcherCli(['refunds', 'list']);
+    console.log('');
+    const { action } = await promptWithEsc(inquirer, [{
+      type: 'list', name: 'action', message: 'Refunds:',
+      choices: [
+        { name: '  Approve a refund', value: 'approve' },
+        { name: '  Reject a refund', value: 'reject' },
+        { name: '  Unblock a stuck refund', value: 'unblock' },
+        new inquirer.Separator(),
+        { name: '  ← Back', value: '__back' },
+      ],
+    }]);
+    if (action === '__back') return;
+    const { jobId } = await promptWithEsc(inquirer, [{ type: 'input', name: 'jobId', message: 'Job id:' }]);
+    const id = String(jobId || '').trim();
+    if (!id) continue;
+    console.log('');
+    await runDispatcherCli(['refunds', action, id]);
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to continue' }]);
+  }
+}
+
+async function depositsScreen(inquirer) {
+  for (;;) {
+    console.clear();
+    console.log('\n  ═══ Deposits ═══\n');
+    await runDispatcherCli(['deposits', 'list']);
+    console.log('');
+    const { action } = await promptWithEsc(inquirer, [{
+      type: 'list', name: 'action', message: 'Deposits:',
+      choices: [
+        { name: '  Credit a deposit', value: 'credit' },
+        { name: '  Dismiss (nothing owed)', value: 'dismiss' },
+        new inquirer.Separator(),
+        { name: '  ← Back', value: '__back' },
+      ],
+    }]);
+    if (action === '__back') return;
+    const agentId = await pickAgentId(inquirer, 'Agent:');
+    if (!agentId) continue;
+    const { txid } = await promptWithEsc(inquirer, [{ type: 'input', name: 'txid', message: 'Txid:' }]);
+    const tx = String(txid || '').trim();
+    if (!tx) continue;
+    const args = ['deposits', action, agentId, tx];
+    if (action === 'dismiss') {
+      const { reason } = await promptWithEsc(inquirer, [{ type: 'input', name: 'reason', message: 'Reason (required):' }]);
+      const r = String(reason || '').trim();
+      if (!r) continue;
+      args.push('--reason', r);
+    }
+    console.log('');
+    await runDispatcherCli(args);
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to continue' }]);
+  }
+}
+
+async function respondDisputeScreen(inquirer, agentId) {
+  console.clear();
+  console.log(`\n  ═══ Respond to dispute: ${agentId} ═══\n`);
+  const { jobId } = await promptWithEsc(inquirer, [{ type: 'input', name: 'jobId', message: 'Job id:' }]);
+  const id = String(jobId || '').trim();
+  if (!id) return;
+  const { action } = await promptWithEsc(inquirer, [{
+    type: 'list', name: 'action', message: 'Response:',
+    choices: [
+      { name: '  Refund', value: 'refund' },
+      { name: '  Rework', value: 'rework' },
+      { name: '  Rejected (defend)', value: 'rejected' },
+      { name: '  ← Back', value: '__back' },
+    ],
+  }]);
+  if (action === '__back') return;
+  const { message } = await promptWithEsc(inquirer, [{ type: 'input', name: 'message', message: 'Statement / reason:' }]);
+  const msg = String(message || '').trim();
+  if (!msg) return;
+  const args = ['respond-dispute', id, '--agent', agentId, '--action', action, '--message', msg];
+  if (action === 'refund') {
+    const { pct } = await promptWithEsc(inquirer, [{ type: 'input', name: 'pct', message: 'Refund percent (1-100):' }]);
+    const p = String(pct || '').trim();
+    if (!p) return;
+    args.push('--refund-percent', p);
+  }
+  console.log('');
+  await runDispatcherCli(args);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
 async function executorConfigScreen(inquirer) {
   const agents = getAgents();
   if (agents.length === 0) {
@@ -2097,12 +2620,15 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
 
   if (action === 'recover') {
     if (!identityName) {
-      const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'What name did you register? (e.g. "myagent" for myagent.agentplatform@):' }]);
+      const retryKind = parseListingKind(keysData.kind) || 'agent';
+      const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: `What name did you register? (e.g. "myagent" for ${advertisedIdentity('myagent', retryKind)}):` }]);
       if (!name) { console.log('\n  ❌ Name required.\n'); return; }
       identityName = name;
     }
 
-    keysData.identity = identityName.includes('@') ? identityName : identityName + '.agentplatform@';
+    const recoverKind = parseListingKind(keysData.kind) || kindFromIdentityName(identityName) || 'agent';
+    keysData.identity = identityName.includes('@') ? identityName : advertisedIdentity(identityName, recoverKind);
+    keysData.kind = recoverKind;
     keysData.registrationStatus = 'timeout';
     writeKeysFile(keysPath, keysData);
 
@@ -2128,20 +2654,22 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
     writeKeysFile(keysPath, keysData);
     console.log('\n  ✅ Stale registration state cleared.\n');
 
-    const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'Identity name:', default: previousName ? previousName.replace('.agentplatform@', '') : '' }]);
+    const cleanKind = parseListingKind(keysData.kind) || kindFromIdentityName(previousName) || 'agent';
+    const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'Identity name:', default: previousName ? leafFromIdentity(previousName) : '' }]);
     if (!name) { console.log('\n  ❌ Name required.\n'); return; }
     identityName = name;
 
-    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${identityName}.agentplatform@ on-chain?`, default: false }]);
+    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${advertisedIdentity(identityName, cleanKind)} on-chain?`, default: false }]);
     if (!confirm) return;
 
     keysData.pendingName = identityName;
+    keysData.kind = cleanKind;
     writeKeysFile(keysPath, keysData);
 
     console.log('');
     console.log('  ℹ️  Registration waits for block confirmations (can take 5-20 min).');
     console.log('  Press Ctrl+C to return to menu — registration continues on the platform.\n');
-    const exitCode = await runCommandAsync(process.execPath, [process.argv[1], 'register', agentId, identityName]);
+    const exitCode = await runCommandAsync(process.execPath, [process.argv[1], 'register', agentId, identityName, '--kind', cleanKind]);
 
     if (exitCode === 0) {
       console.log('\n  ✅ Registration successful!\n');
@@ -2153,6 +2681,7 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
     }
   } else {
     // Register fresh with a new name
+    const freshKind = parseListingKind(keysData.kind) || 'agent';
     const { name } = await promptWithEsc(inquirer, [{ type: 'input', name: 'name', message: 'New identity name (lowercase, no spaces):' }]);
     if (!name) { console.log('\n  ❌ Name required.\n'); return; }
     identityName = name;
@@ -2166,15 +2695,16 @@ async function retryRegisterScreen(inquirer, agentId, keys) {
     delete keysData.pendingName;
     delete keysData.registrationTimestamp;
     keysData.pendingName = identityName;
+    keysData.kind = freshKind;
     writeKeysFile(keysPath, keysData);
 
-    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${identityName}.agentplatform@ on-chain?`, default: false }]);
+    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Register ${advertisedIdentity(identityName, freshKind)} on-chain?`, default: false }]);
     if (!confirm) return;
 
     console.log('');
     console.log('  ℹ️  Registration waits for block confirmations (can take 5-20 min).');
     console.log('  Press Ctrl+C to return to menu — registration continues on the platform.\n');
-    const exitCode = await runCommandAsync(process.execPath, [process.argv[1], 'register', agentId, identityName]);
+    const exitCode = await runCommandAsync(process.execPath, [process.argv[1], 'register', agentId, identityName, '--kind', freshKind]);
 
     if (exitCode === 0) {
       console.log('\n  ✅ Registration successful!\n');
@@ -2809,9 +3339,13 @@ async function apiEndpointSetupScreen(inquirer) {
   console.log('  API access to your LLM server on the J41 marketplace.\n');
 
   // Step 1: Select agent
-  const agents = getAgents().filter(a => a.identity && a.iAddress);
+  // getAgents() is allowLocked (no wif). Secret-read happens below.
+  const agents = getAgents()
+    .filter(a => a.identity && a.iAddress)
+    .filter(a => a.kind !== 'compute');
   if (agents.length === 0) {
-    console.log('  No registered agents. Add and register an agent first.\n');
+    console.log('  No agent/model listings available for API Endpoint Setup.');
+    console.log('  Compute listings use: j41-dispatcher rental-setup <agent-id>\n');
     await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
     return;
   }
@@ -3362,12 +3896,10 @@ async function main() {
       // These shell out to the CLI rather than reimplementing the money paths.
       // Those paths carry allowlists, value ceilings, rate limits and in-flight
       // markers; a second copy in the TUI would be a second thing to get wrong.
-      case 'wallet': await withBack(() => moneyScreen(inquirer, 'Wallet & Fee Tanks', ['wallet'],
-        'Move funds:  j41-dispatcher wallet sweep <agent> | wallet send <from> <to> <amount>')); break;
-      case 'refunds': await withBack(() => moneyScreen(inquirer, 'Refunds Queue', ['refunds', 'list'],
-        'Approve or reject:  j41-dispatcher refunds approve <job-id> | refunds reject <job-id>')); break;
-      case 'deposits': await withBack(() => moneyScreen(inquirer, 'Deposits', ['deposits', 'list'],
-        'Settle:  j41-dispatcher deposits credit <agent> <txid> | deposits dismiss <agent> <txid>')); break;
+      case 'wallet': await withBack(() => walletScreen(inquirer)); break;
+      case 'refunds': await withBack(() => refundsScreen(inquirer)); break;
+      case 'deposits': await withBack(() => depositsScreen(inquirer)); break;
+      case 'build_image': await withBack(() => buildImageScreen(inquirer)); break;
       case 'activate_all': await withBack(() => batchActivateScreen(inquirer, true)); break;
       case 'deactivate_all': await withBack(() => batchActivateScreen(inquirer, false)); break;
       case 'bounties': await withBack(() => bountiesMenuScreen(inquirer)); break;

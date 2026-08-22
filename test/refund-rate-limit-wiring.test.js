@@ -185,6 +185,37 @@ test('a send that fails to BUILD does not consume the hourly budget', async () =
   assert.equal(sendCalls.length, 1, 'ten failed builds must not have spent the hourly budget');
 });
 
+// ── Task 3 / C3: the funnel wiring and its ordering invariants ──
+const { readRefundInflight, loadSendHistory } = require('../src/cli.js');
+
+test('C3: a successful refund clears the inflight marker and COUNTS via recordSendOutcome', async () => {
+  reset();
+  const sendCalls = [];
+  const jobId = 'job-c3-ok';
+  const entry = entryFor(1.0, 1.0);
+  fs.writeFileSync(PENDING_REFUNDS_PATH, JSON.stringify({ [jobId]: entry }));
+  const before = loadSendHistory().global.length;
+
+  const ok = await attemptPendingRefund(makeState(makeSession(sendCalls)), jobId, entry);
+  assert.equal(ok, true);
+  assert.equal(sendCalls.length, 1);
+  assert.ok(!readRefundInflight(jobId), 'inflight marker must be cleared after a recorded send');
+  assert.equal(loadSendHistory().global.length, before + 1, 'recordSendOutcome must count the send');
+});
+
+test('C3: a terminally-denied refund leaves NO inflight marker (nothing was sent)', async () => {
+  reset();
+  const sendCalls = [];
+  const jobId = 'job-c3-deny';
+  const entry = entryFor(5.0, 1.0); // over-value → terminal deny, entry kept
+  fs.writeFileSync(PENDING_REFUNDS_PATH, JSON.stringify({ [jobId]: entry }));
+
+  const ok = await attemptPendingRefund(makeState(makeSession(sendCalls)), jobId, entry);
+  assert.equal(ok, false);
+  assert.equal(sendCalls.length, 0);
+  assert.ok(!readRefundInflight(jobId), 'a send that never happened must not leave a marker');
+});
+
 // ── The double-send that making `approved` retryable opened up ───────────────
 //
 // Found by adversarial review, with a working repro. `drainPendingRefunds` has

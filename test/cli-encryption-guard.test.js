@@ -25,6 +25,7 @@ const COMMANDS = [
   "update-profile <agent-id>",
   "inspect <agent-id>",
   "api-setup <agent-id>",
+  "rental-setup <agent-id>",
   "respond-dispute <jobId>",
   "post-bounty <agent-id>",
   "list-bounties",

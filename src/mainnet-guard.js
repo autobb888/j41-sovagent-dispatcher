@@ -53,6 +53,23 @@ function findMainnetSecurityViolations(env, opts, runtime) {
   if (e.J41_LOCAL_SIGNER_TEST_MODE === '1') v.push('J41_LOCAL_SIGNER_TEST_MODE=1 — lets the local signer sign a deliver message without the authoritative jobHash; a test-only path that must never reach production');
   if (e.J41_TRUST_PLATFORM_RESOLUTION === '1') v.push('J41_TRUST_PLATFORM_RESOLUTION=1 — trusts platform-supplied identity resolution instead of verifying locally, so the platform decides where a payment goes');
 
+  // ── Spend-policy integrity (P5) ──
+  // These are FACTS the caller computed and passed in, so this function stays pure
+  // (no fs/config reads). Each downgrades a money-safety default.
+  //
+  // Only a clamped VALUE multiplier blocks a mainnet start: it widens how much MORE
+  // than the job price a single refund may send — the genuine money-risk knob. Count
+  // limits (per-job, per-hour) clamp-and-run: raising them is a DOCUMENTED backlog-drain
+  // workflow, so a clamp there must not weaponize an operator's own remediation into an
+  // outage. The clamp itself still enforces the ceiling in every case.
+  const clamped = Array.isArray(o.clampedConfigKeys) ? o.clampedConfigKeys : [];
+  if (clamped.includes('max_value_multiplier')) {
+    v.push('refund_limits.max_value_multiplier was clamped to the compiled ceiling — the config/env asked to widen the per-refund value ceiling beyond what the code permits');
+  }
+  if (o.spendLedgerWritable === false) {
+    v.push('the spend-ledger (~/.j41/spend-ledger.jsonl) is not writable — external sends fail closed (nothing broadcasts) until it is');
+  }
+
   return v;
 }
 

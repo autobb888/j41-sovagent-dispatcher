@@ -10,6 +10,7 @@ const DISPATCHER_DIR = path.join(os.homedir(), '.j41', 'dispatcher');
 const CONFIG_PATH = path.join(DISPATCHER_DIR, 'config.json');
 const ACTIVE_JOBS_PATH = path.join(DISPATCHER_DIR, 'active-jobs.json');
 const REACTIVATION_QUEUE_PATH = path.join(DISPATCHER_DIR, 'reactivation-queue.json');
+const LEASES_PATH = path.join(DISPATCHER_DIR, 'leases.json');
 
 const DEFAULTS = {
   runtime: 'docker',
@@ -104,10 +105,58 @@ function loadReactivationQueue() {
   }
 }
 
+// S5 — compute leases. The lease file is the source of truth for crash-recovery
+// release: a leaked lease is capacity (and eventually money) burning, so the write
+// is atomic tmp→rename like the other financial-adjacent state above.
+// SSH secrets (password / privateKey) are redacted on disk — crash recovery only
+// needs containerId / instanceId / jobId / expiresAt.
+function redactLeaseSecrets(lease) {
+  if (!lease || typeof lease !== 'object') return lease;
+  const out = { ...lease };
+  if (lease.ssh && typeof lease.ssh === 'object') {
+    out.ssh = { ...lease.ssh };
+    delete out.ssh.password;
+    delete out.ssh.privateKey;
+  }
+  if (lease.meta && typeof lease.meta === 'object') {
+    out.meta = { ...lease.meta };
+    delete out.meta.password;
+    delete out.meta.sshPrivateKey;
+  }
+  return out;
+}
+
+function persistLeases(leaseMap) {
+  try {
+    fs.mkdirSync(DISPATCHER_DIR, { recursive: true, mode: 0o700 });
+    const raw = leaseMap instanceof Map ? Object.fromEntries(leaseMap) : (leaseMap || {});
+    const obj = {};
+    for (const [k, v] of Object.entries(raw)) {
+      obj[k] = redactLeaseSecrets(v);
+    }
+    const tmp = LEASES_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, LEASES_PATH); // atomic replace
+    fs.chmodSync(LEASES_PATH, 0o600); // umask can mask writeFileSync mode
+  } catch (e) {
+    console.error(`[config] Failed to persist leases: ${e.message}`);
+  }
+}
+
+function loadLeases() {
+  try {
+    if (!fs.existsSync(LEASES_PATH)) return {};
+    return JSON.parse(fs.readFileSync(LEASES_PATH, 'utf8')) || {};
+  } catch {
+    return {};
+  }
+}
+
 module.exports = {
   CONFIG_PATH,
   ACTIVE_JOBS_PATH,
   REACTIVATION_QUEUE_PATH,
+  LEASES_PATH,
   loadConfig,
   saveConfig,
   getRuntime,
@@ -115,4 +164,7 @@ module.exports = {
   loadActiveJobs,
   persistReactivationQueue,
   loadReactivationQueue,
+  persistLeases,
+  loadLeases,
+  redactLeaseSecrets,
 };
