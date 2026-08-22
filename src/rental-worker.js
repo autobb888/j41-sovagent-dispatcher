@@ -134,11 +134,81 @@ async function startRentalJob(opts) {
   return { lease, deliverable };
 }
 
+const TERMINAL_RENTAL_STATUSES = Object.freeze([
+  'delivered', 'completed', 'cancelled', 'resolved', 'resolved_rejected',
+]);
+
+function resolveComputeController(state) {
+  if (!state) return null;
+  return state.computeSupply || (state.proxyContext && state.proxyContext.computeSupply) || null;
+}
+
+function findRentalLease(controller, active, jobId) {
+  if (!controller || typeof controller.getLeases !== 'function') return null;
+  const leases = controller.getLeases() || [];
+  if (active && active.leaseId) {
+    const byId = leases.find((l) => l && l.id === active.leaseId);
+    if (byId) return byId;
+  }
+  return leases.find((l) => l && l.jobId === jobId) || null;
+}
+
+function rentalLeaseGoneOrExpired(lease, now = Date.now()) {
+  if (!lease) return true;
+  if (lease.state === 'released') return true;
+  if (lease.expiresAt != null && Number(lease.expiresAt) <= now) return true;
+  return false;
+}
+
+function shouldTeardownRental({ state, jobId, active, job, now = Date.now() }) {
+  if (job && TERMINAL_RENTAL_STATUSES.includes(job.status)) return true;
+  const ctrl = resolveComputeController(state);
+  const lease = findRentalLease(ctrl, active, jobId);
+  return rentalLeaseGoneOrExpired(lease, now);
+}
+
+async function stopRentalJob(state, jobId, { skipReturnAgent = false } = {}) {
+  const active = state && state.active && state.active.get(jobId);
+  if (!active || active.kind !== 'gpu-rental') return false;
+  if (active._stopping) return false;
+  active._stopping = true;
+
+  const ctrl = resolveComputeController(state);
+  const lease = findRentalLease(ctrl, active, jobId);
+  if (ctrl && typeof ctrl.releaseLease === 'function' && lease && lease.state !== 'released') {
+    try {
+      await ctrl.releaseLease(lease);
+    } catch (e) {
+      console.error(`[Rental] releaseLease failed for ${jobId}: ${e && e.message}`);
+    }
+  }
+
+  if (!skipReturnAgent && !active.paused) {
+    const agentInfo = active.agentInfo;
+    if (Array.isArray(state.available) && agentInfo && agentInfo.id) {
+      if (!state.available.some((a) => a && a.id === agentInfo.id)) state.available.push(agentInfo);
+    }
+  }
+  if (state.retries && typeof state.retries.delete === 'function') state.retries.delete(jobId);
+  if (active._timeoutTimer) clearTimeout(active._timeoutTimer);
+
+  state.active.delete(jobId);
+  try { require('./config').persistActiveJobs(state.active); } catch { /* best-effort */ }
+  if (state._lastSentStatus && typeof state._lastSentStatus.delete === 'function') state._lastSentStatus.delete(jobId);
+  if (state._pendingWorkspace && typeof state._pendingWorkspace.delete === 'function') state._pendingWorkspace.delete(jobId);
+  if (state.pendingPayment && typeof state.pendingPayment.delete === 'function') state.pendingPayment.delete(jobId);
+  state.emitEvent?.('job.stopped', { jobId, agentId: active.agentId, kind: 'gpu-rental' });
+  return true;
+}
+
 module.exports = {
   isGpuRentalJob,
   startRentalJob,
+  stopRentalJob,
+  shouldTeardownRental,
   servicesForAgent,
   agentIsRentalSlot,
   resolveRentalProvider,
   ensureComputeController,
+  TERMINAL_RENTAL_STATUSES,
 };

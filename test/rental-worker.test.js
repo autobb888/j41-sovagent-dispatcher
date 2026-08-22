@@ -7,7 +7,7 @@ const path = require('path');
 const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-rental-worker-'));
 process.env.HOME = TEST_HOME;
 os.homedir = () => TEST_HOME;
-const { isGpuRentalJob, startRentalJob } = require('../src/rental-worker');
+const { isGpuRentalJob, startRentalJob, stopRentalJob, shouldTeardownRental } = require('../src/rental-worker');
 
 test('isGpuRentalJob is true only for gpu-rental services', () => {
   assert.equal(isGpuRentalJob({ serviceType: 'gpu-rental' }), true);
@@ -89,5 +89,48 @@ test('cli.js skips LLM preflight for gpu-rental and routes start to startRentalJ
   assert.match(bounty, /skip(?:ping)? startJob|LLM-only/i);
   const pollPart = CLI.slice(0, CLI.indexOf('async function handleWebhookEvent'));
   assert.match(pollPart, /isGpuRentalJob/, 'poll accept must skip LLM preflight for gpu-rental');
-  assert.match(CLI, /kind === 'gpu-rental'/, 'cleanup must not treat a rental as a missing docker container');
+  const cancelled = CLI.slice(CLI.indexOf("case 'job.cancelled'"), CLI.indexOf("case 'job.delivery_rejected'"));
+  assert.match(cancelled, /kind === 'gpu-rental'/, 'job.cancelled must branch on gpu-rental');
+  assert.match(cancelled, /stopRentalJob/, 'job.cancelled must release via stopRentalJob, not container.stop');
+  assert.match(CLI, /shouldTeardownRental/, 'cleanup must teardown rentals on terminal/expiry, not skip forever');
+});
+
+test('stopRentalJob releases the lease, returns the agent, and never touches container.stop', async () => {
+  const released = [];
+  const stopped = [];
+  const agentInfo = { id: 'gpu-1' };
+  const container = { stop: async () => { stopped.push('nope'); } };
+  const state = {
+    active: new Map([['job-1', {
+      kind: 'gpu-rental', leaseId: 'home:1', agentId: 'gpu-1', agentInfo, container,
+    }]]),
+    available: [],
+    retries: new Map(),
+    emitEvent() {},
+    computeSupply: {
+      getLeases() { return [{ id: 'home:1', jobId: 'job-1', state: 'ready' }]; },
+      async releaseLease(l) { released.push(l.id); l.state = 'released'; },
+    },
+  };
+  const ok = await stopRentalJob(state, 'job-1');
+  assert.equal(ok, true);
+  assert.deepEqual(released, ['home:1']);
+  assert.equal(stopped.length, 0);
+  assert.equal(state.active.has('job-1'), false);
+  assert.equal(state.available[0] && state.available[0].id, 'gpu-1');
+});
+
+test('shouldTeardownRental is true for terminal jobs and expired/gone leases, false while live', () => {
+  const lease = { id: 'home:1', jobId: 'job-1', state: 'ready', expiresAt: 5000 };
+  const state = {
+    computeSupply: { getLeases() { return [lease]; } },
+  };
+  const active = { kind: 'gpu-rental', leaseId: 'home:1' };
+  assert.equal(shouldTeardownRental({ state, jobId: 'job-1', active, job: { status: 'delivered' }, now: 1000 }), true);
+  assert.equal(shouldTeardownRental({ state, jobId: 'job-1', active, job: { status: 'in_progress' }, now: 1000 }), false);
+  assert.equal(shouldTeardownRental({ state, jobId: 'job-1', active, job: { status: 'in_progress' }, now: 5000 }), true);
+  assert.equal(shouldTeardownRental({
+    state: { computeSupply: { getLeases() { return []; } } },
+    jobId: 'job-1', active, job: { status: 'in_progress' }, now: 1000,
+  }), true);
 });

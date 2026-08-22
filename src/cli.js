@@ -95,7 +95,7 @@ const { writeKeysFile, readKeysFile } = require('./keys-file.js');
 const keystore = require('./keystore.js');
 const { encryptAllKeys, decryptAllKeys, listPlaintextKeys } = require('./keys-migrate.js');
 const { preflightAllowsAccept } = require('./preflight-gate.js');
-const { isGpuRentalJob, startRentalJob, servicesForAgent, resolveRentalProvider, ensureComputeController } = require('./rental-worker.js');
+const { isGpuRentalJob, startRentalJob, stopRentalJob, shouldTeardownRental, servicesForAgent, resolveRentalProvider, ensureComputeController } = require('./rental-worker.js');
 const crypto = require('crypto');
 
 /** Feature flag: route in-container signing through the host-side broker
@@ -8439,7 +8439,10 @@ async function handleWebhookEvent(state, agentId, payload) {
         // default 'errors' retention (deterministic + symmetric with local).
         const cancelActive = state.active.get(jobId);
         if (cancelActive) cancelActive._killed = true;
-        if (RUNTIME === 'docker') {
+        if (cancelActive && cancelActive.kind === 'gpu-rental') {
+          await stopRentalJob(state, jobId);
+          removeActiveJobFromAllowlist(jobId);
+        } else if (RUNTIME === 'docker') {
           await stopJobContainer(state, jobId);
         } else {
           await stopJobLocal(state, jobId);
@@ -10069,6 +10072,11 @@ function pruneExtensionChecks(state, jobId) {
 async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   const active = state.active.get(jobId);
   if (!active) return;
+  if (active.kind === 'gpu-rental') {
+    await stopRentalJob(state, jobId, { skipReturnAgent });
+    removeActiveJobFromAllowlist(jobId);
+    return;
+  }
   if (active._stopping) return;
   active._stopping = true;
 
@@ -10372,6 +10380,11 @@ async function startJobLocal(state, job, agentInfo) {
 async function stopJobLocal(state, jobId, skipReturnAgent = false) {
   const active = state.active.get(jobId);
   if (!active) return;
+  if (active.kind === 'gpu-rental') {
+    await stopRentalJob(state, jobId, { skipReturnAgent });
+    removeActiveJobFromAllowlist(jobId);
+    return;
+  }
   if (active._stopping) return;
   active._stopping = true;
 
@@ -10506,7 +10519,18 @@ async function cleanupCompletedJobs(state) {
 
 async function _cleanupCompletedJobs(state) {
   for (const [jobId, active] of state.active) {
-    if (active && active.kind === 'gpu-rental') continue;
+    if (active && active.kind === 'gpu-rental') {
+      let job = null;
+      try {
+        const session = await getAgentSession(state, active.agentInfo);
+        job = await session.client.getJob(jobId);
+      } catch { /* fall through to lease expiry / gone */ }
+      if (shouldTeardownRental({ state, jobId, active, job })) {
+        await stopRentalJob(state, jobId);
+        removeActiveJobFromAllowlist(jobId);
+      }
+      continue;
+    }
     if (RUNTIME === 'local') {
       // Local mode: check if child process exited
       if (active.process && active.process.exitCode !== null) {
@@ -12824,7 +12848,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState, untrusted, untrustedField, requireInteractiveConfirm, printFundingInstructions, handleWebhookEvent, jobImageExists, JOB_IMAGE, NATIVE_COIN,
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState, untrusted, untrustedField, requireInteractiveConfirm, printFundingInstructions, handleWebhookEvent, stopJobContainer, stopJobLocal, _cleanupCompletedJobs, jobImageExists, JOB_IMAGE, NATIVE_COIN,
     // Execution-harness seam: `program` so a test can drive the REAL `start`
     // action through commander, and `__getState` so it can then assert on what
     // that action actually did. See test/helpers/dispatcher-harness.js.
