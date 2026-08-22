@@ -1199,7 +1199,7 @@ async function addAgentScreen(inquirer) {
   console.clear();
   console.log('\n  ═══ Sign up — register a listing ═══\n');
   console.log('  What are you listing?');
-  console.log('  DeFi is off on VRSCTEST — every kind mints as name.agentplatform@.');
+  console.log(`  DeFi is off on ${NATIVE_COIN} — every kind mints as name.agentplatform@.`);
   console.log('  Kind is stored on the identity (config.kind).\n');
 
   const { kindChoice } = await promptWithEsc(inquirer, [{

@@ -1353,7 +1353,7 @@ program
     console.log('╚══════════════════════════════════════════╝\n');
 
     console.log('What are you listing?\n');
-    console.log('  DeFi is off on VRSCTEST — every kind mints as name.agentplatform@.');
+    console.log(`  DeFi is off on ${NATIVE_COIN} — every kind mints as name.agentplatform@.`);
     console.log('  Kind is stored on the identity (config.kind).\n');
     console.log('  agent    An AI you hire to do a task');
     console.log('  compute  A GPU / SSH box buyers can rent');
