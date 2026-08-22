@@ -13,6 +13,18 @@ home-gpu. A Vast box (`canProvision && isElastic`) is refused until
 Cat-1 `waitReady` is SSH-ready (`actual_status === 'running'` + `ssh_host`).
 Cat-2 attach still waits on vLLM `/models` (`readyFor` defaults to `'service'`).
 
+### Cat-1 GPU rental: SSH credentials, stable tunnel bind, lock unlink, on-demand Vast
+
+- home-gpu puts the renter `password` on `lease.ssh` (not only `meta`). Deliverable
+  / `deliverSealed` fail closed without `password` or `privateKey`.
+- Jail `22/tcp` binds `127.0.0.1:${ssh_tunnel_port}` (required 1–65535), never
+  HostPort `0` and never `0.0.0.0`.
+- `release()` always unlinks `deviceLockPath(device_index)` so a reconstructed
+  provider after crash cannot leave `HOME_GPU_BUSY`.
+- Vast Cat-1 acquire omits the bid `price` (`interruptible: false` in meta) and
+  injects a generated ed25519 pubkey via `onstart`; the private key is sealed as
+  `ssh.privateKey`. `readyFor: 'ssh'` degrades if neither password nor key is present.
+
 ## Unreleased
 
 ### sovmodel is a live listing kind; all four mint under agentplatform@ on VRSCTEST

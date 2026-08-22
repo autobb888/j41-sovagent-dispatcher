@@ -104,7 +104,10 @@ function createSupplyController({ cfg, agentConfigs, now = Date.now }) {
     }
     reserved += add;
     try {
-      const lease = await provider.acquire(candidate);
+      const lease = await provider.acquire(candidate, {
+        jobId: opts.jobId,
+        interruptible: opts.interruptible,
+      });
       return recordLease(lease, provider, opts.agentId || null, { providerName: opts.providerName, jobId: opts.jobId });
     } finally {
       reserved -= add;

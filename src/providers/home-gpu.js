@@ -18,6 +18,16 @@ function assertTunnelHostname(host) {
   return host.trim();
 }
 
+// Alice's TCP tunnel targets this loopback port. Never HostPort 0 (ephemeral) —
+// the deliverable port would miss the jail.
+function assertTunnelPort(port) {
+  const n = Number(port);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) {
+    throw new Error('HOME_GPU_NO_TUNNEL: ssh_tunnel_port must be an integer 1-65535');
+  }
+  return n;
+}
+
 function deviceLockPath(deviceIndex) {
   return path.join(os.homedir(), '.j41', 'dispatcher', 'locks', `gpu-${deviceIndex}.lock`);
 }
@@ -100,22 +110,26 @@ class HomeGpuProvider extends ComputeProvider {
     this._lockPath = lockPath;
   }
 
-  _dropFileLock() {
+  _dropFileLock(lease) {
     if (this._lockFd != null) {
       try { fs.closeSync(this._lockFd); } catch { /* already closed */ }
       this._lockFd = null;
     }
-    if (this._lockPath) {
-      try { fs.unlinkSync(this._lockPath); } catch (err) {
-        if (!(err && err.code === 'ENOENT')) throw err;
-      }
-      this._lockPath = null;
+    // Always unlink the device lock, even if this instance did not open the fd
+    // (reconstructed provider after crash still has to free the card).
+    const idx = (lease && lease.meta && lease.meta.device_index != null)
+      ? lease.meta.device_index
+      : this._deviceIndex();
+    const lockPath = this._lockPath || deviceLockPath(idx);
+    try { fs.unlinkSync(lockPath); } catch (err) {
+      if (!(err && err.code === 'ENOENT')) throw err;
     }
+    this._lockPath = null;
   }
 
-  _unlock() {
+  _unlock(lease) {
     this._busy = false;
-    this._dropFileLock();
+    this._dropFileLock(lease);
   }
 
   async discover() {
@@ -163,6 +177,7 @@ class HomeGpuProvider extends ComputeProvider {
     let container = null;
     try {
       const hostname = assertTunnelHostname(this.cfg.ssh_hostname);
+      const tunnelPort = assertTunnelPort(this.cfg.ssh_tunnel_port);
       const memoryMb = Number(this.cfg.memory_mb);
       const deviceId = String(this._deviceIndex());
       const password = (lease.meta && lease.meta.password) || crypto.randomBytes(16).toString('hex');
@@ -175,7 +190,7 @@ class HomeGpuProvider extends ComputeProvider {
         ExposedPorts: { '22/tcp': {} },
         HostConfig: {
           NetworkMode: 'bridge',
-          PortBindings: { '22/tcp': [{ HostIp: '127.0.0.1', HostPort: '0' }] },
+          PortBindings: { '22/tcp': [{ HostIp: '127.0.0.1', HostPort: String(tunnelPort) }] },
           Memory: Number.isFinite(memoryMb) && memoryMb > 0 ? memoryMb * 1024 * 1024 : 0,
           PidsLimit: 1024,
           CapDrop: ['ALL'],
@@ -196,27 +211,28 @@ class HomeGpuProvider extends ComputeProvider {
       const inspect = await container.inspect();
       const binding = inspect && inspect.NetworkSettings && inspect.NetworkSettings.Ports
         && inspect.NetworkSettings.Ports['22/tcp'] && inspect.NetworkSettings.Ports['22/tcp'][0];
-      const publishedPort = binding ? Number(binding.HostPort) : 0;
+      const publishedPort = binding ? Number(binding.HostPort) : tunnelPort;
       lease.meta.publishedPort = publishedPort;
 
       const ssh = {
         host: hostname,
-        port: this.cfg.ssh_tunnel_port,
+        port: tunnelPort,
         user: 'renter',
+        password,
       };
 
       const deadline = Date.now() + timeoutMs;
       for (;;) {
         let up = false;
-        try { up = !!(await this.__probeSsh(publishedPort)); } catch { up = false; }
+        try { up = !!(await this.__probeSsh(tunnelPort)); } catch { up = false; }
         if (up) return { ...lease, state: 'ready', ssh, meta: { ...lease.meta } };
-        if (Date.now() >= deadline) return { ...lease, state: 'degraded', meta: { ...lease.meta } };
+        if (Date.now() >= deadline) return { ...lease, state: 'degraded', ssh, meta: { ...lease.meta } };
         await new Promise((r) => setTimeout(r, 50));
       }
     } catch (err) {
       try { await this._forceRemove(this._containerId || (container && container.id)); } catch { /* still unlock */ }
       this._containerId = null;
-      this._unlock();
+      this._unlock(lease);
       throw err;
     }
   }
@@ -229,7 +245,9 @@ class HomeGpuProvider extends ComputeProvider {
       if (!info.State || !info.State.Running) {
         return { healthy: false, reason: 'container not running' };
       }
-      const port = (lease.meta && lease.meta.publishedPort) || 0;
+      const port = Number.isInteger(Number(this.cfg.ssh_tunnel_port))
+        ? Number(this.cfg.ssh_tunnel_port)
+        : ((lease.meta && lease.meta.publishedPort) || 0);
       let up = false;
       try { up = !!(await this.__probeSsh(port)); } catch { up = false; }
       return { healthy: up, reason: up ? undefined : 'ssh not accepting' };
@@ -242,7 +260,7 @@ class HomeGpuProvider extends ComputeProvider {
     const id = (lease && lease.meta && lease.meta.containerId) || this._containerId;
     await this._forceRemove(id);
     this._containerId = null;
-    this._unlock();
+    this._unlock(lease);
     return { ...lease, state: 'released' };
   }
 
@@ -252,4 +270,4 @@ class HomeGpuProvider extends ComputeProvider {
   }
 }
 
-module.exports = { HomeGpuProvider, assertTunnelHostname };
+module.exports = { HomeGpuProvider, assertTunnelHostname, assertTunnelPort, deviceLockPath };

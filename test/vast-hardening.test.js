@@ -32,9 +32,22 @@ test('C5: interruptible:false creates on-demand (no bid price in the PUT body)',
   const log = [];
   const fetchImpl = recordingFetch([{ method: 'PUT', match: (u) => u.includes('/asks/7'), status: 200, body: { success: true, new_contract: 1 } }], log);
   const p = new VastProvider({ id: 'vast:t', api_key: 'k', fetchImpl, interruptible: false });
-  await p.acquire({ provider: 'vast', usdPerHour: 0.22, gpu: {}, meta: { askId: 7 } });
+  const lease = await p.acquire({ provider: 'vast', usdPerHour: 0.22, gpu: {}, meta: { askId: 7 } });
   const put = log.find((l) => l.method === 'PUT');
   assert.equal(put.body.price, undefined, 'on-demand create must not carry a bid price');
+  assert.equal(lease.meta.interruptible, false);
+});
+
+test('C5: candidate.meta.interruptible false omits bid price even when cfg.interruptible is true', async () => {
+  const log = [];
+  const fetchImpl = recordingFetch([{ method: 'PUT', match: (u) => u.includes('/asks/7'), status: 200, body: { success: true, new_contract: 1 } }], log);
+  const p = new VastProvider({ id: 'vast:t', api_key: 'k', fetchImpl }); // default interruptible true
+  const lease = await p.acquire({ provider: 'vast', usdPerHour: 0.22, gpu: {}, meta: { askId: 7, interruptible: false } }, { jobId: 'job-1' });
+  const put = log.find((l) => l.method === 'PUT');
+  assert.equal(put.body.price, undefined, 'rental acquire must not bid');
+  assert.equal(lease.meta.interruptible, false);
+  assert.ok(lease.meta.sshPrivateKey);
+  assert.match(put.body.onstart, /ssh-ed25519 /);
 });
 
 test('C5: interruptible:true does send a bid price', async () => {

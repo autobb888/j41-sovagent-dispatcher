@@ -12,7 +12,7 @@ function sshProvider() {
     get capabilities() { return { canProvision: true, canSsh: true, canScaleToZero: false, isElastic: true }; },
     async discover(spec) { assert.equal(spec.interruptible, false); return [{ provider: 'vast', usdPerHour: 0.3, gpu: { name: 'A100' }, meta: { askId: 1 } }]; },
     async acquire(c) { return { id: 'vast:r1', provider: 'vast', state: 'pending', usdPerHour: c.usdPerHour, baseUrl: null, ssh: null, meta: {} }; },
-    async waitReady(l) { return { ...l, state: 'ready', ssh: { host: '9.9.9.9', port: 22, user: 'root' } }; },
+    async waitReady(l) { return { ...l, state: 'ready', ssh: { host: '9.9.9.9', port: 22, user: 'root', privateKey: '-----BEGIN OPENSSH PRIVATE KEY-----\nk\n' } }; },
     async release(l) { return { ...l, state: 'released' }; },
   };
 }
@@ -25,6 +25,7 @@ test('acquireRentalLease pins on-demand, binds the job, sets expiry, returns cre
   assert.equal(lease.jobId, 'job-1');
   assert.equal(lease.expiresAt, 1000 + 60 * 60000);
   assert.equal(deliverable.ssh.host, '9.9.9.9');
+  assert.ok(deliverable.ssh.privateKey);
   assert.match(deliverable.disclosure, /all-or-nothing/i);
   assert.equal(ctrl.getLeases().length, 1);
   assert.equal(ctrl.getLeases()[0].jobId, 'job-1');

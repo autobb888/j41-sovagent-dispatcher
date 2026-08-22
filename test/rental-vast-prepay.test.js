@@ -37,7 +37,7 @@ test('startRentalJob gates Vast before acquireRentalLease', async () => {
     get capabilities() { return { canProvision: true, canSsh: true, canScaleToZero: false, isElastic: true }; },
     async discover() { acquired += 1; return [{ provider: 'vast', usdPerHour: 0.3, gpu: {}, meta: { askId: 1 } }]; },
     async acquire(c) { acquired += 1; return { id: 'vast:r1', provider: 'vast', state: 'pending', usdPerHour: c.usdPerHour, ssh: null, meta: {} }; },
-    async waitReady(l) { acquired += 1; return { ...l, state: 'ready', ssh: { host: '9.9.9.9', port: 22, user: 'root' } }; },
+    async waitReady(l) { acquired += 1; return { ...l, state: 'ready', ssh: { host: '9.9.9.9', port: 22, user: 'root', privateKey: 'k' } }; },
     async release(l) { return { ...l, state: 'released' }; },
   };
   const { createSupplyController } = require('../src/compute-supply');
@@ -69,7 +69,7 @@ test('startRentalJob injects ackPostpayVastRisk and may acquire unpaid Vast', as
     get capabilities() { return { canProvision: true, canSsh: true, canScaleToZero: false, isElastic: true }; },
     async discover() { return [{ provider: 'vast', usdPerHour: 0.3, gpu: {}, meta: { askId: 1 } }]; },
     async acquire(c) { return { id: 'vast:r1', provider: 'vast', state: 'pending', usdPerHour: c.usdPerHour, ssh: null, meta: {} }; },
-    async waitReady(l) { return { ...l, state: 'ready', ssh: { host: '9.9.9.9', port: 22, user: 'root' } }; },
+    async waitReady(l) { return { ...l, state: 'ready', ssh: { host: '9.9.9.9', port: 22, user: 'root', privateKey: 'k' } }; },
     async release(l) { return { ...l, state: 'released' }; },
   };
   const { createSupplyController } = require('../src/compute-supply');
@@ -101,7 +101,7 @@ test('acquireRentalLease waitReady is SSH-ready (readyFor: ssh)', async () => {
     get capabilities() { return { canProvision: true, canSsh: true, canScaleToZero: false, isElastic: true }; },
     async discover() { return [{ provider: 'vast', usdPerHour: 0.3, gpu: {}, meta: { askId: 1 } }]; },
     async acquire(c) { return { id: 'vast:r1', provider: 'vast', state: 'pending', usdPerHour: c.usdPerHour, ssh: null, meta: {} }; },
-    async waitReady(l, opts) { seen = opts; return { ...l, state: 'ready', ssh: { host: '9.9.9.9', port: 22, user: 'root' } }; },
+    async waitReady(l, opts) { seen = opts; return { ...l, state: 'ready', ssh: { host: '9.9.9.9', port: 22, user: 'root', privateKey: 'k' } }; },
     async release(l) { return { ...l, state: 'released' }; },
   };
   const { createSupplyController } = require('../src/compute-supply');
@@ -122,6 +122,63 @@ test('startRentalJobWired reads rentalAckPostpayVastRisk from agent-config', () 
   assert.match(wired, /rentalAckPostpayVastRisk/);
   assert.match(wired, /loadAgentConfig/);
   assert.match(wired, /ackPostpayVastRisk/);
+});
+
+test('rental acquire on default-interruptible Vast omits bid price and seals a renter privateKey', async () => {
+  const { VastProvider } = require('../src/providers/vast');
+  const { createSupplyController } = require('../src/compute-supply');
+  const log = [];
+  let created = false;
+  const fetchImpl = async (url, opts = {}) => {
+    const method = (opts.method || 'GET').toUpperCase();
+    const body = opts.body ? JSON.parse(opts.body) : null;
+    log.push({ method, url, body });
+    if (method === 'GET' && String(url).includes('/bundles')) {
+      return {
+        status: 200, ok: true,
+        async json() {
+          return { offers: [{ id: 7, gpu_name: 'RTX 3090', num_gpus: 1, gpu_ram: 24576, dph_total: 0.22, rentable: true, rented: false }] };
+        },
+        async text() { return ''; },
+      };
+    }
+    if (method === 'PUT' && String(url).includes('/asks/7')) {
+      created = true;
+      return { status: 200, ok: true, async json() { return { success: true, new_contract: 42 }; }, async text() { return ''; } };
+    }
+    if (method === 'GET' && String(url).includes('/instances')) {
+      return {
+        status: 200, ok: true,
+        async json() {
+          return {
+            instances: created ? [{
+              id: 42, actual_status: 'running', ssh_host: '9.9.9.9', ssh_port: 22,
+              ports: { '8000/tcp': [{ HostPort: '41000' }] },
+            }] : [],
+          };
+        },
+        async text() { return ''; },
+      };
+    }
+    throw new Error(`no fake route for ${method} ${url}`);
+  };
+  const provider = new VastProvider({ id: 'vast:t', api_key: 'k', fetchImpl }); // interruptible defaults true
+  const ctrl = createSupplyController({
+    cfg: { compute: { enabled: true, max_usd_per_hour: 1, providers: {} } },
+    agentConfigs: new Map(),
+    now: () => 1000,
+  });
+  const { lease, deliverable } = await acquireRentalLease({
+    controller: ctrl, provider, spec: {}, jobId: 'job-1', agentId: 'agent-1', jobTimeoutMin: 60, now: 1000,
+  });
+  const put = log.find((l) => l.method === 'PUT');
+  assert.equal(put.body.price, undefined, 'Cat-1 rental must not bid an interruptible price');
+  assert.match(put.body.onstart, /ssh-ed25519 /, 'renter pubkey is injected on PUT /asks via onstart');
+  assert.equal(lease.meta.interruptible, false);
+  assert.ok(deliverable.ssh.privateKey);
+  assert.match(deliverable.ssh.privateKey, /BEGIN OPENSSH PRIVATE KEY/);
+  assert.equal(deliverable.ssh.host, '9.9.9.9');
+  assert.equal(deliverable.ssh.user, 'root');
 });
 
 test('reconcileTick does not release a job-bound Vast rental when /models is down', async () => {

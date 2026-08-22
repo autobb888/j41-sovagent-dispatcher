@@ -36,9 +36,24 @@ function assertPaidBeforePaidProvision({ job, provider, ackPostpayVastRisk }) {
   throw new Error('VAST_PREPAY_REQUIRED: refusing Vast acquire before payment_verified');
 }
 
+function hasSshCredential(ssh) {
+  if (!ssh || typeof ssh !== 'object') return false;
+  const pw = ssh.password != null && String(ssh.password).length > 0;
+  const key = ssh.privateKey != null && String(ssh.privateKey).length > 0;
+  return pw || key;
+}
+
+function assertSshDeliverable(ssh) {
+  if (!hasSshCredential(ssh)) {
+    throw new Error('RENTAL_SSH_NO_CREDENTIAL: refusing to deliver SSH without password or privateKey');
+  }
+  return ssh;
+}
+
 function formatRentalDeliverable(lease, { jobTimeoutMin } = {}) {
+  const ssh = assertSshDeliverable(lease && lease.ssh);
   return {
-    ssh: lease.ssh,
+    ssh,
     expiresAt: lease.expiresAt,
     disclosure: `This rental runs for up to ${jobTimeoutMin || 60} minutes. Billing is all-or-nothing: `
       + 'there is no pro-rata refund for unused time and the box is released at expiry.',
@@ -52,18 +67,30 @@ async function acquireRentalLease({ controller, provider, spec = {}, jobId, agen
   assertProviderCanSsh(provider);
   const cands = await provider.discover({ ...spec, interruptible: false });
   if (!cands.length) throw new Error('RENTAL_NO_CAPACITY: no on-demand offer matched the spec');
+  const cand = { ...cands[0], meta: { ...(cands[0].meta || {}), interruptible: false } };
   // acquireUnderCeiling records the pending lease (with jobId) BEFORE waitReady (C4), so a
-  // crash/timeout can't leak an untracked billing box.
-  const pending = await controller.acquireUnderCeiling(provider, cands[0], { agentId, providerName, jobId });
+  // crash/timeout can't leak an untracked billing box. interruptible:false is passed through
+  // to acquire so Vast omits the bid price (on-demand, not reclaimable).
+  const pending = await controller.acquireUnderCeiling(provider, cand, {
+    agentId, providerName, jobId, interruptible: false,
+  });
   const expiresAt = now + jobTimeoutMin * 60000;
   const ready = await provider.waitReady(pending, { timeoutMs: 300000, readyFor: 'ssh', ...waitOpts });
   const lease = controller.recordLease({ ...ready, jobId, expiresAt }, provider, agentId, { providerName });
-  // M4 — never hand degraded / ssh:null credentials to a paying buyer. Release + fail.
-  if (lease.state !== 'ready' || !lease.ssh) {
+  // M4 — never hand degraded / ssh:null / credential-less SSH to a paying buyer. Release + fail.
+  if (lease.state !== 'ready' || !hasSshCredential(lease.ssh)) {
     await controller.releaseLease(lease);
     throw new Error('RENTAL_NOT_READY: the rental box did not come up in time (released; no charge should stand)');
   }
-  return { lease, deliverable: formatRentalDeliverable(lease, { jobTimeoutMin }) };
+  try {
+    return { lease, deliverable: formatRentalDeliverable(lease, { jobTimeoutMin }) };
+  } catch (e) {
+    await controller.releaseLease(lease);
+    throw e;
+  }
 }
 
-module.exports = { assertRentalEligibleAgent, assertApiEligibleAgent, assertProviderCanSsh, assertPaidBeforePaidProvision, formatRentalDeliverable, acquireRentalLease };
+module.exports = {
+  assertRentalEligibleAgent, assertApiEligibleAgent, assertProviderCanSsh, assertPaidBeforePaidProvision,
+  hasSshCredential, assertSshDeliverable, formatRentalDeliverable, acquireRentalLease,
+};

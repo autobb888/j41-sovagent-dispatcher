@@ -1,6 +1,73 @@
 'use strict';
+const crypto = require('crypto');
 const { ComputeProvider } = require('./base');
 const { scoreOffers } = require('./vast-offers');
+
+function u32be(n) {
+  const b = Buffer.alloc(4);
+  b.writeUInt32BE(n >>> 0);
+  return b;
+}
+function sshBuf(buf) {
+  const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+  return Buffer.concat([u32be(b.length), b]);
+}
+
+// OpenSSH-format ed25519 pair so Bob can `ssh -i` the sealed privateKey.
+function generateRenterSshKeyPair() {
+  const pair = crypto.generateKeyPairSync('ed25519');
+  const rawPub = pair.publicKey.export({ type: 'spki', format: 'der' }).subarray(-32);
+  const rawSeed = pair.privateKey.export({ type: 'pkcs8', format: 'der' }).subarray(-32);
+  const keyType = Buffer.from('ssh-ed25519');
+  const pubBlob = Buffer.concat([sshBuf(keyType), sshBuf(rawPub)]);
+  const publicKey = `ssh-ed25519 ${pubBlob.toString('base64')} j41-renter`;
+  const check = crypto.randomBytes(4);
+  const comment = Buffer.from('j41-renter');
+  const privInner = Buffer.concat([
+    check, check,
+    sshBuf(keyType),
+    sshBuf(rawPub),
+    sshBuf(Buffer.concat([rawSeed, rawPub])),
+    sshBuf(comment),
+  ]);
+  const padLen = (8 - (privInner.length % 8)) % 8;
+  const pad = Buffer.alloc(padLen);
+  for (let i = 0; i < padLen; i++) pad[i] = i + 1;
+  const body = Buffer.concat([
+    Buffer.from('openssh-key-v1\0'),
+    sshBuf(Buffer.from('none')),
+    sshBuf(Buffer.from('none')),
+    sshBuf(Buffer.alloc(0)),
+    u32be(1),
+    sshBuf(pubBlob),
+    sshBuf(Buffer.concat([privInner, pad])),
+  ]);
+  const wrapped = body.toString('base64').match(/.{1,70}/g).join('\n');
+  const privateKey = `-----BEGIN OPENSSH PRIVATE KEY-----\n${wrapped}\n-----END OPENSSH PRIVATE KEY-----\n`;
+  return { publicKey, privateKey };
+}
+
+function authorizedKeysOnstart(publicKey, existing) {
+  const line = String(publicKey).replace(/[\r\n']/g, '').trim();
+  const inject = `mkdir -p /root/.ssh && echo '${line}' >> /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys`;
+  return existing ? `${inject}; ${existing}` : inject;
+}
+
+function resolveInterruptible(candidate, spec, cfgValue) {
+  if (spec && spec.jobId) return false;
+  if (spec && spec.interruptible === false) return false;
+  if (candidate && candidate.meta && candidate.meta.interruptible === false) return false;
+  if (spec && spec.interruptible === true) return true;
+  if (candidate && candidate.meta && candidate.meta.interruptible === true) return true;
+  return cfgValue !== false;
+}
+
+function instSshPassword(inst) {
+  return (inst && (inst.ssh_password || inst.password || inst.ssh_pw)) || null;
+}
+function instSshPrivateKey(inst) {
+  return (inst && (inst.ssh_private_key || inst.private_key || inst.ssh_key)) || null;
+}
 
 // Vast.ai provider. All HTTP goes through an injectable fetch (llm-health.js idiom),
 // so CI drives it with fixtures and never spends a dollar.
@@ -46,13 +113,23 @@ class VastProvider extends ComputeProvider {
     });
   }
 
-  async acquire(candidate) {
+  async acquire(candidate, spec = {}) {
     const askId = candidate && candidate.meta && candidate.meta.askId;
+    const interruptible = resolveInterruptible(candidate, spec, this.interruptible);
+    const isRental = !!(spec && spec.jobId)
+      || (candidate && candidate.meta && candidate.meta.interruptible === false);
     const body = { disk: this.diskGb, image: this.image };
     if (this.onstart) body.onstart = this.onstart;
     // On-demand (interruptible=false) omits the bid price; a bid price makes the
     // instance interruptible and reclaimable — never for a Cat-1 rental.
-    if (this.interruptible) body.price = candidate.usdPerHour;
+    if (interruptible) body.price = candidate.usdPerHour;
+    let renterKey = null;
+    if (isRental) {
+      renterKey = generateRenterSshKeyPair();
+      // PUT /asks OpenAPI has no ssh_key field; inject via onstart (existing body)
+      // so Bob's pubkey lands in authorized_keys without a new HTTP surface.
+      body.onstart = authorizedKeysOnstart(renterKey.publicKey, body.onstart);
+    }
     const res = await this._req('PUT', `/asks/${askId}/`, body);
     if (res.status === 410) throw new Error('VAST_OFFER_GONE');
     if (res.status === 429) throw new Error('VAST_RATE_LIMITED');
@@ -63,7 +140,11 @@ class VastProvider extends ComputeProvider {
     return {
       id: `vast:${instanceId}`, provider: 'vast', state: 'pending', baseUrl: null, ssh: null,
       gpu: candidate.gpu || null, usdPerHour: candidate.usdPerHour, acquiredAt: Date.now(), expiresAt: null,
-      private: false, meta: { instanceId, askId, interruptible: this.interruptible },
+      private: false,
+      meta: {
+        instanceId, askId, interruptible,
+        ...(renterKey ? { sshPublicKey: renterKey.publicKey, sshPrivateKey: renterKey.privateKey } : {}),
+      },
     };
   }
 
@@ -86,8 +167,19 @@ class VastProvider extends ComputeProvider {
       if (inst && inst.actual_status === 'running' && inst.ssh_host) {
         const baseUrl = this._baseUrlFor(inst, lease);
         const ssh = { host: inst.ssh_host, port: inst.ssh_port, user: 'root' };
+        const password = instSshPassword(inst) || (lease.ssh && lease.ssh.password) || (lease.meta && lease.meta.password) || null;
+        const privateKey = (lease.meta && lease.meta.sshPrivateKey)
+          || (lease.ssh && lease.ssh.privateKey)
+          || instSshPrivateKey(inst)
+          || null;
+        if (password) ssh.password = password;
+        if (privateKey) ssh.privateKey = privateKey;
         // Cat-1 rental: SSH-ready only. Do not wait on vLLM /models.
+        // Fail closed: never ship a root shell Bob cannot open.
         if (readyFor === 'ssh') {
+          if (!ssh.password && !ssh.privateKey) {
+            return { ...lease, state: 'degraded', ssh: null };
+          }
           return { ...lease, state: 'ready', baseUrl, ssh };
         }
         // Cat-2 attach: the instance is up AND vLLM answers /models.
@@ -140,4 +232,4 @@ class VastProvider extends ComputeProvider {
 
   get capabilities() { return { canProvision: true, canSsh: true, canScaleToZero: false, isElastic: true }; }
 }
-module.exports = { VastProvider };
+module.exports = { VastProvider, generateRenterSshKeyPair, resolveInterruptible };

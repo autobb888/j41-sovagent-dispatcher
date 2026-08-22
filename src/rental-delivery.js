@@ -72,6 +72,8 @@ async function postRentalSecret(client, jobId, body) {
 }
 
 async function deliverSealed({ client, signDeliver, signer, job, deliverable }) {
+  const { assertSshDeliverable } = require('./rental-job');
+  assertSshDeliverable(deliverable && deliverable.ssh);
   if (!client) throw new Error('RENTAL_SECRET_FAILED: no client to POST rental-secret (refusing to put ssh in deliverJob)');
   const sign = typeof signDeliver === 'function'
     ? signDeliver

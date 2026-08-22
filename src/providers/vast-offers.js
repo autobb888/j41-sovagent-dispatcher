@@ -15,7 +15,11 @@ function scoreOffers(offers, spec = {}) {
       provider: 'vast',
       usdPerHour: Number(o.dph_total),
       gpu: { name: o.gpu_name || null, vramGb: Math.round((Number(o.gpu_ram) || 0) / 1024), count: Number(o.num_gpus) || 1 },
-      meta: { askId: o.id, geolocation: o.geolocation || null },
+      meta: {
+        askId: o.id,
+        geolocation: o.geolocation || null,
+        ...(spec.interruptible !== undefined ? { interruptible: !!spec.interruptible } : {}),
+      },
     }))
     .sort((a, b) => a.usdPerHour - b.usdPerHour);
 }

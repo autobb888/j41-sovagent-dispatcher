@@ -19,8 +19,18 @@ test('assertProviderCanSsh hard-blocks a provider that cannot offer SSH', () => 
 });
 
 test('formatRentalDeliverable carries ssh, expiry, and the all-or-nothing disclosure', () => {
-  const d = formatRentalDeliverable({ ssh: { host: '1.2.3.4', port: 22, user: 'root' }, expiresAt: 1755500000000 }, { jobTimeoutMin: 60 });
+  const d = formatRentalDeliverable({ ssh: { host: '1.2.3.4', port: 22, user: 'root', password: 'pw' }, expiresAt: 1755500000000 }, { jobTimeoutMin: 60 });
   assert.equal(d.ssh.host, '1.2.3.4');
+  assert.equal(d.ssh.password, 'pw');
   assert.equal(d.expiresAt, 1755500000000);
   assert.match(d.disclosure, /no pro-rata|all-or-nothing|not refundable/i);
+});
+
+test('formatRentalDeliverable fails closed without password or privateKey', () => {
+  const { formatRentalDeliverable: fmt } = require('../src/rental-job');
+  assert.throws(
+    () => fmt({ ssh: { host: '1.2.3.4', port: 22, user: 'root' }, expiresAt: 1 }, { jobTimeoutMin: 60 }),
+    /RENTAL_SSH_NO_CREDENTIAL/,
+  );
+  assert.doesNotThrow(() => fmt({ ssh: { host: '1.2.3.4', port: 22, user: 'root', privateKey: '-----BEGIN OPENSSH PRIVATE KEY-----\nxx\n' } }, { jobTimeoutMin: 60 }));
 });

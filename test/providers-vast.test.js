@@ -43,12 +43,20 @@ test('release treats 404 as success (idempotent)', async () => {
   assert.equal(r.state, 'released');
 });
 
+test('generateRenterSshKeyPair is OpenSSH ed25519', () => {
+  const { generateRenterSshKeyPair } = require('../src/providers/vast');
+  const k = generateRenterSshKeyPair();
+  assert.match(k.publicKey, /^ssh-ed25519 [A-Za-z0-9+/=]+ j41-renter$/);
+  assert.match(k.privateKey, /BEGIN OPENSSH PRIVATE KEY/);
+  assert.match(k.privateKey, /END OPENSSH PRIVATE KEY/);
+});
+
 test('capabilities: elastic + provisionable + ssh', () => {
   const p = new VastProvider({ id: 'vast:t', api_key: 'k', fetchImpl: async () => ({}) });
   assert.deepEqual(p.capabilities, { canProvision: true, canSsh: true, canScaleToZero: false, isElastic: true });
 });
 
-test('vast waitReady({ readyFor: "ssh" }) succeeds without /models', async () => {
+test('vast waitReady({ readyFor: "ssh" }) succeeds without /models when a renter key is present', async () => {
   const fetchImpl = fakeFetch([
     {
       method: 'GET',
@@ -67,15 +75,43 @@ test('vast waitReady({ readyFor: "ssh" }) succeeds without /models', async () =>
     { method: 'GET', match: (u) => u.includes('/models'), status: 500, body: {} },
   ]);
   const p = new VastProvider({ id: 'vast:t', api_key: 'k', fetchImpl });
-  const pending = { id: 'vast:42', provider: 'vast', state: 'pending', ssh: null, meta: { instanceId: 42 } };
+  const pending = {
+    id: 'vast:42', provider: 'vast', state: 'pending', ssh: null,
+    meta: { instanceId: 42, sshPrivateKey: '-----BEGIN OPENSSH PRIVATE KEY-----\nk\n' },
+  };
 
   const sshReady = await p.waitReady(pending, { timeoutMs: 1000, readyFor: 'ssh' });
   assert.equal(sshReady.state, 'ready');
   assert.equal(sshReady.ssh && sshReady.ssh.host, '9.9.9.9');
+  assert.ok(sshReady.ssh.privateKey);
 
   const service = await p.waitReady(pending, { timeoutMs: 20 });
   assert.equal(service.state, 'degraded');
   assert.equal(service.ssh, null);
+});
+
+test('vast waitReady({ readyFor: "ssh" }) fails closed without password or privateKey', async () => {
+  const fetchImpl = fakeFetch([
+    {
+      method: 'GET',
+      match: (u) => u.includes('/instances'),
+      status: 200,
+      body: {
+        instances: [{
+          id: 42,
+          actual_status: 'running',
+          ssh_host: '9.9.9.9',
+          ssh_port: 22,
+          ports: { '8000/tcp': [{ HostPort: '41000' }] },
+        }],
+      },
+    },
+  ]);
+  const p = new VastProvider({ id: 'vast:t', api_key: 'k', fetchImpl });
+  const pending = { id: 'vast:42', provider: 'vast', state: 'pending', ssh: null, meta: { instanceId: 42 } };
+  const sshReady = await p.waitReady(pending, { timeoutMs: 1000, readyFor: 'ssh' });
+  assert.equal(sshReady.state, 'degraded');
+  assert.equal(sshReady.ssh, null);
 });
 
 test('job-bound vast probe is SSH-ready; Cat-2 still requires /models', async () => {

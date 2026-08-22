@@ -62,6 +62,25 @@ test('deliverSealed fails closed when rental-secret cannot be posted', async () 
   assert.equal(delivered, false);
 });
 
+test('deliverSealed fails closed when ssh has neither password nor privateKey', async () => {
+  let posted = false;
+  let delivered = false;
+  await assert.rejects(
+    () => deliverSealed({
+      client: {
+        async postRentalSecret() { posted = true; },
+        async deliverJob() { delivered = true; },
+      },
+      signDeliver: ({ hash }) => ({ signature: 'sig', timestamp: 1, hash }),
+      job: { id: 'job-1', jobHash: 'abcd' },
+      deliverable: { ssh: { host: 'gpu.example.com', port: 2222, user: 'renter' }, expiresAt: 1, disclosure: 'x' },
+    }),
+    /RENTAL_SSH_NO_CREDENTIAL/,
+  );
+  assert.equal(posted, false);
+  assert.equal(delivered, false);
+});
+
 test('deliverSealed does not call deliverJob when postRentalSecret throws', async () => {
   let delivered = false;
   await assert.rejects(
