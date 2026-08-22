@@ -3419,12 +3419,24 @@ program
 // ── The job-agent image ─────────────────────────────────────────────────────
 
 const JOB_IMAGE = `${process.env.J41_JOB_IMAGE || 'j41/job-agent'}:${process.env.J41_JOB_TAG || 'latest'}`;
+const JAIL_IMAGE = `${process.env.J41_JAIL_IMAGE || 'j41/gpu-jail'}:${process.env.J41_JAIL_TAG || 'latest'}`;
 
 /** True if the pre-baked job image is present locally. Never throws. */
 function jobImageExists() {
   try {
     require('child_process').execSync(
       `docker image inspect ${JOB_IMAGE}`,
+      { stdio: 'ignore', timeout: 15000 },
+    );
+    return true;
+  } catch { return false; }
+}
+
+/** True if the pre-baked gpu-jail image is present locally. Never throws. */
+function jailImageExists() {
+  try {
+    require('child_process').execSync(
+      `docker image inspect ${JAIL_IMAGE}`,
       { stdio: 'ignore', timeout: 15000 },
     );
     return true;
@@ -3443,9 +3455,30 @@ function buildImageScriptPath() {
   return path.join(__dirname, '..', 'scripts', 'build-image.sh');
 }
 
+function buildJailImageScriptPath() {
+  return path.join(__dirname, '..', 'scripts', 'build-jail-image.sh');
+}
+
+function spawnImageBuildScript(script) {
+  return new Promise((resolve) => {
+    const child = require('child_process').spawn('bash', [script], {
+      cwd: path.dirname(path.dirname(script)),
+      stdio: 'inherit',
+    });
+    const onSigint = () => { child.kill('SIGTERM'); };
+    process.on('SIGINT', onSigint);
+    child.on('close', (c) => { process.removeListener('SIGINT', onSigint); resolve(c); });
+    child.on('error', (e) => {
+      process.removeListener('SIGINT', onSigint);
+      console.error(`\n❌ Could not run the build script: ${e.message}`);
+      resolve(1);
+    });
+  });
+}
+
 program
   .command('build-image')
-  .description('Build the pre-baked job-agent Docker image (required before running jobs)')
+  .description('Build the pre-baked job-agent and gpu-jail Docker images (required before running jobs)')
   .option('--force', 'Rebuild even if the image already exists')
   .action(async (options) => {
     const script = buildImageScriptPath();
@@ -3454,32 +3487,40 @@ program
       console.error('   This install looks incomplete — try reinstalling the package.');
       process.exit(1);
     }
-    if (!options.force && jobImageExists()) {
-      console.log(`✓ ${JOB_IMAGE} already exists. Nothing to do.`);
-      console.log('  Rebuild it with: j41-dispatcher build-image --force');
-      return;
-    }
-    console.log(`Building ${JOB_IMAGE} — this takes a few minutes on first run.\n`);
-    const code = await new Promise((resolve) => {
-      const child = require('child_process').spawn('bash', [script], {
-        cwd: path.dirname(path.dirname(script)),
-        stdio: 'inherit',
-      });
-      const onSigint = () => { child.kill('SIGTERM'); };
-      process.on('SIGINT', onSigint);
-      child.on('close', (c) => { process.removeListener('SIGINT', onSigint); resolve(c); });
-      child.on('error', (e) => {
-        process.removeListener('SIGINT', onSigint);
-        console.error(`\n❌ Could not run the build script: ${e.message}`);
-        resolve(1);
-      });
-    });
-    if (code !== 0) {
-      console.error(`\n❌ Image build failed (exit ${code}).`);
-      console.error('   Docker must be installed and running, and your user able to reach it.');
+    const jailScript = buildJailImageScriptPath();
+    if (!fs.existsSync(jailScript)) {
+      console.error(`❌ Jail build script not found at ${jailScript}`);
+      console.error('   This install looks incomplete — try reinstalling the package.');
       process.exit(1);
     }
-    console.log(`\n✅ ${JOB_IMAGE} is ready. Next: j41-dispatcher start`);
+    // Job-agent already present: skip that rebuild, then still build the jail.
+    // Alice who already has j41/job-agent must get j41/gpu-jail from one command.
+    if (!options.force && jobImageExists()) {
+      console.log(`✓ ${JOB_IMAGE} already exists. Skipping job-agent rebuild.`);
+      console.log('  Rebuild it with: j41-dispatcher build-image --force');
+    } else {
+      console.log(`Building ${JOB_IMAGE} — this takes a few minutes on first run.\n`);
+      const code = await spawnImageBuildScript(script);
+      if (code !== 0) {
+        console.error(`\n❌ Image build failed (exit ${code}).`);
+        console.error('   Docker must be installed and running, and your user able to reach it.');
+        process.exit(1);
+      }
+    }
+    if (!options.force && jailImageExists()) {
+      console.log(`✓ ${JAIL_IMAGE} already exists. Skipping gpu-jail rebuild.`);
+      console.log('  Rebuild it with: j41-dispatcher build-image --force');
+    } else {
+      console.log(`Building ${JAIL_IMAGE} — this takes a few minutes on first run.\n`);
+      const jailCode = await spawnImageBuildScript(jailScript);
+      if (jailCode !== 0) {
+        console.error(`\n❌ Jail image build failed (exit ${jailCode}).`);
+        console.error('   Docker must be installed and running, and your user able to reach it.');
+        process.exit(1);
+      }
+    }
+    console.log(`\n✅ ${JOB_IMAGE} is ready.`);
+    console.log(`✅ ${JAIL_IMAGE} is ready. Next: j41-dispatcher start`);
   });
 
 // Start command — run the dispatcher (listen for jobs)
@@ -3663,6 +3704,21 @@ program
     // itself is covered directly in test/onboarding-path.test.js.
     if (process.env.NODE_ENV !== 'test' && RUNTIME !== 'local' && !jobImageExists()) {
       console.error(`\n❌ Refusing to start: the job image ${JOB_IMAGE} is not built.`);
+      console.error('   Nothing was accepted and no buyer can pay into this fleet.');
+      console.error('');
+      console.error('   Build it (a few minutes, once):');
+      console.error('     j41-dispatcher build-image');
+      console.error('');
+      console.error('   Every job runs in a fresh container from this image, so there is no');
+      console.error('   partial mode that works without it.');
+      process.exit(1);
+    }
+
+    // Home-gpu rentals need the jail image the same way jobs need job-agent:
+    // find out before anyone pays. Vast-only / compute-off fleets do not.
+    const { homeGpuConfigured } = require('./rental-setup');
+    if (process.env.NODE_ENV !== 'test' && RUNTIME !== 'local' && homeGpuConfigured(loadDispatcherConfig()) && !jailImageExists()) {
+      console.error(`\n❌ Refusing to start: the jail image ${JAIL_IMAGE} is not built.`);
       console.error('   Nothing was accepted and no buyer can pay into this fleet.');
       console.error('');
       console.error('   Build it (a few minutes, once):');
@@ -12850,7 +12906,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState, untrusted, untrustedField, requireInteractiveConfirm, printFundingInstructions, handleWebhookEvent, stopJobContainer, stopJobLocal, _cleanupCompletedJobs, jobImageExists, JOB_IMAGE, NATIVE_COIN,
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState, untrusted, untrustedField, requireInteractiveConfirm, printFundingInstructions, handleWebhookEvent, stopJobContainer, stopJobLocal, _cleanupCompletedJobs, jobImageExists, JOB_IMAGE, jailImageExists, JAIL_IMAGE, NATIVE_COIN,
     // Execution-harness seam: `program` so a test can drive the REAL `start`
     // action through commander, and `__getState` so it can then assert on what
     // that action actually did. See test/helpers/dispatcher-harness.js.

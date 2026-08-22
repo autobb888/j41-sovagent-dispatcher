@@ -41,6 +41,11 @@ function assertRentalSetupAllowed({ agentId, cfg, services, paymentTerms, ackPos
   return { providerName: name, pcfg, provider };
 }
 
+function homeGpuConfigured(cfg) {
+  if (!cfg || !cfg.compute || cfg.compute.enabled !== true) return false;
+  return Object.values(cfg.compute.providers || {}).some((p) => p && p.type === 'home-gpu');
+}
+
 function rentalServiceDescription({ jobTimeoutMin = 60, paymentTerms, vastPostpayAck }) {
   let d = `Raw GPU rental. Runs up to ${jobTimeoutMin} minutes. Billing is all-or-nothing: there is no pro-rata refund for unused time and the box is released at expiry.`;
   if (paymentTerms === 'postpay' && vastPostpayAck) {
@@ -55,4 +60,5 @@ module.exports = {
   providerCfgForAgent,
   slotServicesFromAgentConfig,
   applyRentalAgentConfig,
+  homeGpuConfigured,
 };

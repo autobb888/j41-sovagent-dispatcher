@@ -11,6 +11,7 @@
     "templates",
     "scripts",
     "Dockerfile.job-agent",
+    "Dockerfile.gpu-jail",
     "package.docker.json",
     "README.md",
     "CHANGELOG.md",
