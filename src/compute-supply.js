@@ -14,6 +14,7 @@
 //   - reconcileTick is non-reentrant; the spend ceiling reserves headroom synchronously.
 const { createProvider } = require('./providers');
 const { persistLeases, loadLeases, loadActiveJobs } = require('./config');
+const { slotServicesFromAgentConfig } = require('./rental-setup');
 
 function createSupplyController({ cfg, agentConfigs, now = Date.now }) {
   const leases = new Map();        // leaseId -> lease
@@ -131,6 +132,12 @@ function createSupplyController({ cfg, agentConfigs, now = Date.now }) {
     const max = Number(compute.max_usd_per_hour) || 0;
     for (const [name, pcfg] of Object.entries(provCfgs)) {
       if (pcfg.type !== 'vast') continue;
+      const agentCfg = agentConfigs.get(pcfg.agent_id) || {};
+      const slot = slotServicesFromAgentConfig(agentCfg);
+      if (slot.some((s) => s.serviceType === 'gpu-rental')) {
+        console.log(`  Compute: vast "${name}" idle (gpu-rental slot — acquire on job, not at boot)`);
+        continue;
+      }
       if (max <= 0) { console.log(`  Compute: vast "${name}" provisioning off (set compute.max_usd_per_hour > 0)`); continue; }
       const provider = createProvider('vast', { id: `vast:${name}`, ...pcfg });
       try {

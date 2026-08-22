@@ -44,3 +44,31 @@ test('vast attach provisions one lease under a positive ceiling and publishes it
   assert.equal(leases[0].usdPerHour, 0.2);
   assert.equal(agentConfigs.get('agent-1').endpointUrl, 'http://1.2.3.4:41000/v1');
 });
+
+test('attachVastLeases skips a vast provider whose agent slot is gpu-rental', async () => {
+  const agentConfigs = new Map([['gpu-1', { rental: true, serviceType: 'gpu-rental' }]]);
+  let acquired = 0;
+  const inner = happyFetch();
+  const fetchImpl = async (url, opts = {}) => {
+    const m = (opts.method || 'GET').toUpperCase();
+    if (m === 'PUT' && String(url).includes('/asks')) acquired += 1;
+    return inner(url, opts);
+  };
+  const ctrl = createSupplyController({
+    cfg: { compute: { enabled: true, max_usd_per_hour: 1, providers: {
+      cloud: { type: 'vast', agent_id: 'gpu-1', api_key: 'k', min_vram_gb: 24, fetchImpl },
+    } } },
+    agentConfigs,
+  });
+  await ctrl.attachVastLeases();
+  assert.equal(acquired, 0);
+  assert.equal(ctrl.getLeases().length, 0);
+});
+
+test('attachVastLeases still provisions vast for a Cat-2 api-endpoint agent', async () => {
+  const agentConfigs = new Map([['agent-1', { serviceType: 'api-endpoint' }]]);
+  const ctrl = createSupplyController({ cfg: cfg(1), agentConfigs });
+  await ctrl.attachVastLeases();
+  assert.ok(ctrl.getLeases().length >= 1);
+  assert.equal(ctrl.getLeases()[0].state, 'ready');
+});
