@@ -38,14 +38,21 @@ test('build-image still builds the jail when the job image already exists', () =
   assert.doesNotMatch(skip[0], /\breturn\b/, 'skipping the job image must not return before the jail build');
 });
 
-test('start refuses the jail image with pay-before wording only when home-gpu is configured', () => {
+test('start jail gate inspects jailImageRef per home-gpu provider, not only env JAIL_IMAGE', () => {
   const src = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
   const refuse = src.indexOf('the jail image');
-  assert.ok(refuse > 0, 'jail-image start refusal must exist');
-  const body = src.slice(refuse - 600, refuse + 800);
+  assert.ok(refuse > 0);
+  const body = src.slice(refuse - 900, refuse + 1200);
   assert.match(body, /homeGpuConfigured/);
+  assert.match(body, /jailImageRef/);
+  assert.match(body, /assertHomeGpuHostReady/);
   assert.match(body, /NODE_ENV !== 'test'/);
   assert.match(body, /RUNTIME !== 'local'/);
   assert.match(body, /no buyer can pay into this fleet/);
   assert.match(body, /j41-dispatcher build-image/);
+});
+
+test('JAIL_IMAGE constant is jailImageRef({})', () => {
+  const src = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
+  assert.match(src, /const JAIL_IMAGE = jailImageRef\(\{\}\)/);
 });

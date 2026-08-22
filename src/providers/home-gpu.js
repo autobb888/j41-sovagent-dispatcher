@@ -205,7 +205,7 @@ class HomeGpuProvider extends ComputeProvider {
 
       try {
         container = await this.docker.createContainer({
-          Image: this.cfg.jail_image || 'j41/gpu-jail:latest',
+          Image: jailImageRef(this.cfg),
           Env: [`J41_RENTER_PASSWORD=${password}`],
           ExposedPorts: { '22/tcp': {} },
           HostConfig: {

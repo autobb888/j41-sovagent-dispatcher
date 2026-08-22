@@ -3419,7 +3419,9 @@ program
 // ── The job-agent image ─────────────────────────────────────────────────────
 
 const JOB_IMAGE = `${process.env.J41_JOB_IMAGE || 'j41/job-agent'}:${process.env.J41_JOB_TAG || 'latest'}`;
-const JAIL_IMAGE = `${process.env.J41_JAIL_IMAGE || 'j41/gpu-jail'}:${process.env.J41_JAIL_TAG || 'latest'}`;
+const { jailImageRef } = require('./providers/home-gpu');
+const { dockerImageExists, assertHomeGpuHostReady } = require('./docker-host');
+const JAIL_IMAGE = jailImageRef({});
 
 /** True if the pre-baked job image is present locally. Never throws. */
 function jobImageExists() {
@@ -3433,14 +3435,8 @@ function jobImageExists() {
 }
 
 /** True if the pre-baked gpu-jail image is present locally. Never throws. */
-function jailImageExists() {
-  try {
-    require('child_process').execSync(
-      `docker image inspect ${JAIL_IMAGE}`,
-      { stdio: 'ignore', timeout: 15000 },
-    );
-    return true;
-  } catch { return false; }
+function jailImageExists(image) {
+  return dockerImageExists(image || JAIL_IMAGE);
 }
 
 /**
@@ -3716,17 +3712,28 @@ program
 
     // Home-gpu rentals need the jail image the same way jobs need job-agent:
     // find out before anyone pays. Vast-only / compute-off fleets do not.
+    // Gate the same jailImageRef(pcfg) waitReady will create, plus host preflight.
     const { homeGpuConfigured } = require('./rental-setup');
-    if (process.env.NODE_ENV !== 'test' && RUNTIME !== 'local' && homeGpuConfigured(loadDispatcherConfig()) && !jailImageExists()) {
-      console.error(`\n❌ Refusing to start: the jail image ${JAIL_IMAGE} is not built.`);
-      console.error('   Nothing was accepted and no buyer can pay into this fleet.');
-      console.error('');
-      console.error('   Build it (a few minutes, once):');
-      console.error('     j41-dispatcher build-image');
-      console.error('');
-      console.error('   Every job runs in a fresh container from this image, so there is no');
-      console.error('   partial mode that works without it.');
-      process.exit(1);
+    const startCfg = loadDispatcherConfig();
+    if (process.env.NODE_ENV !== 'test' && RUNTIME !== 'local' && homeGpuConfigured(startCfg)) {
+      const tables = (startCfg.compute && startCfg.compute.providers) || {};
+      for (const pcfg of Object.values(tables)) {
+        if (!pcfg || pcfg.type !== 'home-gpu') continue;
+        const image = jailImageRef(pcfg);
+        try {
+          assertHomeGpuHostReady(pcfg, {
+            imageExists: (img) => dockerImageExists(img),
+          });
+        } catch (e) {
+          console.error(`\n❌ Refusing to start: the jail image ${image} — ${e.message}`);
+          console.error('   Nothing was accepted and no buyer can pay into this fleet.');
+          console.error('');
+          console.error('   Build the jail image (if missing):');
+          console.error('     j41-dispatcher build-image');
+          console.error('');
+          process.exit(1);
+        }
+      }
     }
 
     // Local mode warning timer

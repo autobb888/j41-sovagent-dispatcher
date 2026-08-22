@@ -8,8 +8,39 @@ os.homedir = () => TEST_HOME;
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { HomeGpuProvider, assertTunnelHostname, assertTunnelPort, assertJailResources } = require('../src/providers/home-gpu');
+const { HomeGpuProvider, assertTunnelHostname, assertTunnelPort, assertJailResources, jailImageRef } = require('../src/providers/home-gpu');
 const { listProviderTypes } = require('../src/providers');
+
+test('jailImageRef prefers cfg.jail_image over env default', () => {
+  assert.equal(jailImageRef({ jail_image: 'j41/gpu-jail:custom' }), 'j41/gpu-jail:custom');
+});
+
+test('jailImageRef default matches J41_JAIL_IMAGE:J41_JAIL_TAG or j41/gpu-jail:latest', () => {
+  const prevI = process.env.J41_JAIL_IMAGE;
+  const prevT = process.env.J41_JAIL_TAG;
+  delete process.env.J41_JAIL_IMAGE;
+  delete process.env.J41_JAIL_TAG;
+  try {
+    assert.equal(jailImageRef({}), 'j41/gpu-jail:latest');
+    assert.equal(jailImageRef({}), jailImageRef({ jail_image: undefined }));
+  } finally {
+    if (prevI === undefined) delete process.env.J41_JAIL_IMAGE; else process.env.J41_JAIL_IMAGE = prevI;
+    if (prevT === undefined) delete process.env.J41_JAIL_TAG; else process.env.J41_JAIL_TAG = prevT;
+  }
+});
+
+test('waitReady creates jailImageRef(cfg), not a hardcoded latest that ignores env', async () => {
+  const docker = stubDocker();
+  const provider = new HomeGpuProvider(homeCfg({
+    jail_image: 'j41/gpu-jail:from-toml',
+    docker,
+    __probeSsh: async () => true,
+  }));
+  const lease = await provider.acquire();
+  await provider.waitReady(lease);
+  assert.equal(docker.created[0].Image, 'j41/gpu-jail:from-toml');
+  await provider.release(lease);
+});
 
 test('assertTunnelHostname refuses loopback, wildcard, and HTTP webhook URLs', () => {
   assert.throws(() => assertTunnelHostname(''), /HOME_GPU_NO_TUNNEL/);
