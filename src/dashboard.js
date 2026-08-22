@@ -1278,11 +1278,25 @@ async function addAgentScreen(inquirer) {
       console.log('\n  ✅ Listing created successfully.\n');
 
       if (kind !== 'agent') {
+        if (kind === 'compute') {
+          console.log('  Next: add [compute.providers.card0] (home-gpu or vast), then: j41-dispatcher rental-setup <id>\n');
+          const { runRental } = await promptWithEsc(inquirer, [{
+            type: 'confirm',
+            name: 'runRental',
+            message: 'Run rental-setup now?',
+            default: false,
+          }]);
+          if (runRental) {
+            // Fail-closed on missing tunnel/provider: rental-setup prints the error.
+            // Return to the menu either way — never register an api-endpoint on this slot.
+            await runCommandAsync(process.execPath, [process.argv[1], 'rental-setup', agentId]);
+          }
+          await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+          return;
+        }
         const next = kind === 'data'
           ? '  Use [5] Configure Services to attach the data policy and endpoint you host.\n'
-          : kind === 'model'
-            ? '  Use [5] Configure Services / API endpoint so buyers can talk to this model.\n'
-            : '  Use [5] Configure Services / API endpoint, or [compute] in config.toml, to start earning.\n';
+          : '  Use [5] Configure Services / API endpoint so buyers can talk to this model.\n';
         console.log(next);
         await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
         return;

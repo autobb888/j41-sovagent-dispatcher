@@ -89,3 +89,11 @@ test('cli.js registers rental-setup and wires the reverse api-setup guard', () =
   const apiBlock = cli.slice(apiStart, apiEnd === -1 ? apiStart + 4000 : apiEnd);
   assert.match(apiBlock, /assertApiEligibleAgent/);
 });
+
+test('compute signup copy no longer points at api-endpoint', () => {
+  const cli = fs.readFileSync(require('path').join(__dirname, '../src/cli.js'), 'utf8');
+  const dash = fs.readFileSync(require('path').join(__dirname, '../src/dashboard.js'), 'utf8');
+  // the compute branch (kind === 'compute') must mention rental-setup, not api-endpoint
+  assert.match(cli, /rental-setup/);
+  assert.match(dash, /rental-setup/);
+});

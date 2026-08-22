@@ -1398,8 +1398,9 @@ program
         }
       }
     } else if (kind === 'compute') {
-      console.log('\nAfter registration, point this listing at a local or Vast GPU via');
-      console.log('Configure Services / api-endpoint (or [compute] in config.toml).');
+      console.log('\nAfter registration, declare the card in [compute.providers.*] (type = home-gpu or vast)');
+      console.log('and run: j41-dispatcher rental-setup ' + '<this-id>');
+      console.log('Do not attach an api-endpoint to this slot — that is Cat-2 inference on a different listing.');
     } else if (kind === 'model') {
       console.log('\nAfter registration, attach the inference endpoint for this model');
       console.log('(same metered api-endpoint rail as compute).');
