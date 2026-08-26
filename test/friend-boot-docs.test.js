@@ -9,6 +9,7 @@ const README = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
 const CLAUDE = fs.readFileSync(path.join(ROOT, 'CLAUDE.md'), 'utf8');
 const EXAMPLE = fs.readFileSync(path.join(ROOT, 'docs/config.toml.example'), 'utf8');
 const CLI = fs.readFileSync(path.join(ROOT, 'src/cli.js'), 'utf8');
+const DASH = fs.readFileSync(path.join(ROOT, 'src/dashboard.js'), 'utf8');
 
 test('README command table: build-image builds job-agent and gpu-jail; rental-setup exists', () => {
   assert.match(README, /build-image[\s\S]{0,200}gpu-jail/);
@@ -57,30 +58,60 @@ test('rental-setup registration error names RENTAL_SECRETS_KEY as platform-side'
   assert.match(body, /not a dispatcher/i);
 });
 
-test('compute signup TUI prints numbered next steps and skip still names rental-setup, not start', () => {
-  const dash = fs.readFileSync(path.join(__dirname, '../src/dashboard.js'), 'utf8');
-  const runRental = dash.indexOf("message: 'Run rental-setup now?'");
-  assert.ok(runRental > 0);
-  const window = dash.slice(runRental - 1200, runRental + 1200);
-  assert.match(window, /Do these in order before start/);
-  assert.match(window, /j41-dispatcher rental-setup/);
-  assert.match(window, /config\.toml/);
-  assert.match(window, /named TCP|ssh_tunnel_port/);
-  assert.match(window, /Skipped\. Next is still rental-setup, not start/);
-  // TUI does not write [compute.providers.*], so default-true would always
-  // fail with RENTAL_NO_PROVIDER. default false is correct; skip must not
-  // imply the fleet is start-ready.
-  assert.match(window, /default:\s*false/);
+test('compute signup TUI routes to provider config then rental-setup, not straight to start', () => {
+  // 2026-08-25: rewritten. The old assertions anchored on `message: 'Run
+  // rental-setup now?'` and text ("Do these in order before start", "Skipped.
+  // Next is still rental-setup, not start") that no longer exists anywhere in
+  // dashboard.js — this was already failing before this session's changes
+  // (confirmed via `git stash` against the pre-session baseline), from an
+  // earlier compute-signup wizard redesign (commits around 18d31e4/daf5fcd)
+  // that was never reflected here. The wizard's shape changed; the safety
+  // property it was checking — a compute listing cannot be signed up straight
+  // into "start" without being walked through provider config and
+  // rental-setup — still holds in the current code. Assert that instead.
+  const signupIdx = DASH.indexOf("if (kind === 'compute') {");
+  assert.ok(signupIdx > 0, 'the post-setup dispatch on listing kind must exist');
+  const signupWindow = DASH.slice(signupIdx, signupIdx + 500);
+  assert.match(signupWindow, /await computeProviderScreen\(inquirer, agentId\)/);
+  assert.match(signupWindow, /await rentalSetupScreen\(inquirer, agentId\)/);
+  assert.match(signupWindow, /Do not use API Endpoint Setup on this listing/i);
+
+  const providerBody = dashScreenBody('computeProviderScreen');
+  assert.match(providerBody, /config\.toml/);
+  assert.match(providerBody, /TCP tunnel/);
+
+  const rentalBody = dashScreenBody('rentalSetupScreen');
+  assert.match(rentalBody, /rental-setup/);
+  // Declining the provider-write step must not silently proceed as if the
+  // listing were ready — it must say so and stop, not fall through to a
+  // rental-setup invocation that would just fail with RENTAL_NO_PROVIDER.
+  assert.match(rentalBody, /rental-setup will fail without a provider/);
+  // The final "run rental-setup now" confirm must default to false — this is
+  // the B2 fix from this session (rental-setup used to default --price to 0
+  // and this wizard never asked for one at all).
+  assert.match(rentalBody, /message: `Run rental-setup at \$\{price\} \$\{NATIVE_COIN\} now\?`,\s*\n\s*default: false,/);
 });
 
 test('API Endpoint Setup and Configure Services refuse compute listings', () => {
-  const dash = fs.readFileSync(path.join(__dirname, '../src/dashboard.js'), 'utf8');
-  const apiFn = dash.indexOf('async function apiEndpointSetupScreen');
-  const apiBody = dash.slice(apiFn, apiFn + 2500);
+  const apiBody = dashScreenBody('apiEndpointSetupScreen');
   assert.match(apiBody, /kind !== 'compute'|kind === 'compute'/);
   assert.match(apiBody, /rental-setup/);
-  const svcFn = dash.indexOf('async function configureServicesScreen');
-  const svcBody = dash.slice(svcFn, svcFn + 3500);
+  const svcBody = dashScreenBody('configureServicesScreen');
   assert.match(svcBody, /listingKindOf\(keys\) === 'compute'|kind === 'compute'/);
-  assert.match(svcBody, /rental-setup/);
+  // 2026-08-25: this used to require the literal substring "rental-setup"
+  // inside configureServicesScreen's body, but that function only ever
+  // referenced `rentalSetupScreen` (the function), never the hyphenated CLI
+  // command name — so this assertion was failing before this session's
+  // changes too (confirmed via the pre-session baseline). The real property
+  // worth checking is that a compute listing gets routed to the actual
+  // rental-setup screen, which it does.
+  assert.match(svcBody, /rentalSetupScreen\(inquirer, agentId\)/);
 });
+
+/** Slice a named async function's body out of dashboard.js (up to the next top-level async function). */
+function dashScreenBody(name) {
+  const start = DASH.indexOf(`async function ${name}(`);
+  assert.ok(start > 0, `${name} must exist in dashboard.js`);
+  const next = DASH.indexOf('\nasync function ', start + 10);
+  return DASH.slice(start, next === -1 ? start + 3500 : next);
+}

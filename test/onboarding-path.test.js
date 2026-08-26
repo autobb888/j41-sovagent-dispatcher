@@ -302,27 +302,46 @@ test('a drained fee tank is surfaced on the first screen, not only inside [19]',
     'the daemon must persist the status for the separate TUI process to read');
 });
 
+// 2026-08-25: `moneyScreen(inquirer, title, cliArgs, footer)` — a single
+// read-only-render-plus-footer design — was superseded by three fuller
+// interactive screens (`walletScreen`, `refundsScreen`, `depositsScreen`,
+// each `(inquirer)` only) that let the operator act, not just read. It had
+// been dead code (defined, never called) since that rewrite; removed. These
+// two tests now assert the same properties against the screens that actually
+// run, instead of a function nothing reaches.
+const MONEY_SCREENS = ['walletScreen', 'refundsScreen', 'depositsScreen'];
+
+function moneyScreenBody(name) {
+  const start = DASH.indexOf(`async function ${name}(`);
+  assert.ok(start > 0, `${name} must exist`);
+  const next = DASH.indexOf('\nasync function ', start + 10);
+  return DASH.slice(start, next === -1 ? start + 3000 : next);
+}
+
 test('the TUI money screens shell out to the CLI instead of copying money logic', () => {
   // A second implementation of the refund path would be a second place for the
   // allowlist, value ceiling and in-flight marker to be got wrong.
-  const start = DASH.indexOf('async function moneyScreen(');
-  assert.ok(start > 0);
-  const body = DASH.slice(start, start + 900);
-  assert.match(body, /runCommandAsync\(process\.execPath, \[process\.argv\[1\]/);
+  for (const name of MONEY_SCREENS) {
+    assert.match(moneyScreenBody(name), /runDispatcherCli\(/, `${name} must shell out via runDispatcherCli, not reimplement money logic`);
+  }
+  // runDispatcherCli itself is the one place that spawns the real CLI process.
+  assert.match(DASH, /function runDispatcherCli\(args\) \{\s*\n\s*return runCommandAsync\(process\.execPath, \[process\.argv\[1\], \.\.\.args\]\);/);
 });
 
-test('every TUI money CALL SITE passes a read-only verb', () => {
-  // The earlier version of this test grepped moneyScreen's own body, where a
-  // mutating verb could never appear — it would have passed while a call site
-  // said `['refunds','approve','--all','--yes']`. Assert on the arguments that
-  // are actually handed over.
-  const calls = [...DASH.matchAll(/moneyScreen\(inquirer,[^,]+,\s*(\[[^\]]*\])/g)].map(m => m[1]);
-  assert.ok(calls.length >= 3, `expected at least 3 money screens, found ${calls.length}`);
+test('every TUI money screen\'s unconditional entry call passes a read-only verb', () => {
+  // The earlier version of this test grepped a shared moneyScreen's call
+  // sites; that helper is gone (see above). Each screen now runs one
+  // unconditional runDispatcherCli(...) at the top of its loop BEFORE any
+  // user choice — that is the call that must always be read-only, since it
+  // fires on every visit regardless of what the operator picks next.
   const MUTATING = ['approve', 'reject', 'sweep', 'send', 'credit', 'dismiss', 'unblock', '--yes', '--all'];
-  for (const call of calls) {
+  for (const name of MONEY_SCREENS) {
+    const body = moneyScreenBody(name);
+    const entryCall = body.match(/runDispatcherCli\((\[[^\]]*\])\)/);
+    assert.ok(entryCall, `${name} must have an unconditional entry-point runDispatcherCli call`);
     for (const verb of MUTATING) {
-      assert.ok(!call.includes(`'${verb}'`),
-        `a money screen passes the mutating verb ${verb}: ${call}`);
+      assert.ok(!entryCall[1].includes(`'${verb}'`),
+        `${name}'s unconditional entry call passes the mutating verb ${verb}: ${entryCall[1]}`);
     }
   }
 });

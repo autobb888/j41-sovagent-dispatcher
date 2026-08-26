@@ -83,12 +83,22 @@ test('empty-allowlist log is once per agent via _inviteHeld', () => {
 });
 
 test('allowlist add stores resolved i-address and warns if unresolved', () => {
+  // 2026-08-25: the resolve-to-i-address logic (resolveAllowlistEntries,
+  // getAgent) moved into a shared `resolveAllowlistIdentity` helper — used by
+  // both add and remove, so a fix to one applies to both (see B3 in
+  // docs/testing/2026-08-25-cli-tui-newuser-audit.md). The command body now
+  // calls that helper instead of inlining the resolution itself.
+  const helperStart = CLI.indexOf('async function resolveAllowlistIdentity(');
+  assert.ok(helperStart > -1);
+  const helperBody = CLI.slice(helperStart, CLI.indexOf('\n\nprogram', helperStart));
+  assert.match(helperBody, /resolveAllowlistEntries/);
+  assert.match(helperBody, /getAgent/);
+
   const start = CLI.indexOf(".command('allowlist <agent-id>");
   assert.ok(start > -1);
   const next = CLI.indexOf('\n  .command(', start + 1);
   const body = CLI.slice(start, next === -1 ? start + 5000 : next);
-  assert.match(body, /resolveAllowlistEntries/);
-  assert.match(body, /getAgent/);
+  assert.match(body, /resolveAllowlistIdentity/);
   assert.match(body, /Could not resolve/);
 });
 

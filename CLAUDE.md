@@ -10,7 +10,7 @@ Multi-agent orchestration for the Junction41 sovereign AI agent marketplace. Man
 yarn global add @junction41/dispatcher
 j41-dispatcher dashboard          # Interactive TUI — agent detail: allowlist, sales-mode, accept-job, prefer-allowlist
 j41-dispatcher build-image        # job-agent AND j41/gpu-jail (required once before start)
-j41-dispatcher rental-setup gpu-1 # Cat-1 gpu-rental; needs [compute] home-gpu + named TCP tunnel
+j41-dispatcher rental-setup gpu-1 --price 5 # Cat-1 gpu-rental; needs [compute] home-gpu + named TCP tunnel; --price required, no free default
 j41-dispatcher setup agent-1 myname --template code-review
 j41-dispatcher start              # Listen for jobs
 j41-dispatcher allowlist gpu-1 add bob.agentplatform@   # local buyerAllowlist (not financial-allowlist)
@@ -237,6 +237,7 @@ j41-dispatcher update-profile agent-1 --display-name "Test" --dry-run  # Preview
   agents/<id>/SOUL.md             # Agent personality
   agents/<id>/agent-config.json   # Per-agent executor config (0600)
   agents/<id>/finalize-state.json # Onboarding progress
+  agents/<id>/profile.json        # Profile/services/disputePolicy `register` collected — `finalize` falls back to this when run standalone with no flags
   agents/<id>/deposits.json       # Deposit ledger: processed, pending, reversed, creditedTxids
   agents/<id>/deposits.lock       # Per-agent deposit lock (see file-lock.js)
   agents/<id>/credit-meters.json  # Per-buyer prepaid balances (0600)

@@ -671,6 +671,12 @@ function buildFullProfile(options, keys) {
  * Returns { profile, services } ready for buildAgentContentMultimap.
  */
 async function interactiveProfileSetup(keys, soulContent) {
+  // B11 — this used to have no TTY guard: run headlessly (CI, `docker run`
+  // without `-it`, piped stdin — or the SDK's own EOF, which never invokes
+  // rl.question's callback), the ~15-prompt walkthrough hung forever with no
+  // error and no exit code. This is also the exact prompt a first-timer
+  // following the README's `register`/`finalize` flow is most likely to hit.
+  requireInteractiveConfirm('interactive profile setup');
   const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout });
   const ask = (q, def) => new Promise(resolve => {
     const prompt = def != null ? `${q} [${def}]: ` : `${q}: `;
@@ -964,6 +970,7 @@ function addServiceOptions(cmd) {
  * Used by setup --interactive.
  */
 async function interactiveOnboarding(identityName) {
+  requireInteractiveConfirm('interactive onboarding'); // B11 — same TTY-hang class as interactiveProfileSetup
   const readline = require('readline');
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const ask = (q, def) => new Promise(resolve => {
@@ -1052,6 +1059,24 @@ async function interactiveOnboarding(identityName) {
   };
 }
 
+function saveProfile(agentId, profile, services, disputePolicy) {
+  const profilePath = path.join(AGENTS_DIR, agentId, 'profile.json');
+  fs.writeFileSync(profilePath, JSON.stringify({ profile, services, disputePolicy }, null, 2));
+  return profilePath;
+}
+
+function loadSavedProfile(agentId) {
+  const profilePath = path.join(AGENTS_DIR, agentId, 'profile.json');
+  if (!fs.existsSync(profilePath)) return null;
+  try {
+    const saved = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
+    if (!saved || !saved.profile) return null;
+    return { profile: saved.profile, services: saved.services || [], disputePolicy: saved.disputePolicy };
+  } catch {
+    return null;
+  }
+}
+
 function createFinalizeHooks(agentId, identityName, profile, services = [], disputePolicy) {
   const agentDir = path.join(AGENTS_DIR, agentId);
   const keys = loadAgentKeys(agentId) || {};
@@ -1073,31 +1098,45 @@ function createFinalizeHooks(agentId, identityName, profile, services = [], disp
       } = require('@junction41/sovagent-sdk/dist/index.js');
       const { buildIdentityUpdateTx } = require('@junction41/sovagent-sdk/dist/identity/update.js');
 
-      const fields = profile
-        ? {
-            displayName: profile.name,
-            type: profile.type,
-            description: profile.description,
-            status: 'active',
-            services: JSON.stringify(services.map((svc) => ({
-              name: svc.name,
-              description: svc.description,
-              category: svc.category,
-              pricing: [{ currency: svc.currency, amount: String(svc.price) }],
-              turnaround: svc.turnaround,
-              status: 'active',
-              resolutionWindow: svc.resolutionWindow,
-              refundPolicy: svc.refundPolicy,
-            }))),
-            networkCapabilities: JSON.stringify(profile.network?.capabilities || []),
-            networkEndpoints: JSON.stringify(profile.network?.endpoints || []),
-            networkProtocols: JSON.stringify(profile.network?.protocols || []),
-            profileTags: JSON.stringify(profile.profile?.tags || []),
-            profileWebsite: profile.profile?.website || '',
-            profileAvatar: profile.profile?.avatar || '',
-            profileCategory: profile.profile?.category || '',
-          }
-        : { services: '[]' };
+      if (!profile) {
+        // B1 — this used to fall through to `{ services: '[]' }` and broadcast a
+        // no-op update while printing "Identity updated on-chain", spending a
+        // real fee to publish nothing. Refuse instead, same philosophy as the
+        // no-UTXOs guard (F1) below: don't let the state machine advance past a
+        // step that did not actually happen.
+        console.log('   ⚠️  No profile to publish — nothing would be written on-chain.');
+        console.log('   ↳ Provide one with --profile-name/--profile-description, use');
+        console.log('     --interactive, or run "register" first (its profile is saved');
+        console.log(`     to agents/${agentId}/profile.json and picked up automatically).`);
+        throw new Error(
+          `VDXF publish skipped: no profile was supplied for ${identityName}. ` +
+          'Nothing was published in THIS run.'
+        );
+      }
+
+      const fields = {
+        displayName: profile.name,
+        type: profile.type,
+        description: profile.description,
+        status: 'active',
+        services: JSON.stringify(services.map((svc) => ({
+          name: svc.name,
+          description: svc.description,
+          category: svc.category,
+          pricing: [{ currency: svc.currency, amount: String(svc.price) }],
+          turnaround: svc.turnaround,
+          status: 'active',
+          resolutionWindow: svc.resolutionWindow,
+          refundPolicy: svc.refundPolicy,
+        }))),
+        networkCapabilities: JSON.stringify(profile.network?.capabilities || []),
+        networkEndpoints: JSON.stringify(profile.network?.endpoints || []),
+        networkProtocols: JSON.stringify(profile.network?.protocols || []),
+        profileTags: JSON.stringify(profile.profile?.tags || []),
+        profileWebsite: profile.profile?.website || '',
+        profileAvatar: profile.profile?.avatar || '',
+        profileCategory: profile.profile?.category || '',
+      };
 
       const payload = buildCanonicalAgentUpdate({
         fullName: identityName,
@@ -1353,6 +1392,10 @@ program
   .description('Guided first-run setup — pick a listing kind, register, configure')
   .action(async () => {
     ensureDirs();
+    // B11 — no TTY guard: run headlessly this hung forever with no error and
+    // no exit code. This is the command the README recommends first, so it's
+    // the single most likely place a newcomer's first invocation hangs.
+    requireInteractiveConfirm('quickstart');
     const readline = require('readline');
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     const ask = (q, def) => new Promise(resolve => {
@@ -1649,6 +1692,16 @@ program
         disputePolicyData = result.disputePolicy;
       }
 
+      // Persist so a later standalone `finalize <agent-id>` (the documented
+      // two-step onboarding flow) can find the profile this command just
+      // collected — without this, finalize silently publishes nothing (B1).
+      try {
+        const savedPath = saveProfile(agentId, profileData, serviceData, disputePolicyData);
+        console.log(`   ↳ Profile saved to ${savedPath} (used by 'finalize' if run separately)`);
+      } catch (e) {
+        console.error(`   ⚠️  Could not save profile.json: ${e.message}`);
+      }
+
       console.log(`\n→ Registering agent profile on J41 platform...`);
       try {
         // Re-create agent with identity info for platform registration
@@ -1682,21 +1735,17 @@ program
         const finalizeStatePath = path.join(AGENTS_DIR, agentId, FINALIZE_STATE_FILENAME);
         console.log(`\n→ Finalizing onboarding (${options.interactive ? 'interactive' : 'headless'})...`);
 
-        const profile = options.interactive
-          ? undefined
-          : (options.profileName && options.profileDescription
-            ? buildFullProfile(options, keys)
-            : undefined);
-
-        const services = buildServiceFromOptions(options, options.profileDescription);
-
+        // Reuse the profile/services this same invocation already collected
+        // above (interactively or from flags) rather than re-deriving from
+        // options — the old re-derivation dropped the interactively-collected
+        // profile entirely, publishing an empty on-chain update (B1).
         const finalizeResult = await finalizeOnboarding({
           agent,
           statePath: finalizeStatePath,
           mode: options.interactive ? 'interactive' : 'headless',
-          profile,
-          services,
-          hooks: createFinalizeHooks(agentId, keys.identity, profile, services, disputePolicyData),
+          profile: profileData,
+          services: serviceData,
+          hooks: createFinalizeHooks(agentId, keys.identity, profileData, serviceData, disputePolicyData),
         });
 
         console.log(`✅ Finalize stage: ${finalizeResult.stage}`);
@@ -1783,27 +1832,62 @@ program
     const finalizeStatePath = path.join(AGENTS_DIR, agentId, FINALIZE_STATE_FILENAME);
     console.log(`\n→ Finalizing ${agentId} (${options.interactive ? 'interactive' : 'headless'})...`);
 
-    const profile = options.interactive
-      ? undefined
-      : (options.profileName && options.profileDescription
-        ? buildFullProfile(options, keys)
-        : undefined);
+    // Resolve the profile fully up front (B1) — the on-chain VDXF publish
+    // (createFinalizeHooks.publishVdxf) runs before the SDK's own interactive
+    // prompt stage ever fires, so `--interactive` must collect the profile
+    // here, not defer to the SDK, or the on-chain write still goes out empty.
+    let profile;
+    let services;
+    let disputePolicy;
+    if (options.interactive) {
+      const soulPath = path.join(AGENTS_DIR, agentId, 'SOUL.md');
+      const soul = fs.existsSync(soulPath) ? fs.readFileSync(soulPath, 'utf-8').trim() : '';
+      const result = await interactiveProfileSetup(keys, soul);
+      profile = result.profile;
+      services = result.services;
+      disputePolicy = result.disputePolicy;
+    } else if (options.profileName && options.profileDescription) {
+      profile = buildFullProfile(options, keys);
+      services = buildServiceFromOptions(options, options.profileDescription);
+    } else {
+      const saved = loadSavedProfile(agentId);
+      // Service flags on THIS invocation always win over the saved profile's
+      // services — otherwise `finalize <id> --service-name X --service-price 5`
+      // silently drops the flags and re-publishes the stale saved services
+      // (found in code review of the B1 fix).
+      const flagServices = buildServiceFromOptions(options, options.profileDescription);
+      if (saved) {
+        profile = saved.profile;
+        services = flagServices.length ? flagServices : saved.services;
+        disputePolicy = saved.disputePolicy;
+        console.log(`   ↳ Using saved profile from agents/${agentId}/profile.json (collected during 'register')`);
+      } else {
+        services = flagServices;
+      }
+    }
 
-    const services = buildServiceFromOptions(options, options.profileDescription);
+    try {
+      saveProfile(agentId, profile, services, disputePolicy);
+    } catch { /* best-effort — not fatal if this can't be written */ }
 
-    const finalizeResult = await finalizeOnboarding({
-      agent,
-      statePath: finalizeStatePath,
-      mode: options.interactive ? 'interactive' : 'headless',
-      profile,
-      services,
-      hooks: createFinalizeHooks(agentId, keys.identity, profile, services),
-    });
+    try {
+      const finalizeResult = await finalizeOnboarding({
+        agent,
+        statePath: finalizeStatePath,
+        mode: options.interactive ? 'interactive' : 'headless',
+        profile,
+        services,
+        hooks: createFinalizeHooks(agentId, keys.identity, profile, services, disputePolicy),
+      });
 
-    console.log(`✅ Finalize stage: ${finalizeResult.stage}`);
-    console.log(`   State file: ${finalizeStatePath}`);
-    if (finalizeResult.stage !== 'ready') {
-      console.log('ℹ️  Finalization can be resumed by rerunning this command.');
+      console.log(`✅ Finalize stage: ${finalizeResult.stage}`);
+      console.log(`   State file: ${finalizeStatePath}`);
+      if (finalizeResult.stage !== 'ready') {
+        console.log('ℹ️  Finalization can be resumed by rerunning this command.');
+      }
+    } catch (e) {
+      console.error(`\n❌ Finalize failed: ${e.message}`);
+      process.exit(1);
     }
   });
 
@@ -2473,6 +2557,34 @@ program
     console.log(`\n✅ Done: ${succeeded} deactivated, ${failed} failed`);
   });
 
+// Shared by allowlist add/remove (below) — resolving a pasted name to its
+// i-address is identical work for both, and a future fix to one (auth setup,
+// error handling) must apply to both or `remove` silently regresses to the
+// B3 bug this pair exists to close.
+async function resolveAllowlistIdentity(pasted, keys) {
+  if (/^i[1-9A-HJ-NP-Za-km-z]{25,}$/.test(pasted)) return null; // already an i-address
+  try {
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+    const agent = new J41Agent({
+      apiUrl: J41_API_URL,
+      wif: keys.wif,
+      identityName: keys.identity,
+      iAddress: keys.iAddress,
+    });
+    if (keys.wif && keys.identity) await agent.authenticate();
+    const resolved = await resolveAllowlistEntries(
+      [pasted],
+      (id) => agent.client.getIdentityKeys(id).then(k => ({ identityaddress: k.iaddress, iAddress: k.iaddress, iaddress: k.iaddress })),
+      (id) => agent.client.getAgent(id),
+    );
+    return resolved[0] || null;
+  } catch (e) {
+    const err = new Error(`Could not resolve ${pasted} to an i-address (${e.message})`);
+    err.cause = e;
+    throw err;
+  }
+}
+
 program
   .command('allowlist <agent-id> [action] [identity]')
   .description('List, add, or remove buyer identities this listing will auto-accept when sales-mode is invite')
@@ -2514,38 +2626,40 @@ program
     if (act === 'add') {
       const pasted = String(identity).trim();
       cfg = addBuyerAllowlistEntry(cfg, pasted);
-      const alreadyIAddr = /^i[1-9A-HJ-NP-Za-km-z]{25,}$/.test(pasted);
-      if (!alreadyIAddr) {
-        try {
-          const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
-          const agent = new J41Agent({
-            apiUrl: J41_API_URL,
-            wif: keys.wif,
-            identityName: keys.identity,
-            iAddress: keys.iAddress,
-          });
-          if (keys.wif && keys.identity) await agent.authenticate();
-          const resolved = await resolveAllowlistEntries(
-            [pasted],
-            (id) => agent.client.getIdentityKeys(id).then(k => ({ identityaddress: k.iaddress, iAddress: k.iaddress, iaddress: k.iaddress })),
-            (id) => agent.client.getAgent(id),
-          );
-          if (resolved[0]) {
-            cfg = addBuyerAllowlistEntry(cfg, resolved[0]);
-            console.log(`   resolved ${pasted} → ${resolved[0]}`);
-          } else {
-            console.warn(`⚠️  Could not resolve ${pasted} to an i-address. Auto-accept will not match buyerVerusId until it resolves. Re-run allowlist add after the name is listed, or add the i-address directly.`);
-          }
-        } catch (e) {
-          console.warn(`⚠️  Could not resolve ${pasted} to an i-address (${e.message}). Auto-accept will not match buyerVerusId until it resolves.`);
+      try {
+        const resolved = await resolveAllowlistIdentity(pasted, keys);
+        if (resolved) {
+          cfg = addBuyerAllowlistEntry(cfg, resolved);
+          console.log(`   resolved ${pasted} → ${resolved}`);
+        } else if (!/^i[1-9A-HJ-NP-Za-km-z]{25,}$/.test(pasted)) {
+          console.warn(`⚠️  Could not resolve ${pasted} to an i-address. Auto-accept will not match buyerVerusId until it resolves. Re-run allowlist add after the name is listed, or add the i-address directly.`);
         }
+      } catch (e) {
+        console.warn(`⚠️  ${e.message}. Auto-accept will not match buyerVerusId until it resolves.`);
       }
     } else {
-      cfg = removeBuyerAllowlistEntry(cfg, identity);
+      // B3 — `add` can write TWO entries for one buyer (the pasted name AND
+      // its resolved i-address, above). Removing by name alone left the
+      // resolved i-address entry allowlisted while claiming "Removed" — a
+      // silent allowlist-bypass. Resolve the same way `add` does and strip
+      // both forms.
+      const pasted = String(identity).trim();
+      cfg = removeBuyerAllowlistEntry(cfg, pasted);
+      try {
+        const resolved = await resolveAllowlistIdentity(pasted, keys);
+        if (resolved) cfg = removeBuyerAllowlistEntry(cfg, resolved);
+      } catch (e) {
+        console.warn(`⚠️  ${e.message} while removing.`);
+        console.warn(`   If it was added as both a name and an i-address, the i-address entry`);
+        console.warn(`   may still be allowlisted — check with: allowlist ${agentId} list`);
+      }
     }
     fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + '\n');
     fs.chmodSync(configPath, 0o600);
     console.log(`✅ ${act === 'add' ? 'Added' : 'Removed'} ${identity} ${act === 'add' ? 'to' : 'from'} ${agentId} allowlist`);
+    if (act === 'remove') {
+      console.log(`   Current allowlist: ${loadBuyerAllowlist(cfg).join(', ') || '(empty)'}`);
+    }
   });
 
 // NOT gated: do not run while an inbox identity tx for this agent is unconfirmed
@@ -3533,7 +3647,7 @@ program
 program
   .command('rental-setup <agent-id>')
   .description('Register a raw-GPU rental (Cat-1) service. All-or-nothing; contained SSH, never host SSH.')
-  .option('--price <vrsc>', 'Price per rental window (VRSC)', '0')
+  .option('--price <vrsc>', 'Price per rental window (VRSC) — required unless --no-register')
   .option('--name <name>', 'Service name')
   .option('--service-payment-terms <terms>', 'prepay|postpay', 'prepay')
   .option('--ack-postpay-vast-risk', 'Required if payment terms are postpay AND this slot sources a Vast box (Alice eats the Vast bill if the buyer never pays)')
@@ -3559,9 +3673,20 @@ program
       console.error('✗ --service-payment-terms must be prepay or postpay');
       process.exit(1);
     }
-    const price = parseFloat(options.price);
-    if (!Number.isFinite(price) || price < 0) {
-      console.error('✗ --price must be a non-negative number');
+    // B2 — --price used to default to '0'. That published a live rental
+    // listing for free by default, and the dashboard's guided wizard never
+    // collected a price either, so following it produced the same result.
+    // A missing price is refused, not treated as free.
+    let price = 0;
+    if (options.price !== undefined) {
+      price = parseFloat(options.price);
+      if (!Number.isFinite(price) || price < 0) {
+        console.error('✗ --price must be a non-negative number');
+        process.exit(1);
+      }
+    } else if (options.register) {
+      console.error('✗ --price <vrsc> is required to register a rental listing.');
+      console.error('  Pass a price, or --no-register to only save agent-config.json without publishing.');
       process.exit(1);
     }
 
@@ -3627,7 +3752,7 @@ program
         sovguard: false,
         serviceType: 'gpu-rental',
       });
-      console.log(`✓ Service registered on platform (id: ${svc?.id || svc?.data?.id || '?'})`);
+      console.log(`✓ Service registered on platform (id: ${svc?.id || svc?.data?.id || '?'}, price: ${price} ${NATIVE_COIN}, terms: ${paymentTerms})`);
       console.log('Next: start the dispatcher (j41-dispatcher start) — your rental is now discoverable.');
       console.log('Remember: a rental job delivers contained SSH credentials and the box is released at expiry. Never host SSH.');
     } catch (e) {
@@ -4002,10 +4127,24 @@ program
     }
     console.log('Privacy: Deletion attestations\n');
 
-    // H5: Validate executor URLs at startup (SSRF protection)
-    validateExecutorUrl(cfg.executor.url, 'executor.url');
-    validateExecutorUrl(cfg.executor.mcp_url, 'executor.mcp_url');
-    validateExecutorUrl(cfg.llm.base_url, 'llm.base_url');
+    // H5: Validate executor URLs at startup (SSRF protection).
+    // B10 — these used to throw un-caught, before the unhandledRejection
+    // handler further down in this same closure is even registered, so a
+    // rejected URL (e.g. a private-LAN LLM endpoint, which this check
+    // deliberately blocks) crashed with a raw Node stack trace instead of a
+    // clean, actionable CLI error. The validation itself is unchanged.
+    try {
+      validateExecutorUrl(cfg.executor.url, 'executor.url');
+      validateExecutorUrl(cfg.executor.mcp_url, 'executor.mcp_url');
+      validateExecutorUrl(cfg.llm.base_url, 'llm.base_url');
+    } catch (e) {
+      console.error(`\n❌ ${e.message}`);
+      console.error('   HTTPS URLs are required (localhost/127.0.0.1 excepted); private LAN');
+      console.error('   IPs (10.x, 172.16-31.x, 192.168.x, link-local) are rejected as SSRF');
+      console.error('   protection. Fix the URL in config.toml (or the relevant env override)');
+      console.error('   and retry.');
+      process.exit(1);
+    }
 
     // Check which agents are registered and ACTIVE on the platform
     const enforceFinalize = cfg.runtime.require_finalize;
@@ -4021,6 +4160,10 @@ program
     const _shutdownDeactivateTxids = readShutdownDeactivatedTxids();
     const _reactivatedOnStart = [];
     const _unresolvedWaits = new Set();
+    // B9 — agents skipped for having no on-chain identity at all, tracked
+    // separately from "inactive", so the aggregate error below can send the
+    // operator to `register` instead of the useless `activate-all`.
+    const _unregisteredAgents = [];
     let _lastSeenPlatformStatus = null;
     let _lastSeenChainStatus = null;
     for (const agentId of agents) {
@@ -4045,7 +4188,8 @@ program
 
       const keys = loadAgentKeys(agentId);
       if (!keys?.identity) {
-        console.log(`⚠️  ${agentId}: not registered on platform`);
+        console.log(`⚠️  ${agentId}: not registered on platform (fix: j41-dispatcher register ${agentId} <name>)`);
+        _unregisteredAgents.push(agentId);
         continue;
       }
 
@@ -4191,8 +4335,20 @@ program
     if (readyAgents.length === 0) {
       // Never send the operator to `register` for a fleet that is merely offline —
       // re-registering costs on-chain writes and does not fix an inactive agent.
+      // And never send them to `activate-all` for agents that were never
+      // registered at all (B9) — activate-all has nothing to activate, and a
+      // stranger who ran `init` then jumped straight to `start` got exactly
+      // that useless instruction instead of the one that actually helps.
       if (agents.length === 0) {
         console.error('\n❌ No agents registered. Run: j41-dispatcher register <agent> <name>');
+      } else if (_unregisteredAgents.length === agents.length) {
+        console.error(`\n❌ ${agents.length} agent(s) exist locally (from 'init') but have never been registered on-chain.`);
+        for (const id of _unregisteredAgents) console.error(`   j41-dispatcher register ${id} <name>`);
+      } else if (_unregisteredAgents.length > 0) {
+        console.error(`\n❌ No agents available to poll (${agents.length} registered locally; ${_unregisteredAgents.length} never registered on-chain, the rest inactive).`);
+        console.error('   Register the unregistered ones first:');
+        for (const id of _unregisteredAgents) console.error(`     j41-dispatcher register ${id} <name>`);
+        console.error('   Then bring the rest back online with: j41-dispatcher activate-all');
       } else {
         console.error(`\n❌ No agents available to poll (${agents.length} registered, none active on the platform).`);
         console.error('   Bring them back online with: j41-dispatcher activate-all');
@@ -5729,9 +5885,43 @@ program
 program
   .command('decrypt-keys')
   .description('Remove at-rest encryption; store WIFs as plaintext again')
-  .action(async () => {
-    if (!fs.existsSync(MASTER_KEY_PATH)) { console.error('❌ Keys are not encrypted.'); process.exit(1); }
-    const pass = await keystore.resolvePassphrase({ promptFn: () => keystore.promptHidden('Passphrase: ') });
+  .option('-y, --yes', 'Skip confirmation prompt')
+  .action(async (options) => {
+    if (!fs.existsSync(MASTER_KEY_PATH)) { console.error('❌ Keys are not encrypted. (Use encrypt-keys to enable it first.)'); process.exit(1); }
+
+    // B4 — this is the most consequential of the three key commands: it
+    // permanently writes every agent's WIF back to plaintext on disk. It had
+    // no "are you sure" at all beyond the passphrase itself.
+    console.log('\n  ⚠️  This permanently stores your private keys UNENCRYPTED on disk.');
+    console.log(`     (mode 0600, but plaintext — protects against nothing but a shared account.)\n`);
+    if (!options.yes) {
+      requireInteractiveConfirm('decrypt-keys');
+      const readline = require('readline');
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      const answer = await new Promise(resolve => rl.question('  Continue? (y/N) ', resolve));
+      rl.close();
+      if (answer.trim().toLowerCase() !== 'y' && answer.trim().toLowerCase() !== 'yes') {
+        console.log('\n  Cancelled. Keys remain encrypted.');
+        process.exit(0);
+      }
+    }
+
+    // B4 — this also had no upfront TTY/non-interactive-source guard, unlike
+    // its two siblings: run headlessly with no J41_KEYS_PASSPHRASE/systemd
+    // credential set, resolvePassphrase throws ENOPASS with nothing to catch
+    // it, crashing with a raw stack trace instead of a clean error.
+    let pass;
+    try {
+      pass = await keystore.resolvePassphrase({ promptFn: () => keystore.promptHidden('Passphrase: ') });
+    } catch (e) {
+      console.error(`❌ ${e.message}`);
+      console.error('   Nothing changed; your keys are still encrypted.');
+      process.exit(1);
+    }
+    if (!pass) {
+      console.error('❌ No passphrase given. Nothing changed; your keys are still encrypted.');
+      process.exit(1);
+    }
     try { keystore.unlock(pass, MASTER_KEY_PATH); }
     catch (e) { console.error(`❌ ${e.message}`); process.exit(1); }
     const n = decryptAllKeys(AGENTS_DIR); // locks the keystore internally
@@ -11101,6 +11291,7 @@ program
   .option('--refund-percent <percent>', 'Refund percentage (1-100, required for refund action)')
   .option('--rework-cost <cost>', 'Additional cost for rework (default: 0)', '0')
   .requiredOption('--message <message>', 'Agent statement / reason')
+  .option('-y, --yes', 'Skip confirmation prompt')
   .action(async (jobId, options) => {
     await ensureKeystoreUnlockedIfEncrypted();
     try {
@@ -11109,8 +11300,21 @@ program
         console.error('❌ --action must be refund, rework, or rejected');
         process.exit(1);
       }
-      if (action === 'refund' && !options.refundPercent) {
-        console.error('❌ --refund-percent is required for refund action');
+      let refundPercent;
+      if (action === 'refund') {
+        if (!options.refundPercent) {
+          console.error('❌ --refund-percent is required for refund action');
+          process.exit(1);
+        }
+        refundPercent = parseInt(options.refundPercent, 10);
+        if (!Number.isInteger(refundPercent) || refundPercent < 1 || refundPercent > 100) {
+          console.error(`❌ --refund-percent must be a whole number 1-100 (got "${options.refundPercent}")`);
+          process.exit(1);
+        }
+      }
+      const reworkCost = parseFloat(options.reworkCost);
+      if (options.reworkCost !== undefined && (!Number.isFinite(reworkCost) || reworkCost < 0)) {
+        console.error(`❌ --rework-cost must be a non-negative number (got "${options.reworkCost}")`);
         process.exit(1);
       }
 
@@ -11173,10 +11377,30 @@ program
         }
       }
 
+      // B5 — this used to submit straight to chain with no recap and no
+      // confirmation, unlike every structurally similar money/dispute verb
+      // (post-bounty, wallet send/sweep, refunds approve/unblock, deposits
+      // credit/dismiss). A mistyped refund percent had nothing to catch it.
+      console.log(`\n  Dispute response for job ${jobId}:`);
+      console.log(`    Agent:  ${agentId}`);
+      console.log(`    Action: ${action}${action === 'refund' ? ` (${refundPercent}% refund)` : ''}${action === 'rework' ? ` (rework cost: ${reworkCost || 0} ${NATIVE_COIN})` : ''}`);
+      console.log(`    Message: ${message}`);
+      if (!options.yes) {
+        requireInteractiveConfirm('respond-dispute');
+        const readline = require('readline');
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        const answer = await new Promise(resolve => rl.question('\n  Submit this response? (y/N) ', resolve));
+        rl.close();
+        if (answer.trim().toLowerCase() !== 'y' && answer.trim().toLowerCase() !== 'yes') {
+          console.log('\n  Cancelled. Nothing was submitted.');
+          process.exit(0);
+        }
+      }
+
       const result = await agent.respondToDispute(jobId, {
         action,
-        refundPercent: options.refundPercent ? parseInt(options.refundPercent, 10) : undefined,
-        reworkCost: parseFloat(options.reworkCost) || 0,
+        refundPercent,
+        reworkCost: reworkCost || 0,
         message,
       });
 
@@ -12965,6 +13189,33 @@ program
 
     if (action === 'reject') {
       if (!jobId) { console.error('❌ Provide a <job-id> to reject'); process.exit(1); }
+
+      // B5 — this used to reject straight off with no recap and no
+      // confirmation, unlike its siblings `approve`/`unblock`. A rejected
+      // refund is not automatically retryable by the buyer, so this is the
+      // one destructive decision in the refund queue that could previously
+      // fire off a single mistyped/misremembered job-id with no chance to
+      // double-check what was being denied.
+      const ledger = loadPendingRefunds();
+      const entry = ledger[jobId];
+      if (!entry) { console.error(`❌ No pending refund entry for job ${jobId}`); process.exit(1); }
+      console.log(`\n[refunds] About to REJECT:`);
+      console.log(`  Job:     ${jobId}`);
+      console.log(`  Amount:  ${entry.refundAmount ?? '?'} ${entry.orphan?.currency || NATIVE_COIN}`);
+      console.log(`  Buyer:   ${untrusted(entry.buyerAddress)}`);
+      if (entry.buyerDisplayName) console.log(`  Name:    ${untrustedField(entry.buyerDisplayName)}`);
+      console.log(`  Reason:  ${untrustedField(options.reason || 'owner-rejected', 300)}`);
+      if (!options.yes) {
+        requireInteractiveConfirm('refunds reject');
+        const readline = require('readline');
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        const answer = await new Promise(resolve => rl.question('\n  Reject this refund? (y/N) ', resolve));
+        rl.close();
+        if (answer.toLowerCase() !== 'y' && answer.toLowerCase() !== 'yes') {
+          console.log('[refunds] Cancelled — not rejected.');
+          return;
+        }
+      }
       refundsReject(state, jobId, { reason: options.reason });
       return;
     }
@@ -13234,6 +13485,7 @@ program
 
 if (process.env.NODE_ENV === 'test') {
   module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, shouldWriteChainActiveOnActivate, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState, untrusted, untrustedField, requireInteractiveConfirm, printFundingInstructions, handleWebhookEvent, stopJobContainer, stopJobLocal, _cleanupCompletedJobs, jobImageExists, JOB_IMAGE, jailImageExists, JAIL_IMAGE, NATIVE_COIN,
+    saveProfile, loadSavedProfile, createFinalizeHooks,
     // Execution-harness seam: `program` so a test can drive the REAL `start`
     // action through commander, and `__getState` so it can then assert on what
     // that action actually did. See test/helpers/dispatcher-harness.js.

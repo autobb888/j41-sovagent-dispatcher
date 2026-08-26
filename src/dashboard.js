@@ -464,7 +464,7 @@ async function agentDetailScreen(inquirer, agentId) {
       if (action === 'vdxf') await vdxfScreen(inquirer, secretKeys);
       else if (action === 'platform') await platformScreen(inquirer, secretKeys);
       else if (action === 'services') await servicesScreen(inquirer, secretKeys);
-      else if (action === 'jobs') await jobsScreen(inquirer, secretKeys);
+      else if (action === 'jobs') await jobsScreen(inquirer, secretKeys, agentId);
       else await updateProfileScreen(inquirer, agentId, secretKeys);
       break;
     }
@@ -2160,14 +2160,39 @@ async function rentalSetupScreen(inquirer, agentId) {
       return;
     }
   }
+  // B2 — this used to call rental-setup with no --price, and the CLI's own
+  // default was '0': a first-timer following this exact wizard ended up with
+  // a live rental listing at 0 VRSC. Collect the price here instead.
+  let price;
+  while (price === undefined) {
+    const { priceInput } = await promptWithEsc(inquirer, [{
+      type: 'input', name: 'priceInput',
+      message: `Price per rental window (${NATIVE_COIN}):`,
+    }]);
+    const parsed = parseFloat(priceInput);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      console.log('  Enter a non-negative number (e.g. 5, 0.5) — required, not optional.\n');
+      continue;
+    }
+    if (parsed === 0) {
+      const { confirmFree } = await promptWithEsc(inquirer, [{
+        type: 'confirm', name: 'confirmFree',
+        message: `0 ${NATIVE_COIN} means this rental is free — really list it at 0?`,
+        default: false,
+      }]);
+      if (!confirmFree) continue;
+    }
+    price = parsed;
+  }
+
   const { confirm } = await promptWithEsc(inquirer, [{
     type: 'confirm', name: 'confirm',
-    message: 'Run rental-setup now?',
+    message: `Run rental-setup at ${price} ${NATIVE_COIN} now?`,
     default: false,
   }]);
   if (!confirm) return;
   console.log('');
-  await runDispatcherCli(['rental-setup', agentId]);
+  await runDispatcherCli(['rental-setup', agentId, '--price', String(price)]);
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
@@ -2354,6 +2379,11 @@ async function respondDisputeScreen(inquirer, agentId) {
     if (!p) return;
     args.push('--refund-percent', p);
   }
+  // B8 — this screen used to have no confirmation of its own before spawning
+  // the CLI. It doesn't need one: `runDispatcherCli` inherits this process's
+  // TTY (stdio: 'inherit'), and `respond-dispute` (cli.js) now always prints
+  // a recap and requires an interactive y/N itself unless --yes is passed
+  // (which it isn't, here) — so the confirmation happens one level down.
   console.log('');
   await runDispatcherCli(args);
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
@@ -3502,7 +3532,11 @@ async function apiEndpointSetupScreen(inquirer) {
   }
   console.log('');
 
-  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Apply this configuration?', default: true }]);
+  // B7 — this defaulted to true in front of an on-chain service registration
+  // (agent.registerService below), violating this file's own documented
+  // convention that any confirm committing money or an on-chain write must
+  // default to false. A bare Enter here published a paid API endpoint.
+  const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Apply this configuration? (registers a paid service on-chain)', default: false }]);
   if (!confirm) return;
 
   // Apply
@@ -3621,25 +3655,6 @@ WantedBy=multi-user.target
 }
 
 // ── Main Loop ──
-
-/**
- * Show a read-only money view by running the CLI's own list command.
- *
- * Deliberately read-only: the mutating verbs have confirmations, allowlists and
- * value ceilings that belong in one place, and the footer names them so the
- * operator can run them directly. The gap this closes is that the TUI showed
- * refunds and fee tanks NOWHERE — a dashboard user could not learn that buyers
- * were owed money or that an agent's fee tank had run dry.
- */
-async function moneyScreen(inquirer, title, cliArgs, footer) {
-  console.clear();
-  console.log(`\n  ═══ ${title} ═══\n`);
-  await runCommandAsync(process.execPath, [process.argv[1], ...cliArgs]);
-  console.log('');
-  if (footer) console.log(`  ${footer}`);
-  console.log('');
-  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
-}
 
 async function main() {
   // The TUI's confirmations are its ONLY safety layer, and they are not a

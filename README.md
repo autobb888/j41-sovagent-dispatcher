@@ -836,7 +836,7 @@ Cat-2 (`[18] API Endpoint Setup`) is metered inference on a different listing. D
 2. In `~/.j41/dispatcher/config.toml` set `[compute] enabled = true` and paste a `home-gpu` provider (see `docs/config.toml.example`, the PASTE RECIPE). Required keys: `agent_id`, `device_index`, `memory_mb` (≥ 256), `disk_gb` (≥ 1), `ssh_hostname`, `ssh_tunnel_port`.
 3. Point a **Cloudflare named TCP tunnel** (or equivalent) at `127.0.0.1:$ssh_tunnel_port`. This is not the HTTP webhook / `cloudflared` URL used for jobs. `ssh_hostname` is a hostname, not `127.0.0.1`, not `0.0.0.0`, not `https://…`.
 4. NVIDIA Container Toolkit + `docker.sock` on the **GPU machine**. The dispatcher for `home-gpu` runs on that box. Typical overlay2/ext4 without quota cannot cap `disk_gb` — `rental-setup` and `start` refuse rather than list an uncapped jail.
-5. `j41-dispatcher rental-setup <agent-id>` (prepay). Do **not** set `RENTAL_SECRETS_KEY` here — that 64-hex key lives on the Junction41 API `.env` (`openssl rand -hex 32`); it is not a dispatcher env. A `RENTAL_SECRETS_KEY_MISSING` 503 is the **platform** operator, not your laptop.
+5. `j41-dispatcher rental-setup <agent-id> --price <vrsc>` (prepay). `--price` is required — there is no free default. Do **not** set `RENTAL_SECRETS_KEY` here — that 64-hex key lives on the Junction41 API `.env` (`openssl rand -hex 32`); it is not a dispatcher env. A `RENTAL_SECRETS_KEY_MISSING` 503 is the **platform** operator, not your laptop.
 6. `j41-dispatcher start`.
 
 TCP tunnel stays your job. The dispatcher will not run `cloudflared` for you.
