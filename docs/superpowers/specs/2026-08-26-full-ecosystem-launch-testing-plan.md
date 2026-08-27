@@ -250,6 +250,104 @@ both-axes check. So a restart is a deliberate, verified step with a known
 follow-up, not a free action. Scenario L5 tests exactly this, so the first
 restart is best done *as* L5 rather than incidentally.
 
+### 2.5 Test-artifact isolation — nothing we build for testing enters a repo
+
+**Owner constraint, 2026-08-27:** *"ensure anything we build is separate and
+not going into the repos — this is purely for testing, our patches should not
+be pushed."*
+
+**Rule:** every executable artefact created to run these tests lives **outside
+every repo**, in a dedicated testkit, and is never committed or pushed.
+
+**Proposed location: `/home/mainn/j41-testkit/`** — a sibling of
+`dispatchertest3/`, not inside it, so no repo's `git status` can ever see it.
+
+```
+/home/mainn/j41-testkit/
+  bin/dispb                  # the HOME-scoped Dispatcher B wrapper (§2.3)
+  bin/fund-buyer.js          # SDK sendCurrency → Dispatcher B (§4.6 P-2)
+  bin/backend-precheck.js    # platform capability probe (§4.6 P-6)
+  drivers/                   # BuyerSession scenario drivers
+  homes/dispatcher-b/        # Dispatcher B's HOME
+  homes/clean-install/       # throwaway HOME for F1a/F1b
+  runs/<date>/               # per-run evidence: output, txids, health snapshots
+```
+
+**Also applies to:**
+- **Temporary code patches.** If a scenario needs instrumentation (extra
+  logging, a stubbed clock), it goes on a **local throwaway branch or a
+  separate clone** — never on `main`, never pushed. Revert before the next
+  scenario, and record in the results that instrumentation was present, since
+  an instrumented run is not a clean-artifact run.
+- **The loose `buyer-*.js` scripts** already at `dispatchertest3/` root. They
+  are outside the repos (fine) but unmanaged. Fold them into
+  `j41-testkit/drivers/` as part of Track B prep (§4.2).
+- **Scratch HOMEs and installs**, which can be large — keep them out of the
+  repo tree so a stray `git add -A` can never sweep them in.
+
+**Guard:** before any commit during test execution, `git status` in the
+affected repo should show **only** intended source changes. Anything under
+`j41-testkit/` appearing in a repo's status means the rule has been broken.
+
+**Open question — results docs (#15).** Prior rounds put results in
+`j41-sovagent-dispatcher/docs/testing/` (many `2026-0X-XX-*-results.md`), and
+this plan's Track B currently says to continue that. That is *documentation*,
+not something "built", so it may be the intended exception — but it does put
+test output in a repo. **Default taken:** raw evidence stays in
+`j41-testkit/runs/`; a distilled results doc still goes to `docs/testing/`,
+matching precedent. Say the word and both move out.
+
+The same question applies to **this plan document**, which is already committed
+to the dispatcher repo (`docs/superpowers/specs/`, matching a long-standing
+convention for design docs). Kept in-repo on the same reasoning — flagging it
+rather than assuming.
+
+### 2.6 The VM question — and why it *is* the GPU blocker
+
+**Verified 2026-08-27:** this machine is a **VirtualBox VM** —
+`systemd-detect-virt` → `oracle`; DMI reports `innotek GmbH / VirtualBox`. The
+only display device is a `VMware SVGA II Adapter`. Host CPU is an
+**i7-12800HX** (a mobile workstation part, commonly paired with a discrete
+NVIDIA GPU). Guest resources: 8 vCPU, 21 GB RAM, 80 GB free.
+
+**This fully explains §4.6 P-1.** VirtualBox does not offer VFIO/PCI
+passthrough for NVIDIA CUDA workloads. The missing GPU is not a misconfiguration
+to fix inside the guest — **no amount of guest-side work will make the C family
+runnable here.** The options collapse to:
+
+| Option | Gets us | Cost / risk |
+|---|---|---|
+| **Move to the host** | Real GPU (if the host has one) → C1-C5 runnable on owned hardware | Migration work; must move or re-register identities |
+| **Vast provider** | Compute path tested without local hardware | Real USD; needs a Vast key; tests the `vast` code path, **not** `home-gpu` |
+| **Defer compute** | No work | Launch without compute listings — and they must actually be delisted, not merely untested (exit criterion §11.3) |
+
+**Unknown that decides it:** does the host actually have an NVIDIA GPU? Cannot
+be determined from inside the guest. **Owner input needed (#16).**
+
+**If we migrate, this must be planned, not improvised:**
+- **Identity/key movement is the risk.** `~/.j41/dispatcher/agents/*/keys.json`
+  holds WIFs. Moving them is a secret-handling operation: copy over a trusted
+  channel, verify, then **destroy the source copies** — and consider running
+  `encrypt-keys` first so what moves is already encrypted at rest.
+- **🔴 Never run both machines against the same identities.** Two dispatchers
+  holding one identity is the same double-spend hazard as the two-HOME rule in
+  §4.6 P-2, just across hosts. The VM's fleet must be **stopped and left
+  stopped** before the host fleet starts.
+- **Re-establish the environment:** Docker, the `j41-isolated` bridge, gVisor
+  (`runsc` is present in the guest — verify on the host), the job-agent and
+  gpu-jail images (`build-image`), config.toml, and provider keys.
+- **The §2.1 isolation recipe still applies unchanged** on the host — two
+  dispatchers there need the same `HOME` + three-port treatment.
+- **Alternative that avoids key movement:** leave the VM fleet as Dispatcher A
+  and stand up only the *new* pieces on the host. Requires host↔VM network
+  reachability and reopens the "same machine?" question in §1.2 — but it would
+  make §1.2's isolation caveat **go away**, since buyer and seller would then
+  genuinely be different hosts.
+
+**Recommendation:** decide the GPU question (#16) first, because it determines
+whether migration buys anything. If the host has no NVIDIA GPU, migrating gains
+little and Vast-or-defer is the real choice.
+
 ---
 
 ## 3. Track A — Security audit refresh
@@ -536,20 +634,25 @@ Nothing here has ever been exercised live. Expect the most findings:
 Each was checked on this machine. These gate Track B; several have no
 workaround and force a scope decision.
 
-**🔴 P-1. There is no NVIDIA GPU on this machine.** `nvidia-smi` is absent;
-`docker info` lists runtimes `runsc runsc-nogso io.containerd.runc.v2 runc` —
-**no `nvidia` runtime**. `rental-setup` fails closed without NVIDIA +
-StorageOpt-capable storage (and storage here is `overlay2`, which per the
-README typically cannot cap `disk_gb`). **The entire C family — 5 scenarios,
-3 of them P0 — cannot run on this box as configured.** Options:
- - (a) Use the **`vast`** provider type instead of `home-gpu` — sourced GPU,
-   no local hardware. Costs **real USD**, needs a Vast API key, and the
-   platform-side `RENTAL_SECRETS_KEY` is a backend env, not ours.
- - (b) Defer the C family and launch without compute listings enabled.
- - (c) Add GPU hardware / test on a GPU box.
- **This is an owner decision (new open decision #9); the plan cannot resolve
- it.** Note gVisor (`runsc`) *is* present, so V5/V6 isolation scenarios are
- unaffected.
+**🔴 P-1. There is no NVIDIA GPU on this machine — because it is a VM.**
+`nvidia-smi` is absent; `docker info` lists runtimes `runsc runsc-nogso
+io.containerd.runc.v2 runc` — **no `nvidia` runtime**; the only display device
+is a `VMware SVGA II Adapter`. **Root cause identified 2026-08-27: this is a
+VirtualBox guest** (§2.6), and VirtualBox has no NVIDIA passthrough. This is
+**not fixable inside the guest.** `rental-setup` fails closed without NVIDIA +
+StorageOpt-capable storage (storage here is `overlay2`, which per the README
+typically cannot cap `disk_gb` either). **The entire C family — 5 scenarios,
+3 of them P0 — cannot run on this box.** Options:
+ - (a) **Move to the host** — see §2.6. Only viable if the host has an NVIDIA
+   GPU (unknown, owner input needed).
+ - (b) Use the **`vast`** provider type instead of `home-gpu` — sourced GPU,
+   no local hardware. Costs **real USD**, needs a Vast API key, and exercises
+   the `vast` code path rather than `home-gpu`. The platform-side
+   `RENTAL_SECRETS_KEY` is a backend env, not ours.
+ - (c) Defer the C family — and **actually delist compute listings**, not
+   merely leave them untested (exit criterion §11.3).
+ **Owner decision #9 / #16.** Note gVisor (`runsc`) *is* present, so V5/V6
+ isolation scenarios are unaffected.
 
 **🔴 P-2. Dispatcher B's buyer cannot be funded by `wallet send`.** Wallet
 destinations are **fleet agent-ids only** — a raw address is refused by design,
@@ -872,6 +975,24 @@ they have been through the same gate everything else is.
 14. **Restarting the stale fleet** — PID 381346 still runs 2.34.0/`c97be4b`.
     Restart it onto current code **as scenario L5** (recommended, tests the
     reactivation path), or restart it informally now and lose that coverage?
+
+**Raised by the 2026-08-27 constraints (test isolation + VM question):**
+15. **Do results docs stay in the repo?** Prior rounds put them in
+    `docs/testing/`; the new "nothing test-related in the repos" rule may
+    supersede that. Default taken: raw evidence in `j41-testkit/runs/`,
+    distilled results still in `docs/testing/`. Same question applies to this
+    plan document. See §2.5.
+16. 🔴 **Does the host machine have an NVIDIA GPU?** Cannot be determined from
+    inside the VM, and it decides everything about §2.6 — whether migrating
+    unlocks the C family or gains almost nothing. **This is the highest-value
+    unknown in the plan right now.**
+17. **If migrating: move identities or re-register?** Moving WIFs is a
+    secret-handling operation with a hard rule attached (never run both
+    machines against the same identities). Re-registering is cleaner but costs
+    5-20 min per agent and fresh funding. A third option — keep the VM fleet as
+    Dispatcher A and put only new pieces on the host — would additionally
+    **dissolve the §1.2 same-machine caveat**, since buyer and seller would
+    then be genuinely different hosts.
 
 ---
 
