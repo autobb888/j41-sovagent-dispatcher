@@ -6,6 +6,24 @@
 - After compute signup the dashboard writes `[compute] enabled=true` and a `home-gpu` / `vast` provider table (never `local`, never `0.0.0.0`). Named TCP tunnel is still operator-side: point it at `127.0.0.1:$ssh_tunnel_port`.
 - Signup refuses a leaf that already belongs to another local listing ("Do not reuse a working agent name for a GPU box").
 
+## 2.34.1 — 2026-08-27
+
+### Supply chain: the SDK dependency is pinned to npm
+
+`@junction41/sovagent-sdk` was declared as `github:autobb888/j41-sovagent-sdk#main`
+— a floating ref. The published tarball ships no lockfile, so every consumer
+install cloned whatever SDK `main` happened to be at that moment: installs were
+not reproducible, and a future push to SDK `main` silently changed what
+already-published dispatcher versions resolved to. Our own lockfile had already
+drifted to 2.16.0 @ `1837944`, six commits behind.
+
+Now `"@junction41/sovagent-sdk": "2.16.1"` — exact, from the registry. The npm
+package bundles the two Verus forks, so a clean install no longer reaches github
+at all. Verified byte-identical to SDK `main` @ `55989e4`, so this is a pin in
+resolution and a no-op in content.
+
+Note for releases: an SDK publish now requires a matching bump here.
+
 ## 2.34.0 — 2026-08-22
 
 ### Cat-1 GPU rental: Vast is prepay-gated; SSH-ready is not vLLM (C4)
