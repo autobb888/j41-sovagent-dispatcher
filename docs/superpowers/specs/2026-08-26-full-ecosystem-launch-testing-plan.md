@@ -9,9 +9,65 @@ launched for testing" → reworked on the owner's instruction: "we are going to
 use 2 dispatchers and the chrome plug from this computer for testing, j41 is
 on another pc, plan needs to be robust af."
 
-This is a roadmap. It decomposes into 4 tracks; each gets its own detailed
+This is a roadmap. It decomposes into 5 tracks; each gets its own detailed
 implementation plan immediately before that track runs, because plans written
 now for track C/D would be stale by the time we reach them, sessions away.
+
+---
+
+## STATUS — 2026-08-27, post-publish
+
+**Track E ran early and is essentially complete.** The owner chose to publish
+before testing so the matrix runs against what strangers actually install —
+which inverts §9's ordering but is defensible: the previously-published 2.31.0
+carried the *known-broken* behaviour the 08-25 fixes closed, so shipping was
+strictly safer than leaving it live.
+
+Published + clean-install verified from the registry:
+
+| package | was | now |
+|---|---|---|
+| `@junction41/sovagent-sdk` | 2.14.2 | **2.16.1** |
+| `@junction41/dispatcher` | 2.31.0 | **2.34.1** |
+| `@junction41/secure-setup` | 0.3.2 | **0.3.5** |
+| `@junction41/jailbox` | 2.1.2 | **2.1.3** |
+
+All five repos clean, 0 unpushed. Verified independently, not taken on trust.
+
+**Four review findings closed since the plan was written:**
+- ✅ **npm auth** renewed (expires ~2026-09-03 — rotate after; it was pasted in
+  a transcript).
+- ✅ **Supply-chain floating ref** — dispatcher now pins
+  `"@junction41/sovagent-sdk": "2.16.1"` exact from the registry, replacing
+  `github:…#main`. Our own lockfile had already drifted 6 commits behind main,
+  so the risk was live, not theoretical. A clean npm install now reaches github
+  **zero** times (the two Verus forks ship as `bundledDependencies`; the 6
+  github refs remaining in our *dev* lockfile are those forks and are expected).
+- ✅ **jailbox divergence reconciled** — rebased onto main, published 2.1.3;
+  both checkouts now sit at `c9c33cd`. Notably, two of 2.1.3's three findings
+  were **dropped as already-superseded**, and one (F3, "bwrap is not a counted
+  wall") would have *regressed* main had it landed. **A stale security finding
+  can become a security regression** — re-verify findings against the branch
+  you are landing on, not the one they were written on.
+- ✅ **`secure-setup --version`** implemented (0.3.5) — it previously printed
+  nothing and fell through to the "no action" branch, which *with a product
+  flag would have run a privileged setup the user never asked for*. That is a
+  bigger deal than the missing flag it looked like.
+
+**New standing release-checklist item, created by the pin:** the dispatcher no
+longer picks up a new SDK on its own. **An SDK publish now requires a matching
+dispatcher manifest bump + release.** That is the point of pinning, but it is a
+step that will be forgotten exactly once.
+
+**⚠️ The running fleet is stale.** PID 381346 is still on **2.34.0 /
+`c97be4b`**, one release behind published, and still reports `degraded` (the
+stale `agent-3` container-exited-1 error, §4.6 P-4). Restarting it onto current
+code is the natural next action — and per §2.4 that restart should be performed
+**as scenario L5**, so the deactivate/reactivate path gets tested rather than
+merely survived.
+
+**Still open — these gate Track B, unchanged:** GPU/compute (§4.6 P-1),
+buyer funding (P-2), LLM probe (P-5), backend capability (P-6), Chrome (P-7).
 
 ---
 
@@ -620,23 +676,35 @@ several cite behaviour that may have changed.
 
 ---
 
-## 6. Track C — Stranger-UX audit: connect, jailbox, secure-setup
+## 6. Track C — Stranger-UX audit: jailbox, secure-setup
+
+**Scope shrank on 2026-08-27.** `j41-connect/` and `j41-jailbox/` turned out to
+be two checkouts of **one repo** publishing **one package** (`@junction41/
+jailbox`); the divergence was reconciled and both now sit at `c9c33cd`. So this
+track covers **two codebases, not three**. (Collapsing the duplicate checkout
+is optional housekeeping — see open decision #13.)
 
 **Method:** identical to the 2026-08-25 dispatcher CLI/TUI audit — parallel
 research agents reading full command/flow bodies (not grepping), hunting
 missing auto-fill and non-intuitive UX; then fix → code-review → regression
-tests, in that order. Proven this session: it found 11 real blockers, and the
-review stage then caught 4 issues in the fix itself, one a regression the fix
-had introduced.
+tests, in that order. Proven: it found 11 real blockers, and the review stage
+then caught 4 issues in the fix itself, one a regression the fix had introduced.
 
-- `j41-connect`, `j41-jailbox`: CLI + relay, smaller than dispatcher's 37
-  commands. ~1 session each. **Carries the §1.2 caveat** — findings are
-  source-level and functional, not isolation-proof.
-- `j41-secure-setup`: an installer, not a daily driver. Different questions —
-  "does it say what it will do with sudo before doing it" rather than
-  "is there an auto-fill gap". Own pass, not a forced fit of the CLI method.
+- **jailbox** (`@junction41/jailbox` 2.1.3): CLI + relay + confinement, smaller
+  than dispatcher's 37 commands. ~1 session. **Carries the §1.2 caveat** —
+  findings are source-level and functional, not isolation-proof on one machine.
+  Worth extra attention post-reconciliation: the rebase dropped two findings
+  and rewrote CLAUDE.md/README to post-merge truth, so docs-vs-code drift is
+  freshly plausible here.
+- **secure-setup** (0.3.5): an installer, not a daily driver. Different
+  questions — "does it say what it will do with sudo before doing it" rather
+  than "is there an auto-fill gap". Own pass, not a forced fit of the CLI
+  method. **One finding already closed early:** `--version` printed nothing
+  and fell through to the no-action branch, which with a product flag would
+  have run a privileged setup unasked. That it surfaced during a routine smoke
+  test suggests the rest of this surface is worth a real pass.
 
-**Estimate:** 2-3 sessions.
+**Estimate:** ~2 sessions (was 2-3; one codebase fewer).
 
 ---
 
@@ -661,60 +729,71 @@ Track C session has room.
 ## 8. Track E — Release & publish
 
 **This track did not exist until the 2026-08-27 review, and its absence was
-the single largest hole in the plan.** Everything above tests *this working
-tree*. "Launch for testing" means strangers install from npm — and what npm
-serves is not what we are testing.
+the single largest hole in the plan.** It has since been **executed** — the
+narrative below is kept as the historical record of *why*, because the lesson
+generalises to every future release.
 
-**Verified state:**
+**The problem as found (2026-08-27, now resolved):** everything else in this
+plan tests *the working tree*. "Launch for testing" means strangers install
+from npm — and what npm served was not what we were testing.
 
-| | Version |
-|---|---|
-| Local working tree | **2.34.0** (`main` @ `c97be4b`) |
-| npm `@junction41/dispatcher` | **2.31.0** |
+| | Version at review | Now |
+|---|---|---|
+| Local working tree | 2.34.0 (`c97be4b`) | 2.34.1 (`e627bf6`) |
+| npm `@junction41/dispatcher` | **2.31.0** | **2.34.1** |
 
-Three releases of drift. A stranger invited today gets **none** of the 11
-CLI/TUI blocker fixes from 2026-08-25 — including the empty-on-chain-profile
-bug (B1), free-by-default GPU rentals (B2), and the allowlist bypass (B3).
-Testing 2.34.0 exhaustively and then inviting people onto 2.31.0 would make
-the entire exercise decorative.
+Three releases of drift. A stranger invited that morning would have got
+**none** of the 11 CLI/TUI blocker fixes from 2026-08-25 — including the
+empty-on-chain-profile bug (B1), free-by-default GPU rentals (B2), and the
+allowlist bypass (B3). Testing 2.34.0 exhaustively and then inviting people
+onto 2.31.0 would have made the entire exercise decorative.
 
-**`npm publish` is currently blocked** — `npm whoami` returns
-`E401 Unauthorized`. The recorded token expiry was 2026-08-12; today is
-2026-08-27, so it is expired exactly as predicted. **Renewing npm auth is a
-prerequisite for launch, not a detail.** `npm whoami` is the real diagnostic —
-a stale token in `~/.npmrc` looks fine until a publish fails.
+`npm publish` was also **blocked** — `npm whoami` returned `E401
+Unauthorized`, the token having expired 2026-08-12 exactly as the project's
+own notes predicted. **`npm whoami` is the real diagnostic**; a stale token in
+`~/.npmrc` looks fine until a publish fails. Auth has been renewed (expires
+~2026-09-03 — rotate, it was pasted in a transcript).
 
-**Track E steps:**
-1. Renew npm auth; confirm with `npm whoami` (not by reading `.npmrc`).
-2. Decide the version to ship and whether SDK (2.16.1) needs a matching
-   publish — check whether 2.34.0 depends on unpublished SDK changes.
-3. Publish dispatcher (+ SDK if needed).
-4. **Smoke-test the published tarball from a clean directory with a scratch
-   `HOME`** — `npm i` into an empty dir, run `--version`, run one real command.
-   This is non-negotiable: the 2.29.1 `json-canonicalize` outage made *every
-   fresh install* dead while four source-reading audits saw nothing, and one
-   `npm i` into an empty dir found it in 30 seconds. **Publishing is not
-   shipping.**
-5. Re-run scenario F1 against the **published** artifact, not the working tree.
+**Track E steps — ✅ ALL DONE 2026-08-27** (see STATUS at top):
+1. ✅ Renew npm auth; confirm with `npm whoami` (not by reading `.npmrc`).
+2. ✅ Version decided; SDK published alongside, and the floating github ref
+   replaced with an exact registry pin.
+3. ✅ Published: SDK 2.16.1, dispatcher 2.34.1, secure-setup 0.3.5,
+   jailbox 2.1.3.
+4. ✅ **Smoke-tested from a clean directory with a scratch `HOME`** — versions
+   resolve, SDK pulls in at 2.16.1, zero `codeload.github.com` in the tree,
+   `--version` works on all three binaries. Non-negotiable and it earned its
+   keep before: the 2.29.1 `json-canonicalize` outage made *every fresh
+   install* dead while four source-reading audits saw nothing, and one `npm i`
+   into an empty dir found it in 30 seconds. **Publishing is not shipping.**
+5. ✅ B9 fix verified live on the published artifact (`init` → `start` names
+   `register`, not `activate-all`).
 
-**Ordering consequence:** F1 ("clean install") is ambiguous as written. It
-splits in two — **F1a** against a local `npm pack` tarball (early, to catch
-packaging bugs before publishing) and **F1b** against the published artifact
-(after Track E, as the final gate). Only F1b proves what a stranger actually
-receives.
+**Standing item for every future release** (created by the SDK pin): an SDK
+publish no longer propagates on its own — it requires a **matching dispatcher
+manifest bump and release**. Add to the release checklist.
+
+**Ordering consequence:** F1 ("clean install") splits in two — **F1a** against
+a local `npm pack` tarball (to catch packaging bugs pre-publish) and **F1b**
+against the published artifact. F1b was effectively executed as step 4 above,
+but should be **re-run as a formal scenario** once Track B starts, because
+step 4 exercised install + `--version` + one command, not the full
+`init → register → finalize → start` walk F1 specifies.
 
 ---
 
 ## 9. Sequencing
 
-**Step 0 — unblockers (can run in parallel with Track A, and should start now
-because two have external lead time):**
-- Renew **npm auth** (Track E prerequisite; currently E401).
-- Decide the **compute/GPU question** (§4.6 P-1) — it may need hardware or a
-  Vast account.
-- Connect **Chrome** (`/chrome`) — gates ~6 W-path scenarios.
-- Write the **buyer-funding script** (§4.6 P-2) and the **backend-capability
-  precheck** (P-6).
+**Step 0 — unblockers.** Two are done; four remain and two of those have
+external lead time, so they should start now:
+- ✅ ~~Renew npm auth~~ — done 2026-08-27.
+- ✅ ~~**Track E** publish~~ — done early (see STATUS). Ordering inverted
+  deliberately; rationale below.
+- ⏳ Decide the **compute/GPU question** (§4.6 P-1) — may need hardware or a
+  Vast account. **Blocks 5 scenarios and an exit criterion.**
+- ⏳ Connect **Chrome** (`/chrome`) — gates ~6 W-path scenarios.
+- ⏳ Write the **buyer-funding script** (§4.6 P-2).
+- ⏳ Write the **backend-capability precheck** (P-6).
 
 Then:
 1. **Track A** — security audit refresh *(needs Workflow opt-in)*
@@ -722,19 +801,26 @@ Then:
 3. **Track B prep** — stand up Dispatcher B with the §2.1 recipe, build the
    `dispb` wrapper, register + fund its buyer identity, audit the buyer
    scripts, capture the `/health` baseline (§4.6 P-4), probe the LLM (P-5).
+   **Restart the stale fleet onto 2.34.1 as scenario L5**, not informally.
 4. **Track B** — execute the matrix, P0 first
 5. **Track B** — re-runs per the §4.7 defect loop
-6. **Track E** — publish, then **F1b** against the published artifact
-7. **Track C** — connect + jailbox
-8. **Track C** — secure-setup, **Track D** folded in
+6. **Track C** — jailbox
+7. **Track C** — secure-setup, **Track D** folded in
+8. **Re-publish** any fixes Tracks A-D produce (Track E's checklist again —
+   note the SDK pin means an SDK bump now needs a dispatcher bump too)
 9. **Exit-criteria review** (§11) → GO / NO-GO
 
 Order per the owner: A and B gate whether it is safe to open the door at all;
-C and D are quality work that matters once it is open. **Track E sits after B
-deliberately** — publishing before the matrix passes would ship untested code
-to the very strangers this exercise exists to protect. But its *prerequisite*
-(npm auth) belongs in step 0, because discovering an expired token on publish
-day costs a day.
+C and D are quality work that matters once it is open.
+
+**On Track E running first.** The plan originally placed it last, reasoning
+that publishing before the matrix passes ships untested code to the very
+strangers this exercise protects. The owner inverted it, and that was the
+better call *in this specific case*: the already-published 2.31.0 carried
+known-broken money and access behaviour, so leaving it live was strictly worse
+than shipping tested-by-unit-tests-only 2.34.1. **The original reasoning still
+holds for step 8** — fixes found by Tracks A-D should not be published until
+they have been through the same gate everything else is.
 
 ---
 
@@ -767,8 +853,9 @@ day costs a day.
 9. 🔴 **Compute/GPU (§4.6 P-1)** — no NVIDIA GPU on this box, so the C family
    (3 P0) cannot run. Vast (real USD), defer compute at launch, or add
    hardware? **Blocks 5 scenarios and an exit criterion.**
-10. **Track E version** — ship 2.34.0 as-is, and does the SDK (2.16.1) need a
-    matching publish? Check whether 2.34.0 depends on unpublished SDK changes.
+10. ~~Track E version~~ — **CLOSED 2026-08-27.** Shipped SDK 2.16.1,
+    dispatcher 2.34.1 (SDK pinned exact), secure-setup 0.3.5, jailbox 2.1.3;
+    all clean-install verified. See STATUS at top.
 11. **Track C/D rigour** — Track B has 67 numbered scenarios; C and D are
     prose. Do they get their own matrices before execution, or is
     lighter-touch acceptable given they gate less?
@@ -776,6 +863,15 @@ day costs a day.
     historical jobs. Do test artefacts get cleaned up between rounds, or
     accumulate? Affects repeatability more than correctness, but a polluted
     fleet makes "is this a new failure?" much harder to answer.
+
+**Raised by the post-publish cleanup:**
+13. **Duplicate jailbox checkout** — `j41-connect/` and `j41-jailbox/` are two
+    working copies of one repo, now identical at `c9c33cd`. Collapse to one,
+    or keep both? Harmless today; it is exactly the shape that produced the
+    divergence trap, so keeping it means the trap can recur.
+14. **Restarting the stale fleet** — PID 381346 still runs 2.34.0/`c97be4b`.
+    Restart it onto current code **as scenario L5** (recommended, tests the
+    reactivation path), or restart it informally now and lose that coverage?
 
 ---
 
