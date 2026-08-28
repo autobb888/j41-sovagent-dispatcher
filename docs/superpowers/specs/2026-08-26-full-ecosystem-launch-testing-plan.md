@@ -335,19 +335,26 @@ be pushed."*
 **Rule:** every executable artefact created to run these tests lives **outside
 every repo**, in a dedicated testkit, and is never committed or pushed.
 
-**Proposed location: `/home/mainn/j41-testkit/`** — a sibling of
-`dispatchertest3/`, not inside it, so no repo's `git status` can ever see it.
+**Location: `/home/mainn/j41-testkit/`** — a sibling of `dispatchertest3/`, not
+inside it, so no repo's `git status` can ever see it. **Created 2026-08-28 and
+verified invisible to all four repos.**
 
 ```
 /home/mainn/j41-testkit/
-  bin/dispb                  # the HOME-scoped Dispatcher B wrapper (§2.3)
-  bin/fund-buyer.js          # SDK sendCurrency → Dispatcher B (§4.6 P-2)
-  bin/backend-precheck.js    # platform capability probe (§4.6 P-6)
-  drivers/                   # BuyerSession scenario drivers
-  homes/dispatcher-b/        # Dispatcher B's HOME
-  homes/clean-install/       # throwaway HOME for F1a/F1b
-  runs/<date>/               # per-run evidence: output, txids, health snapshots
+  bin/backend-precheck.js    ✅ built + green — platform capability probe (P-6)
+  bin/llm-probe.js           ✅ built + green — LLM liveness/usability (P-5)
+  bin/fund-agent.js          ✅ built + guards verified — cross-fleet funding (P-2)
+  bin/dispb                  ⏳ HOME-scoped wrapper, if a 2nd instance is needed (§2.3)
+  drivers/                   ⏳ BuyerSession scenario drivers (fold in buyer-*.js)
+  homes/                     scratch HOMEs for isolated instances
+  runs/<date>/               per-run evidence: output, txids, health snapshots
 ```
+
+All three built tools are **read-only or explicitly gated**; `fund-agent.js`
+is the only one that moves money and its guards were verified firing (amount
+ceiling, i-address rejection, non-TTY refusal). **Port them to the host** —
+they take `--home`/`--api` and are not VM-specific, but `fund-agent.js`
+hardcodes the SDK path and will need that adjusted.
 
 **Also applies to:**
 - **Temporary code patches.** If a scenario needs instrumentation (extra
@@ -801,12 +808,21 @@ be a pass criterion until this baseline is cleared** (a restart should clear
 it — fold into L5). Capture a pre-test baseline snapshot and diff against it,
 rather than asserting green.
 
-**🟡 P-5. The seller needs a live LLM or every job is refused.** The preflight
-gate declines jobs when the provider is down — correct money-safety behaviour,
-but indistinguishable from "no demand" in a test. Provider is configured as
-`kimi-nvidia` / `openai/gpt-oss-120b`. **Probe it as an explicit precondition
-step** before any H/R/E scenario, and re-probe after any failure that looks
-like silence.
+**🟢 P-5. LLM — CLOSED 2026-08-28, probe built and green.** The preflight gate
+declines jobs when the provider is down — correct money-safety behaviour, but
+indistinguishable from "no demand" in a test. Probed live on the VM fleet:
+`kimi-nvidia` / `openai/gpt-oss-120b` @ `integrate.api.nvidia.com/v1` →
+**reachable, http 200, ~550ms, `usable: true`.**
+
+Tool: `j41-testkit/bin/llm-probe.js` (reuses the dispatcher's own `probeLLM`
++ `resolveLLMConfig`, so "probe ok" means *the executor* can call). **Re-run it
+on the host fleet before any H/R/E scenario**, and after any silence that looks
+like a stall.
+
+⚠️ It reports **`usable`, not just reachable** — deliberately. Keyless presets
+(`ollama`, `lmstudio`, `vllm`) can probe green while the executor falls through
+to **template filler**, and that filler has previously been delivered and hashed
+as a buyer's paid work product. Reachable ≠ able to do real work.
 > 🔑 **Security note:** the live provider API key sits in plaintext in
 > `~/.j41/dispatcher/config.toml` and was surfaced in this planning session.
 > Rotate it before launch and keep it out of any results doc or screenshot.
@@ -1087,9 +1103,16 @@ rather than after a buyer has paid.
 
 ### 9.1.3 Suggested sequencing for Track F
 
-- **Now, cheap:** F-3 and F-4 — widen the storage gate to accept `prjquota` and
-  the btrfs/zfs drivers, with tests that feed *real* mount/driver output rather
-  than the current mocks (§9.2).
+- ✅ **DONE 2026-08-28 — F-3 and F-4 shipped in dispatcher 2.34.2.** The storage
+  gate now accepts `prjquota` as well as `pquota` (and still refuses
+  `pqnoenforce`, which accounts without enforcing, and `uquota`/`gquota`), and
+  accepts the btrfs/zfs drivers which cap natively. The misleading "overlay2
+  size or xfs pquota" error text was corrected. Tests replaced the old
+  command-string mock with **real `mount` output**; both fixes mutation-checked
+  (reverting the regex fails 3 tests, dropping btrfs/zfs fails 1). README gained
+  a real storage section with a capability table and the two commands a host
+  owner runs to check. Also widens disk capping for ordinary job containers,
+  since `cli.js` gates `StorageOpt` on the same function.
 - **Design decision:** F-1 approach (loopback volume vs. data-root migration).
 - **Then:** F-2 tunnel assistance, at least a preflight.
 - **Docs, regardless:** the requirement is currently three words in a README
@@ -1171,12 +1194,16 @@ on a correctly built GPU host is exactly the "stranger cannot use it" class the
 - ✅ ~~**Compute/GPU question**~~ — closed 2026-08-28: host has a GPU, fresh
   dispatcher there (§1).
 - 🔴 **Settle how the host is driven** (#19) — nothing starts until this is
-  answered.
+  answered. **This is now the only hard blocker.**
+- ✅ ~~`fund-agent.js`~~ — built, guards verified (§2.5).
+- ✅ ~~backend-capability precheck~~ — built and run; all required features
+  present (§4.5.1).
+- ✅ ~~LLM probe~~ — built; provider green (P-5).
+- ✅ ~~F-3/F-4 storage-gate fixes~~ — shipped in **2.34.2**, so the host build
+  will not hit a false `HOME_GPU_NO_DISK_QUOTA` from a `prjquota` spelling or
+  a btrfs/zfs driver.
 - ⏳ **Build the host** — see Step 0.5 below.
 - ⏳ Connect **Chrome** on the host — gates ~6 W-path scenarios.
-- ⏳ Write `fund-agent.js` (§4.6 P-2) — **needed in both directions** now, since
-  a fresh seller has only its ~33-write registration seed.
-- ⏳ Write the **backend-capability precheck** (P-6).
 - ⏳ Decide the fate of the VM's 9 live listings (#18).
 
 **Step 0.5 — build the host seller from scratch.** This is itself scenario
