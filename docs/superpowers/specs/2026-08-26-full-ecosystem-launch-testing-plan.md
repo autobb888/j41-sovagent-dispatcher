@@ -86,12 +86,63 @@ source.
 
 ## 1. Topology
 
+**Revised 2026-08-28.** The owner confirmed **the host has an NVIDIA GPU** and
+chose to **stand up a brand-new dispatcher and test from scratch**. That
+resolves open decisions #16 and #17 and produces a materially better setup than
+the original single-machine design.
+
 | Role | Where | What it is |
 |---|---|---|
 | **Backend / platform** | Separate PC | junction41.io + API. Already remote. |
-| **Dispatcher A — seller** | This machine | The agent under test. Gets hired, delivers, gets paid. |
-| **Dispatcher B — buyer-agent** | This machine, isolated instance | Provides the buyer *identity + wallet*. A `BuyerSession` script runs against its keys. |
-| **Web frontend** | This machine, Chrome | junction41.io in the browser, driven by the Claude-in-Chrome extension. |
+| **Dispatcher A — seller** | **Host (bare metal, has GPU)** | **Fresh install, registered from scratch.** The system under test: gets hired, delivers, gets paid, rents GPU. |
+| **Dispatcher B — buyer** | **This VM** (existing fleet) | Provides the buyer *identity + wallet*. A `BuyerSession` script runs against its keys. Already registered and funded. |
+| **Web frontend** | Host, Chrome | junction41.io in the browser, driven by the Claude-in-Chrome extension. |
+
+### 1.0 Why this topology is strictly better
+
+Three problems the plan had been carrying dissolve at once:
+
+1. **The GPU blocker (§4.6 P-1) is gone.** The host has real hardware, so the
+   C family (5 scenarios, 3 P0) becomes runnable on `home-gpu` — the path we
+   actually ship — instead of Vast, deferral, or nothing.
+2. **The same-machine isolation caveat (§1.2) is gone.** Buyer and seller are
+   now genuinely different hosts, so Track C's jailbox findings can be
+   isolation-relevant rather than source-level only.
+3. **No WIF ever moves.** "From scratch" means the host seller **registers new
+   identities**, so the key-movement hazard in §2.6 never arises. The VM keeps
+   its existing funded identities and simply becomes the buyer — a role that
+   does not need to be pristine, only funded and real.
+
+It also makes **F1 a genuine test rather than a simulation**: the first-run
+path gets walked on a machine that has never run this software, which is
+exactly the condition under which the `json-canonicalize` outage and the
+2026-08-14 audit corrections were found.
+
+### 1.0.1 Consequences to plan for
+
+- 🔴 **The VM fleet must be STOPPED before the host fleet is hired against**,
+  or at minimum must never share identities with it. They will not share
+  identities (fresh registration), so both *may* run — but the VM's 9 agents
+  are still live marketplace listings that can be hired by strangers. Decide
+  whether to `deactivate-all` them so test traffic is unambiguous (#18).
+- 🟡 **A fresh seller starts with ~33 on-chain writes** (the 0.0033 VRSCTEST
+  registration seed, §5) and **there is no faucet**. A 67-scenario matrix with
+  reviews, attestations, job records and profile updates will exceed that.
+  Refill comes from either earning-then-sweeping, or an SDK `sendCurrency`
+  from a funded VM agent. **The funding script (§4.6 P-2) is therefore needed
+  in both directions** — plan it as `fund-agent.js`, not `fund-buyer.js`.
+- 🟡 **Docker images must be rebuilt on the host** (`build-image` → job-agent
+  *and* gpu-jail). On a GPU host the jail image gate becomes live rather than
+  skipped, so this is itself worth recording as scenario C5.
+- 🟡 **The host needs the full environment**: Docker, gVisor (`runsc` — present
+  in the guest, verify on host), the `j41-isolated` bridge, NVIDIA Container
+  Toolkit, and **StorageOpt-capable storage** for `disk_gb` caps. Plain
+  `overlay2` typically cannot cap disk, and `rental-setup` fails closed on it —
+  so this may need attention even with a GPU present.
+- 🟡 **Execution question (#19):** this session runs *inside the VM* and cannot
+  reach the host. Driving the host needs either a Claude Code session opened
+  **on the host** (simplest — the host becomes the primary session and this VM
+  session becomes the buyer side), or SSH access from here.
 
 ### 1.1 Why Dispatcher B is an identity, not a hiring engine
 
@@ -112,29 +163,49 @@ This also means Dispatcher B **must be running** for some scenarios (so its
 agent is `active` on both status axes and its fee tank is being swept), even
 though the purchase itself comes from a script.
 
-### 1.2 The honest limitation of same-machine testing
+### 1.2 ~~The limitation of same-machine testing~~ — RESOLVED by the host split
 
-Both dispatchers share one kernel, one Docker daemon, one filesystem, one
-network namespace. That is fine for everything in Track B (the marketplace
-protocol, money lifecycle, and web frontend do not care where the peer runs —
-they meet at the remote backend and on-chain).
+**Superseded 2026-08-28.** The original plan put both dispatchers on one box
+and carried this caveat:
 
-It is **not** sufficient to validate `j41-connect` / `j41-jailbox` isolation
-claims. Those exist to confine a buyer-side agent, and the June 2026-06-01
-audit already found their marketed "Three-Wall Isolation" diverges from the
-code (Wall 1 silently falls back to plain Docker; audit logs record the
-agent's *claimed* path, not the real one). A same-machine test can pass while
-the actual guarantee is broken. **Track C therefore carries an explicit
-caveat: its jailbox/connect findings are source-level and functional, not
-isolation-proof.** Proving isolation needs a genuinely separate host, and that
-is deliberately deferred, not silently dropped.
+> Both dispatchers share one kernel, one Docker daemon, one filesystem, one
+> network namespace… **not** sufficient to validate `j41-connect` /
+> `j41-jailbox` isolation claims. Those exist to confine a buyer-side agent,
+> and the June 2026-06-01 audit already found their marketed "Three-Wall
+> Isolation" diverges from the code (Wall 1 silently falls back to plain
+> Docker; audit logs record the agent's *claimed* path, not the real one). A
+> same-machine test can pass while the actual guarantee is broken.
+
+**With seller on the host and buyer on the VM, buyer and seller are genuinely
+different machines** — different kernel, Docker daemon, filesystem and network
+namespace. Track C's jailbox findings can therefore be isolation-relevant, and
+the caveat in §6 is lifted.
+
+**One honest residual:** the VM is a guest *of* the host, so they are not
+independent in the way two physical machines are — a host-level compromise
+sees both. That is irrelevant to every scenario here (which test confinement of
+an agent, not host compromise), but it should not be described as full physical
+separation in any published claim.
+
+**Still deliberately out of scope:** proving the isolation *walls themselves*
+(gVisor actually engaged vs. silently falling back, audit logs recording
+realpaths). That is a security-audit question for Track A, not a functional
+E2E one — the topology now permits it, but it is a different kind of test.
 
 ---
 
-## 2. Two dispatchers on one machine — verified isolation recipe
+## 2. Running two dispatchers on one machine — verified isolation recipe
 
-Everything in this section was verified empirically on this machine today, not
-inferred from docs.
+> **Note (2026-08-28):** the topology moved to host-seller / VM-buyer (§1), so
+> A and B are no longer co-located and this recipe is not needed for that
+> split. **It is retained deliberately** — it still applies to any second
+> instance on either machine, and §2.1's egress-proxy finding (a fatal bind
+> failure on the shared docker bridge) is the reason a second dispatcher can
+> start at all. §2.4-2.6 remain live: the VM fleet's state, the test-artifact
+> rule, and the VM/GPU analysis.
+
+Everything in this section was verified empirically on the VM, not inferred
+from docs.
 
 ### 2.1 What isolates, and how
 
@@ -321,8 +392,12 @@ runnable here.** The options collapse to:
 | **Vast provider** | Compute path tested without local hardware | Real USD; needs a Vast key; tests the `vast` code path, **not** `home-gpu` |
 | **Defer compute** | No work | Launch without compute listings — and they must actually be delisted, not merely untested (exit criterion §11.3) |
 
-**Unknown that decides it:** does the host actually have an NVIDIA GPU? Cannot
-be determined from inside the guest. **Owner input needed (#16).**
+**✅ ANSWERED 2026-08-28: the host has an NVIDIA GPU**, and the owner chose to
+**stand up a fresh dispatcher on it and test from scratch**. Decisions #16 and
+#17 are closed; see §1 for the resulting topology. The "move to the host"
+column below is the option taken — but as a **fresh registration, not a
+migration**, so the key-movement hazard described further down never arises.
+It is retained here because the hazard still applies to any *future* migration.
 
 **If we migrate, this must be planned, not improvised:**
 - **Identity/key movement is the risk.** `~/.j41/dispatcher/agents/*/keys.json`
@@ -794,8 +869,11 @@ tests, in that order. Proven: it found 11 real blockers, and the review stage
 then caught 4 issues in the fix itself, one a regression the fix had introduced.
 
 - **jailbox** (`@junction41/jailbox` 2.1.3): CLI + relay + confinement, smaller
-  than dispatcher's 37 commands. ~1 session. **Carries the §1.2 caveat** —
-  findings are source-level and functional, not isolation-proof on one machine.
+  than dispatcher's 37 commands. ~1 session. **The §1.2 caveat is lifted** —
+  with buyer and seller on different machines, findings here can be
+  isolation-relevant rather than source-level only. (Residual: the VM is a
+  guest of the host, so this is not full physical separation — fine for
+  confinement testing, not a claim to publish.)
   Worth extra attention post-reconciliation: the rebase dropped two findings
   and rewrote CLAUDE.md/README to post-merge truth, so docs-vs-code drift is
   freshly plausible here.
@@ -887,24 +965,53 @@ step 4 exercised install + `--version` + one command, not the full
 
 ## 9. Sequencing
 
-**Step 0 — unblockers.** Two are done; four remain and two of those have
-external lead time, so they should start now:
+**Step 0 — unblockers.** Three done; the rest are now mostly host setup:
 - ✅ ~~Renew npm auth~~ — done 2026-08-27.
-- ✅ ~~**Track E** publish~~ — done early (see STATUS). Ordering inverted
-  deliberately; rationale below.
-- ⏳ Decide the **compute/GPU question** (§4.6 P-1) — may need hardware or a
-  Vast account. **Blocks 5 scenarios and an exit criterion.**
-- ⏳ Connect **Chrome** (`/chrome`) — gates ~6 W-path scenarios.
-- ⏳ Write the **buyer-funding script** (§4.6 P-2).
+- ✅ ~~**Track E** publish~~ — done early (see STATUS).
+- ✅ ~~**Compute/GPU question**~~ — closed 2026-08-28: host has a GPU, fresh
+  dispatcher there (§1).
+- 🔴 **Settle how the host is driven** (#19) — nothing starts until this is
+  answered.
+- ⏳ **Build the host** — see Step 0.5 below.
+- ⏳ Connect **Chrome** on the host — gates ~6 W-path scenarios.
+- ⏳ Write `fund-agent.js` (§4.6 P-2) — **needed in both directions** now, since
+  a fresh seller has only its ~33-write registration seed.
 - ⏳ Write the **backend-capability precheck** (P-6).
+- ⏳ Decide the fate of the VM's 9 live listings (#18).
+
+**Step 0.5 — build the host seller from scratch.** This is itself scenario
+**F1b** (clean install of the published artifact) and should be *recorded as
+such*, not treated as mere setup — it is the single most representative test of
+what a stranger experiences.
+
+1. Verify prerequisites **before** installing: Docker, gVisor (`runsc`), NVIDIA
+   Container Toolkit, `nvidia-smi`, and **StorageOpt-capable storage** (#20 —
+   `overlay2` alone typically cannot cap `disk_gb`).
+2. `yarn global add @junction41/dispatcher` (2.34.1 from the registry — **not**
+   this working tree, and not a clone).
+3. Walk `init` → `register` → `finalize` → `start` **capturing every prompt and
+   message**. This exercises the 2026-08-25 B1 fix (profile persistence) on a
+   machine that has never run the software.
+4. `build-image` — job-agent **and** gpu-jail. On a GPU host the jail gate is
+   live, so record this as **C5**.
+5. Record the ~33-write starting fee-tank budget and watch it; top up via
+   `fund-agent.js` before it blocks a scenario rather than after.
+6. Capture the `/health` baseline on a genuinely clean fleet — unlike the VM's,
+   this one should be `ok`, which finally makes "green" a usable criterion
+   (§4.6 P-4).
 
 Then:
 1. **Track A** — security audit refresh *(needs Workflow opt-in)*
 2. **Track A** — triage + start CRITICAL/HIGH remediation
-3. **Track B prep** — stand up Dispatcher B with the §2.1 recipe, build the
-   `dispb` wrapper, register + fund its buyer identity, audit the buyer
-   scripts, capture the `/health` baseline (§4.6 P-4), probe the LLM (P-5).
-   **Restart the stale fleet onto 2.34.1 as scenario L5**, not informally.
+3. **Track B prep** — on the **VM (buyer side)**: pick the buyer identity from
+   the existing fleet, deactivate the rest (#18), fold the loose `buyer-*.js`
+   into `j41-testkit/drivers/`, probe the LLM (P-5). On the **host (seller)**:
+   Step 0.5 above. **Restart the VM fleet onto 2.34.1 as scenario L5**, not
+   informally — it is still on 2.34.0/`c97be4b`.
+   *(§2.1's two-dispatchers-one-box recipe is no longer needed for A-vs-B, but
+   is retained: it still applies if a second instance is ever wanted on either
+   machine, and its egress-proxy finding is the reason a second dispatcher can
+   boot at all.)*
 4. **Track B** — execute the matrix, P0 first
 5. **Track B** — re-runs per the §4.7 defect loop
 6. **Track C** — jailbox
@@ -982,17 +1089,24 @@ they have been through the same gate everything else is.
     supersede that. Default taken: raw evidence in `j41-testkit/runs/`,
     distilled results still in `docs/testing/`. Same question applies to this
     plan document. See §2.5.
-16. 🔴 **Does the host machine have an NVIDIA GPU?** Cannot be determined from
-    inside the VM, and it decides everything about §2.6 — whether migrating
-    unlocks the C family or gains almost nothing. **This is the highest-value
-    unknown in the plan right now.**
-17. **If migrating: move identities or re-register?** Moving WIFs is a
-    secret-handling operation with a hard rule attached (never run both
-    machines against the same identities). Re-registering is cleaner but costs
-    5-20 min per agent and fresh funding. A third option — keep the VM fleet as
-    Dispatcher A and put only new pieces on the host — would additionally
-    **dissolve the §1.2 same-machine caveat**, since buyer and seller would
-    then be genuinely different hosts.
+16. ~~Does the host have an NVIDIA GPU?~~ — **CLOSED 2026-08-28: yes.**
+17. ~~Move identities or re-register?~~ — **CLOSED 2026-08-28: re-register.**
+    Fresh dispatcher on the host, VM keeps its funded fleet as the buyer. No
+    WIF movement; the §1.2 caveat dissolves as a bonus. See §1.
+
+**Raised by the host-split decision:**
+18. **What happens to the VM's 9 live listings during testing?** They are real
+    marketplace agents a stranger could hire. `deactivate-all` them so test
+    traffic is unambiguous, or leave them up? Recommendation: deactivate all
+    except the one acting as buyer.
+19. 🔴 **How is the host driven?** This session runs inside the VM and cannot
+    reach the host. Either open a Claude Code session **on the host** (simplest
+    — host becomes primary, this VM session becomes the buyer side), or set up
+    SSH. **Nothing in Track B can start until this is settled.**
+20. **Does the host have StorageOpt-capable storage?** A GPU is necessary but
+    not sufficient — `rental-setup` also fails closed without a disk-quota-capable
+    driver, and plain `overlay2` typically cannot cap `disk_gb`. Worth checking
+    early, since it may need a filesystem change rather than a package install.
 
 ---
 
