@@ -6,6 +6,13 @@ const path = require('path');
 
 const DASH = fs.readFileSync(path.join(__dirname, '../src/dashboard.js'), 'utf8');
 
+test('TUI and CLI can hire as a buyer, not only accept as a seller', () => {
+  assert.match(DASH, /Hire a listing \(this fleet as buyer\)/);
+  assert.match(DASH, /hireScreen/);
+  const cli = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
+  assert.match(cli, /\.command\('hire <buyer-agent-id> <seller>'\)/);
+});
+
 test('TUI can build jail images, rental-setup a compute listing, and activate this listing', () => {
   assert.match(DASH, /Build job-agent \+ gpu-jail images|build_image/);
   assert.match(DASH, /'build-image'/);

@@ -327,6 +327,7 @@ async function mainMenu(inquirer) {
       new inquirer.Separator('  ── Marketplace ──'),
       { name: '[17] Bounties', value: 'bounties' },
       { name: '[18] API Endpoint Setup (resell your LLM, metered)', value: 'api_setup' },
+      { name: '     Hire a listing (this fleet as buyer)', value: 'hire' },
       new inquirer.Separator('  ── Money ──'),
       { name: `[19] Wallet & Fee Tanks${money.feeTanksNeedingFunding ? ` \x1b[31m(${money.feeTanksNeedingFunding} empty)\x1b[0m` : ''}`, value: 'wallet' },
       { name: `[20] Refunds Queue${money.pendingRefunds ? ` \x1b[33m(${money.pendingRefunds} awaiting you)\x1b[0m` : ''}`, value: 'refunds' },
@@ -2141,6 +2142,99 @@ async function computeProviderScreen(inquirer, agentId) {
   }
 }
 
+async function hireScreen(inquirer) {
+  console.clear();
+  console.log('\n  ═══ Hire a listing ═══\n');
+  console.log('  This fleet identity is the BUYER. The seller is any J41 listing');
+  console.log('  (agent / compute gpu-rental / model api-endpoint). Data is browse-only.\n');
+
+  const agents = getAgents().filter(a => a.identity && a.iAddress && a.wif);
+  if (agents.length === 0) {
+    console.log('  No registered identities to hire as.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+  const { buyerId } = await promptWithEsc(inquirer, [{
+    type: 'list', pageSize: 15, name: 'buyerId',
+    message: 'Hire AS (buyer):',
+    choices: [
+      ...agents.map(a => ({ name: `  ${a.id.padEnd(12)} ${a.identity}`, value: a.id })),
+      new inquirer.Separator(),
+      { name: '  ← Back', value: '__back' },
+    ],
+  }]);
+  if (!buyerId || buyerId === '__back') return;
+
+  const { seller } = await promptWithEsc(inquirer, [{
+    type: 'input', name: 'seller',
+    message: 'Seller (VerusID or i-address):',
+  }]);
+  const sellerId = String(seller || '').trim();
+  if (!sellerId) return;
+
+  const buyer = agents.find(a => a.id === buyerId);
+  let listing;
+  let services = [];
+  try {
+    const agent = await createAgent(buyer);
+    try {
+      listing = await agent.client.getAgent(sellerId);
+      const svc = await agent.client.getAgentServices(listing.id || sellerId);
+      services = (svc && (svc.data || svc)) || [];
+      if (!Array.isArray(services)) services = [];
+    } finally { agent.stop(); }
+  } catch (e) {
+    console.log(`\n  ❌ Could not load seller: ${e.message}\n`);
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  const kind = listing.kind || listing.listingKind || 'agent';
+  console.log(`\n  Seller kind: ${kind}  ${listing.qualifiedName || listing.name || sellerId}`);
+  if (kind === 'data') {
+    console.log('  Data listings are browse-only — POST /v1/jobs is refused.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  let serviceId = '';
+  if (services.length > 0) {
+    const { svcChoice } = await promptWithEsc(inquirer, [{
+      type: 'list', pageSize: 12, name: 'svcChoice',
+      message: 'Service:',
+      choices: [
+        ...services.map(s => ({
+          name: `  ${(s.name || s.id).toString().slice(0, 40).padEnd(40)} ${(s.serviceType || 'agent')}  ${s.price} ${s.currency || ''}`,
+          value: s.id,
+        })),
+        ...(kind === 'agent' ? [{ name: '  (labour job, no service id)', value: '' }] : []),
+      ],
+    }]);
+    serviceId = svcChoice || '';
+  } else if (kind !== 'agent') {
+    console.log('  This kind needs a service (gpu-rental or api-endpoint) and none are listed.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+
+  const picked = services.find(s => s.id === serviceId);
+  const defaultAmt = picked && picked.price != null ? String(picked.price) : '';
+  const { amount } = await promptWithEsc(inquirer, [{ type: 'input', name: 'amount', message: 'Amount:', default: defaultAmt }]);
+  const { description } = await promptWithEsc(inquirer, [{ type: 'input', name: 'description', message: 'Description:', default: (picked && picked.description) || 'Hire from dispatcher TUI' }]);
+  const { pay } = await promptWithEsc(inquirer, [{
+    type: 'confirm', name: 'pay',
+    message: 'Broadcast dual payment now? (spends this identity\'s wallet)',
+    default: false,
+  }]);
+
+  const args = ['hire', buyerId, listing.id || sellerId, '--amount', String(amount), '--description', String(description), '--yes'];
+  if (serviceId) args.push('--service', serviceId);
+  if (pay) args.push('--pay');
+  console.log('');
+  await runDispatcherCli(args);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
 async function rentalSetupScreen(inquirer, agentId) {
   console.clear();
   console.log(`\n  ═══ Rental-setup: ${agentId} ═══\n`);
@@ -3720,6 +3814,7 @@ async function main() {
       case 'executor': await withBack(() => executorConfigScreen(inquirer)); break;
       case 'llm': await withBack(() => llmScreen(inquirer)); break;
       case 'services': await withBack(() => configureServicesScreen(inquirer)); break;
+      case 'hire': await withBack(() => hireScreen(inquirer)); break;
       case 'security': await withBack(() => securityScreen(inquirer)); break;
       case 'start': await withBack(async () => {
         const status = getDispatcherStatus();

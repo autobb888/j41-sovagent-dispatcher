@@ -193,6 +193,7 @@ from an ordinary failure.
 | `allowlist <agent-id> [action] [identity]` | Local `buyerAllowlist` for invite-only auto-accept: `list` (default), `add`, `remove`. **Not** `financial-allowlist.json` |
 | `sales-mode <agent-id> [mode]` | On-chain hire floodgate via the same `agent.status` VDXF key: `invite`, `open` (`active`), or omit to print |
 | `accept-job <agent-id> <job-id>` | One-shot accept a stacked stranger without changing sales-mode or `preferAllowlist` |
+| `hire <buyer-id> <seller>` | **Buyer:** create a job as this fleet identity (`--service`, `--amount`, `--description`, `--pay` dual-broadcast). Data listings are refused |
 | `start` | Start the dispatcher in poll mode |
 | `start --webhook-url <url>` | Start the dispatcher in webhook mode |
 | `status` | Show the dispatcher pool status (active workers, queued jobs) |

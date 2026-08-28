@@ -2768,6 +2768,121 @@ program
     }
   });
 
+program
+  .command('hire <buyer-agent-id> <seller>')
+  .description('Hire a listing as this fleet identity (create job; --pay broadcasts dual payment)')
+  .requiredOption('--amount <n>', 'Job price in the listing currency')
+  .option('--service <id>', 'Marketplace service id (required for compute gpu-rental and model api-endpoint)')
+  .option('--description <text>', 'Job description')
+  .option('--currency <c>', 'Payment currency', NATIVE_COIN)
+  .option('--pay', 'Broadcast dual payment (seller + platform fee) after create')
+  .option('--yes', 'Skip the interactive confirmation (--pay on mainnet still requires a TTY retype)')
+  .action(async (buyerAgentId, seller, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
+    ensureDirs();
+
+    const amount = Number(options.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      console.error('❌ --amount must be a positive number');
+      process.exit(1);
+    }
+    const keys = loadAgentKeys(buyerAgentId);
+    if (!keys) {
+      console.error(`❌ Agent ${buyerAgentId} not found.`);
+      process.exit(1);
+    }
+    if (!keys.identity || !keys.wif || !keys.address) {
+      console.error(`❌ Agent ${buyerAgentId} is not registered — hire is a buyer identity, not a local folder.`);
+      process.exit(1);
+    }
+
+    const { assertHireAllowed, paymentOutputs } = require('./hire.js');
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+    const agent = new J41Agent({
+      apiUrl: J41_API_URL,
+      wif: keys.wif,
+      identityName: keys.identity,
+      iAddress: keys.iAddress,
+    });
+
+    try {
+      await agent.authenticate();
+      const listing = await agent.client.getAgent(seller);
+      let service = null;
+      if (options.service) {
+        service = await agent.client.getService(options.service);
+      }
+      const sellerKind = listing.kind || listing.listingKind || null;
+      const serviceType = service && (service.serviceType || service.service_type);
+      const gate = assertHireAllowed({
+        sellerKind,
+        serviceType,
+        serviceId: options.service || null,
+      });
+      if (!gate.ok) {
+        console.error(`❌ ${gate.code}: ${gate.message}`);
+        process.exit(1);
+      }
+
+      const description = options.description || (service && service.description) || `Hire via dispatcher (${buyerAgentId})`;
+      console.log(`\n  Buyer:  ${keys.identity} (${buyerAgentId})`);
+      console.log(`  Seller: ${listing.qualifiedName || listing.name || seller}  kind=${sellerKind || 'agent'}`);
+      if (service) console.log(`  Service: ${service.id}  type=${serviceType || 'agent'}  listed=${service.price} ${service.currency || ''}`);
+      console.log(`  Amount: ${amount} ${options.currency}`);
+      console.log(`  Pay:    ${options.pay ? 'yes — dual output after create' : 'no — create only (seller waits for payment)'}`);
+      console.log('');
+
+      if (options.pay && IS_MAINNET && options.yes && !process.stdin.isTTY) {
+        console.error('❌ --yes cannot skip hire payment confirmation on mainnet without a TTY.');
+        process.exit(1);
+      }
+      if (!options.yes) {
+        const ok = await confirmHire({ amountText: String(options.amount), pay: !!options.pay });
+        if (!ok) {
+          console.log('Cancelled.');
+          process.exit(0);
+        }
+      }
+
+      const job = await agent.createJob({
+        sellerVerusId: listing.id || listing.verusId || seller,
+        description,
+        amount,
+        currency: options.currency,
+        serviceId: options.service,
+      });
+      console.log(`✅ Job ${job.id} created (status=${job.status})`);
+
+      if (options.pay) {
+        const outputs = paymentOutputs(job, amount);
+        const txid = await agent.sendMultiPayment(outputs);
+        await agent.client.recordPaymentCombined(job.id, txid);
+        console.log(`✅ Payment broadcast ${String(txid).substring(0, 16)}… (${outputs.length} output${outputs.length === 1 ? '' : 's'})`);
+        console.log('   Wait for confirmations; seller accept may already be stacked.');
+      } else {
+        console.log('   Pay later with --pay, or from the website. Seller cannot start until payment verifies.');
+      }
+    } catch (e) {
+      console.error(`❌ ${e.message}`);
+      process.exit(1);
+    }
+  });
+
+async function confirmHire({ amountText, pay }) {
+  const readline = require('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const q = pay
+      ? `Broadcast dual payment of ${amountText}? This spends the buyer's wallet. (y/N) `
+      : `Create this job for ${amountText} without paying yet? (y/N) `;
+    const answer = await new Promise(resolve => rl.question(q, resolve));
+    const a = String(answer || '').trim().toLowerCase();
+    return a === 'y' || a === 'yes';
+  } finally {
+    rl.close();
+  }
+}
+
 /**
  * The standard dispute policy — identical to what `setup`/`quickstart` writes at
  * onboarding (see the interactive defaults above), so `--dispute-policy default`

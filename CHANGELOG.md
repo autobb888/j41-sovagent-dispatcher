@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Buyer hire from CLI and TUI
+The dispatcher was seller-only (`accept-job`, refunds, rental-setup). Terminal
+access to J41 includes hiring. `j41-dispatcher hire <buyer-id> <seller>
+--amount <n> [--service <id>] [--pay]` creates the job as that fleet identity
+and optionally broadcasts the dual payment. TUI: Marketplace → Hire a listing.
+Data listings are refused locally (`DATA_NOT_HIREABLE`). Compute requires
+`gpu-rental`; model requires `api-endpoint`.
+
 ### TUI writes [compute.providers.*]; listing_kind is sticky
 - After compute signup the dashboard writes `[compute] enabled=true` and a `home-gpu` / `vast` provider table (never `local`, never `0.0.0.0`). Named TCP tunnel is still operator-side: point it at `127.0.0.1:$ssh_tunnel_port`.
 - Signup refuses a leaf that already belongs to another local listing ("Do not reuse a working agent name for a GPU box").

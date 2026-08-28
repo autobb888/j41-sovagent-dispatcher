@@ -64,15 +64,14 @@ longer picks up a new SDK on its own. **An SDK publish now requires a matching
 dispatcher manifest bump + release.** That is the point of pinning, but it is a
 step that will be forgotten exactly once.
 
-**⚠️ The running fleet is stale.** PID 381346 is still on **2.34.0 /
-`c97be4b`**, one release behind published, and still reports `degraded` (the
-stale `agent-3` container-exited-1 error, §4.6 P-4). Restarting it onto current
-code is the natural next action — and per §2.4 that restart should be performed
-**as scenario L5**, so the deactivate/reactivate path gets tested rather than
-merely survived.
+**Published dispatcher is 2.34.2** (storage-gate F-3/F-4). GPU-host install
+must be **2.34.2**, not 2.34.1. Host seller is a **fresh** fleet; do not
+treat the VM PID/2.34.0 notes as current.
 
-**Still open — these gate Track B, unchanged:** GPU/compute (§4.6 P-1),
-buyer funding (P-2), LLM probe (P-5), backend capability (P-6), Chrome (P-7).
+**Still open for Track B on the host:** Chrome (P-7), host storage quota
+(§9.2 / #20), VM listing deactivate (#18), **buyer hire is now a dispatcher
+command** (`hire` CLI + TUI) — the 2026-08-27 “dispatcher cannot hire”
+finding is closed in source; re-verify on 2.34.2+ before scoring H2.
 
 ---
 
@@ -149,24 +148,26 @@ exactly the condition under which the `json-canonicalize` outage and the
   **on the host** (simplest — the host becomes the primary session and this VM
   session becomes the buyer side), or SSH access from here.
 
-### 1.1 Why Dispatcher B is an identity, not a hiring engine
+### 1.1 Dispatcher B is a buyer identity — and the dispatcher now hires
 
-Verified by grepping the entire dispatcher `src/` case-insensitively for
-`hire`, `BuyerSession`, `createJob`, `.hire(`, plus enumerating all 37 CLI
-commands: **the dispatcher has no buyer-side hiring capability at all.** Every
-"hire" in the codebase is seller-side language (an agent *being* hired). The
-command set is register / accept-job / deliver / post-bounty / wallet /
-refunds — seller and operator-money verbs only.
+**Was (2026-08-27):** grepping `src/` found no buyer hire. Every "hire" was
+seller-side (`accept-job`). Agent-to-agent hiring was a `BuyerSession` script
+against B's keys. That was a product hole if the dispatcher is full J41 access
+from the terminal.
 
-So "agent-to-agent hiring via a second dispatcher" is mechanically: a
-`BuyerSession` script, run against Dispatcher B's registered agent's keys and
-wallet. Dispatcher B exists to own a real, separately-registered, separately-
-funded on-chain identity so the buyer is genuinely a different marketplace
-actor — not to execute the purchase itself.
+**Now:** `j41-dispatcher hire <buyer-agent-id> <seller> --amount <n>
+[--service <id>] [--pay]` creates the job as that fleet identity (SDK
+`createJob`) and optionally broadcasts the dual payment. TUI: Marketplace →
+Hire a listing. Gate matches the platform: agent labour, compute=`gpu-rental`,
+model=`api-endpoint`; **data is browse-only**.
 
-This also means Dispatcher B **must be running** for some scenarios (so its
-agent is `active` on both status axes and its fee tank is being swept), even
-though the purchase itself comes from a script.
+Dispatcher B still must be **running** (both status axes active, fee tank
+alive) so the buyer identity is hireable *as a seller of its own listings*
+and can sign. The purchase itself is `hire` from B's CLI/TUI, or Chrome on
+the host, or a leftover SDK script.
+
+Raw `BuyerSession` remains a valid third path; it is no longer the only
+non-web path.
 
 ### 1.2 ~~The limitation of same-machine testing~~ — RESOLVED by the host split
 
@@ -499,17 +500,19 @@ waits. Each step's actual output captured before the next begins.
 
 ### 4.1 Three buyer paths
 
-1. **Web frontend** (Chrome + Claude-in-Chrome, this machine)
-2. **Agent-to-agent** — `BuyerSession` on Dispatcher B's identity
-3. **Raw SDK** — `BuyerSession`
+1. **Web frontend** (Chrome on the **host**, junction41.io — `/sovcompute`
+   `/sovdata` `/sovmodel` `/listings`). Claude-in-Chrome optional; owner
+   clicking is a valid W path.
+2. **Dispatcher hire** — `j41-dispatcher hire` / TUI “Hire a listing” on
+   Dispatcher B, as that fleet identity.
+3. **Raw SDK** — `BuyerSession` script (same keys as path 2; use for
+   automation the TUI should not auto-confirm).
 
-**2 and 3 are the same mechanism** (§1.1); they differ only in framing. One
-script covers both. Path 1 is genuinely separate and is what the Chrome
-extension is for.
+Path 1 and path 2 are different surfaces. **Do not score a CLI-only hire as
+covering the website**, or a website hire as covering the TUI.
 
-**Chrome is not currently connected** — the extension is not set up in this
-session. Connect via `/chrome` (claude.ai/chrome) before Track B, or path 1
-falls back to the owner clicking manually while narrating results.
+**Chrome on this Grok/API session is not path 1.** Path 1 is a browser on
+the machine that can load junction41.io.
 
 ### 4.2 Existing buyer scripts — audit before reuse
 
@@ -556,16 +559,17 @@ commands**, the **27 webhook event types** it handles (`case 'job.*'` etc. in
 - **P1** — should pass before wide invite; a bug here is embarrassing not fatal.
 - **P2** — completeness; can trail the launch.
 
-Buyer path: **W** = web frontend (Chrome), **S** = `BuyerSession` script
-(covers both the "agent-to-agent via Dispatcher B" and "raw SDK" framings),
-**—** = seller/operator-side only.
+Buyer path: **W** = web frontend (Chrome on host), **S** = dispatcher
+`hire` CLI/TUI as Dispatcher B (raw `BuyerSession` only if noted),
+**—** = seller/operator-side only (TUI/CLI as the **seller**).
+Seller TUI is required for R4/R5/S3 — M5 smoke is not enough.
 
 #### F — Foundation & onboarding
 
 | ID | Scenario | Path | Pri | Notes |
 |---|---|---|---|---|
 | F1 | Clean install → `init` → `register` → `finalize` → `start` (agent kind), throwaway `HOME` | — | P0 | B1 profile-persistence fix; the clean-install class that caught the npm outage |
-| F2 | Register **compute**, **data**, **model** listings | — | P0 | **data + model never registered, ever** |
+| F2 | Register **compute**, **data**, **model** listings | — | P0 | **data + model never registered, ever.** Distinct leaves under `agentplatform@`; do not reuse a labour name. Kind is `config.kind` |
 | F3 | `quickstart` guided path; `setup --template` (all 5 templates) | — | P1 | `setup --help` previously listed 3 of 5 |
 | F4 | Key lifecycle: `encrypt-keys` → `start` w/ passphrase → `change-passphrase` → `decrypt-keys` | — | P0 | B4 fix; irreversible ops |
 | F5 | `recover` a timed-out registration; `set-authorities` / `check-authorities` | — | P1 | |
@@ -593,14 +597,14 @@ nothing downstream matters however well the hire flow works.
 | ID | Scenario | Path | Pri | Notes |
 |---|---|---|---|---|
 | H1 | Agent hire → accept → chat → deliver → complete → payment | **W** | P0 | the path most real buyers take |
-| H2 | Same, via `BuyerSession` from Dispatcher B | **S** | P0 | agent-to-agent framing |
+| H2 | Same, via dispatcher `hire --pay` from Dispatcher B (TUI or CLI) | **S** | P0 | terminal full-access path; do not substitute a raw SDK script |
 | H3 | Chat: send/receive, held messages, `release`/`appeal`, communication policy | W+S | P1 | `getChatMessages ?since=` trap (§5) |
-| H4 | Workspace: connect → list/read/write → done → `workspace.completed` | S | P1 | 3 webhook events |
+| H4 | Workspace: connect → list/read/write → done → `workspace.completed` | S | P1 | **Jailbox parked** (`JAILBOX_ENABLED` default off). Expect 403 `JAILBOX_PARKED` unless explicitly re-enabled. Waive or assert the 403 — do not score a workspace session as P1-required |
 | H5 | Files: upload / download / delete, `file.uploaded` | S | P2 | |
 | H6 | **Review**: buyer submits → `review.received` → `acceptReview` → on-chain | W+S | P0 | inbox batching; trust/reputation update |
 | H7 | Trust/reputation/transparency profile reflects the review | W | P1 | |
-| H8 | `model`-kind listing hired (metered inference) | S | P0 | never tested |
-| H9 | `data`-kind listing queried | S | P1 | never tested |
+| H8 | `model`-kind listing hired (`api-endpoint`) | **W+S** | P0 | never tested; distinct leaf, never reuse a labour name. Same wire as P family — register `kind=model` |
+| H9 | `data`-kind listing **browsed** (D4); confirm `hire` / `POST /v1/jobs` **refuses** | W+S | P0 | **not a job.** Live platform refuses kind=data. A "hire dataset" fail is the correct product result |
 | H10 | **Seller reviews the BUYER**; `get_buyer_reviews` reflects it | S | P1 | two-sided reputation — H6/H7 only cover the seller being reviewed |
 | H11 | Payment address / `get_payment_qr` / `verify_payment` path | W+S | P1 | how a human buyer actually pays |
 | H12 | Multi-currency: a service with `acceptedCurrencies` is payable in each | S | P2 | |
@@ -610,10 +614,10 @@ nothing downstream matters however well the hire flow works.
 | ID | Scenario | Path | Pri | Notes |
 |---|---|---|---|---|
 | R1 | Buyer rejects delivery (`job.delivery_rejected`) → re-deliver | W+S | P0 | |
-| R2 | Dispute filed → `respond-dispute --action rejected` (defend) | S | P0 | B5 new confirm |
-| R3 | Dispute → `--action rework` → `rework_accepted` → re-deliver | S | P0 | rework-cycle limit refusal path too |
-| R4 | Dispute → `--action refund --refund-percent` → refunds queue → `approve` → on-chain send | S | **P0** | the money-return path; bounds per §4.6 |
-| R5 | `refunds reject` / `refunds unblock` | — | P0 | B5 fix; `unblock` refuses `--yes` by design |
+| R2 | Dispute filed → seller TUI/CLI `respond-dispute --action rejected` (defend) | W buyer + **TUI seller** | P0 | B5 new confirm; not CLI-only |
+| R3 | Dispute → TUI/CLI `--action rework` → `rework_accepted` → re-deliver | W buyer + **TUI seller** | P0 | rework-cycle limit refusal path too |
+| R4 | Dispute → refund percent → refunds queue → TUI `approve` → on-chain send | W buyer + **TUI seller** | **P0** | operator uses TUI for money; CLI `--yes` is the scripted twin |
+| R5 | TUI/CLI `refunds reject` / `refunds unblock` | — | P0 | B5 fix; `unblock` refuses `--yes` by design |
 | R6 | Rework budget invariant: mid-job re-grant offsets cumulative usage | S | P1 | §5 hazard |
 | R7 | Dispute metrics / resolver visibility | W | P2 | |
 
@@ -641,7 +645,7 @@ nothing downstream matters however well the hire flow works.
 | ID | Scenario | Path | Pri | Notes |
 |---|---|---|---|---|
 | C1 | `rental-setup --price <n>` → listing live at the right price | — | P0 | B2 fix; verify price echoed |
-| C2 | Buyer rents → SSH credentials delivered → jail reachable | S | P0 | never live-tested |
+| C2 | Buyer rents → SSH credentials delivered → jail reachable | **W+S** | P0 | never live-tested; website HireModal is Cat-1 `gpu-rental` |
 | C3 | Lease expiry → box released, billing stops | S | P0 | money leak risk if broken |
 | C4 | Prepay gating; postpay `--ack-postpay-vast-risk` refusal | — | P1 | |
 | C5 | `build-image` (job-agent **and** gpu-jail), preflight failures | — | P0 | fails closed w/o docker/nvidia/StorageOpt |
@@ -671,8 +675,8 @@ nothing downstream matters however well the hire flow works.
 
 | ID | Scenario | Path | Pri | Notes |
 |---|---|---|---|---|
-| S1 | `sales-mode invite` + allowlisted buyer → auto-accepted | S | P0 | |
-| S2 | Non-allowlisted buyer → **held**, not accepted | S | **P0** | the actual security property |
+| S1 | `sales-mode invite` + allowlisted buyer → auto-accepted | **W+S** | P0 | website hire of an invite listing too |
+| S2 | Non-allowlisted buyer → **held**, not accepted | **W+S** | **P0** | the actual security property; prove on the dashboard, not only SDK |
 | S3 | `allowlist add` (name → resolves i-address) then `remove` → **both** entries gone | — | **P0** | B3 fix; verify with `allowlist list` |
 | S4 | `sales-mode open` → floodgate, stacked jobs accepted | S | P0 | |
 | S5 | `accept-job` one-shot on a stacked stranger | — | P1 | |
@@ -708,7 +712,7 @@ nothing downstream matters however well the hire flow works.
 | M2 | Concurrent jobs across multiple agents | S | P1 | |
 | M3 | Inbox batching: several items → **one** identity tx, 0 rejections | — | P0 | CMM ordering (§5) |
 | M4 | Dispatcher A and B both live, both hiring/selling, no interference | — | P0 | validates §2 isolation |
-| M5 | TUI: every menu item reachable; money screens; the 11 fixed blockers live | — | P0 | |
+| M5 | TUI: every menu item reachable including **Hire a listing**; money screens; the 11 fixed blockers live | — | P0 | hire is buyer-side; accept-job is seller-side |
 | M6 | **WEBHOOK MODE**: run `start --webhook-url …` and drive a full hire → deliver → pay under it | — | **P0** | see note below — an entire operating mode, otherwise untested |
 | M7 | Inbox verbs: `accept_inbox_item` / `reject_inbox_item`, `get_inbox_count` | — | P1 | M3 covers batching, not the operator verbs |
 | M8 | Seller's job views: `list_jobs`, `get_unread_jobs` | — | P1 | |
@@ -789,7 +793,7 @@ they take minutes and are the cheapest guard against silent coverage rot.
 ### 4.5 Known-untested surface (highest expected yield)
 
 Nothing here has ever been exercised live. Expect the most findings:
-- `data` and `model` listing kinds (F2, H8, H9) — never registered
+- `data` and `model` listing kinds (F2, H8, H9) — never registered. H9 is **browse + refuse hire**, not a job.
 - GPU rental end-to-end (C2, C3) — shipped since 08-14
 - M4 0-conf deposit reconciler (P4) — explicitly recorded as never run on real data
 - Restart mid-job (L3) — recorded repeatedly as never run end-to-end
@@ -844,25 +848,10 @@ rather than code ones.
 Each was checked on this machine. These gate Track B; several have no
 workaround and force a scope decision.
 
-**🔴 P-1. There is no NVIDIA GPU on this machine — because it is a VM.**
-`nvidia-smi` is absent; `docker info` lists runtimes `runsc runsc-nogso
-io.containerd.runc.v2 runc` — **no `nvidia` runtime**; the only display device
-is a `VMware SVGA II Adapter`. **Root cause identified 2026-08-27: this is a
-VirtualBox guest** (§2.6), and VirtualBox has no NVIDIA passthrough. This is
-**not fixable inside the guest.** `rental-setup` fails closed without NVIDIA +
-StorageOpt-capable storage (storage here is `overlay2`, which per the README
-typically cannot cap `disk_gb` either). **The entire C family — 5 scenarios,
-3 of them P0 — cannot run on this box.** Options:
- - (a) **Move to the host** — see §2.6. Only viable if the host has an NVIDIA
-   GPU (unknown, owner input needed).
- - (b) Use the **`vast`** provider type instead of `home-gpu` — sourced GPU,
-   no local hardware. Costs **real USD**, needs a Vast API key, and exercises
-   the `vast` code path rather than `home-gpu`. The platform-side
-   `RENTAL_SECRETS_KEY` is a backend env, not ours.
- - (c) Defer the C family — and **actually delist compute listings**, not
-   merely leave them untested (exit criterion §11.3).
- **Owner decision #9 / #16.** Note gVisor (`runsc`) *is* present, so V5/V6
- isolation scenarios are unaffected.
+**🟢 P-1. GPU — CLOSED 2026-08-28.** Seller is a **fresh dispatcher on the
+NVIDIA host** (`home-gpu`). The VM still has no GPU; do not run C on the VM.
+Host install **2.34.2**. StorageOpt still required (§9.2 / #20). `RENTAL_SECRETS_KEY`
+is Junction41 API `.env` on the platform PC, not the dispatcher.
 
 **🔴 P-2. Dispatcher B's buyer cannot be funded by `wallet send`.** Wallet
 destinations are **fleet agent-ids only** — a raw address is refused by design,
@@ -918,8 +907,9 @@ precheck live rather than deferring it (see §4.5.1 for full results):
   ever existed in production** — accepted-in-principle is not the same as
   exercised. Treat those families as first-ever (§4.5.1).
 - ⏳ **Still unverified:** the per-seller dispute resolver (no feature flag;
-  confirm it is enabled for the test seller before R2-R4) and whatever
-  platform-side support the spend-policy work assumes.
+  live default `DISPUTE_RESOLVER_ENABLED` is **unset/off** on the platform PC).
+  Confirm it is enabled for the test seller before R2-R4, or those fail as
+  config. Also whatever platform-side support the spend-policy work assumes.
 
 A scenario failing because the backend does not implement it is a different
 finding from a dispatcher bug, and conflating them wastes a cycle — doubly so
@@ -1273,8 +1263,9 @@ on a correctly built GPU host is exactly the "stranger cannot use it" class the
 - ✅ ~~**Track E** publish~~ — done early (see STATUS).
 - ✅ ~~**Compute/GPU question**~~ — closed 2026-08-28: host has a GPU, fresh
   dispatcher there (§1).
-- 🔴 **Settle how the host is driven** (#19) — nothing starts until this is
-  answered. **This is now the only hard blocker.**
+- 🟡 **GPU seller session** (#19 closed for the platform PC). Track B still
+  needs a human/session **on the GPU box** to install 2.34.2 and mint. Do not
+  SSH the VM into this API host.
 - ✅ ~~`fund-agent.js`~~ — built, guards verified (§2.5).
 - ✅ ~~backend-capability precheck~~ — built and run; all required features
   present (§4.5.1).
@@ -1294,8 +1285,9 @@ what a stranger experiences.
 1. Verify prerequisites **before** installing — see §9.2 for the storage
    requirement, which is the fiddly one: Docker, gVisor (`runsc`), NVIDIA
    Container Toolkit, `nvidia-smi`, and **XFS-with-project-quota** storage.
-2. `yarn global add @junction41/dispatcher` (2.34.1 from the registry — **not**
-   this working tree, and not a clone).
+2. `yarn global add @junction41/dispatcher` (**2.34.2** from the registry once
+   published — **not** 2.34.1, not this working tree). If 2.34.2 is not on npm
+   yet, install from the git tag / GPU-box pull of `f06935b`+ so F-3/F-4 land.
 3. Walk `init` → `register` → `finalize` → `start` **capturing every prompt and
    message**. This exercises the 2026-08-25 B1 fix (profile persistence) on a
    machine that has never run the software.
@@ -1365,16 +1357,16 @@ they have been through the same gate everything else is.
    cleaner and self-funds, but costs 5-20 min.
 6. **Chrome extension** — connect via `/chrome` so I can drive path 1
    directly, or does the owner click through junction41.io manually?
-7. **Which listing kinds does the web frontend expose?** Determines whether
-   C1-C3 (compute), H8 (model) and H9 (data) have web-path variants or are
-   `BuyerSession`-only. Affects ~8 matrix rows.
+7. ~~Which listing kinds does the web frontend expose?~~ — **CLOSED 2026-08-28
+   (platform host).** `/sovcompute` `/sovdata` `/sovmodel` are live. Compute =
+   Cat-1 `gpu-rental` (W+S). Model = `api-endpoint` (W+S). Data = browse-only
+   (H9 is refuse-hire, not a job). Distinct leaves; do not reuse a labour name.
 8. **Scope call on the 87-scenario matrix** — all of it, or P0-only for
    launch with P1/P2 trailing? Drives whether Track B is ~4 sessions or ~8.
 
 **Raised by the 2026-08-27 review:**
-9. 🔴 **Compute/GPU (§4.6 P-1)** — no NVIDIA GPU on this box, so the C family
-   (3 P0) cannot run. Vast (real USD), defer compute at launch, or add
-   hardware? **Blocks 5 scenarios and an exit criterion.**
+9. ~~Compute/GPU (§4.6 P-1)~~ — **CLOSED 2026-08-28:** host has NVIDIA; C
+   family runs there on `home-gpu`. Do not re-open.
 10. ~~Track E version~~ — **CLOSED 2026-08-27.** Shipped SDK 2.16.1,
     dispatcher 2.34.1 (SDK pinned exact), secure-setup 0.3.5, jailbox 2.1.3;
     all clean-install verified. See STATUS at top.
@@ -1411,10 +1403,11 @@ they have been through the same gate everything else is.
     marketplace agents a stranger could hire. `deactivate-all` them so test
     traffic is unambiguous, or leave them up? Recommendation: deactivate all
     except the one acting as buyer.
-19. 🔴 **How is the host driven?** This session runs inside the VM and cannot
-    reach the host. Either open a Claude Code session **on the host** (simplest
-    — host becomes primary, this VM session becomes the buyer side), or set up
-    SSH. **Nothing in Track B can start until this is settled.**
+19. ~~How is the host driven?~~ — **CLOSED for the platform PC (2026-08-28):**
+    review session is `bigbox` / live API. **Do not SSH the VM into the
+    platform host.** Three seats: GPU box = seller dispatcher; platform PC =
+    API/web/logs; VM = buyer `hire`. GPU seller still needs its own session.
+    Track B waits on that GPU session, not on VM→host SSH.
 20. **Host storage: XFS with project quota required** — investigated in §9.2.
     A GPU is necessary but not sufficient; `overlay2` can only cap `disk_gb` on
     XFS with project quotas, so an ext4 host (Ubuntu default) needs a dedicated

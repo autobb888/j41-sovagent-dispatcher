@@ -64,6 +64,11 @@ test('register and setup CLI accept --kind', () => {
   assert.match(CLI, /agent, compute, data, or model/);
 });
 
+test('CLI hire exists so the dispatcher is not seller-only', () => {
+  assert.match(CLI, /\.command\('hire <buyer-agent-id> <seller>'\)/);
+  assert.match(CLI, /assertHireAllowed/);
+});
+
 test('TUI signup offers model as a live kind under agentplatform@', () => {
   assert.match(DASH, /What are you listing/);
   assert.match(DASH, /agentplatform@/);
