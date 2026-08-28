@@ -246,7 +246,7 @@ test('waitReady wraps storage-opt quota errors as HOME_GPU_NO_DISK_QUOTA and unl
   const lease = await p.acquire((await p.discover())[0]);
   await assert.rejects(
     () => p.waitReady(lease, { timeoutMs: 1000 }),
-    /HOME_GPU_NO_DISK_QUOTA: host docker cannot cap disk_gb \(need overlay2 size or xfs pquota\):/,
+    /HOME_GPU_NO_DISK_QUOTA: host docker cannot cap disk_gb \(need overlay2 over XFS -o prjquota, or btrfs\/zfs\):/,
   );
   assert.equal((await p.discover()).length, 1);
   assert.equal(fs.existsSync(lockPath(0)), false);

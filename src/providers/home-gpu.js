@@ -228,7 +228,7 @@ class HomeGpuProvider extends ComputeProvider {
       } catch (err) {
         const msg = String((err && err.message) || '');
         if (/storage-opt|storage opt|storage option|\bquota\b/i.test(msg)) {
-          throw new Error(`HOME_GPU_NO_DISK_QUOTA: host docker cannot cap disk_gb (need overlay2 size or xfs pquota): ${err.message}`);
+          throw new Error(`HOME_GPU_NO_DISK_QUOTA: host docker cannot cap disk_gb (need overlay2 over XFS -o prjquota, or btrfs/zfs): ${err.message}`);
         }
         throw err;
       }

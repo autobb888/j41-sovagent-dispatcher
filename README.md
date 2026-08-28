@@ -835,11 +835,41 @@ Cat-2 (`[18] API Endpoint Setup`) is metered inference on a different listing. D
 1. `j41-dispatcher build-image` — builds **job-agent and** `j41/gpu-jail`.
 2. In `~/.j41/dispatcher/config.toml` set `[compute] enabled = true` and paste a `home-gpu` provider (see `docs/config.toml.example`, the PASTE RECIPE). Required keys: `agent_id`, `device_index`, `memory_mb` (≥ 256), `disk_gb` (≥ 1), `ssh_hostname`, `ssh_tunnel_port`.
 3. Point a **Cloudflare named TCP tunnel** (or equivalent) at `127.0.0.1:$ssh_tunnel_port`. This is not the HTTP webhook / `cloudflared` URL used for jobs. `ssh_hostname` is a hostname, not `127.0.0.1`, not `0.0.0.0`, not `https://…`.
-4. NVIDIA Container Toolkit + `docker.sock` on the **GPU machine**. The dispatcher for `home-gpu` runs on that box. Typical overlay2/ext4 without quota cannot cap `disk_gb` — `rental-setup` and `start` refuse rather than list an uncapped jail.
-5. `j41-dispatcher rental-setup <agent-id> --price <vrsc>` (prepay). `--price` is required — there is no free default. Do **not** set `RENTAL_SECRETS_KEY` here — that 64-hex key lives on the Junction41 API `.env` (`openssl rand -hex 32`); it is not a dispatcher env. A `RENTAL_SECRETS_KEY_MISSING` 503 is the **platform** operator, not your laptop.
-6. `j41-dispatcher start`.
+4. NVIDIA Container Toolkit + `docker.sock` on the **GPU machine**. The dispatcher for `home-gpu` runs on that box.
+5. **Disk-cap capable storage — see below.** `rental-setup` and `start` refuse rather than list a jail whose `disk_gb` cannot be enforced.
+6. `j41-dispatcher rental-setup <agent-id> --price <vrsc>` (prepay). `--price` is required — there is no free default. Do **not** set `RENTAL_SECRETS_KEY` here — that 64-hex key lives on the Junction41 API `.env` (`openssl rand -hex 32`); it is not a dispatcher env. A `RENTAL_SECRETS_KEY_MISSING` 503 is the **platform** operator, not your laptop.
+7. `j41-dispatcher start`.
 
 TCP tunnel stays your job. The dispatcher will not run `cloudflared` for you.
+
+#### Storage: your host must be able to cap the jail's disk
+
+A rental hands a stranger a shell. Without an enforced disk cap they can fill
+your drive, so the dispatcher **fails closed** rather than listing an uncappable
+box. Docker can enforce `disk_gb` in exactly these configurations:
+
+| Storage driver | Works? | What is needed |
+|---|---|---|
+| `btrfs` | ✅ | nothing extra — caps natively |
+| `zfs` | ✅ | nothing extra — caps natively |
+| `overlay2` over **XFS** | ✅ | XFS made with `ftype=1` (modern `mkfs.xfs` default) **and** mounted `-o prjquota` (or `pquota`) |
+| `overlay2` over **ext4** | ❌ | **not supported by Docker at all** — this is the common default on Ubuntu/Debian/Mint/Pop!_OS |
+| anything else (`vfs`, `aufs`, …) | ❌ | — |
+
+Check what you have:
+
+```bash
+docker info --format '{{.Driver}}'   # storage driver
+mount | grep -E 'prjquota|pquota'    # project quota, if you are on XFS
+```
+
+`pqnoenforce` does **not** count — it accounts without enforcing, so Docker
+accepts the flag and then fails to cap.
+
+If you are on `overlay2` + ext4 (the most likely case), give Docker's
+data-root its own XFS filesystem — a dedicated partition, or an XFS image file
+mounted at `/var/lib/docker` — created with `ftype=1` and mounted with
+`prjquota`. Changing Docker's `data-root` requires restarting the daemon.
 
 ### Invite-only sales
 

@@ -12,6 +12,19 @@ function runExec(execSync, cmd, opts) {
   return run(cmd, opts);
 }
 
+/**
+ * XFS project-quota mount options, per xfs(5): `pquota` and `prjquota` both
+ * enable accounting AND enforcement; `pqnoenforce` accounts without enforcing,
+ * so it must NOT count — Docker would accept the flag and then fail to cap.
+ *
+ * Word-anchored so `pqnoenforce` cannot match, and so `gquota`/`uquota`
+ * (group/user quotas) are not mistaken for project quotas.
+ */
+const XFS_PROJECT_QUOTA_RE = /\b(?:pquota|prjquota)\b/;
+
+/** Storage drivers that enforce `--storage-opt size` without a quota mount option. */
+const SIZE_CAPABLE_DRIVERS = new Set(['btrfs', 'zfs']);
+
 function supportsStorageOpt({ execSync } = {}) {
   const injected = typeof execSync === 'function';
   if (!injected && _storageOptSupported !== null) return _storageOptSupported;
@@ -20,13 +33,25 @@ function supportsStorageOpt({ execSync } = {}) {
     const driver = String(runExec(execSync, 'docker info --format "{{.Driver}}"', {
       encoding: 'utf8', timeout: 5000,
     })).trim();
-    if (driver !== 'overlay2') {
-      ok = false;
-    } else {
-      runExec(execSync, 'mount | grep pquota', {
-        encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'],
-      });
+    if (SIZE_CAPABLE_DRIVERS.has(driver)) {
+      // btrfs and zfs cap disk natively. Previously these were refused outright
+      // (`driver !== 'overlay2'`), which turned away hosts that CAN enforce a
+      // quota — a false refusal, since the gate is fail-closed.
       ok = true;
+    } else if (driver === 'overlay2') {
+      // overlay2 enforces `size` ONLY over XFS with project quotas.
+      //
+      // This used to shell out to `mount | grep pquota` and rely on grep's exit
+      // code. Two problems: the literal `pquota` does not match the `prjquota`
+      // spelling the kernel actually reports, so a correctly configured XFS host
+      // was refused; and the exit-code control flow could not be tested against
+      // real mount output. Read `mount` and match here instead.
+      const mounts = String(runExec(execSync, 'mount', {
+        encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'],
+      }));
+      ok = XFS_PROJECT_QUOTA_RE.test(mounts);
+    } else {
+      ok = false;
     }
   } catch {
     ok = false;
@@ -78,14 +103,14 @@ function assertHomeGpuHostReady(pcfg, deps = {}) {
   // hermetic rental-setup tests can refuse disk without a live docker.sock.
   if (typeof deps.supportsStorageOpt === 'function' && !deps.supportsStorageOpt()) {
     throw new Error(
-      'HOME_GPU_NO_DISK_QUOTA: host docker cannot cap disk_gb (need overlay2 size or xfs pquota). Nothing was accepted and no buyer can pay into this fleet.',
+      'HOME_GPU_NO_DISK_QUOTA: host docker cannot cap disk_gb. Need one of: overlay2 over XFS mounted -o prjquota (or pquota), or the btrfs/zfs storage driver. Nothing was accepted and no buyer can pay into this fleet.',
     );
   }
   assertDockerReachable({ execSync });
   assertNvidiaRuntime({ execSync });
   if (typeof deps.supportsStorageOpt !== 'function' && !supportsStorageOpt({ execSync })) {
     throw new Error(
-      'HOME_GPU_NO_DISK_QUOTA: host docker cannot cap disk_gb (need overlay2 size or xfs pquota). Nothing was accepted and no buyer can pay into this fleet.',
+      'HOME_GPU_NO_DISK_QUOTA: host docker cannot cap disk_gb. Need one of: overlay2 over XFS mounted -o prjquota (or pquota), or the btrfs/zfs storage driver. Nothing was accepted and no buyer can pay into this fleet.',
     );
   }
   const { jailImageRef } = require('./providers/home-gpu');
@@ -103,6 +128,8 @@ function assertHomeGpuHostReady(pcfg, deps = {}) {
 
 module.exports = {
   supportsStorageOpt,
+  XFS_PROJECT_QUOTA_RE,
+  SIZE_CAPABLE_DRIVERS,
   resetStorageOptCache,
   assertDockerReachable,
   assertNvidiaRuntime,
