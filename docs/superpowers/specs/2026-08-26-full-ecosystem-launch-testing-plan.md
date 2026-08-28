@@ -709,6 +709,49 @@ Nothing here has ever been exercised live. Expect the most findings:
 - Headless bounty award (B4)
 - Everything from the 2026-08-25 CLI/TUI fix batch (F1, F4, C1, S3, R5, plus M5)
 
+#### 4.5.1 ⚠️ Three families are FIRST-EVER-IN-PRODUCTION — probed live 2026-08-28
+
+Queried the live platform directly. This is stronger than "we have not tested
+it": **nobody has, including the backend.**
+
+| Probe | Result |
+|---|---|
+| `/v1/services?limit=50` | 24 services, **serviceType `agent` × 24** |
+| `/v1/services?serviceType=api-endpoint` | **0** |
+| `/v1/services?serviceType=gpu-rental` | **0** |
+| `/v1/stats` | 20 agents (18 active), all `agent` kind; indexer live at block 1209520 |
+| `/v1/version` → `hosting.kinds` | all four kinds `open: true`, parent `agentplatform@` |
+
+So the backend **accepts** all four listing kinds, but **no compute, data,
+model, api-endpoint or gpu-rental listing has ever existed in production.**
+
+**Consequences for how Track B is run:**
+1. **~13 scenarios across the C, P, H8/H9 families — 8 of them P0 — will be the
+   first real transactions of their type on the platform.** A failure there is
+   at least as likely to be a **backend** defect as a dispatcher one.
+2. **The §4.7 classify-before-fixing step becomes load-bearing.** Debugging a
+   backend bug as if it were a dispatcher bug is the expensive failure mode
+   here, and both sides are owned by the same person, which makes conflating
+   them *easier*, not harder.
+3. **Order within P0 accordingly.** Run the first-ever families **early**, not
+   last, so backend fixes have runway before launch. The natural P0 order is:
+   golden path (F1, H1/H2, H6) to prove the rig → then first-ever families
+   (C, P, H8/H9) → then the rest.
+4. Budget for backend round-trips in the schedule. These families may not make
+   the launch cut, and it is better to learn that in week one.
+
+**Useful confirmations from the same probe** — these backend features are
+present, so the scenarios depending on them are viable: `agent.status-invite-v1`
+(S family), `agent.platform-status-v1` (two status axes), `signing.canonical-v1`,
+`proxy.forward-access` (P family), `reviews.api-session` (H6),
+`tx.status-notfound-code` + `tx.confirmation-tiers-v1` (M4's strong path is
+armed), `health.chain-sync-v1`, `hosting.kinds-v1`.
+
+**Not advertised as a feature flag:** any dispute-resolver toggle. Prior notes
+record it as a per-seller backend setting; confirm it is enabled for the test
+seller before running R2-R4, or those will fail for configuration reasons
+rather than code ones.
+
 ### 4.6 Hard preconditions — verified blockers, found in the 2026-08-27 review
 
 Each was checked on this machine. These gate Track B; several have no
@@ -768,13 +811,23 @@ like silence.
 > `~/.j41/dispatcher/config.toml` and was surfaced in this planning session.
 > Rotate it before launch and keep it out of any results doc or screenshot.
 
-**🟡 P-6. Backend capability is assumed, not verified.** Several scenarios
-need platform-side support that may not be enabled: `data`/`model` listing
-hire flows (F2/H8/H9 — never exercised by anyone), the per-seller dispute
-resolver, and whatever the spend-policy work expects. **Add a backend-capability
-precheck as Track B step 0** (`/v1/version` feature flags + a read-only probe
-per kind). A scenario failing because the backend does not implement it is a
-different finding from a dispatcher bug, and conflating them wastes a cycle.
+**🟢→🟡 P-6. Backend capability — PROBED 2026-08-28, mostly cleared.** Ran the
+precheck live rather than deferring it (see §4.5.1 for full results):
+- ✅ All four listing kinds are `open: true` server-side (`hosting.kinds-v1`),
+  so F2/H8/H9 are not blocked by the platform refusing the kind.
+- ✅ Feature flags confirm S-family (`agent.status-invite-v1`), two status axes,
+  canonical-v1 signing, proxy forward-access, review sessions, and M4's strong
+  `tx.status-notfound-code` path.
+- ⚠️ **But zero compute / data / model / api-endpoint / gpu-rental listings have
+  ever existed in production** — accepted-in-principle is not the same as
+  exercised. Treat those families as first-ever (§4.5.1).
+- ⏳ **Still unverified:** the per-seller dispute resolver (no feature flag;
+  confirm it is enabled for the test seller before R2-R4) and whatever
+  platform-side support the spend-policy work assumes.
+
+A scenario failing because the backend does not implement it is a different
+finding from a dispatcher bug, and conflating them wastes a cycle — doubly so
+here, where the same person owns both sides.
 
 **🟡 P-7. The web path is blocked until Chrome is connected.** Every **W**-path
 row is unrunnable until the extension is set up (`/chrome`). That is ~6
