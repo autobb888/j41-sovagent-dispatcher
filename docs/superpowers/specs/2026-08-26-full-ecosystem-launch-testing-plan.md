@@ -9,9 +9,14 @@ launched for testing" → reworked on the owner's instruction: "we are going to
 use 2 dispatchers and the chrome plug from this computer for testing, j41 is
 on another pc, plan needs to be robust af."
 
-This is a roadmap. It decomposes into 5 tracks; each gets its own detailed
+This is a roadmap. It decomposes into 6 tracks; each gets its own detailed
 implementation plan immediately before that track runs, because plans written
 now for track C/D would be stale by the time we reach them, sessions away.
+
+**Tracks:** A security-audit refresh · B live E2E · C stranger-UX ·
+D version-drift · E release/publish · **F GPU-hosting portability** (added
+2026-08-28 when the owner set the bar at *"any human can download the
+dispatcher and host their GPU"* — the current path cannot meet that, see §9).
 
 ---
 
@@ -963,76 +968,87 @@ step 4 exercised install + `--version` + one command, not the full
 
 ---
 
-## 9. Sequencing
+## 9. Track F — "Any human can host their GPU" (portability)
 
-**Step 0 — unblockers.** Three done; the rest are now mostly host setup:
-- ✅ ~~Renew npm auth~~ — done 2026-08-27.
-- ✅ ~~**Track E** publish~~ — done early (see STATUS).
-- ✅ ~~**Compute/GPU question**~~ — closed 2026-08-28: host has a GPU, fresh
-  dispatcher there (§1).
-- 🔴 **Settle how the host is driven** (#19) — nothing starts until this is
-  answered.
-- ⏳ **Build the host** — see Step 0.5 below.
-- ⏳ Connect **Chrome** on the host — gates ~6 W-path scenarios.
-- ⏳ Write `fund-agent.js` (§4.6 P-2) — **needed in both directions** now, since
-  a fresh seller has only its ~33-write registration seed.
-- ⏳ Write the **backend-capability precheck** (P-6).
-- ⏳ Decide the fate of the VM's 9 live listings (#18).
+**Added 2026-08-28 on the owner's goal statement:** *"I need this solution to
+be robust enough for any human to download the dispatcher and host their GPU."*
 
-**Step 0.5 — build the host seller from scratch.** This is itself scenario
-**F1b** (clean install of the published artifact) and should be *recorded as
-such*, not treated as mere setup — it is the single most representative test of
-what a stranger experiences.
+That is a **product requirement, not a test concern**, and the current
+`home-gpu` path cannot meet it. This track exists to close the gap. Migrating
+to the GPU host makes these barriers testable; it does not remove any of them.
 
-1. Verify prerequisites **before** installing — see §9.1 for the storage
-   requirement, which is the fiddly one: Docker, gVisor (`runsc`), NVIDIA
-   Container Toolkit, `nvidia-smi`, and **XFS-with-project-quota** storage.
-2. `yarn global add @junction41/dispatcher` (2.34.1 from the registry — **not**
-   this working tree, and not a clone).
-3. Walk `init` → `register` → `finalize` → `start` **capturing every prompt and
-   message**. This exercises the 2026-08-25 B1 fix (profile persistence) on a
-   machine that has never run the software.
-4. `build-image` — job-agent **and** gpu-jail. On a GPU host the jail gate is
-   live, so record this as **C5**.
-5. Record the ~33-write starting fee-tank budget and watch it; top up via
-   `fund-agent.js` before it blocks a scenario rather than after.
-6. Capture the `/health` baseline on a genuinely clean fleet — unlike the VM's,
-   this one should be `ok`, which finally makes "green" a usable criterion
-   (§4.6 P-4).
+### 9.1 The barrier inventory (verified by reading the gates, 2026-08-28)
 
-Then:
-1. **Track A** — security audit refresh *(needs Workflow opt-in)*
-2. **Track A** — triage + start CRITICAL/HIGH remediation
-3. **Track B prep** — on the **VM (buyer side)**: pick the buyer identity from
-   the existing fleet, deactivate the rest (#18), fold the loose `buyer-*.js`
-   into `j41-testkit/drivers/`, probe the LLM (P-5). On the **host (seller)**:
-   Step 0.5 above. **Restart the VM fleet onto 2.34.1 as scenario L5**, not
-   informally — it is still on 2.34.0/`c97be4b`.
-   *(§2.1's two-dispatchers-one-box recipe is no longer needed for A-vs-B, but
-   is retained: it still applies if a second instance is ever wanted on either
-   machine, and its egress-proxy finding is the reason a second dispatcher can
-   boot at all.)*
-4. **Track B** — execute the matrix, P0 first
-5. **Track B** — re-runs per the §4.7 defect loop
-6. **Track C** — jailbox
-7. **Track C** — secure-setup, **Track D** folded in
-8. **Re-publish** any fixes Tracks A-D produce (Track E's checklist again —
-   note the SDK pin means an SDK bump now needs a dispatcher bump too)
-9. **Exit-criteria review** (§11) → GO / NO-GO
+A human who downloads the dispatcher and wants to rent out their GPU must
+clear **all** of the following. Two are structural.
 
-Order per the owner: A and B gate whether it is safe to open the door at all;
-C and D are quality work that matters once it is open.
+| # | Barrier | Who it blocks | Severity vs. the goal |
+|---|---|---|---|
+| F-1 | **Disk cap needs overlay2 + XFS + project quota** (`home-gpu.js:216` sets `StorageOpt: {size}`) | **ext4 hosts — Ubuntu, Debian, Mint, Pop!_OS**, i.e. most Linux desktops | 🔴 **structural** |
+| F-2 | **A public named TCP tunnel** with a real hostname (`ssh_hostname` may not be loopback/`0.0.0.0`/an HTTP URL) | anyone behind NAT without a domain or Cloudflare account | 🔴 **structural** |
+| F-3 | `prjquota` spelling missed by the gate's `grep pquota` | correctly-configured XFS hosts | 🟡 cheap bug |
+| F-4 | **btrfs / zfs rejected outright** (`if (driver !== 'overlay2') ok = false`) though both support Docker `StorageOpt` size caps | btrfs/zfs hosts that *can* cap disk | 🟡 cheap bug |
+| F-5 | NVIDIA Container Toolkit required (`docker info` runtimes must match `/nvidia/i`) | AMD/Intel GPU owners | ⚪ accepted scope |
+| F-6 | Hand-edited `[compute.providers.*]` TOML | — | ✅ largely solved: the TUI's `computeProviderScreen` writes it |
 
-**On Track E running first.** The plan originally placed it last, reasoning
-that publishing before the matrix passes ships untested code to the very
-strangers this exercise protects. The owner inverted it, and that was the
-better call *in this specific case*: the already-published 2.31.0 carried
-known-broken money and access behaviour, so leaving it live was strictly worse
-than shipping tested-by-unit-tests-only 2.34.1. **The original reasoning still
-holds for step 8** — fixes found by Tracks A-D should not be published until
-they have been through the same gate everything else is.
+**F-1 and F-2 are the ones that decide whether the stated goal is met.** F-3
+and F-4 are ten-line fixes that widen the audience and should just be done.
 
-### 9.1 GPU host storage — the exact requirement, and a likely trap
+### 9.1.1 F-1 — the disk cap
+
+Docker's `StorageOpt: {size}` works on `overlay2` **only** over XFS with
+project quotas. On ext4 it is not merely unset — it is unsupported, so the
+gate correctly refuses. Telling a GPU owner to reformat Docker's data-root as
+XFS is a storage-admin task, not a download-and-run one.
+
+Options, best first:
+
+1. **Per-rental loopback volume (recommended).** Create a fixed-size file,
+   `mkfs` it, mount it, bind-mount it as the jail's writable area. Caps disk on
+   **any** host filesystem; no data-root migration, no storage-driver
+   dependency, no Docker daemon restart. Cost: loop-device lifecycle and
+   guaranteed cleanup on teardown/crash — which the rental path already has a
+   home for (`shouldTeardownRental`, kind-aware stop).
+2. **Automated XFS loopback for the data-root**, scripted into `secure-setup`.
+   Works, but relocates *all* Docker storage and needs a daemon restart —
+   invasive on a machine the user also uses for other things.
+3. **Degrade with disclosure** — rent without a hard cap, monitor and kill on
+   overage. **Not recommended:** a renter can fill a disk faster than a monitor
+   reacts, and it silently weakens a guarantee the product sells.
+
+### 9.1.2 F-2 — the tunnel
+
+`README:842` is explicit: *"TCP tunnel stays your job. The dispatcher will not
+run `cloudflared` for you."* For a home GPU behind NAT this is usually the
+hardest step, and the product currently offers nothing — no guidance beyond a
+README line, no detection, no setup help.
+
+Note the asymmetry: the **api-endpoint** flow already auto-detects a
+cloudflared tunnel (`README:801`), so the capability exists in the codebase for
+the HTTP case but not the TCP/SSH case a GPU rental needs.
+
+Options: guided setup in `rental-setup`/TUI (detect `cloudflared`, offer to
+create a named TCP tunnel, verify reachability end-to-end before listing); or
+at minimum a **reachability preflight** so failure surfaces at setup time
+rather than after a buyer has paid.
+
+### 9.1.3 Suggested sequencing for Track F
+
+- **Now, cheap:** F-3 and F-4 — widen the storage gate to accept `prjquota` and
+  the btrfs/zfs drivers, with tests that feed *real* mount/driver output rather
+  than the current mocks (§9.2).
+- **Design decision:** F-1 approach (loopback volume vs. data-root migration).
+- **Then:** F-2 tunnel assistance, at least a preflight.
+- **Docs, regardless:** the requirement is currently three words in a README
+  table cell. Whatever the outcome, a GPU host needs a real setup page.
+
+**Exit criterion this track adds:** a GPU owner on a **stock Ubuntu box with an
+NVIDIA card** can go from `yarn global add` to a live, rentable listing without
+reformatting a filesystem. Until that holds, "any human can host their GPU" is
+not true, and the C-family scenarios only prove the path works on a
+specially-prepared machine.
+
+### 9.2 GPU host storage — the exact requirement, and a likely trap
 
 Investigated 2026-08-28 because "a GPU is not sufficient" needed to be made
 concrete before provisioning the host.
@@ -1094,7 +1110,83 @@ on a correctly built GPU host is exactly the "stranger cannot use it" class the
 
 ---
 
-## 10. Open decisions
+## 10. Sequencing
+
+**Step 0 — unblockers.** Three done; the rest are now mostly host setup:
+- ✅ ~~Renew npm auth~~ — done 2026-08-27.
+- ✅ ~~**Track E** publish~~ — done early (see STATUS).
+- ✅ ~~**Compute/GPU question**~~ — closed 2026-08-28: host has a GPU, fresh
+  dispatcher there (§1).
+- 🔴 **Settle how the host is driven** (#19) — nothing starts until this is
+  answered.
+- ⏳ **Build the host** — see Step 0.5 below.
+- ⏳ Connect **Chrome** on the host — gates ~6 W-path scenarios.
+- ⏳ Write `fund-agent.js` (§4.6 P-2) — **needed in both directions** now, since
+  a fresh seller has only its ~33-write registration seed.
+- ⏳ Write the **backend-capability precheck** (P-6).
+- ⏳ Decide the fate of the VM's 9 live listings (#18).
+
+**Step 0.5 — build the host seller from scratch.** This is itself scenario
+**F1b** (clean install of the published artifact) and should be *recorded as
+such*, not treated as mere setup — it is the single most representative test of
+what a stranger experiences.
+
+1. Verify prerequisites **before** installing — see §9.2 for the storage
+   requirement, which is the fiddly one: Docker, gVisor (`runsc`), NVIDIA
+   Container Toolkit, `nvidia-smi`, and **XFS-with-project-quota** storage.
+2. `yarn global add @junction41/dispatcher` (2.34.1 from the registry — **not**
+   this working tree, and not a clone).
+3. Walk `init` → `register` → `finalize` → `start` **capturing every prompt and
+   message**. This exercises the 2026-08-25 B1 fix (profile persistence) on a
+   machine that has never run the software.
+4. `build-image` — job-agent **and** gpu-jail. On a GPU host the jail gate is
+   live, so record this as **C5**.
+5. Record the ~33-write starting fee-tank budget and watch it; top up via
+   `fund-agent.js` before it blocks a scenario rather than after.
+6. Capture the `/health` baseline on a genuinely clean fleet — unlike the VM's,
+   this one should be `ok`, which finally makes "green" a usable criterion
+   (§4.6 P-4).
+
+Then:
+1. **Track A** — security audit refresh *(needs Workflow opt-in)*
+2. **Track A** — triage + start CRITICAL/HIGH remediation
+3. **Track B prep** — on the **VM (buyer side)**: pick the buyer identity from
+   the existing fleet, deactivate the rest (#18), fold the loose `buyer-*.js`
+   into `j41-testkit/drivers/`, probe the LLM (P-5). On the **host (seller)**:
+   Step 0.5 above. **Restart the VM fleet onto 2.34.1 as scenario L5**, not
+   informally — it is still on 2.34.0/`c97be4b`.
+   *(§2.1's two-dispatchers-one-box recipe is no longer needed for A-vs-B, but
+   is retained: it still applies if a second instance is ever wanted on either
+   machine, and its egress-proxy finding is the reason a second dispatcher can
+   boot at all.)*
+4. **Track B** — execute the matrix, P0 first
+5. **Track B** — re-runs per the §4.7 defect loop
+6. **Track F** — F-3/F-4 gate widening early (cheap, and they may unblock the
+   host itself); F-1 design decision; F-2 tunnel assistance
+7. **Track C** — jailbox
+8. **Track C** — secure-setup, **Track D** folded in
+9. **Re-publish** any fixes Tracks A-F produce (Track E's checklist again —
+   note the SDK pin means an SDK bump now needs a dispatcher bump too)
+10. **Exit-criteria review** (§12) → GO / NO-GO
+
+**Track F can start immediately and does not need the host.** F-3 and F-4 are
+source-level fixes with tests; the F-1 design decision is a design discussion.
+Only *validating* them needs GPU hardware. Doing F-3/F-4 before migrating may
+save a false `HOME_GPU_NO_DISK_QUOTA` on the new host.
+
+Order per the owner: A and B gate whether it is safe to open the door at all;
+C and D are quality work that matters once it is open.
+
+**On Track E running first.** The plan originally placed it last, reasoning
+that publishing before the matrix passes ships untested code to the very
+strangers this exercise protects. The owner inverted it, and that was the
+better call *in this specific case*: the already-published 2.31.0 carried
+known-broken money and access behaviour, so leaving it live was strictly worse
+than shipping tested-by-unit-tests-only 2.34.1. **The original reasoning still
+holds for step 9** — fixes found by Tracks A-D and F should not be published until
+they have been through the same gate everything else is.
+
+## 11. Open decisions
 
 **Before Track A:**
 1. **Workflow opt-in** — needed for the fan-out; I will ask again rather than
@@ -1163,7 +1255,7 @@ on a correctly built GPU host is exactly the "stranger cannot use it" class the
     reach the host. Either open a Claude Code session **on the host** (simplest
     — host becomes primary, this VM session becomes the buyer side), or set up
     SSH. **Nothing in Track B can start until this is settled.**
-20. **Host storage: XFS with project quota required** — investigated in §9.1.
+20. **Host storage: XFS with project quota required** — investigated in §9.2.
     A GPU is necessary but not sufficient; `overlay2` can only cap `disk_gb` on
     XFS with project quotas, so an ext4 host (Ubuntu default) needs a dedicated
     XFS volume or loopback for Docker's data-root. **Also carries a likely
@@ -1172,7 +1264,7 @@ on a correctly built GPU host is exactly the "stranger cannot use it" class the
 
 ---
 
-## 11. Launch-ready exit criteria
+## 12. Launch-ready exit criteria
 
 **Added by the 2026-08-27 review — the plan previously described a great deal
 of testing and never said what result meant "go."** Without this, "are we
@@ -1188,6 +1280,11 @@ Launch for testing is **GO** when all of the following hold:
 3. **Compute (C family):** either passed, or the C-family decision (§4.6 P-1)
    is recorded as "launching without compute listings" **and** compute
    listings are actually disabled/unlisted so a stranger cannot buy one.
+3a. **Track F, if GPU hosting is part of the launch claim:** a GPU owner on a
+   **stock Ubuntu box with an NVIDIA card** reaches a live rentable listing
+   without reformatting a filesystem (§9.1). If this does not hold, the honest
+   position is that GPU hosting works *on a prepared machine* — say that
+   plainly rather than implying "any human can host their GPU".
 4. **Track E:** published, and **F1b** (clean install of the *published*
    artifact, scratch `HOME`) passed. Not "published" alone.
 5. **Money paths proven end-to-end at least once each:** payment received
@@ -1211,7 +1308,7 @@ Launch for testing is **GO** when all of the following hold:
 
 ---
 
-## 12. Self-review
+## 13. Self-review
 
 - **Placeholders:** none. The two port unknowns flagged in the first draft
   were resolved before publishing rather than deferred — the egress-proxy one
