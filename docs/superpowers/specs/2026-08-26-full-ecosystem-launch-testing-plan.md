@@ -131,7 +131,7 @@ exactly the condition under which the `json-canonicalize` outage and the
   are still live marketplace listings that can be hired by strangers. Decide
   whether to `deactivate-all` them so test traffic is unambiguous (#18).
 - 🟡 **A fresh seller starts with ~33 on-chain writes** (the 0.0033 VRSCTEST
-  registration seed, §5) and **there is no faucet**. A 67-scenario matrix with
+  registration seed, §5) and **there is no faucet**. An 87-scenario matrix with
   reviews, attestations, job records and profile updates will exceed that.
   Refill comes from either earning-then-sweeping, or an SDK `sendCurrency`
   from a funded VM agent. **The funding script (§4.6 P-2) is therefore needed
@@ -570,6 +570,23 @@ Buyer path: **W** = web frontend (Chrome), **S** = `BuyerSession` script
 | F4 | Key lifecycle: `encrypt-keys` → `start` w/ passphrase → `change-passphrase` → `decrypt-keys` | — | P0 | B4 fix; irreversible ops |
 | F5 | `recover` a timed-out registration; `set-authorities` / `check-authorities` | — | P1 | |
 | F6 | `update-profile` (VDXF write), `inspect`, `status`, `providers`, `config` | — | P1 | check `pendingWrites` empty first (§5) |
+| F7 | **Service CRUD after creation**: change a price (`update_service`), delist (`delete_service`) | — | **P0** | a seller changing price or withdrawing is basic; F6 only covers the *profile* |
+| F8 | `logs [job-id]`, `privacy`, `ctl inbox-redrive`, `ctl shutdown` | — | P2 | operator verbs not exercised elsewhere |
+
+#### D — Discovery (how a buyer ever FINDS the seller)
+
+**Added 2026-08-28 by the coverage audit — this family was entirely missing.**
+It sits upstream of every other family: if a listing is not discoverable,
+nothing downstream matters however well the hire flow works.
+
+| ID | Scenario | Path | Pri | Notes |
+|---|---|---|---|---|
+| D1 | Newly registered listing appears in `browse_services` / `browse_agents` | W+S | **P0** | the marketplace's whole purpose |
+| D2 | `search` finds it by keyword; categories / featured / trending render | W | P1 | |
+| D3 | `get_service` / `get_agent_detail` show the correct price, terms, currency and **kind** | W+S | **P0** | what a buyer actually decides on |
+| D4 | Non-agent kinds (compute/data/model) are discoverable and distinguishable | W+S | P0 | first-ever (§4.5.1) |
+| D5 | `estimate_price` / `recommend_price` during listing creation | — | P2 | |
+| D6 | `check_agent_name` / name-collision refusal at registration | — | P1 | dispatcher also guards this locally (`listingsCollide`) |
 
 #### H — Hire → deliver → pay (the core loop)
 
@@ -584,6 +601,9 @@ Buyer path: **W** = web frontend (Chrome), **S** = `BuyerSession` script
 | H7 | Trust/reputation/transparency profile reflects the review | W | P1 | |
 | H8 | `model`-kind listing hired (metered inference) | S | P0 | never tested |
 | H9 | `data`-kind listing queried | S | P1 | never tested |
+| H10 | **Seller reviews the BUYER**; `get_buyer_reviews` reflects it | S | P1 | two-sided reputation — H6/H7 only cover the seller being reviewed |
+| H11 | Payment address / `get_payment_qr` / `verify_payment` path | W+S | P1 | how a human buyer actually pays |
+| H12 | Multi-currency: a service with `acceptedCurrencies` is payable in each | S | P2 | |
 
 #### R — Rework, dispute, refund
 
@@ -645,6 +665,7 @@ Buyer path: **W** = web frontend (Chrome), **S** = `BuyerSession` script
 | B2 | `select-bounty-claimants` → award → `bounty.awarded` | W | P1 | §5: sign over **i-addresses**, submit **application row-ids**, field is `applications` |
 | B3 | Cancel bounty | W | P2 | |
 | B4 | **Headless bounty award** | — | P1 | previously dashboard-only → headless operator could post but not award |
+| B5 | `my-bounties <agent-id>` — the poster's own view | — | P2 | |
 
 #### S — Sales gating (invite-only floodgate)
 
@@ -665,6 +686,7 @@ Buyer path: **W** = web frontend (Chrome), **S** = `BuyerSession` script
 | W2 | Fee-tank auto-sweep fires on schedule | — | P1 | |
 | W3 | Mainnet guards (verify **refusal** without being on mainnet) | — | P1 | `--yes` refused; retype-amount |
 | W4 | `--json` on every command that claims it | — | P2 | |
+| W5 | `transfer_funds` / `send_multi_payment` beyond single `wallet send` | — | P2 | |
 
 #### V — Privacy & security
 
@@ -682,10 +704,14 @@ Buyer path: **W** = web frontend (Chrome), **S** = `BuyerSession` script
 | ID | Scenario | Path | Pri | Notes |
 |---|---|---|---|---|
 | M1 | `activate-all` / `deactivate-all`; both status axes verified | — | P0 | |
+| M1b | **Single-agent** `activate <id>` / `deactivate <id>` | — | P1 | distinct code path; the 08-25 audit found `activate` had no confirmation while `deactivate` did |
 | M2 | Concurrent jobs across multiple agents | S | P1 | |
 | M3 | Inbox batching: several items → **one** identity tx, 0 rejections | — | P0 | CMM ordering (§5) |
 | M4 | Dispatcher A and B both live, both hiring/selling, no interference | — | P0 | validates §2 isolation |
 | M5 | TUI: every menu item reachable; money screens; the 11 fixed blockers live | — | P0 | |
+| M6 | **WEBHOOK MODE**: run `start --webhook-url …` and drive a full hire → deliver → pay under it | — | **P0** | see note below — an entire operating mode, otherwise untested |
+| M7 | Inbox verbs: `accept_inbox_item` / `reject_inbox_item`, `get_inbox_count` | — | P1 | M3 covers batching, not the operator verbs |
+| M8 | Seller's job views: `list_jobs`, `get_unread_jobs` | — | P1 | |
 
 #### N — Notifications & integration
 
@@ -695,8 +721,26 @@ Buyer path: **W** = web frontend (Chrome), **S** = `BuyerSession` script
 | N2 | Webhooks: register / test / update / delete; HMAC verified | — | P1 | |
 | N3 | Earnings, public stats, `ctl` read surfaces, `/health`, `/metrics` | — | P1 | |
 
-**Totals (counted, not estimated): 67 scenarios — 30 P0, 30 P1, 7 P2.** That is realistically
-3-4 sessions of live wall-clock for P0 alone, given block confirmations. This
+#### ⚠️ M6 deserves its own note: two operating modes, one tested
+
+`start` runs in **poll mode** (the default) **or webhook mode** — the branch is
+`if (options.webhookUrl)` at `cli.js:4610`, and `cfg.runtime.webhook_url`
+silently selects it too (`cli.js:4595`). **All 27 webhook event handlers are
+the webhook path.** Poll mode reaches the same lifecycle by a different route.
+
+Until this audit the matrix implicitly tested **poll only**, and webhook mode
+appeared in the plan solely as a port-collision footnote. N2 covers webhook
+*registration* (register/test/update/delete + HMAC) — not *running the
+dispatcher under it*. An operator who sets `webhook_url` in `config.toml` gets
+a materially different code path for the entire job lifecycle, and it would
+have shipped unexercised.
+
+M6 does not need the full matrix re-run under webhook mode; one complete
+hire → chat → deliver → pay under it, plus one dispute, is enough to prove the
+event path carries the lifecycle.
+
+**Totals (counted after the 2026-08-28 coverage audit): 87 scenarios — 40 P0, 36 P1, 11 P2.** That is realistically
+4-5 sessions of live wall-clock for P0 alone, given block confirmations. This
 is the honest size of "test every functionality that exists"; it is not a
 one-sitting exercise, and pretending otherwise is how coverage silently
 becomes a golden-path-only run.
@@ -705,6 +749,42 @@ becomes a golden-path-only run.
 prioritise anything that moves money or gates access — R4, P2, P4, S2, S3,
 C3, W1, E1. Those are the ones where a bug costs funds or lets the wrong
 buyer in.
+
+#### 4.4.1 Coverage audit — how this matrix was verified, and what it had missed
+
+Owner, 2026-08-28: *"are we testing all Junction41 and dispatcher
+functionality? I don't want to leave anything out."* The matrix had been built
+by reasoning about families, so it was audited **mechanically** instead:
+
+1. every `.command()` in `cli.js` (**38**) diffed against the plan text;
+2. every webhook `case '<event>'` handler (**27**) diffed the same way;
+3. the platform capability surface swept area by area (discovery, pricing,
+   identity, services, payments, trust, privacy, inbox, bounties, wallet).
+
+**It was not complete. Fifteen scenarios were added**, including one whole
+family and one whole operating mode:
+
+| Gap found | Added as |
+|---|---|
+| **Discovery** — nothing covered how a buyer *finds* a listing (`browse_*`, `search`, categories, featured/trending) | new **D family** (D1-D6) |
+| **Webhook operating mode** — appeared only as a port footnote | **M6** |
+| Service CRUD after creation (price change, delist) | **F7** |
+| Two-sided reputation — seller reviewing the *buyer* | **H10** |
+| Payment address / QR / `verify_payment` | **H11** |
+| Multi-currency `acceptedCurrencies` | **H12** |
+| Inbox operator verbs (accept/reject item) | **M7** |
+| Seller job views (`list_jobs`, unread) | **M8** |
+| `transfer_funds` / `send_multi_payment` | **W5** |
+| `logs`, `privacy`, `ctl inbox-redrive`, `ctl shutdown` | **F8** |
+
+**The lesson worth keeping:** a matrix assembled from *families* feels
+exhaustive and is not. Discovery went missing precisely because it is upstream
+of the flows we were thinking in — no family called "hire" or "money" contains
+"can the buyer find you at all", yet nothing downstream matters without it.
+**Enumerate the interface mechanically; reason about families afterwards.**
+
+Re-run the three diffs above after any release that adds commands or events —
+they take minutes and are the cheapest guard against silent coverage rot.
 
 ### 4.5 Known-untested surface (highest expected yield)
 
@@ -899,7 +979,7 @@ than implied.
 
 **Estimate:** **3-4 sessions for P0 alone**, more with P1/P2 — wall-clock-bound
 (block confirmations), not compute-bound. The earlier "1-2 sessions" estimate
-was written against a 6-scenario list and is superseded by the 67-scenario
+was written against a 6-scenario list and is superseded by the 87-scenario
 matrix.
 
 ---
@@ -1288,7 +1368,7 @@ they have been through the same gate everything else is.
 7. **Which listing kinds does the web frontend expose?** Determines whether
    C1-C3 (compute), H8 (model) and H9 (data) have web-path variants or are
    `BuyerSession`-only. Affects ~8 matrix rows.
-8. **Scope call on the 67-scenario matrix** — all of it, or P0-only for
+8. **Scope call on the 87-scenario matrix** — all of it, or P0-only for
    launch with P1/P2 trailing? Drives whether Track B is ~4 sessions or ~8.
 
 **Raised by the 2026-08-27 review:**
