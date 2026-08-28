@@ -984,9 +984,9 @@ step 4 exercised install + `--version` + one command, not the full
 such*, not treated as mere setup — it is the single most representative test of
 what a stranger experiences.
 
-1. Verify prerequisites **before** installing: Docker, gVisor (`runsc`), NVIDIA
-   Container Toolkit, `nvidia-smi`, and **StorageOpt-capable storage** (#20 —
-   `overlay2` alone typically cannot cap `disk_gb`).
+1. Verify prerequisites **before** installing — see §9.1 for the storage
+   requirement, which is the fiddly one: Docker, gVisor (`runsc`), NVIDIA
+   Container Toolkit, `nvidia-smi`, and **XFS-with-project-quota** storage.
 2. `yarn global add @junction41/dispatcher` (2.34.1 from the registry — **not**
    this working tree, and not a clone).
 3. Walk `init` → `register` → `finalize` → `start` **capturing every prompt and
@@ -1031,6 +1031,66 @@ known-broken money and access behaviour, so leaving it live was strictly worse
 than shipping tested-by-unit-tests-only 2.34.1. **The original reasoning still
 holds for step 8** — fixes found by Tracks A-D should not be published until
 they have been through the same gate everything else is.
+
+### 9.1 GPU host storage — the exact requirement, and a likely trap
+
+Investigated 2026-08-28 because "a GPU is not sufficient" needed to be made
+concrete before provisioning the host.
+
+**What the gate actually demands** (`src/docker-host.js:15-36`,
+`supportsStorageOpt`) — **both**, not either:
+1. `docker info --format "{{.Driver}}"` is **exactly** `overlay2`, and
+2. `mount | grep pquota` **succeeds**.
+
+The error text says *"need overlay2 size or xfs pquota"*, which reads as
+alternatives. It is not — the code requires both, and that is correct for real
+Docker: `overlay2` supports `--storage-opt size=` **only** on XFS with project
+quotas. Docker's own message (quoted in
+`test/providers-home-gpu.test.js:243`) says as much:
+*"--storage-opt is supported only for overlay over xfs with 'pquota' mount
+option"*. **The wording is misleading; the behaviour is right.**
+
+**So the host needs:**
+- Docker data-root (`/var/lib/docker`, or a configured `data-root`) on an
+  **XFS** filesystem
+- formatted with **`ftype=1`** (default in modern `mkfs.xfs`; overlay2 refuses
+  XFS without it)
+- mounted with **project quota** enabled
+- storage driver left as `overlay2`
+- plus `nvidia` runtime and the `j41/gpu-jail` image (`build-image`)
+
+Ubuntu hosts default to **ext4**, on which overlay2 cannot cap disk at all. If
+the host root is ext4, the realistic route is a dedicated XFS volume (or an XFS
+loopback file) mounted at the Docker data-root — not a driver change.
+
+**⚠️ Likely trap — verify before trusting the gate.** `xfs(5)` lists three
+spellings: **`pquota` / `prjquota` / `pqnoenforce`**. The gate greps for the
+literal string `pquota`, and **`prjquota` does not contain `pquota` as a
+substring** (verified: `echo prjquota | grep pquota` → no match). If the kernel
+reports the mount as `prjquota` — which is the spelling most XFS/Docker guides
+use, and which I believe XFS's `show_options` emits for enforcing project
+quota — then a **correctly configured host is rejected** with
+`HOME_GPU_NO_DISK_QUOTA`, telling the operator they lack a capability they
+actually have.
+
+**This cannot be caught by the current tests.** `test/docker-host.test.js:26`
+stubs the mount check by matching on the *command string* and returns a
+hand-written `'... type xfs (pquota)'`, so no test ever sees real
+`/proc/mounts` output. Textbook [[feedback_untestable_paths]]: the one thing
+that would fail is the one thing that is mocked.
+
+**Settle it with one command on the host**, once XFS project quota is mounted:
+```bash
+mount | grep -E 'pquota|prjquota'
+```
+- prints `prjquota` → **the gate is broken for this host**; fix is a one-line
+  regex change (`/p(rj)?quota/`) plus a test that feeds real mount output.
+- prints `pquota` → gate works as written; no change needed.
+
+Either way this is a **Track A/C finding**, not a blocker: fail-closed, so it
+can only produce a false *refusal*, never an unsafe accept. But a false refusal
+on a correctly built GPU host is exactly the "stranger cannot use it" class the
+2026-08-25 audit existed to close.
 
 ---
 
@@ -1103,10 +1163,12 @@ they have been through the same gate everything else is.
     reach the host. Either open a Claude Code session **on the host** (simplest
     — host becomes primary, this VM session becomes the buyer side), or set up
     SSH. **Nothing in Track B can start until this is settled.**
-20. **Does the host have StorageOpt-capable storage?** A GPU is necessary but
-    not sufficient — `rental-setup` also fails closed without a disk-quota-capable
-    driver, and plain `overlay2` typically cannot cap `disk_gb`. Worth checking
-    early, since it may need a filesystem change rather than a package install.
+20. **Host storage: XFS with project quota required** — investigated in §9.1.
+    A GPU is necessary but not sufficient; `overlay2` can only cap `disk_gb` on
+    XFS with project quotas, so an ext4 host (Ubuntu default) needs a dedicated
+    XFS volume or loopback for Docker's data-root. **Also carries a likely
+    gate bug** (`pquota` vs `prjquota` grep) — settle with one command on the
+    host: `mount | grep -E 'pquota|prjquota'`.
 
 ---
 
