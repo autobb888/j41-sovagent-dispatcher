@@ -2165,23 +2165,102 @@ async function hireScreen(inquirer) {
   }]);
   if (!buyerId || buyerId === '__back') return;
 
-  const { seller } = await promptWithEsc(inquirer, [{
-    type: 'input', name: 'seller',
-    message: 'Seller (VerusID or i-address):',
+  const { how } = await promptWithEsc(inquirer, [{
+    type: 'list', name: 'how',
+    message: 'Find listing:',
+    choices: [
+      { name: '  Browse marketplace (agent / compute / model / data)', value: 'browse' },
+      { name: '  Type a seller VerusID or i-address', value: 'type' },
+      { name: '  ← Back', value: '__back' },
+    ],
   }]);
-  const sellerId = String(seller || '').trim();
-  if (!sellerId) return;
+  if (!how || how === '__back') return;
 
   const buyer = agents.find(a => a.id === buyerId);
   let listing;
   let services = [];
+  let sellerId = '';
+  let prePickedService = null;
+
+  if (how === 'browse') {
+    const { kindPick } = await promptWithEsc(inquirer, [{
+      type: 'list', name: 'kindPick',
+      message: 'Kind:',
+      choices: [
+        { name: '  agent     labour jobs', value: 'agent' },
+        { name: '  compute   gpu-rental', value: 'compute' },
+        { name: '  model     api-endpoint', value: 'model' },
+        { name: '  data      browse only (not hireable)', value: 'data' },
+      ],
+    }]);
+    let result;
+    try {
+      const { fetchMarketplaceListings } = require('./hire.js');
+      result = await fetchMarketplaceListings({
+        apiUrl: loadCfg().platform.api_url,
+        kind: kindPick,
+        limit: 24,
+      });
+    } catch (e) {
+      console.log(`\n  ❌ Could not list marketplace: ${e.message}\n`);
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+      return;
+    }
+    if (!result.rows.length) {
+      console.log('\n  No listings of that kind.\n');
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+      return;
+    }
+    if (result.browseOnly) {
+      console.log('\n  Data listings (browse only — hire is refused):\n');
+      for (const r of result.rows) console.log(`    ${r.qualifiedName || r.seller}`);
+      console.log('');
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+      return;
+    }
+    const { rowKey } = await promptWithEsc(inquirer, [{
+      type: 'list', pageSize: 16, name: 'rowKey',
+      message: 'Hire:',
+      choices: [
+        ...result.rows.map((r, i) => ({
+          name: `  ${(r.qualifiedName || r.seller || '').toString().slice(0, 28).padEnd(28)} ${(r.serviceType || '').padEnd(12)} ${r.price} ${r.currency || ''}`,
+          value: String(i),
+        })),
+        new inquirer.Separator(),
+        { name: '  ← Back', value: '__back' },
+      ],
+    }]);
+    if (rowKey === '__back' || rowKey == null) return;
+    const row = result.rows[Number(rowKey)];
+    sellerId = row.seller;
+    prePickedService = row;
+  } else {
+    const { seller } = await promptWithEsc(inquirer, [{
+      type: 'input', name: 'seller',
+      message: 'Seller (VerusID or i-address):',
+    }]);
+    sellerId = String(seller || '').trim();
+    if (!sellerId) return;
+  }
+
   try {
     const agent = await createAgent(buyer);
     try {
       listing = await agent.client.getAgent(sellerId);
-      const svc = await agent.client.getAgentServices(listing.id || sellerId);
-      services = (svc && (svc.data || svc)) || [];
-      if (!Array.isArray(services)) services = [];
+      if (prePickedService && prePickedService.serviceId) {
+        services = [{
+          id: prePickedService.serviceId,
+          name: prePickedService.name,
+          serviceType: prePickedService.serviceType,
+          price: prePickedService.price,
+          currency: prePickedService.currency,
+          description: prePickedService.name,
+        }];
+      } else {
+        const svc = await agent.client.getAgentServices(listing.id || sellerId);
+        services = (svc && (svc.data || svc)) || [];
+        if (!Array.isArray(services)) services = [];
+      }
     } finally { agent.stop(); }
   } catch (e) {
     console.log(`\n  ❌ Could not load seller: ${e.message}\n`);

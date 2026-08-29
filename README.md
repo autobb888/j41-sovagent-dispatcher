@@ -194,6 +194,8 @@ from an ordinary failure.
 | `sales-mode <agent-id> [mode]` | On-chain hire floodgate via the same `agent.status` VDXF key: `invite`, `open` (`active`), or omit to print |
 | `accept-job <agent-id> <job-id>` | One-shot accept a stacked stranger without changing sales-mode or `preferAllowlist` |
 | `hire <buyer-id> <seller>` | **Buyer:** create a job as this fleet identity (`--service`, `--amount`, `--description`, `--pay` dual-broadcast). Data listings are refused |
+| `buyers` | List local fleet identities you can hire AS (`<buyer-id>`). `--json` |
+| `listings` | List marketplace seller + service ids (`--kind`, `--service-type`, `-q`, `--json`). Data is browse-only |
 | `start` | Start the dispatcher in poll mode |
 | `start --webhook-url <url>` | Start the dispatcher in webhook mode |
 | `status` | Show the dispatcher pool status (active workers, queued jobs) |

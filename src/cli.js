@@ -2868,6 +2868,83 @@ program
     }
   });
 
+program
+  .command('buyers')
+  .description('List local fleet identities you can hire AS (the <buyer-agent-id> for hire)')
+  .option('--json', 'Raw JSON')
+  .action(async (options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
+    ensureDirs();
+    const { localBuyers } = require('./hire.js');
+    const rows = localBuyers(listRegisteredAgents(), (id) => loadAgentKeys(id));
+    if (options.json) {
+      console.log(JSON.stringify({ data: rows }, null, 2));
+      return;
+    }
+    if (rows.length === 0) {
+      console.log('No local identities. Register one, then: j41-dispatcher hire <buyer-id> <seller> --amount <n>');
+      return;
+    }
+    console.log('\n  Local buyer identities (hire AS these ids)\n');
+    console.log(`  ${'BUYER-ID'.padEnd(14)} ${'IDENTITY'.padEnd(34)} ${'I-ADDRESS'.padEnd(36)} HIRE?`);
+    for (const r of rows) {
+      console.log(`  ${String(r.buyerAgentId).padEnd(14)} ${String(r.identity || '(unregistered)').slice(0, 33).padEnd(34)} ${String(r.iAddress || '—').padEnd(36)} ${r.canHire ? 'yes' : 'no'}`);
+    }
+    console.log('\n  Next: j41-dispatcher listings [--kind compute]');
+    console.log('        j41-dispatcher hire <buyer-id> <seller> --service <id> --amount <n> [--pay]\n');
+  });
+
+program
+  .command('listings')
+  .description('List marketplace listings (seller + service ids for hire). Data is browse-only.')
+  .option('--kind <kind>', 'agent | compute | data | model')
+  .option('--service-type <type>', 'agent | gpu-rental | api-endpoint')
+  .option('-q, --query <text>', 'Search')
+  .option('--limit <n>', 'Max rows', '20')
+  .option('--json', 'Raw JSON')
+  .action(async (options) => {
+    const { fetchMarketplaceListings } = require('./hire.js');
+    if (options.kind && !parseListingKind(options.kind)) {
+      console.error('❌ --kind must be agent, compute, data, or model');
+      process.exit(1);
+    }
+    try {
+      const result = await fetchMarketplaceListings({
+        apiUrl: J41_API_URL,
+        kind: options.kind,
+        serviceType: options.serviceType,
+        q: options.query,
+        limit: options.limit,
+      });
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      if (result.browseOnly) {
+        console.log('\n  Data listings (browse only — hire is refused)\n');
+      } else {
+        console.log('\n  Hireable marketplace listings\n');
+      }
+      console.log(`  ${'KIND'.padEnd(8)} ${'SELLER-ID (hire arg)'.padEnd(38)} ${'SERVICE-ID (--service)'.padEnd(38)} TYPE         PRICE`);
+      for (const r of result.rows) {
+        const price = r.price == null ? '' : `${r.price} ${r.currency || ''}`.trim();
+        const name = r.qualifiedName ? `  ${r.qualifiedName}` : '';
+        console.log(`  ${String(r.kind).padEnd(8)} ${String(r.seller || '').padEnd(38)} ${String(r.serviceId || '—').padEnd(38)} ${String(r.serviceType || '—').padEnd(12)} ${price}${name}`);
+      }
+      if (!result.rows.length) console.log('  (none)');
+      if (result.total != null) console.log(`\n  ${result.rows.length} shown / ${result.total} total`);
+      if (!result.browseOnly && result.rows[0]) {
+        console.log('\n  Hire: j41-dispatcher hire <buyer-id> <seller> --service <service-id> --amount <n> [--pay]');
+        console.log('  Buyer ids: j41-dispatcher buyers\n');
+      } else {
+        console.log('');
+      }
+    } catch (e) {
+      console.error(`❌ ${e.message}`);
+      process.exit(1);
+    }
+  });
+
 async function confirmHire({ amountText, pay }) {
   const readline = require('readline');
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });

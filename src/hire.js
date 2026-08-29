@@ -79,4 +79,103 @@ function paymentOutputs(job, amount) {
   return outputs;
 }
 
-module.exports = { assertHireAllowed, paymentOutputs, isVerusAddr };
+function localBuyers(ids, loadKeys) {
+  const out = [];
+  for (const id of ids || []) {
+    let keys;
+    try { keys = loadKeys(id); } catch { continue; }
+    if (!keys) continue;
+    out.push({
+      buyerAgentId: id,
+      identity: keys.identity || null,
+      iAddress: keys.iAddress || null,
+      kind: keys.kind || 'agent',
+      canHire: !!(keys.identity && keys.wif && keys.address),
+    });
+  }
+  return out;
+}
+
+const SERVICE_TYPES = Object.freeze(['agent', 'gpu-rental', 'api-endpoint']);
+
+function parseServiceType(raw) {
+  return SERVICE_TYPES.includes(raw) ? raw : null;
+}
+
+function defaultServiceTypeForKind(kind) {
+  if (kind === 'compute') return 'gpu-rental';
+  if (kind === 'model') return 'api-endpoint';
+  if (kind === 'agent') return 'agent';
+  return undefined;
+}
+
+async function fetchMarketplaceListings({
+  apiUrl, kind, serviceType, q, limit = 20, fetchImpl,
+} = {}) {
+  const base = String(apiUrl || '').replace(/\/+$/, '');
+  if (!base) throw new Error('API URL missing');
+  const lim = Math.min(Math.max(parseInt(String(limit), 10) || 20, 1), 100);
+  const doFetch = fetchImpl || globalThis.fetch;
+  if (typeof doFetch !== 'function') throw new Error('fetch is not available');
+
+  const k = kind ? parseListingKind(kind) : null;
+  if (kind && !k) throw new Error('INVALID_KIND: kind must be agent, compute, data, or model');
+  if (serviceType && !parseServiceType(serviceType)) {
+    throw new Error('INVALID_SERVICE_TYPE: serviceType must be agent, gpu-rental, or api-endpoint');
+  }
+  if (k === 'data') {
+    const u = new URL(`${base}/v1/agents`);
+    u.searchParams.set('status', 'active');
+    u.searchParams.set('kind', 'data');
+    u.searchParams.set('limit', String(lim));
+    const res = await doFetch(u);
+    if (!res.ok) throw new Error(`listings HTTP ${res.status}`);
+    const body = await res.json();
+    const rows = (body.data || []).map((a) => ({
+      hireable: false,
+      kind: 'data',
+      seller: a.id || a.verusId,
+      qualifiedName: a.qualifiedName || a.name || null,
+      serviceId: null,
+      serviceType: null,
+      price: null,
+      currency: null,
+      name: a.name || null,
+    }));
+    return { rows, total: body.meta && body.meta.total, browseOnly: true };
+  }
+
+  const u = new URL(`${base}/v1/services`);
+  u.searchParams.set('status', 'active');
+  u.searchParams.set('limit', String(lim));
+  if (k) u.searchParams.set('kind', k);
+  const st = serviceType || defaultServiceTypeForKind(k);
+  if (st) u.searchParams.set('serviceType', st);
+  if (q) u.searchParams.set('q', q);
+  const res = await doFetch(u);
+  if (!res.ok) throw new Error(`listings HTTP ${res.status}`);
+  const body = await res.json();
+  const rows = (body.data || []).map((s) => ({
+    hireable: true,
+    kind: s.kind || 'agent',
+    seller: s.verusId || s.agentId,
+    qualifiedName: s.qualifiedName || s.agentName || null,
+    serviceId: s.id,
+    serviceType: s.serviceType || 'agent',
+    price: s.price,
+    currency: s.currency || null,
+    name: s.name || null,
+  }));
+  return { rows, total: body.meta && body.meta.total, browseOnly: false };
+}
+
+module.exports = {
+  assertHireAllowed,
+  paymentOutputs,
+  isVerusAddr,
+  localBuyers,
+  defaultServiceTypeForKind,
+  parseServiceType,
+  SERVICE_TYPES,
+  fetchMarketplaceListings,
+};

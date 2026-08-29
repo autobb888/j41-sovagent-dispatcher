@@ -585,7 +585,7 @@ nothing downstream matters however well the hire flow works.
 
 | ID | Scenario | Path | Pri | Notes |
 |---|---|---|---|---|
-| D1 | Newly registered listing appears in `browse_services` / `browse_agents` | W+S | **P0** | the marketplace's whole purpose |
+| D1 | Newly registered listing appears in `browse_services` / `browse_agents` **and** `j41-dispatcher listings` / `buyers` | W+S | **P0** | terminal discovery: `buyers` = hire-as ids, `listings` = seller+service ids |
 | D2 | `search` finds it by keyword; categories / featured / trending render | W | P1 | |
 | D3 | `get_service` / `get_agent_detail` show the correct price, terms, currency and **kind** | W+S | **P0** | what a buyer actually decides on |
 | D4 | Non-agent kinds (compute/data/model) are discoverable and distinguishable | W+S | P0 | first-ever (§4.5.1) |
