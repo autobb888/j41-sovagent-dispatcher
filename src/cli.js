@@ -2777,23 +2777,37 @@ program
   .option('--currency <c>', 'Payment currency', NATIVE_COIN)
   .option('--pay', 'Broadcast dual payment (seller + platform fee) after create')
   .option('--yes', 'Skip the interactive confirmation (--pay on mainnet still requires a TTY retype)')
+  .option('--json', 'Emit the result as one JSON object on stdout. Non-interactive, so it requires --yes.')
   .action(async (buyerAgentId, seller, options) => {
+    // The machine-driven path. Every exit emits exactly one JSON object on stdout carrying a
+    // stable `code`, so a caller branches on the code instead of pattern-matching prose — and the
+    // FULL txid is reported, which the human line truncates to 16 chars and therefore loses.
+    const fail = (code, message, extra = {}) => {
+      if (options.json) console.log(JSON.stringify({ ok: false, code, message, ...extra }, null, 2));
+      else console.error(`❌ ${message}`);
+      process.exit(1);
+    };
+    const say = (line) => { if (!options.json) console.log(line); };
+
+    // confirmHire() reads stdin. Under --json nobody is there to answer it, so without --yes this
+    // would block forever rather than fail.
+    if (options.json && !options.yes) {
+      fail('JSON_REQUIRES_YES', '--json is non-interactive and requires --yes');
+    }
+
     await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
 
     const amount = Number(options.amount);
     if (!Number.isFinite(amount) || amount <= 0) {
-      console.error('❌ --amount must be a positive number');
-      process.exit(1);
+      fail('BAD_AMOUNT', '--amount must be a positive number');
     }
     const keys = loadAgentKeys(buyerAgentId);
     if (!keys) {
-      console.error(`❌ Agent ${buyerAgentId} not found.`);
-      process.exit(1);
+      fail('BUYER_NOT_FOUND', `Agent ${buyerAgentId} not found.`);
     }
     if (!keys.identity || !keys.wif || !keys.address) {
-      console.error(`❌ Agent ${buyerAgentId} is not registered — hire is a buyer identity, not a local folder.`);
-      process.exit(1);
+      fail('BUYER_NOT_REGISTERED', `Agent ${buyerAgentId} is not registered — hire is a buyer identity, not a local folder.`);
     }
 
     const { assertHireAllowed, paymentOutputs } = require('./hire.js');
@@ -2820,21 +2834,26 @@ program
         serviceId: options.service || null,
       });
       if (!gate.ok) {
-        console.error(`❌ ${gate.code}: ${gate.message}`);
-        process.exit(1);
+        fail(gate.code, gate.message);
       }
 
       const description = options.description || (service && service.description) || `Hire via dispatcher (${buyerAgentId})`;
-      console.log(`\n  Buyer:  ${keys.identity} (${buyerAgentId})`);
-      console.log(`  Seller: ${listing.qualifiedName || listing.name || seller}  kind=${sellerKind || 'agent'}`);
-      if (service) console.log(`  Service: ${service.id}  type=${serviceType || 'agent'}  listed=${service.price} ${service.currency || ''}`);
-      console.log(`  Amount: ${amount} ${options.currency}`);
-      console.log(`  Pay:    ${options.pay ? 'yes — dual output after create' : 'no — create only (seller waits for payment)'}`);
-      console.log('');
+      say(`\n  Buyer:  ${keys.identity} (${buyerAgentId})`);
+      say(`  Seller: ${listing.qualifiedName || listing.name || seller}  kind=${sellerKind || 'agent'}`);
+      if (service) say(`  Service: ${service.id}  type=${serviceType || 'agent'}  listed=${service.price} ${service.currency || ''}`);
+      say(`  Amount: ${amount} ${options.currency}`);
+      say(`  Pay:    ${options.pay ? 'yes — dual output after create' : 'no — create only (seller waits for payment)'}`);
+      say('');
 
-      if (options.pay && IS_MAINNET && options.yes && !process.stdin.isTTY) {
-        console.error('❌ --yes cannot skip hire payment confirmation on mainnet without a TTY.');
-        process.exit(1);
+      // Headless mainnet payment is opt-in through its own env var, deliberately NOT --yes:
+      // --yes is a general "skip the prompt" flag a script sets once and forgets, and it must
+      // never be the thing that authorises real money with nobody watching. Setting this also
+      // routes the send through the spend gate below.
+      const headlessMainnetPay = process.env.J41_HEADLESS_MAINNET_PAY === '1';
+      if (options.pay && IS_MAINNET && options.yes && !process.stdin.isTTY && !headlessMainnetPay) {
+        fail('MAINNET_TTY_REQUIRED',
+          '--yes cannot skip hire payment confirmation on mainnet without a TTY. ' +
+          'Set J41_HEADLESS_MAINNET_PAY=1 to authorise headless mainnet payment.');
       }
       if (!options.yes) {
         const ok = await confirmHire({ amountText: String(options.amount), pay: !!options.pay });
@@ -2851,20 +2870,97 @@ program
         currency: options.currency,
         serviceId: options.service,
       });
-      console.log(`✅ Job ${job.id} created (status=${job.status})`);
+      say(`✅ Job ${job.id} created (status=${job.status})`);
 
+      let txid = null;
+      let outputs = [];
       if (options.pay) {
-        const outputs = paymentOutputs(job, amount);
-        const txid = await agent.sendMultiPayment(outputs);
+        outputs = paymentOutputs(job, amount);
+
+        // `hire --pay` is the ONLY money-broadcast site in the dispatcher with no spend gate
+        // (refunds gate at cli.js:7669, the operator backfill at scripts/pay-jobs.js:107). Its
+        // entire protection is confirmHire's keystroke — precisely what the autonomous path
+        // removes. So the autonomous path, and only it, is gated here: applying these caps
+        // (1000 VRSC per tx, 3 sends per job for life, hourly limit) to the interactive command
+        // would silently break hires that work today. Gating that path too is filed, not done here.
+        const autonomous = !!(options.json || headlessMainnetPay);
+        if (autonomous) {
+          // expectedRecipients is resolved from the CHAIN, never from job.payment.address.
+          // Deriving the expected set from the value under test is what makes the existing
+          // kind:'payment' check a tautology (2026-09-01 review, S6). Resolving independently
+          // means a payment address the platform returned that is NOT one of the seller's own
+          // on-chain addresses gets denied right here, before any money moves.
+          const sellerId = listing.id || listing.verusId || seller;
+          let payInfo = null;
+          try {
+            payInfo = await agent.client.getAgentPaymentAddress(sellerId);
+          } catch (e) {
+            fail('RECIPIENT_UNRESOLVED',
+              `Cannot resolve the seller's on-chain address to authorise payment: ${e.message}`,
+              { jobId: job.id });
+          }
+          const expected = [payInfo && payInfo.address, payInfo && payInfo.iAddress, listing.payaddress]
+            .filter((a) => typeof a === 'string' && a.length > 0);
+          if (!expected.length) {
+            fail('RECIPIENT_UNRESOLVED',
+              'No on-chain address for the seller — refusing to pay an unverifiable recipient.',
+              { jobId: job.id });
+          }
+          const g = gateExternalSend({
+            jobId: job.id,
+            toAddress: job.payment && job.payment.address,
+            amount,
+            jobPrice: amount,
+            kind: 'payment',
+            expectedRecipients: expected,
+          });
+          if (!g.allowed) {
+            fail('SPEND_DENIED', g.reason, { jobId: job.id, retryable: !!g.retryable });
+          }
+        }
+
+        txid = await agent.sendMultiPayment(outputs);
         await agent.client.recordPaymentCombined(job.id, txid);
-        console.log(`✅ Payment broadcast ${String(txid).substring(0, 16)}… (${outputs.length} output${outputs.length === 1 ? '' : 's'})`);
-        console.log('   Wait for confirmations; seller accept may already be stacked.');
+        if (autonomous) {
+          recordSendOutcome({
+            kind: 'payment',
+            jobId: job.id,
+            toAddress: job.payment && job.payment.address,
+            amount,
+            txid,
+          });
+        }
+        say(`✅ Payment broadcast ${String(txid).substring(0, 16)}… (${outputs.length} output${outputs.length === 1 ? '' : 's'})`);
+        say('   Wait for confirmations; seller accept may already be stacked.');
       } else {
-        console.log('   Pay later with --pay, or from the website. Seller cannot start until payment verifies.');
+        say('   Pay later with --pay, or from the website. Seller cannot start until payment verifies.');
+      }
+
+      if (options.json) {
+        console.log(JSON.stringify({
+          ok: true,
+          jobId: job.id,
+          status: job.status,
+          buyer: { agentId: buyerAgentId, identity: keys.identity, iAddress: keys.iAddress || null },
+          seller: {
+            id: listing.id || listing.verusId || seller,
+            name: listing.qualifiedName || listing.name || null,
+            kind: sellerKind || 'agent',
+          },
+          serviceId: options.service || null,
+          amount,
+          currency: options.currency,
+          paid: !!options.pay,
+          txid, // FULL txid. The human line above truncates to 16 chars, which loses it entirely.
+          outputs,
+        }, null, 2));
       }
     } catch (e) {
-      console.error(`❌ ${e.message}`);
-      process.exit(1);
+      // hire.js throws `CODE: message` for its own refusals; keep the code rather than flattening
+      // every failure to HIRE_FAILED.
+      const m = /^([A-Z][A-Z0-9_]+):\s*([\s\S]*)$/.exec(e.message || '');
+      if (m) fail(m[1], m[2]);
+      fail('HIRE_FAILED', e.message);
     }
   });
 
