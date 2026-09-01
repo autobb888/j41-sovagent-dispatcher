@@ -867,6 +867,8 @@ your dispatcher answers it, and the lease expiry moves out. The rules:
 - Rental extensions are decided on the **lease**, not on host CPU/RAM. The capacity gate
   that guards labour extensions does not apply: the box is already leased and running.
 - `extension_auto_approve = false` still means you answer by hand.
+- **The buyer is told the new expiry.** A successful extension posts it to the job chat —
+  otherwise the only end time they have is the one sealed at hire.
 - **Restarts are safe.** A live rental is re-adopted on boot (`[Rental] Re-adopted N live
   rental(s)`). Before `2.36.0` a restart made the dispatcher forget a box the renter was
   still on — crash recovery skips a `delivered` job and then clears the ledger, and the job

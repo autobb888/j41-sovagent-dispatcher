@@ -237,3 +237,13 @@ test('cli.js re-adopts live rentals on boot, after crash recovery and before the
   assert.ok(adopt > recovery, 'crash recovery clears active-jobs.json — re-adopt after it, never before');
   assert.ok(adopt < firstPoll, 'the teardown sweep must already see the rental on the first pass');
 });
+
+test('cli.js tells the buyer their new expiry from both paid paths', () => {
+  const helper = CLI.slice(CLI.indexOf('async function announceRentalExtension'), CLI.indexOf('Auto-approve or reject extension requests'));
+  assert.match(helper, /sendChatMessage\(/, 'the only expiry a renter sees is the one sealed at hire — an extension must send a new one');
+  assert.match(helper, /result\.expiresAt/);
+  const webhookCase = CLI.slice(CLI.indexOf("case 'job.extension_paid':"), CLI.indexOf("case 'job.extension_rejected':"));
+  assert.match(webhookCase, /announceRentalExtension\(/);
+  const poll = CLI.slice(CLI.indexOf('Poll-mode fallback: check for pending extension'), CLI.indexOf('Sweep queued reactivation entries'));
+  assert.match(poll, /announceRentalExtension\(/);
+});

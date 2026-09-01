@@ -43,6 +43,12 @@ NEXT boot's `releaseOrphansOnBoot` saw a lease whose job was no longer in the le
 released a box the renter was still on, inside time they had paid for. `adoptLiveRentals`
 re-adopts on boot, after crash recovery and before the first poll, and rewrites the ledger.
 
+**The buyer was never told their new expiry.** The only end time a renter ever sees is the
+one sealed into the deliverable at hire; a rental has no worker process to say anything else,
+and the platform's job record carries no lease expiry. So an extension was invisible to the
+person who paid for it. A successful extension now posts the new expiry to the job's chat
+from both paid paths.
+
 Needs the matching platform release: the rental extension window and the
 `job.extension_paid` webhook are backend changes.
 

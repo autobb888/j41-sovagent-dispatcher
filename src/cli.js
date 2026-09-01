@@ -8643,6 +8643,29 @@ async function refundAbandonedJob(state, jobId, active) {
 }
 
 /**
+ * Tell the buyer their new expiry after a paid extension.
+ *
+ * Without this the extension is invisible to the person who paid for it. The only expiry a
+ * renter ever sees is the one in the sealed deliverable, written at hire — there is no
+ * worker process on a rental to say anything else, and the platform's job record does not
+ * carry a lease expiry. So they would send VRSC and have no way to learn what they bought.
+ * Best-effort and never fatal: the time is already on the lease whether or not this lands.
+ */
+async function announceRentalExtension(state, jobId, agentInfo, result) {
+  try {
+    const agent = await getAgentSession(state, agentInfo);
+    await agent.client.sendChatMessage(
+      jobId,
+      `Rental extended by ${result.minutes} minutes. Your box now runs until `
+      + `${new Date(result.expiresAt).toISOString()} (UTC). Same host, same credentials — `
+      + 'nothing to reconnect.',
+    );
+  } catch (e) {
+    console.warn(`[Extension] Extended the lease but could not tell the buyer their new expiry (${jobId.substring(0, 8)}): ${e.message}`);
+  }
+}
+
+/**
  * Auto-approve or reject extension requests based on system capacity.
  * Approve if: queue empty + slots open + system has headroom.
  * Reject with reason otherwise.
@@ -9114,6 +9137,7 @@ async function pollForJobs(state) {
           const r = applyRentalExtension({ state, jobId, extensionId: ext.id, amount: ext.amount });
           if (r.extended && r.changed) {
             console.log(`[Extension] Rental lease extended by ${r.minutes} min (poll) — job ${jobId.substring(0, 8)}, expires ${new Date(r.expiresAt).toISOString()}`);
+            await announceRentalExtension(state, jobId, activeInfo.agentInfo, r);
           } else if (!r.extended) {
             console.warn(`[Extension] Paid rental extension ${ext.id.substring(0, 8)} could NOT be applied — ${r.reason}`);
           }
@@ -9658,6 +9682,7 @@ async function handleWebhookEvent(state, agentId, payload) {
         const r = applyRentalExtension({ state, jobId, extensionId: data.extensionId, amount: data.amount });
         if (r.extended && r.changed) {
           console.log(`[Webhook] Rental lease extended by ${r.minutes} min — job ${jobId?.substring(0, 8)}, expires ${new Date(r.expiresAt).toISOString()}`);
+          await announceRentalExtension(state, jobId, paidJob.agentInfo, r);
         } else if (!r.extended) {
           console.error(`[Webhook] Paid rental extension could NOT be applied — ${r.reason}. The box will still be released at its current expiry.`);
         }
