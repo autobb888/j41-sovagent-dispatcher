@@ -193,7 +193,7 @@ from an ordinary failure.
 | `allowlist <agent-id> [action] [identity]` | Local `buyerAllowlist` for invite-only auto-accept: `list` (default), `add`, `remove`. **Not** `financial-allowlist.json` |
 | `sales-mode <agent-id> [mode]` | On-chain hire floodgate via the same `agent.status` VDXF key: `invite`, `open` (`active`), or omit to print |
 | `accept-job <agent-id> <job-id>` | One-shot accept a stacked stranger without changing sales-mode or `preferAllowlist` |
-| `hire <buyer-id> <seller>` | **Buyer:** create a job as this fleet identity (`--service`, `--amount`, `--description`, `--pay` dual-broadcast). Data listings are refused |
+| `hire <buyer-id> <seller>` | **Buyer:** create a job as this fleet identity (`--service`, `--amount`, `--description`, `--pay` dual-broadcast, `--yes` to skip the confirm). Data listings are refused. `--json` for machine callers — one JSON object on stdout with a stable `code`, and the **full** txid the human line truncates. Implies non-interactive, so it requires `--yes` |
 | `buyers` | List local fleet identities you can hire AS (`<buyer-id>`). `--json` |
 | `listings` | List marketplace seller + service ids (`--kind`, `--service-type`, `-q`, `--json`). Data is browse-only |
 | `start` | Start the dispatcher in poll mode |
@@ -513,6 +513,7 @@ These env vars override the corresponding `config.toml` value for CI or one-shot
 | `J41_FEE_SWEEP` | Enable/disable the i→R fee-tank sweep (default: enabled) — see [Wallets & Fee Tank](#wallets--fee-tank) |
 | `J41_FEE_SWEEP_FLOOR` | Sweep when an agent can afford fewer than this many on-chain writes (default: 100) |
 | `J41_FEE_SWEEP_INTERVAL_MS` | Fee-tank check interval in **milliseconds** (default: 1800000 / 30 min). The CLI flag takes minutes |
+| `J41_HEADLESS_MAINNET_PAY` | `=1` authorises `hire --pay` on **mainnet** with no TTY. Deliberately separate from `--yes`, which is a general skip-the-prompt flag a script sets once and forgets — this one, and only this one, is what lets real money move unattended. Setting it also routes the send through the spend gate |
 | `J41_NO_STATUS_TOGGLE` | `=1` skips the startup activate-all and shutdown deactivate-all loops, leaving platform state as-is. **Env-only by design** — a per-run flag, deliberately not persistable in `config.toml`, since a persisted value would permanently stop a dispatcher from activating or deactivating its agents |
 
 Full override list: `ENV_OVERRIDES` in `src/config-loader.js`.
