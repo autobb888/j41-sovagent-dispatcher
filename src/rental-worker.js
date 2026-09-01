@@ -229,6 +229,75 @@ const YANK_RENTAL_STATUSES = Object.freeze([
   'cancelled', 'resolved', 'resolved_rejected',
 ]);
 
+/**
+ * Re-adopt rentals that outlived a dispatcher restart.
+ *
+ * A Cat-1 rental is `delivered` from the moment credentials go out, and nothing puts a
+ * delivered job back into `state.active` on boot: crash recovery deliberately SKIPS it
+ * (delivered means earned — auto-refunding it would make the operator eat the compute and
+ * the payout) and then clears active-jobs.json, while the job poll only fetches
+ * requested/accepted/in_progress. So a restart left a live, paid box running with the
+ * dispatcher no longer tracking it, and two things broke:
+ *
+ *  1. Mid-session extension went dead. Both delivery paths — the `job.extension_paid`
+ *     webhook and the poll sweep — key off `state.active`, so a renter could pay for more
+ *     time and nothing would move the lease.
+ *  2. The NEXT boot released the box early. `releaseOrphansOnBoot` keeps only leases whose
+ *     jobId is in active-jobs.json; once that file has been cleared and never rewritten
+ *     with the rental, the lease reads as an orphan and is released — while the renter is
+ *     on it, inside time they paid for.
+ *
+ * The lease itself survives a restart intact (it is persisted whole, including the period
+ * and the applied-extension ids), so re-adoption needs no platform state to reconstruct.
+ */
+async function adoptLiveRentals({ state, getSession, now = Date.now(), persist } = {}) {
+  const ctrl = resolveComputeController(state);
+  if (!ctrl || typeof ctrl.getLeases !== 'function' || !state || !state.active) return 0;
+  let adopted = 0;
+  for (const lease of ctrl.getLeases() || []) {
+    if (!lease || !lease.jobId) continue;
+    if (lease.state === 'released' || lease.state === 'release-pending') continue;
+    if (!(Number(lease.expiresAt) > now)) continue;      // expiry is the reconcile loop's job
+    if (state.active.has(lease.jobId)) continue;
+    const agentInfo = (state.agents || []).find((a) => a && a.id === lease.boundAgentId);
+    if (!agentInfo) continue;                            // cannot act for an agent we do not hold
+
+    // Confirm the job is not one of the statuses that yank a rental. A fetch failure is NOT
+    // a reason to skip: leaving it unadopted is what strands the box. Adopt, and let the
+    // teardown sweep — which re-checks the status every pass — correct it.
+    let status = null;
+    if (typeof getSession === 'function') {
+      try {
+        const session = await getSession(agentInfo);
+        const job = await session.client.getJob(lease.jobId);
+        status = job && job.status;
+      } catch { /* adopt anyway; the sweep re-checks */ }
+    }
+    if (status && YANK_RENTAL_STATUSES.includes(status)) continue;
+
+    state.active.set(lease.jobId, {
+      kind: 'gpu-rental',
+      leaseId: lease.id,
+      agentId: agentInfo.id,
+      agentInfo,
+      agentInfoId: agentInfo.id,
+      startedAt: now,
+      rentalPeriodMin: lease.rentalPeriodMin ?? null,
+      rentalPeriodAmount: lease.rentalPeriodAmount ?? null,
+      readopted: true,
+    });
+    if (Array.isArray(state.available)) {
+      state.available = state.available.filter((a) => a.id !== agentInfo.id);
+    }
+    adopted++;
+  }
+  if (adopted) {
+    // Rewrite active-jobs.json so the NEXT boot's orphan sweep still sees these as live.
+    try { (persist || require('./config').persistActiveJobs)(state.active); } catch { /* best-effort */ }
+  }
+  return adopted;
+}
+
 function resolveComputeController(state) {
   if (!state) return null;
   return state.computeSupply || (state.proxyContext && state.proxyContext.computeSupply) || null;
@@ -304,4 +373,5 @@ module.exports = {
   YANK_RENTAL_STATUSES,
   decideRentalExtension,
   applyRentalExtension,
+  adoptLiveRentals,
 };

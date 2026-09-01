@@ -95,7 +95,7 @@ const { writeKeysFile, readKeysFile } = require('./keys-file.js');
 const keystore = require('./keystore.js');
 const { encryptAllKeys, decryptAllKeys, listPlaintextKeys } = require('./keys-migrate.js');
 const { preflightAllowsAccept } = require('./preflight-gate.js');
-const { isGpuRentalJob, startRentalJob, stopRentalJob, shouldTeardownRental, servicesForAgent, resolveRentalProvider, ensureComputeController, decideRentalExtension, applyRentalExtension } = require('./rental-worker.js');
+const { isGpuRentalJob, startRentalJob, stopRentalJob, shouldTeardownRental, servicesForAgent, resolveRentalProvider, ensureComputeController, decideRentalExtension, applyRentalExtension, adoptLiveRentals } = require('./rental-worker.js');
 const {
   decideAutoAccept,
   loadBuyerAllowlist,
@@ -5460,6 +5460,21 @@ program
 
     // Crash recovery — process orphaned jobs before accepting new ones
     await handleCrashRecovery(state);
+
+    // A live rental is `delivered`, so crash recovery skipped it (correctly — delivered is
+    // earned) and then cleared active-jobs.json, and the job poll only fetches
+    // requested/accepted/in_progress. Without this the dispatcher forgets a box the renter
+    // is still on: paid extensions stop reaching the lease, and the next boot's orphan
+    // sweep releases it early. Runs BEFORE the first poll so the teardown sweep sees it.
+    if (cfg.compute && cfg.compute.enabled) {
+      try {
+        await ensureComputeController(state, cfg);
+        const readopted = await adoptLiveRentals({ state, getSession: (ai) => getAgentSession(state, ai) });
+        if (readopted) console.log(`[Rental] Re-adopted ${readopted} live rental(s) after restart`);
+      } catch (e) {
+        console.error(`[Rental] Boot re-adoption failed (a live rental may be untracked): ${e.message}`);
+      }
+    }
 
     // Initial poll (catch-up for anything missed while offline)
     await pollForJobs(state);

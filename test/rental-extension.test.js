@@ -133,6 +133,77 @@ test('an extension cannot resurrect an expired lease', async () => {
   assert.equal(r.extended, false);
 });
 
+// ── Restart: a live rental must be re-adopted, or the whole feature is dead ───────
+
+const { adoptLiveRentals } = require('../src/rental-worker');
+
+// What a restart actually looks like: the lease survives on disk, state.active does not.
+function afterRestart(controller, { agents = [{ id: 'gpu-1' }], available = [{ id: 'gpu-1' }] } = {}) {
+  return { active: new Map(), agents, available, computeSupply: controller, emitEvent() {} };
+}
+const session = (status) => async () => ({ client: { async getJob() { return { id: 'job-1', status }; } } });
+
+test('a live rental is re-adopted after a restart, with the kind the extension paths key off', async () => {
+  const { controller } = await bootRental({ jobTimeoutMin: 60, amount: 2 });
+  const state = afterRestart(controller);
+  const persisted = [];
+  const n = await adoptLiveRentals({ state, getSession: session('delivered'), now: NOW, persist: (m) => persisted.push(m.size) });
+  assert.equal(n, 1);
+  const rec = state.active.get('job-1');
+  assert.equal(rec.kind, 'gpu-rental', 'without this the webhook and the poll sweep both skip it');
+  assert.equal(rec.leaseId, 'home:1');
+  assert.equal(rec.agentInfo.id, 'gpu-1');
+  assert.deepEqual(state.available, [], 'the card is still rented — it is not free to take another job');
+  assert.deepEqual(persisted, [1], 'active-jobs.json must be rewritten or the NEXT boot releases the box');
+});
+
+test('re-adoption is what makes a paid extension work after a restart', async () => {
+  const { controller, lease } = await bootRental({ jobTimeoutMin: 60, amount: 2 });
+  const state = afterRestart(controller);
+
+  // Before adoption the job is unknown, exactly as a restarted dispatcher sees it.
+  assert.equal(applyRentalExtension({ state, jobId: 'job-1', extensionId: 'e1', amount: 2, now: NOW }).extended, true,
+    'applyRentalExtension itself works off the lease');
+  assert.equal(state.active.has('job-1'), false);
+
+  // ...but the callers gate on state.active, which is the actual break.
+  await adoptLiveRentals({ state, getSession: session('delivered'), now: NOW, persist: () => {} });
+  assert.equal(state.active.get('job-1').kind, 'gpu-rental');
+  const r = applyRentalExtension({ state, jobId: 'job-1', extensionId: 'e2', amount: 2, now: NOW });
+  assert.equal(r.changed, true);
+  assert.equal(r.expiresAt, lease.expiresAt + 120 * MIN, 'both extensions applied, none double-counted');
+});
+
+test('re-adoption skips what it must: expired, released, already-tracked, yanked, or not ours', async () => {
+  const { controller } = await bootRental({ jobTimeoutMin: 60, amount: 2 });
+
+  const expired = afterRestart(controller);
+  assert.equal(await adoptLiveRentals({ state: expired, getSession: session('delivered'), now: NOW + 61 * MIN }), 0);
+
+  const yanked = afterRestart(controller);
+  assert.equal(await adoptLiveRentals({ state: yanked, getSession: session('cancelled'), now: NOW }), 0);
+
+  const foreign = afterRestart(controller, { agents: [{ id: 'someone-else' }] });
+  assert.equal(await adoptLiveRentals({ state: foreign, getSession: session('delivered'), now: NOW }), 0);
+
+  const tracked = afterRestart(controller);
+  tracked.active.set('job-1', { kind: 'gpu-rental' });
+  assert.equal(await adoptLiveRentals({ state: tracked, getSession: session('delivered'), now: NOW }), 0);
+});
+
+test('a platform fetch failure adopts anyway — not adopting is what strands the box', async () => {
+  const { controller } = await bootRental({ jobTimeoutMin: 60, amount: 2 });
+  const state = afterRestart(controller);
+  const n = await adoptLiveRentals({
+    state,
+    getSession: async () => ({ client: { async getJob() { throw new Error('platform unreachable'); } } }),
+    now: NOW,
+    persist: () => {},
+  });
+  assert.equal(n, 1);
+  assert.equal(state.active.get('job-1').kind, 'gpu-rental');
+});
+
 // ── Wiring. Every assertion below dies if its line is deleted from cli.js. ────────
 const CLI = fs.readFileSync(require.resolve('../src/cli.js'), 'utf8');
 
@@ -157,4 +228,12 @@ test('cli.js decides rental extensions on the lease, not on host CPU/RAM', () =>
   assert.ok(rentalBranch > 0, 'rental jobs need their own decision');
   assert.ok(cpuGate > rentalBranch, 'the rental branch must return before the host-capacity gate');
   assert.match(handler.slice(rentalBranch, cpuGate), /decideRentalExtension\(/);
+});
+
+test('cli.js re-adopts live rentals on boot, after crash recovery and before the first poll', () => {
+  const recovery = CLI.indexOf('await handleCrashRecovery(state);');
+  const adopt = CLI.indexOf('adoptLiveRentals({ state');
+  const firstPoll = CLI.indexOf('await pollForJobs(state);', recovery);
+  assert.ok(adopt > recovery, 'crash recovery clears active-jobs.json — re-adopt after it, never before');
+  assert.ok(adopt < firstPoll, 'the teardown sweep must already see the rental on the first pass');
 });

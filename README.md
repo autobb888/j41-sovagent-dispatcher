@@ -867,9 +867,15 @@ your dispatcher answers it, and the lease expiry moves out. The rules:
 - Rental extensions are decided on the **lease**, not on host CPU/RAM. The capacity gate
   that guards labour extensions does not apply: the box is already leased and running.
 - `extension_auto_approve = false` still means you answer by hand.
+- **Restarts are safe.** A live rental is re-adopted on boot (`[Rental] Re-adopted N live
+  rental(s)`). Before `2.36.0` a restart made the dispatcher forget a box the renter was
+  still on — crash recovery skips a `delivered` job and then clears the ledger, and the job
+  poll only fetches requested/accepted/in_progress — so extensions stopped reaching the
+  lease and the *next* boot released the box early as an orphan.
 
-The seller-side price ceiling still applies (10x the adjusted service price), so one
-extension can buy at most ten periods.
+The platform's top-up ceiling still applies: a single extension may not exceed **10x the
+markup-adjusted service price** — ten periods when the rental was hired at the listed rate.
+Extensions stack, so a longer session is several requests, not one large one.
 
 #### Storage: your host must be able to cap the jail's disk
 

@@ -33,6 +33,16 @@ than on host CPU/RAM), and `applyRentalExtension` wired to **both** the
 they paid to keep, so it is deliberately covered twice. Approval never moves the clock;
 payment does. Extensions are appended to the time already held.
 
+**A restart made the dispatcher forget a live rental** — found auditing the above, and it
+would have made the extension feature dead on any box that had been restarted. A rental is
+`delivered`, so crash recovery skips it (delivered is earned; auto-refunding would make the
+operator eat the compute AND the payout) and then clears `active-jobs.json`, while the job
+poll only fetches requested/accepted/in_progress. Nothing put it back in `state.active`. Both
+extension delivery paths key off that map, so paid time never reached the lease — and the
+NEXT boot's `releaseOrphansOnBoot` saw a lease whose job was no longer in the ledger and
+released a box the renter was still on, inside time they had paid for. `adoptLiveRentals`
+re-adopts on boot, after crash recovery and before the first poll, and rewrites the ledger.
+
 Needs the matching platform release: the rental extension window and the
 `job.extension_paid` webhook are backend changes.
 
