@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.36.0 — 2026-09-01
 
 ### Rental duration was a lie, and rentals could never be extended
 Two defects on the Cat-1 money path, found while answering "could I rent a GPU to
