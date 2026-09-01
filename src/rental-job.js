@@ -56,14 +56,36 @@ function formatRentalDeliverable(lease, { jobTimeoutMin } = {}) {
     ssh,
     expiresAt: lease.expiresAt,
     disclosure: `This rental runs for up to ${jobTimeoutMin || 60} minutes. Billing is all-or-nothing: `
-      + 'there is no pro-rata refund for unused time and the box is released at expiry.',
+      + 'there is no pro-rata refund for unused time and the box is released at expiry. '
+      + `To keep the box past that, request a session extension BEFORE it expires — each extension `
+      + `buys another whole ${jobTimeoutMin || 60}-minute period at the same rate, added to the time you already hold.`,
   };
+}
+
+// Money -> wall-clock for a Cat-1 extension. Whole periods only: the rental is sold
+// all-or-nothing with no pro-rata refund, so selling a fractional period would contradict
+// the term the buyer accepted at hire. `amount` under one period buys nothing and MUST be
+// refused at approval, before the buyer sends VRSC.
+//
+// Fails closed on a non-positive/absent period price: without a price there is no honest
+// exchange rate, and guessing one sells time we did not price.
+function rentalExtensionGrant({ amount, periodAmount, periodMin } = {}) {
+  const a = Number(amount);
+  const price = Number(periodAmount);
+  const min = Number(periodMin);
+  if (!Number.isFinite(a) || a <= 0) return null;
+  if (!Number.isFinite(price) || price <= 0) return null;
+  if (!Number.isFinite(min) || min <= 0) return null;
+  // Tolerate float dust in a decimal price (0.1 + 0.2 problems arrive here as amounts).
+  const periods = Math.floor((a + 1e-8) / price);
+  if (periods < 1) return null;
+  return { periods, minutes: periods * min, ms: periods * min * 60000 };
 }
 
 // Acquire a rental lease for a job: canSsh-gated, on-demand pinned (a Cat-1 rental
 // must not be reclaimed mid-hour), job-bound with an expiry. Returns the lease plus
 // the credentials deliverable the (owner-reviewed) worker hook will hand to the buyer.
-async function acquireRentalLease({ controller, provider, spec = {}, jobId, agentId, jobTimeoutMin = 60, providerName, now = Date.now(), waitOpts = {} }) {
+async function acquireRentalLease({ controller, provider, spec = {}, jobId, agentId, jobTimeoutMin = 60, periodAmount = null, providerName, now = Date.now(), waitOpts = {} }) {
   assertProviderCanSsh(provider);
   const cands = await provider.discover({ ...spec, interruptible: false });
   if (!cands.length) throw new Error('RENTAL_NO_CAPACITY: no on-demand offer matched the spec');
@@ -76,7 +98,14 @@ async function acquireRentalLease({ controller, provider, spec = {}, jobId, agen
   });
   const expiresAt = now + jobTimeoutMin * 60000;
   const ready = await provider.waitReady(pending, { timeoutMs: 300000, readyFor: 'ssh', ...waitOpts });
-  const lease = controller.recordLease({ ...ready, jobId, expiresAt }, provider, agentId, { providerName });
+  // rentalPeriodMin/rentalPeriodAmount travel ON THE LEASE (which is persisted), not in
+  // process memory: a mid-session extension arriving after a dispatcher restart still needs
+  // the exchange rate that was agreed at hire, and jobs.amount is mutated by every paid
+  // extension so it cannot be read back as the original period price.
+  const lease = controller.recordLease(
+    { ...ready, jobId, expiresAt, rentalPeriodMin: jobTimeoutMin, rentalPeriodAmount: periodAmount ?? null },
+    provider, agentId, { providerName },
+  );
   // M4 — never hand degraded / ssh:null / credential-less SSH to a paying buyer. Release + fail.
   if (lease.state !== 'ready' || !hasSshCredential(lease.ssh)) {
     await controller.releaseLease(lease);
@@ -93,4 +122,5 @@ async function acquireRentalLease({ controller, provider, spec = {}, jobId, agen
 module.exports = {
   assertRentalEligibleAgent, assertApiEligibleAgent, assertProviderCanSsh, assertPaidBeforePaidProvision,
   hasSshCredential, assertSshDeliverable, formatRentalDeliverable, acquireRentalLease,
+  rentalExtensionGrant,
 };

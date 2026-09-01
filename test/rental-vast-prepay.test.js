@@ -51,7 +51,7 @@ test('startRentalJob gates Vast before acquireRentalLease', async () => {
   await assert.rejects(
     () => startRentalJob({
       state,
-      job: { id: 'job-1', serviceType: 'gpu-rental', payment: { verified: false }, timeoutMin: 60 },
+      job: { id: 'job-1', serviceType: 'gpu-rental', payment: { verified: false } },
       agentInfo: { id: 'gpu-1' },
       controller,
       provider,
@@ -82,7 +82,7 @@ test('startRentalJob injects ackPostpayVastRisk and may acquire unpaid Vast', as
   const client = { async postRentalSecret() {}, async deliverJob() { return {}; } };
   const { lease } = await startRentalJob({
     state,
-    job: { id: 'job-ack', serviceType: 'gpu-rental', payment: { verified: false }, timeoutMin: 60 },
+    job: { id: 'job-ack', serviceType: 'gpu-rental', payment: { verified: false } },
     agentInfo: { id: 'gpu-1' },
     controller,
     provider,

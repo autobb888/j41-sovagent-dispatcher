@@ -117,6 +117,38 @@ function createSupplyController({ cfg, agentConfigs, now = Date.now }) {
     }
   }
 
+  // Public: buy more wall-clock on a live rental lease (Cat-1 mid-session extension).
+  //
+  // Fails CLOSED on a lease that is gone, released, or already past its expiry: the
+  // reconcile loop releases on expiry, so "extend an expired lease" would hand the buyer
+  // a box that is already being torn down. The caller must refuse the extension BEFORE
+  // taking payment (see decideRentalExtension) — this is the last line, not the gate.
+  //
+  // Idempotent by extensionId. The webhook and the poll fallback both deliver a paid
+  // extension, and leases are persisted, so without this an at-least-once delivery (or a
+  // restart mid-sweep) would grant the same paid hour twice.
+  function extendLease(leaseId, extraMs, extensionId, now = Date.now()) {
+    const cur = leases.get(leaseId);
+    if (!cur) return null;
+    if (cur.state === 'released' || cur.state === 'release-pending') return null;
+    const applied = Array.isArray(cur.appliedExtensions) ? cur.appliedExtensions : [];
+    if (extensionId && applied.includes(extensionId)) return cur;
+    const expiresAt = Number(cur.expiresAt);
+    if (!Number.isFinite(expiresAt) || expiresAt <= now) return null;
+    const ms = Number(extraMs);
+    if (!Number.isFinite(ms) || ms <= 0) return null;
+    // Extend from the CURRENT expiry, not from now: the buyer bought contiguous time and
+    // must not silently lose the remainder of the hour they already paid for.
+    const next = {
+      ...cur,
+      expiresAt: expiresAt + ms,
+      appliedExtensions: extensionId ? [...applied, extensionId] : applied,
+    };
+    leases.set(leaseId, next);
+    persist();
+    return next;
+  }
+
   // Public: release a specific lease now (used by rental M4 cleanup).
   async function releaseLease(lease) {
     const provider = reconstructProvider(lease);
@@ -284,7 +316,7 @@ function createSupplyController({ cfg, agentConfigs, now = Date.now }) {
   return {
     attachLocalLeases, attachVastLeases, reconcileTick, releaseOrphansOnBoot, getLeases,
     publishUpstream, unpublishUpstream, committedUsdPerHour, acquireUnderCeiling, recordLease,
-    releaseLease, bindJobLease, _injectBoundLease,
+    releaseLease, extendLease, bindJobLease, _injectBoundLease,
   };
 }
 

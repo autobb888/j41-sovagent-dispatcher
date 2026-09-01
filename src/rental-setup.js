@@ -57,7 +57,8 @@ function homeGpuConfigured(cfg) {
 }
 
 function rentalServiceDescription({ jobTimeoutMin = 60, paymentTerms, vastPostpayAck }) {
-  let d = `Raw GPU rental. Runs up to ${jobTimeoutMin} minutes. Billing is all-or-nothing: there is no pro-rata refund for unused time and the box is released at expiry.`;
+  let d = `Raw GPU rental. Runs up to ${jobTimeoutMin} minutes. Billing is all-or-nothing: there is no pro-rata refund for unused time and the box is released at expiry.`
+    + ` You can extend mid-session: request a session extension before it expires and each whole period's price buys another ${jobTimeoutMin} minutes on the same box.`;
   if (paymentTerms === 'postpay' && vastPostpayAck) {
     d += ' Seller sources this box from Vast.ai: if you do not pay, the seller still owes Vast.';
   }

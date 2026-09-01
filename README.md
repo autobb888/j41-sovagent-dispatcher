@@ -846,6 +846,31 @@ Cat-2 (`[18] API Endpoint Setup`) is metered inference on a different listing. D
 
 TCP tunnel stays your job. The dispatcher will not run `cloudflared` for you.
 
+#### Rental duration and mid-session extension
+
+The rental period is your `job_timeout_min` (`j41-dispatcher config --job-timeout <min>`,
+default 60). It is written into the listing description **and** into the lease, so what the
+buyer is shown is what the box actually gets. Before `2.36.0` the listing advertised your
+configured value while the lease was always created for 60 minutes — a seller running 180
+sold three hours and delivered one, under an all-or-nothing no-refund term.
+
+A renter can buy more time **while the box is running**: they request a session extension,
+your dispatcher answers it, and the lease expiry moves out. The rules:
+
+- **Whole periods only.** One period's price buys one more `job_timeout_min` block. An
+  amount under one period is rejected at approval, before the buyer sends anything — there
+  is no pro-rata, matching the term they accepted at hire.
+- **Payment moves the clock, not approval.** The expiry advances on `job.extension_paid`.
+- **Time is added, not reset** — an extension is appended to the time already held.
+- **A dead box cannot be extended.** Once the lease has expired or been released, the
+  extension is refused rather than taking money for a box that is being torn down.
+- Rental extensions are decided on the **lease**, not on host CPU/RAM. The capacity gate
+  that guards labour extensions does not apply: the box is already leased and running.
+- `extension_auto_approve = false` still means you answer by hand.
+
+The seller-side price ceiling still applies (10x the adjusted service price), so one
+extension can buy at most ten periods.
+
 #### Storage: your host must be able to cap the jail's disk
 
 A rental hands a stranger a shell. Without an enforced disk cap they can fill

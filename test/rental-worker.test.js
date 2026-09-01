@@ -34,7 +34,7 @@ test('startRentalJob acquires + seals and does not invoke startJobContainer', as
     async confirmWorkerAttached() {},
   };
   await startRentalJob({
-    state, job: { id: 'job-1', jobHash: 'h', serviceType: 'gpu-rental', timeoutMin: 60 },
+    state, job: { id: 'job-1', jobHash: 'h', serviceType: 'gpu-rental' },
     agentInfo: { id: 'gpu-1' }, controller, provider, client,
     signDeliver: ({ hash }) => ({ signature: 's', timestamp: 1, hash }),
     startJobContainer: async () => { startedContainers.push('nope'); },
@@ -62,7 +62,7 @@ test('startRentalJob confirms worker-attached and records leaseId, never a docke
     async confirmWorkerAttached(jobId) { attached.push(jobId); },
   };
   await startRentalJob({
-    state, job: { id: 'job-1', jobHash: 'h', serviceType: 'gpu-rental', timeoutMin: 60 },
+    state, job: { id: 'job-1', jobHash: 'h', serviceType: 'gpu-rental' },
     agentInfo: { id: 'gpu-1' }, controller, provider, client,
     signDeliver: ({ hash }) => ({ signature: 's', timestamp: 1, hash }),
     now: 1000,

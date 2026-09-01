@@ -2,7 +2,7 @@
 // Cat-1 gpu-rental worker. Accepted rental jobs acquire a lease, seal SSH via
 // POST /v1/jobs/:id/rental-secret, and deliverJob a notice with NO host/password.
 // Never calls startJob / startJobContainer / startJobLocal / JOB_IMAGE.
-const { acquireRentalLease, assertPaidBeforePaidProvision } = require('./rental-job');
+const { acquireRentalLease, assertPaidBeforePaidProvision, rentalExtensionGrant } = require('./rental-job');
 const { deliverSealed } = require('./rental-delivery');
 
 function isGpuRentalJob(job, services = []) {
@@ -70,7 +70,7 @@ async function ensureComputeController(state, cfg) {
 async function startRentalJob(opts) {
   const {
     state, job, agentInfo, controller, provider, spec = {}, now = Date.now(),
-    client, signDeliver, signer, providerName, ackPostpayVastRisk,
+    client, signDeliver, signer, providerName, ackPostpayVastRisk, jobTimeoutMin,
     startJobContainer: _startJobContainer,
   } = opts || {};
   // Injected in tests only to prove it is not called. Never invoke.
@@ -84,14 +84,29 @@ async function startRentalJob(opts) {
 
   assertPaidBeforePaidProvision({ job, provider, ackPostpayVastRisk });
 
-  const jobTimeoutMin = Number(job.timeoutMin || job.jobTimeoutMin || spec.jobTimeoutMin) || 60;
+  // The rental period comes from the SELLER'S CONFIG, passed in explicitly by the caller.
+  //
+  // This used to read `job.timeoutMin ?? job.jobTimeoutMin ?? spec.jobTimeoutMin` and fall back
+  // to 60. None of those three fields exists: the backend has no timeoutMin column or field, the
+  // SDK never sends one, and the live caller passed no `spec` — so every rental was leased for 60
+  // minutes while `rental-setup` advertised the seller's configured `job_timeout_min` in the
+  // service description. A seller running 180 sold three hours, took the money under an
+  // all-or-nothing no-refund term, and the reconcile loop killed the box at one.
+  //
+  // The tests could not catch it because all four of them passed `job.timeoutMin: 60` — a field
+  // they invented. The phantom fallbacks are deliberately GONE so that can never recur.
+  const periodMin = Number(jobTimeoutMin) > 0 ? Number(jobTimeoutMin) : 60;
+  // The period price for mid-session extensions: the job amount at hire, BEFORE any paid
+  // extension increments it on the platform side.
+  const periodAmount = Number(job.amount) > 0 ? Number(job.amount) : null;
   const { lease, deliverable } = await acquireRentalLease({
     controller,
     provider,
     spec,
     jobId: job.id,
     agentId: agentInfo.id,
-    jobTimeoutMin,
+    jobTimeoutMin: periodMin,
+    periodAmount,
     providerName,
     now,
   });
@@ -120,6 +135,8 @@ async function startRentalJob(opts) {
     agentInfo,
     agentInfoId: agentInfo.id,
     startedAt: now,
+    rentalPeriodMin: periodMin,
+    rentalPeriodAmount: periodAmount,
     jobAmount: job.amount || null,
     buyerPayAddress: job.buyerPayAddress || (job.buyer && job.buyer.payAddress) || null,
     currency: job.currency || null,
@@ -134,6 +151,76 @@ async function startRentalJob(opts) {
   try { require('./config').persistActiveJobs(state.active); } catch { /* crash-recovery best-effort */ }
   state.emitEvent?.('job.started', { jobId: job.id, agentId: agentInfo.id, kind: 'gpu-rental', leaseId: lease.id });
   return { lease, deliverable };
+}
+
+/**
+ * Should this rental extension be approved? Pure — no I/O.
+ *
+ * A rental extension is NOT a labour extension: CPU load and free RAM say nothing about
+ * whether a leased box can be held for another hour, so the capacity gate that guards
+ * labour jobs is meaningless here and would reject a perfectly extendable rental on a
+ * busy host. What matters is (a) the box is still live and (b) the money buys at least
+ * one whole period at the rate agreed at hire.
+ *
+ * Refusing BEFORE payment is the point: approval is what generates the buyer's invoice, so
+ * an amount that buys nothing must be rejected here rather than discovered after the VRSC
+ * has moved.
+ */
+function decideRentalExtension({ lease, amount, now = Date.now() } = {}) {
+  if (!lease) return { approve: false, reason: 'no rental lease for this job' };
+  if (lease.state === 'released' || lease.state === 'release-pending') {
+    return { approve: false, reason: 'the rental box has been released' };
+  }
+  const expiresAt = Number(lease.expiresAt);
+  if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+    return { approve: false, reason: 'the rental has already expired' };
+  }
+  const grant = rentalExtensionGrant({
+    amount,
+    periodAmount: lease.rentalPeriodAmount,
+    periodMin: lease.rentalPeriodMin,
+  });
+  if (!grant) {
+    const price = Number(lease.rentalPeriodAmount);
+    return {
+      approve: false,
+      reason: Number.isFinite(price) && price > 0
+        ? `an extension must buy at least one whole period (${price} minimum)`
+        : 'this rental has no period price recorded, so extra time cannot be priced',
+    };
+  }
+  return { approve: true, grant };
+}
+
+/**
+ * Apply a PAID rental extension: push the lease expiry out by the time bought.
+ *
+ * Idempotent by extensionId (see compute-supply.extendLease) — the webhook and the poll
+ * fallback both deliver the same paid extension, deliberately, so that a missed webhook
+ * cannot cost the buyer a box they paid to keep.
+ */
+function applyRentalExtension({ state, jobId, extensionId, amount, now = Date.now() } = {}) {
+  const ctrl = resolveComputeController(state);
+  if (!ctrl || typeof ctrl.extendLease !== 'function') {
+    return { extended: false, reason: 'no compute controller' };
+  }
+  const active = state && state.active && state.active.get(jobId);
+  const lease = findRentalLease(ctrl, active, jobId);
+  const decision = decideRentalExtension({ lease, amount, now });
+  if (!decision.approve) return { extended: false, reason: decision.reason };
+  const before = Number(lease.expiresAt);
+  const next = ctrl.extendLease(lease.id, decision.grant.ms, extensionId, now);
+  if (!next) return { extended: false, reason: 'the lease could not be extended (gone or expired)' };
+  // `changed` separates a real grant from the idempotent re-delivery of one already applied,
+  // so the poll fallback can re-check every sweep without re-announcing the same hour.
+  return {
+    extended: true,
+    changed: Number(next.expiresAt) !== before,
+    leaseId: lease.id,
+    minutes: decision.grant.minutes,
+    periods: decision.grant.periods,
+    expiresAt: next.expiresAt,
+  };
 }
 
 // Delivered/completed is NOT a yank — Cat-1 credentials delivered means the buyer
@@ -215,4 +302,6 @@ module.exports = {
   resolveRentalProvider,
   ensureComputeController,
   YANK_RENTAL_STATUSES,
+  decideRentalExtension,
+  applyRentalExtension,
 };

@@ -95,7 +95,7 @@ const { writeKeysFile, readKeysFile } = require('./keys-file.js');
 const keystore = require('./keystore.js');
 const { encryptAllKeys, decryptAllKeys, listPlaintextKeys } = require('./keys-migrate.js');
 const { preflightAllowsAccept } = require('./preflight-gate.js');
-const { isGpuRentalJob, startRentalJob, stopRentalJob, shouldTeardownRental, servicesForAgent, resolveRentalProvider, ensureComputeController } = require('./rental-worker.js');
+const { isGpuRentalJob, startRentalJob, stopRentalJob, shouldTeardownRental, servicesForAgent, resolveRentalProvider, ensureComputeController, decideRentalExtension, applyRentalExtension } = require('./rental-worker.js');
 const {
   decideAutoAccept,
   loadBuyerAllowlist,
@@ -8632,7 +8632,7 @@ async function refundAbandonedJob(state, jobId, active) {
  * Approve if: queue empty + slots open + system has headroom.
  * Reject with reason otherwise.
  */
-async function handleExtensionRequest(state, jobId, extensionId, agentInfo) {
+async function handleExtensionRequest(state, jobId, extensionId, agentInfo, amount = null) {
   const os = require('os');
   const cfg = loadConfig();
 
@@ -8648,6 +8648,45 @@ async function handleExtensionRequest(state, jobId, extensionId, agentInfo) {
     } catch (e) {
       console.error(`[Extension] Could not deliver the rejection for ${extensionId.substring(0, 8)}: ${e.message}`);
       console.error('           The buyer may still be waiting — answer it from the platform UI.');
+    }
+    return;
+  }
+
+  // Cat-1 rental: decide on the LEASE, not on host capacity.
+  //
+  // A rental extension buys wall-clock on a box that is already leased and already running.
+  // Host CPU load and free RAM are irrelevant to whether it can be held for another period,
+  // so the labour gate below would reject an extendable rental purely because this machine
+  // is busy — and on a home-gpu box, the rental itself is part of what makes it busy.
+  const rentalActive = state && state.active && state.active.get(jobId);
+  if (rentalActive && rentalActive.kind === 'gpu-rental') {
+    let extAmount = amount;
+    if (extAmount == null) {
+      // The webhook carries the amount; the poll path passes it. This is the last resort.
+      try {
+        const agentSession = await getAgentSession(state, agentInfo);
+        const list = await agentSession.client.getExtensions(jobId);
+        const found = (list || []).find((e) => e && e.id === extensionId);
+        extAmount = found ? found.amount : null;
+      } catch { /* decided as unpriced below — fails closed */ }
+    }
+    const ctrl = state.computeSupply || (state.proxyContext && state.proxyContext.computeSupply) || null;
+    const leases = ctrl && typeof ctrl.getLeases === 'function' ? (ctrl.getLeases() || []) : [];
+    const lease = leases.find((l) => l && l.id === rentalActive.leaseId)
+      || leases.find((l) => l && l.jobId === jobId)
+      || null;
+    const decision = decideRentalExtension({ lease, amount: extAmount });
+    try {
+      const agent = await getAgentSession(state, agentInfo);
+      if (decision.approve) {
+        await agent.client.approveExtension(jobId, extensionId);
+        console.log(`[Extension] Rental ${extensionId.substring(0, 8)} approved — buys ${decision.grant.minutes} more minutes on lease ${lease.id}`);
+      } else {
+        await agent.client.rejectExtension(jobId, extensionId);
+        console.log(`[Extension] Rental ${extensionId.substring(0, 8)} rejected — ${decision.reason}`);
+      }
+    } catch (e) {
+      console.error(`[Extension] Failed to answer rental extension ${extensionId.substring(0, 8)}: ${e.message}`);
     }
     return;
   }
@@ -9048,7 +9087,21 @@ async function pollForJobs(state) {
         for (const ext of pending) {
           if (state._lastExtensionCheck.has(ext.id)) continue;
           state._lastExtensionCheck.set(ext.id, { ts: Date.now(), jobId });
-          await handleExtensionRequest(state, jobId, ext.id, activeInfo.agentInfo);
+          await handleExtensionRequest(state, jobId, ext.id, activeInfo.agentInfo, ext.amount);
+        }
+      }
+      // A PAID rental extension must reach the lease even if the webhook never arrived:
+      // the reconcile loop releases the box on expiry, so a dropped `job.extension_paid`
+      // costs the buyer time they have already paid for. applyRentalExtension is idempotent
+      // by extension id, which is what makes running both paths safe.
+      if (activeInfo.kind === 'gpu-rental') {
+        for (const ext of (extensions || []).filter((e) => e && e.status === 'paid')) {
+          const r = applyRentalExtension({ state, jobId, extensionId: ext.id, amount: ext.amount });
+          if (r.extended && r.changed) {
+            console.log(`[Extension] Rental lease extended by ${r.minutes} min (poll) — job ${jobId.substring(0, 8)}, expires ${new Date(r.expiresAt).toISOString()}`);
+          } else if (!r.extended) {
+            console.warn(`[Extension] Paid rental extension ${ext.id.substring(0, 8)} could NOT be applied — ${r.reason}`);
+          }
         }
       }
     } catch {
@@ -9146,6 +9199,7 @@ async function pollForJobs(state) {
 const WEBHOOK_EVENT_MAP = {
   'job.extension_request': 'extension.requested',
   'job.extension_approved': 'extension.approved',
+  'job.extension_paid': 'extension.paid',
   'job.extension_rejected': 'extension.rejected',
   'job.dispute.filed': 'dispute.filed',
   'job.disputed': 'dispute.filed',
@@ -9445,7 +9499,7 @@ async function handleWebhookEvent(state, agentId, payload) {
       console.log(`[Webhook] Extension requested for job ${jobId?.substring(0, 8)}`);
       const extensionJob = state.active.get(jobId);
       if (extensionJob && data?.extensionId) {
-        await handleExtensionRequest(state, jobId, data.extensionId, extensionJob.agentInfo);
+        await handleExtensionRequest(state, jobId, data.extensionId, extensionJob.agentInfo, data.amount);
       }
       break;
     }
@@ -9576,6 +9630,21 @@ async function handleWebhookEvent(state, agentId, payload) {
           sendToJobAgent(extJob, { type: 'budget_increased', data: { additionalTokens } });
         } else {
           console.warn(`[Webhook] Extension approved but token count unknown — job-agent will re-request`);
+        }
+      }
+      break;
+    }
+
+    case 'job.extension_paid': {
+      // The money leg landed. For a rental this is the ONLY event that may move the lease
+      // expiry — approval alone must never buy time, or a buyer gets free hours by asking.
+      const paidJob = state.active.get(jobId);
+      if (paidJob && paidJob.kind === 'gpu-rental' && data?.extensionId) {
+        const r = applyRentalExtension({ state, jobId, extensionId: data.extensionId, amount: data.amount });
+        if (r.extended && r.changed) {
+          console.log(`[Webhook] Rental lease extended by ${r.minutes} min — job ${jobId?.substring(0, 8)}, expires ${new Date(r.expiresAt).toISOString()}`);
+        } else if (!r.extended) {
+          console.error(`[Webhook] Paid rental extension could NOT be applied — ${r.reason}. The box will still be released at its current expiry.`);
         }
       }
       break;
@@ -11346,6 +11415,10 @@ async function startRentalJobWired(state, job, agentInfo) {
     client: agent.client,
     signDeliver: ({ hash }) => signer.signDeliver({ jobHash: job.jobHash, deliveryHash: hash }),
     ackPostpayVastRisk: !!(agentCfg && agentCfg.rentalAckPostpayVastRisk),
+    // The advertised period. `rental-setup` writes this same value into the service
+    // description ("Runs up to N minutes"), so anything else here sells one duration and
+    // delivers another under an all-or-nothing, no-refund term.
+    jobTimeoutMin: cfgNow.jobTimeoutMin || 60,
     now: Date.now(),
   });
 }

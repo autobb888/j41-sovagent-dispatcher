@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### Rental duration was a lie, and rentals could never be extended
+Two defects on the Cat-1 money path, found while answering "could I rent a GPU to
+game on remotely?".
+
+**The advertised period never reached the lease.** `startRentalJob` read the rental
+duration from `job.timeoutMin ?? job.jobTimeoutMin ?? spec.jobTimeoutMin`, then fell
+back to 60. **None of those three fields exists** — the backend has no such column or
+field, the SDK never sends one, and the live caller passed no `spec`. So every rental
+was leased for 60 minutes while `rental-setup` advertised the seller's configured
+`job_timeout_min` in the listing. A seller running 180 sold three hours, took the money
+under an explicit all-or-nothing no-refund term, and the reconcile loop killed the box
+at one. The period is now passed explicitly from the seller's config, and the phantom
+fallbacks are gone.
+
+**None of the four existing tests could catch it: every one of them passed
+`job.timeoutMin: 60`, a field they invented.** The new tests may not name it.
+
+**A rental could not be extended at all.** `expiresAt` was written once at acquire and
+afterwards only ever compared — nothing could move it — and the platform's extension
+rail was closed to rentals anyway: `POST /v1/jobs/:id/extensions` required
+`in_progress`/`paused`, and a rental is `delivered` for its entire life. So a renter
+whose hour was running out had no way to buy more; the box was released and they had to
+hire again from cold.
+
+Now: `compute-supply.extendLease()` (idempotent by extension id, refuses a released or
+expired lease), `decideRentalExtension` (whole periods only, decided on the lease rather
+than on host CPU/RAM), and `applyRentalExtension` wired to **both** the
+`job.extension_paid` webhook and the poll sweep — a dropped webhook costs the buyer a box
+they paid to keep, so it is deliberately covered twice. Approval never moves the clock;
+payment does. Extensions are appended to the time already held.
+
+Needs the matching platform release: the rental extension window and the
+`job.extension_paid` webhook are backend changes.
+
+
 ### Buyer hire from CLI and TUI
 The dispatcher was seller-only (`accept-job`, refunds, rental-setup). Terminal
 access to J41 includes hiring. `j41-dispatcher hire <buyer-id> <seller>
