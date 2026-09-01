@@ -49,6 +49,18 @@ and the platform's job record carries no lease expiry. So an extension was invis
 person who paid for it. A successful extension now posts the new expiry to the job's chat
 from both paid paths.
 
+**A released jail left the renter's files on the seller's disk forever.** `/workspace` is a
+HOST bind mount (`~/.j41/dispatcher/jails/<leaseId>`); removing the container never removed
+it. Every past renter's data stayed on the box with no expiry and no deletion attestation,
+and the leak was unbounded across rentals. `release()` now removes it, best-effort so a
+failure can never block freeing the card.
+
+**Related, NOT fixed — `disk_gb` does not cover `/workspace`.** `StorageOpt` caps the
+container's writable layer; a bind mount is host disk and is exempt. So the one writable path
+the renter is handed is outside the very cap the README fails closed to guarantee. Reported
+in the audit log rather than patched blind — the fix changes the container spec and could not
+be exercised against a real jail image in this session.
+
 Needs the matching platform release: the rental extension window and the
 `job.extension_paid` webhook are backend changes.
 

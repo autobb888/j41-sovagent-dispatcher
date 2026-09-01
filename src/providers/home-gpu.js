@@ -289,6 +289,15 @@ class HomeGpuProvider extends ComputeProvider {
     const id = (lease && lease.meta && lease.meta.containerId) || this._containerId;
     await this._forceRemove(id);
     this._containerId = null;
+    // The renter's /workspace is a HOST directory. Removing the container does not remove
+    // it, so without this every past renter's files stayed on the seller's disk forever —
+    // a stranger's data with no expiry and no deletion attestation, and an unbounded disk
+    // leak across rentals. Best-effort: a failure here must never block freeing the card.
+    if (lease && lease.id) {
+      const jailDir = path.join(os.homedir(), '.j41', 'dispatcher', 'jails', String(lease.id));
+      try { fs.rmSync(jailDir, { recursive: true, force: true }); }
+      catch (e) { console.error(`[home-gpu] could not remove jail dir ${jailDir}: ${e && e.message}`); }
+    }
     this._unlock(lease);
     return { ...lease, state: 'released' };
   }

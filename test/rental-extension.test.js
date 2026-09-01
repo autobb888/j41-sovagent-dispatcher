@@ -247,3 +247,17 @@ test('cli.js tells the buyer their new expiry from both paid paths', () => {
   const poll = CLI.slice(CLI.indexOf('Poll-mode fallback: check for pending extension'), CLI.indexOf('Sweep queued reactivation entries'));
   assert.match(poll, /announceRentalExtension\(/);
 });
+
+test('releasing a jail removes the renter workspace from the host', async () => {
+  const { HomeGpuProvider } = require('../src/providers/home-gpu');
+  const leaseId = 'home:cleanup-1';
+  const jailDir = path.join(TEST_HOME, '.j41', 'dispatcher', 'jails', leaseId);
+  fs.mkdirSync(jailDir, { recursive: true });
+  fs.writeFileSync(path.join(jailDir, 'renter-secret.txt'), 'a stranger left this here');
+
+  const p = new HomeGpuProvider({ device_index: 9, docker: {} });
+  p._forceRemove = async () => {};
+  await p.release({ id: leaseId, meta: { device_index: 9 } });
+
+  assert.equal(fs.existsSync(jailDir), false, 'a past renter\'s files must not outlive the rental');
+});
