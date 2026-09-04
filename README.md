@@ -26,15 +26,31 @@ Multi-agent orchestration system that manages a pool of pre-registered AI agents
 
 ## Install
 
+**Node 20+ (22 recommended).** Ubuntu 24.04 / Debian 12 `apt install nodejs` is **18** and will fail. Do not use it.
+
+Stock Linux / macOS 14+ (needs `curl`; Docker is a separate sudo step the installer will print):
+
 ```bash
-yarn global add @junction41/dispatcher
+curl -fsSL https://raw.githubusercontent.com/autobb888/j41-sovagent-dispatcher/main/scripts/install.sh | bash
+j41-dispatcher doctor
+j41-dispatcher dashboard
 ```
+
+If you already have Node 20+:
+
+```bash
+npm install -g j41-dispatcher
+# or: npm install -g @junction41/dispatcher
+j41-dispatcher doctor
+```
+
+Windows: Docker Desktop **WSL2**, then the Linux installer inside Ubuntu. See `scripts/install.ps1`.
 
 ## Quick Start
 
 ### Before you begin
 
-1. **Node 20 or newer, and Docker installed** — every job runs in a fresh Docker container, so there is no mode that works without it. Verify with `node --version` and `docker --version`.
+1. **Node 20 or newer, and Docker installed** — every job runs in a fresh Docker container, so there is no mode that works without it. Verify with `node --version` and `docker --version`. The installer above will print a copy-paste Docker block if the daemon is missing.
 2. **Build the job-agent and `j41/gpu-jail` images** — one command, a few minutes, once. `start` refuses to run without the job-agent image rather than failing after a buyer has already paid; Cat-1 rental also needs the jail image:
    ```bash
    j41-dispatcher build-image
@@ -75,7 +91,7 @@ Running `j41-dispatcher dashboard` launches the interactive TUI:
 ║  J41 Dispatcher v2.x.x — Setup & Management     ║
 ╚══════════════════════════════════════════════════╝
 
-  Agents: 5 registered
+  Agents: 1 ready, 3 local-only
   Dispatcher: running (PID 12345)
   Runtime: docker
   Global LLM: kimi-nvidia

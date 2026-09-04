@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.37.0 — 2026-09-04
+
+### Mass-use first-run: doctor, honest TUI, installer that does not lie
+
+A stock Ubuntu user who followed the advertised two-liner still got frozen
+`j41-dispatcher@2.0.0`, or a current CLI that wrote `runtime: local` when Docker
+was missing (`curl | bash`). That is the launch bug; listing kind is later.
+
+**`j41-dispatcher doctor`** (and `--json`) is the shared classifier for CLI and
+the TUI. It distinguishes Docker sock missing from `EACCES` (new terminal /
+`newgrp docker`, never `config --runtime local`), clock skew vs the API, local
+identities vs on-chain vs finalized, fee-tank **low** vs **empty**, and skips
+GPU checks on macOS/Windows. The TUI header no longer says “N registered”;
+Start logs to `~/.j41/dispatcher/dispatcher.log`; Sign-up hides `compute` off
+Linux.
+
+**`scripts/install.sh`** no longer clones the 404 `github.com/junction41/…`
+repo, no longer NodeSource/apt-installs Node 18, no longer pipes
+`get.docker.com` into `sh`, and **never** writes process-mode runtime. Missing
+Docker prints a distro sudo block and exits 1. Node 22.19.0 linux tarballs are
+SHA256-pinned into `~/.local/node`. The package is `npm install -g --prefix
+~/.local @junction41/dispatcher`. Next command is `doctor`. `setup.sh` is a
+wrapper; `scripts/install.ps1` fail-closes to WSL2.
+
+The unscoped npm name `j41-dispatcher` is an alias of the scoped package (same
+version). `npm install -g j41-dispatcher` must not stay on 2.0.0.
+
 ## 2.36.0 — 2026-09-01
 
 ### Rental duration was a lie, and rentals could never be extended

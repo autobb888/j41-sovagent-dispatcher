@@ -1,4 +1,5 @@
 node_modules/
+*.tgz
 .env
 config.toml
 .build-temp/

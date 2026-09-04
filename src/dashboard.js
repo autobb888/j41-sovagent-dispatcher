@@ -41,7 +41,14 @@ const {
 const { sendCommand } = require('./control.js');
 const { renderActiveJobs, runLiveScreen } = require('./tui/live-screen.js');
 const { formatUpstreamHealthTag } = require('./tui/health-tag.js');
+const {
+  classifyIdentities,
+  formatIdentitySummary,
+  runDoctor,
+  formatDoctorTable,
+} = require('./doctor.js');
 function loadCfg() { return loadDispatcherConfig(); }
+const DISPATCHER_LOG = path.join(DISPATCHER_DIR, 'dispatcher.log');
 
 // ── VDXF key → human name mapping ──
 const VDXF_KEY_NAMES = {
@@ -154,7 +161,7 @@ async function createAgent(keys) {
  * screens are authoritative.
  */
 function readMoneyAttention(agents) {
-  const out = { pendingRefunds: 0, depositsNeedOperator: 0, feeTanksNeedingFunding: 0, feeTankCheckedAt: 0 };
+  const out = { pendingRefunds: 0, depositsNeedOperator: 0, feeTanksNeedingFunding: 0, feeTanksLow: 0, feeTankCheckedAt: 0 };
   try {
     const raw = fs.readFileSync(path.join(DISPATCHER_DIR, 'pending-refunds.json'), 'utf8');
     const ledger = JSON.parse(raw);
@@ -169,7 +176,8 @@ function readMoneyAttention(agents) {
     const raw = fs.readFileSync(path.join(DISPATCHER_DIR, 'fee-tank-status.json'), 'utf8');
     const doc = JSON.parse(raw);
     const rows = Array.isArray(doc.agents) ? doc.agents : [];
-    out.feeTanksNeedingFunding = rows.filter((r) => r && r.needsFunding).length;
+    out.feeTanksNeedingFunding = rows.filter((r) => r && (r.needsFunding || r.writes === 0)).length;
+    out.feeTanksLow = rows.filter((r) => r && Number(r.writes) > 0 && Number(r.writes) < 100).length;
     out.feeTankCheckedAt = Number(doc.at) || 0;
   } catch { /* absent or unreadable — report nothing */ }
   try {
@@ -269,11 +277,12 @@ async function mainMenu(inquirer) {
   const cfg = loadCfg();
 
   const dispatcherVersion = require('../package.json').version;
+  const identityRows = classifyIdentities(AGENTS_DIR);
   console.clear();
   console.log('╔══════════════════════════════════════════════════╗');
   console.log(`║  J41 Dispatcher v${dispatcherVersion.padEnd(8)} — Setup & Management    ║`);
   console.log('╚══════════════════════════════════════════════════╝');
-  console.log(`\n  Agents: ${agents.length} registered`);
+  console.log(`\n  Agents: ${formatIdentitySummary(identityRows)}`);
   console.log(`  Dispatcher: ${status.running ? `running (PID ${status.pid})` : 'stopped'}`);
   console.log(`  Runtime: ${config.runtime || 'docker'}`);
   console.log(`  Global LLM: ${cfg.llm.provider || '(not configured)'}`);
@@ -295,6 +304,11 @@ async function mainMenu(inquirer) {
       ? ` as of ${Math.round((Date.now() - money.feeTankCheckedAt) / 60000)}m ago`
       : '';
     console.log(`  \x1b[31m⚠ ${money.feeTanksNeedingFunding} agent(s) have an EMPTY fee tank${age} — they cannot write on-chain ([19])\x1b[0m`);
+  } else if (money.feeTanksLow) {
+    const age = money.feeTankCheckedAt
+      ? ` as of ${Math.round((Date.now() - money.feeTankCheckedAt) / 60000)}m ago`
+      : '';
+    console.log(`  \x1b[33m⚠ ${money.feeTanksLow} agent(s) have a LOW fee tank${age} (below 100 writes — not empty) ([19])\x1b[0m`);
   }
   console.log('');
 
@@ -303,7 +317,7 @@ async function mainMenu(inquirer) {
     name: 'choice',
     message: 'What would you like to do?',
     choices: [
-      { name: `[1]  View listings (${agents.length} registered)`, value: 'agents' },
+      { name: `[1]  View listings (${formatIdentitySummary(identityRows)})`, value: 'agents' },
       { name: '[2]  Sign up — register a listing', value: 'add' },
       { name: '[3]  Configure Agent Executor', value: 'executor' },
       { name: '[4]  Configure Global LLM Default', value: 'llm' },
@@ -315,6 +329,7 @@ async function mainMenu(inquirer) {
       { name: `[8]  Stop Dispatcher ${status.running ? '' : '\x1b[2m(not running)\x1b[0m'}`, value: 'stop' },
       { name: '[9]  View Logs', value: 'logs' },
       { name: '[10] Status & Health', value: 'status' },
+      { name: '     Doctor (this machine)', value: 'doctor' },
       new inquirer.Separator('  ── Tools ──'),
       { name: '[11] Inspect Agent (on-chain)', value: 'inspect' },
       { name: '[12] Check Inbox', value: 'inbox' },
@@ -329,7 +344,7 @@ async function mainMenu(inquirer) {
       { name: '[18] API Endpoint Setup (resell your LLM, metered)', value: 'api_setup' },
       { name: '     Hire a listing (this fleet as buyer)', value: 'hire' },
       new inquirer.Separator('  ── Money ──'),
-      { name: `[19] Wallet & Fee Tanks${money.feeTanksNeedingFunding ? ` \x1b[31m(${money.feeTanksNeedingFunding} empty)\x1b[0m` : ''}`, value: 'wallet' },
+      { name: `[19] Wallet & Fee Tanks${money.feeTanksNeedingFunding ? ` \x1b[31m(${money.feeTanksNeedingFunding} empty)\x1b[0m` : money.feeTanksLow ? ` \x1b[33m(${money.feeTanksLow} low)\x1b[0m` : ''}`, value: 'wallet' },
       { name: `[20] Refunds Queue${money.pendingRefunds ? ` \x1b[33m(${money.pendingRefunds} awaiting you)\x1b[0m` : ''}`, value: 'refunds' },
       { name: `[21] Deposits${money.depositsNeedOperator ? ` \x1b[33m(${money.depositsNeedOperator} need a decision)\x1b[0m` : ''}`, value: 'deposits' },
       new inquirer.Separator(),
@@ -870,11 +885,38 @@ function resolveDispatcherLogPath() {
     const cfg = loadCfg();
     if (cfg && cfg.runtime && cfg.runtime.log_file) candidates.push(cfg.runtime.log_file);
   } catch { /* ignore */ }
-  candidates.push('/tmp/dispatcher.log'); // path used when the dashboard starts it
+  candidates.push(DISPATCHER_LOG);
+  candidates.push('/tmp/dispatcher.log'); // leftover from pre-2.37 Start; do not write here
   for (const p of candidates) {
     if (p && fs.existsSync(p)) return p;
   }
   return null;
+}
+
+async function doctorScreen(inquirer) {
+  console.clear();
+  console.log('\n  ═══ Doctor ═══\n');
+  let llm = { configured: false, provider: '' };
+  try {
+    const c = loadCfg();
+    const provider = (c.llm && c.llm.provider) || '';
+    const keys = c.provider_keys || {};
+    const hasKey = !!(c.llm && c.llm.api_key && String(c.llm.api_key).trim())
+      || Object.values(keys).some((v) => v && String(v).trim());
+    llm = { provider, configured: hasKey };
+  } catch { /* still run */ }
+  let computeEnabled = false;
+  try { computeEnabled = !!(loadCfg().compute && loadCfg().compute.enabled); } catch {}
+  let nvidiaRuntime = false;
+  try {
+    const out = require('child_process').execSync('docker info --format "{{json .Runtimes}}"', {
+      encoding: 'utf8', timeout: 8000, stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    nvidiaRuntime = /nvidia/i.test(out);
+  } catch {}
+  const report = await runDoctor({ llm, computeEnabled, nvidiaRuntime });
+  console.log(formatDoctorTable(report));
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
 async function statusScreen(inquirer) {
@@ -893,12 +935,27 @@ async function statusScreen(inquirer) {
     console.log('  ── Live (dispatcher) ──');
     console.log('  Dispatcher not running (no control socket).\n');
   }
-  console.log(`\n  ═══ Dispatcher Status & Health ═══\n`);
-
   const status = getDispatcherStatus();
   const config = loadConfig();
   const cfg = loadCfg();
   const apiUrl = cfg.platform.api_url;
+
+  console.log(`\n  ═══ Doctor ═══\n`);
+  try {
+    let llm = { configured: false, provider: (cfg && cfg.llm && cfg.llm.provider) || '' };
+    try {
+      const keys = (cfg && cfg.provider_keys) || {};
+      const hasKey = !!(cfg.llm && cfg.llm.api_key && String(cfg.llm.api_key).trim())
+        || Object.values(keys).some((v) => v && String(v).trim());
+      llm.configured = hasKey;
+    } catch {}
+    const report = await runDoctor({ llm, computeEnabled: !!(cfg.compute && cfg.compute.enabled) });
+    console.log(formatDoctorTable(report));
+  } catch (e) {
+    console.log(`  doctor failed: ${e.message}\n`);
+  }
+
+  console.log(`\n  ═══ Dispatcher Status & Health ═══\n`);
 
   // ── Section 1: Dispatcher ──
   const dispatcherVersion = (() => {
@@ -955,7 +1012,8 @@ async function statusScreen(inquirer) {
   const agents = getAgents();
   const registered = agents.filter(a => a.identity);
   console.log(`\n  ── Agents ──`);
-  console.log(`  Registered: ${registered.length}  (total local: ${agents.length})`);
+  console.log(`  ${formatIdentitySummary(classifyIdentities(AGENTS_DIR))}`);
+  console.log(`  On-chain names: ${registered.length}  (local folders: ${agents.length})`);
 
   // Identify api-endpoint agents (config-side, since dispatcher may not be running)
   const apiAgents = [];
@@ -1251,16 +1309,26 @@ async function addAgentScreen(inquirer) {
   console.log('  What are you listing?');
   console.log(`  DeFi is off on ${NATIVE_COIN} — every kind mints as name.agentplatform@.`);
   console.log('  Kind is stored on the identity (config.kind).\n');
+  const gpuOffered = process.platform === 'linux';
+  if (!gpuOffered) {
+    console.log('  compute (GPU rental) is a Linux NVIDIA host chapter — hidden on this OS.\n');
+  }
+
+  const kindChoices = [
+    { name: `  agent     ${KIND_BLURB.agent}`, value: 'agent' },
+  ];
+  if (gpuOffered) {
+    kindChoices.push({ name: `  compute   ${KIND_BLURB.compute}`, value: 'compute' });
+  }
+  kindChoices.push(
+    { name: `  data      ${KIND_BLURB.data}`, value: 'data' },
+    { name: `  model     ${KIND_BLURB.model}`, value: 'model' },
+  );
 
   const { kindChoice } = await promptWithEsc(inquirer, [{
     type: 'list', pageSize: 10, name: 'kindChoice',
     message: 'Kind:',
-    choices: [
-      { name: `  agent     ${KIND_BLURB.agent}`, value: 'agent' },
-      { name: `  compute   ${KIND_BLURB.compute}`, value: 'compute' },
-      { name: `  data      ${KIND_BLURB.data}`, value: 'data' },
-      { name: `  model     ${KIND_BLURB.model}`, value: 'model' },
-    ],
+    choices: kindChoices,
   }]);
   const kind = parseListingKind(kindChoice);
   if (!kind) return;
@@ -3895,15 +3963,18 @@ async function main() {
       case 'services': await withBack(() => configureServicesScreen(inquirer)); break;
       case 'hire': await withBack(() => hireScreen(inquirer)); break;
       case 'security': await withBack(() => securityScreen(inquirer)); break;
+      case 'doctor': await withBack(() => doctorScreen(inquirer)); break;
       case 'start': await withBack(async () => {
         const status = getDispatcherStatus();
         if (status.running) {
           console.log(`\n  Dispatcher already running (PID ${status.pid})\n`);
         } else {
           const { spawn } = require('child_process');
+          fs.mkdirSync(DISPATCHER_DIR, { recursive: true, mode: 0o700 });
+          const logFd = fs.openSync(DISPATCHER_LOG, 'a');
           const child = spawn(process.execPath, [process.argv[1], 'start'], {
             detached: true,
-            stdio: ['ignore', fs.openSync('/tmp/dispatcher.log', 'a'), fs.openSync('/tmp/dispatcher.log', 'a')],
+            stdio: ['ignore', logFd, logFd],
           });
           child.unref();
 
@@ -3920,7 +3991,7 @@ async function main() {
           });
 
           if (_alive.ok) {
-            console.log(`\n  ✅ Dispatcher started (PID ${child.pid})\n  Logs: tail -f /tmp/dispatcher.log\n`);
+            console.log(`\n  ✅ Dispatcher started (PID ${child.pid})\n  Logs: tail -f ${DISPATCHER_LOG}\n`);
           } else {
             console.log(`\n  ❌ Dispatcher exited immediately (code ${_alive.code}).`);
             // F7 follow-up — local runtime now refuses to START (2.21.0), and this
@@ -3941,7 +4012,7 @@ async function main() {
             console.log('     A dashboard-spawned dispatcher has no terminal to prompt on, so set');
             console.log('     J41_KEYS_PASSPHRASE in the environment, or start it from a terminal:');
             console.log('       j41-dispatcher start');
-            console.log('     Full reason: tail -20 /tmp/dispatcher.log\n');
+            console.log(`     Full reason: tail -20 ${DISPATCHER_LOG}\n`);
           }
         }
         await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);

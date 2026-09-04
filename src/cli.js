@@ -19,6 +19,13 @@ const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
 const { getRuntime, persistActiveJobs, loadActiveJobs, saveConfig, loadConfig, persistReactivationQueue, loadReactivationQueue } = require('./config');
+const {
+  runDoctor,
+  formatDoctorTable,
+  formatIdentitySummary,
+  classifyIdentities,
+  dockerAdviceFromError,
+} = require('./doctor');
 const rq = require('./reactivation-queue.js');
 const {
   isDeadLettered,
@@ -1254,8 +1261,9 @@ function getActiveJobs() {
   }
   // Docker mode
   if (!docker) {
-    console.error('❌ Docker runtime selected but Docker is not available.');
-    console.error('   Install Docker or switch to local mode: j41-dispatcher config --runtime local');
+    const advice = dockerAdviceFromError(new Error('Docker is not available'), process.platform);
+    console.error(`❌ ${advice.message}`);
+    if (advice.nextCommand) console.error(`   Next: ${advice.nextCommand}`);
     return Promise.resolve([]);
   }
   return docker.listContainers().then(containers => {
@@ -1263,10 +1271,33 @@ function getActiveJobs() {
       c.Names.some(n => n.startsWith('/j41-job-'))
     );
   }).catch(e => {
-    console.error(`❌ Docker error: ${e.message}`);
-    console.error('   Install Docker or switch to local mode: j41-dispatcher config --runtime local');
+    const advice = dockerAdviceFromError(e, process.platform);
+    console.error(`❌ ${advice.message}`);
+    if (advice.nextCommand) console.error(`   Next: ${advice.nextCommand}`);
     return [];
   });
+}
+
+function doctorLiveInputs() {
+  let llm = { configured: false, provider: '' };
+  let computeEnabled = false;
+  try {
+    const c = loadDispatcherConfig();
+    const provider = (c.llm && c.llm.provider) || '';
+    const keys = c.provider_keys || {};
+    const hasKey = !!(c.llm && c.llm.api_key && String(c.llm.api_key).trim())
+      || Object.values(keys).some((v) => v && String(v).trim());
+    llm = { provider, configured: hasKey };
+    computeEnabled = !!(c.compute && c.compute.enabled);
+  } catch { /* doctor still runs */ }
+  let nvidiaRuntime = false;
+  try {
+    const out = require('child_process').execSync('docker info --format "{{json .Runtimes}}"', {
+      encoding: 'utf8', timeout: 8000, stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    nvidiaRuntime = /nvidia/i.test(out);
+  } catch { /* no docker */ }
+  return { llm, computeEnabled, nvidiaRuntime };
 }
 
 program
@@ -6250,6 +6281,18 @@ program
     console.log('\n🔐 Passphrase changed.');
   });
 
+// Doctor — mass-use machine diagnosis (single classifier shared with the TUI)
+program
+  .command('doctor')
+  .description('Diagnose this machine for dispatcher mass-use (Node, Docker, clock, identity)')
+  .option('--json', 'Print DoctorReport JSON')
+  .action(async (options) => {
+    const report = await runDoctor(doctorLiveInputs());
+    if (options.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    else process.stdout.write(formatDoctorTable(report));
+    process.exit(report.ok ? 0 : 1);
+  });
+
 // Status command
 program
   .command('status')
@@ -6257,7 +6300,7 @@ program
   .action(async () => {
     ensureDirs();
     
-    const agents = listRegisteredAgents();
+    const identityRows = classifyIdentities(AGENTS_DIR);
     const activeJobs = await getActiveJobs();
     const queueFiles = fs.existsSync(QUEUE_DIR) ? fs.readdirSync(QUEUE_DIR) : [];
     
@@ -6265,9 +6308,9 @@ program
     console.log('║     Dispatcher Status                    ║');
     console.log('╚══════════════════════════════════════════╝\n');
     
-    const finalized = agents.filter(a => isFinalizedReady(a)).length;
-    console.log(`Agents: ${agents.length} registered`);
-    console.log(`Finalized ready: ${finalized}/${agents.length}`);
+    const finalized = identityRows.filter(a => a.finalized).length;
+    console.log(`Agents: ${formatIdentitySummary(identityRows)}`);
+    console.log(`Finalized ready: ${finalized}/${identityRows.length}`);
     console.log(`Active jobs: ${activeJobs.length}/${MAX_AGENTS}`);
     console.log(`Queue: ${queueFiles.length} pending\n`);
     

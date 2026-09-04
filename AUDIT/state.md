@@ -933,3 +933,98 @@ button 2948-2997. `src/executors/local-llm.js` 14-74 + 115-137 + 205-256 +
 - **Style, prose and UX opinion.** "Setup should print the funding address" is a
   fix proposal attached to F1, not a standalone finding. Nothing in this file is
   reported on taste.
+
+---
+
+## mass-onboarding — 2026-09-04 — DONE
+
+Artifacts: `AUDIT/mass-onboarding.md` (findings + plan threat model + clean
+list), `AUDIT/mass-onboarding-claims.md` (70 claims across 11 groups).
+
+**Counts by severity:** crit 0 · high 2 · med 5 · low 2 · total 9
+
+| Sev | Finding |
+|---|---|
+| high | MO1 — shipped `install.sh` clones 404 `github.com/junction41/…` into the runtime data dir and falls through to a `vlatest` tarball that is not a release |
+| high | MO2 — Docker EACCES is collapsed into "no Docker" / "image not built" / "switch to local"; installer still silently writes `runtime=local`; `config --runtime local` has no warning |
+| med | MO3 — `secure-setup` labels every non-Linux distro `macos`; win32 takes the Docker Desktop VM branch |
+| med | MO4 — TUI Start/logs hardcode `/tmp/dispatcher.log` + `tail -f` (Windows throw, `/tmp` precreate race) |
+| med | MO5 — CLI never refuses Node < 20; Ubuntu apt Node 18 loses the security gate silently (pairs I11) |
+| med | MO6 — no clock preflight; 65 min skew kills signed login as "challenge expired" |
+| med | MO9 — `install.sh` pipes unsigned nvm/NodeSource/get.docker.com to bash with no checksums; `usermod docker` without root-equivalent disclosure |
+| low | MO7 — TUI header "N registered" counts every local `keys.json` |
+| low | MO8 — `build-image` is `spawn('bash', [script])` |
+
+**Claims checklist outcome:** 70 claims — 28 VERIFIED · 24 DRIFT · 14 MISSING
+· 4 UNVERIFIED. 11 rows are *(prior)* and cite first-run F4/F5/F7/F8/F9/F11/F12,
+isolation I4/I11/I12, docs-truth D1 (fixed), scale S15.
+
+**Shape of the domain.** Current `main` already has the two *runtime* gates
+the 2026-08-10 first-run pass demanded: `start` refuse-before-accept on
+`runtime=local` without `--dev-unsafe`, and refuse-without-job-image. Dashboard
+Start cannot pass `--dev-unsafe`. `HOME_GPU_NO_DISK_QUOTA` is still fail-closed
+(including Docker 29 `overlayfs`). Those are checked-clean and must not regress.
+
+What is still broken is the **door**, which is the thing the proposed
+installer-first plan is about to put in front of every stock user:
+
+- `scripts/install.sh` now *ships* in the npm tarball (D1's `files` fix) and
+  still cannot install (404 clone, `J41_VERSION=latest` is not a GitHub tag,
+  silent `runtime=local` on `curl | bash`, `init -n 9` as next step, unsigned
+  nvm/NodeSource/get.docker.com pipes).
+- Docker permission errors are not a distinct state, so the printed remedies
+  *create* the F7 config the start-gate then correctly refuses — a brick, not
+  a paid-job bug.
+- There is no `doctor`, no `install.ps1`, no Node version gate, no clock
+  check, and win32 is handled as macOS.
+
+The documented `yarn global add @junction41/dispatcher` path still works for
+an operator who already has Node ≥ 20 and Docker group membership. The live
+trap is unscoped `j41-dispatcher@2.0.0`. Plan alias is the safety net, not a
+substitute for a working installer.
+
+**Plan MUST-FIX-BEFORE-SHIP (installer/doctor/TUI), condensed:** rewrite
+`install.sh` (npm user-prefix, no data-dir clone, no silent local, checksums,
+refuse root, ENOENT vs EACCES); CLI Node ≥ 20 gate; npm alias of unscoped
+name; `src/doctor.js` shared with TUI (no secrets, no local-as-prod, clock
+vs API Date); `build-image` in Node; TUI log under `~/.j41/dispatcher/`;
+win32 ≠ macos; macOS ≤ 13 fail closed; honour `setup()` `{success:false}`
+(F4) and stop the 10 s mutate-after-timeout (F5); GPU quota script
+Linux-only with typed consent, do not relax `HOME_GPU_NO_DISK_QUOTA`.
+
+**Files read in full:** `scripts/install.sh`, `setup.sh`, `scripts/build-image.sh`
+(head + docker check), `package.json`, `src/config.js`, `src/docker-host.js`,
+`src/mainnet-guard.js`, `src/cli.js` (runtime/getActiveJobs 123-131 + 1240-1270,
+config 1278-1300, quickstart 1391-1514, init 1517-1583, inspect local 3221-3242,
+setup funding 3601-3609, build-image 4066-4166, start gate + image/jail
+preflight + first-run security 4170-4817, startJobContainer docker 10608-10614,
+startJobLocal gate 11138-11154), `src/dashboard.js` (getAgents 84-96, header
+265-298, resolveDispatcherLogPath 865-878, status registered split 954-958,
+Start/logs 3898-4000), `j41-secure-setup/lib/detect-platform.js`,
+`lib/index.js` (setup + marker 68-296), `lib/quick-check.js`; README Install /
+Quick Start / Runtime Modes / Local Mode / First-Run Security / Friend boot
+Storage; CLAUDE.md Quick Reference + data dirs. SDK clock:
+`sovagent-sdk/dist/agent.js:349-356`, `dist/crypto/canonical.js:28,149-153`,
+`dist/webhook/verify.js:49-57`. Prior: `AUDIT/first-run.md` F1–F12,
+`AUDIT/state.md` first-run + docs-truth D1.
+
+### Deliberately NOT covered, and why
+
+- **Re-opening F1–F12 as new findings.** Procedure. F7 start-gate and F8 image
+  preflight are fixed; F7 installer half, F4, F5, F9, F10, F11, F12 are cited
+  as prior and still load-bearing for the plan.
+- **Money / keys / isolation / trust-boundary / liveness / scale internals**
+  except where an onboarding surface is the trigger (MO4 vs S15, MO5 vs I11,
+  MO2 vs F7).
+- **`recover`, 26-field interactive onboarding, Cat-2 `api-setup`.** Not the
+  stock labour first-run.
+- **npm publish tokens, 2FA, provenance.** Out of scope (operator note).
+- **Windows named-pipe ACL matrix and ExecutionPolicy.** No `install.ps1` to
+  read; claims J2–J3 MISSING/UNVERIFIED.
+- **Platform-side window on `J41-ACCEPT` timestamps.** Verifier is
+  `api.junction41.io`.
+- **Unscoped `2.0.0` tarball internals.** Live that it installs; not this tree.
+- **Running any code.** Read-only. No `npm pack`, no `node --check`, no docker,
+  no network. GitHub 404 of `junction41/j41-sovagent-dispatcher` is the live
+  test already recorded plus the URL mismatch with `package.json` `repository`;
+  not re-fetched.

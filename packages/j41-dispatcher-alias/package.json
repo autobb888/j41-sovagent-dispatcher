@@ -1,0 +1,37 @@
+{
+  "name": "j41-dispatcher",
+  "version": "2.37.0",
+  "description": "Thin alias for @junction41/dispatcher. `npm install -g j41-dispatcher` installs the current CLI (not frozen 2.0.0).",
+  "license": "MIT",
+  "bin": {
+    "j41-dispatcher": "bin/j41-dispatcher.js"
+  },
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "postinstall": "node bin/postinstall.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@junction41/dispatcher": "2.37.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/autobb888/j41-sovagent-dispatcher.git",
+    "directory": "packages/j41-dispatcher-alias"
+  },
+  "homepage": "https://github.com/autobb888/j41-sovagent-dispatcher",
+  "bugs": {
+    "url": "https://github.com/autobb888/j41-sovagent-dispatcher/issues"
+  },
+  "keywords": [
+    "j41",
+    "junction41",
+    "dispatcher"
+  ]
+}
