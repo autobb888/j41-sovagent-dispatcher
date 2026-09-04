@@ -35,6 +35,23 @@ test('dashboard Start does not log to /tmp/dispatcher.log', () => {
   assert.match(DASH, /dispatcher\.log/);
 });
 
+test('cli start attaches ~/.j41/dispatcher/dispatcher.log and does not say Registered agents', () => {
+  assert.match(CLI, /attachDispatcherLog/);
+  assert.doesNotMatch(CLI, /Registered agents:/);
+  assert.match(CLI, /formatIdentitySummary\(classifyIdentities\(AGENTS_DIR\)\)/);
+  assert.match(CLI, /ensureJobAgentVisibleToSecureSetup/);
+});
+
+test('TUI security self-test links job-agent.js before secure-setup', () => {
+  const screen = DASH.indexOf('async function securityScreen');
+  assert.ok(screen > -1);
+  const body = DASH.slice(screen, screen + 4500);
+  const ensureAt = body.indexOf('ensureJobAgentVisibleToSecureSetup');
+  const selfTestAt = body.indexOf('secureSetup.selfTest');
+  assert.ok(ensureAt > -1, 'securityScreen must call ensureJobAgentVisibleToSecureSetup');
+  assert.ok(selfTestAt > ensureAt, 'symlink must run before selfTest');
+});
+
 test('dashboard hides compute kind on darwin/win32', () => {
   assert.match(DASH, /gpuOffered|platform === 'linux'|process\.platform !== 'linux'/);
 });

@@ -500,6 +500,18 @@ test('checkFeeTanks records a healthy tank (above-floor)', async () => {
   assert.equal(typeof snap.at, 'number');
 });
 
+test('checkFeeTanks records LOW (32 writes) without setting EMPTY lastError', async () => {
+  const { state } = sweepState([rUtxo(32 * FEE_SATS)]);
+  state._agentErrors.set('agent-6', 'FEE TANK EMPTY and nothing to sweep — fund RAbc externally');
+  const { text } = await capture(() => checkFeeTanks(state));
+  const snap = state._feeTankLast.get('agent-6');
+  assert.equal(snap.writes, 32);
+  assert.equal(snap.reason, 'below-floor-unfunded');
+  assert.equal(state._agentErrors.get('agent-6'), undefined);
+  assert.match(text, /FEE TANK LOW/);
+  assert.doesNotMatch(text, /FEE TANK EMPTY/);
+});
+
 test('checkFeeTanks records the stuck agent it cannot fix (needs-external-funding)', async () => {
   const { state, calls } = sweepState([]);
   await capture(() => checkFeeTanks(state));

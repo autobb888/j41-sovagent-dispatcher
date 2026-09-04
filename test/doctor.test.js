@@ -236,6 +236,25 @@ test('clock skew 65 min: clock fail, NTP copy-paste', async () => {
   assert.match(check(report, 'clock').copyPasteBlock, /timedatectl set-ntp true/);
 });
 
+test('omitted feeTankRows loads fee-tank-status.json from homedir (32 writes is low)', async () => {
+  const home = tmpHome();
+  writeKeys(home, 'gpu-1', { identity: 'testgpu01.agentplatform@', iAddress: 'iSeRTHj42a5QBHkX1njACV4iup5t4eqHYF', kind: 'compute' });
+  writeFinalize(home, 'gpu-1', 'ready');
+  const dir = path.join(home, '.j41', 'dispatcher');
+  fs.writeFileSync(path.join(dir, 'fee-tank-status.json'), JSON.stringify({
+    at: Date.now(),
+    agents: [{ agentId: 'gpu-1', writes: 32, reason: 'below-floor-unfunded', needsFunding: false }],
+  }));
+  const opts = baseOpts({ homedir: home });
+  delete opts.feeTankRows;
+  const report = await runDoctor(opts);
+  const ft = check(report, 'fee-tank');
+  assert.equal(ft.status, 'warn');
+  assert.match(ft.detail, /low/i);
+  assert.doesNotMatch(ft.detail, /EMPTY/);
+  assert.doesNotMatch(ft.detail, /no snapshot/);
+});
+
 test('wallet row 32 writes: fee-tank warn low, detail MUST NOT contain EMPTY', async () => {
   const home = tmpHome();
   writeKeys(home, 'gpu-1', { identity: 'testgpu01.agentplatform@', iAddress: 'iSeRTHj42a5QBHkX1njACV4iup5t4eqHYF', kind: 'compute' });

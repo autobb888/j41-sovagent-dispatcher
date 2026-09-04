@@ -2816,6 +2816,7 @@ program
     const fail = (code, message, extra = {}) => {
       if (options.json) console.log(JSON.stringify({ ok: false, code, message, ...extra }, null, 2));
       else console.error(`❌ ${message}`);
+      process.exitCode = 1;
       process.exit(1);
     };
     const say = (line) => { if (!options.json) console.log(line); };
@@ -4208,6 +4209,15 @@ program
   .option('--fee-sweep-interval <minutes>', 'Minutes between fee-tank checks (default: 30)')
   .action(async (options) => {
     ensureDirs();
+    if (process.env.NODE_ENV !== 'test') {
+      try { require('./dispatcher-log').attachDispatcherLog(); } catch { /* never block start */ }
+      try {
+        const vis = require('./job-agent-path').ensureJobAgentVisibleToSecureSetup();
+        if (vis && vis.reason === 'symlinked') {
+          console.log('  Canary path: aliased job-agent.js linked for secure-setup');
+        }
+      } catch { /* never block start */ }
+    }
 
     // Spend-policy approval mode (P6): "always" is the only supported value — every
     // external send is owner-approved. There is deliberately no auto-approve path, so
@@ -4424,7 +4434,7 @@ program
     }
 
     console.log(`Runtime: ${RUNTIME} mode`);
-    console.log(`Registered agents: ${agents.length}`);
+    console.log(`Agents: ${formatIdentitySummary(classifyIdentities(AGENTS_DIR))}`);
     console.log(`Max concurrent: ${MAX_AGENTS}${MAX_AGENTS_AUTO ? ' (auto)' : ' (owner override)'}`);
     if (MAX_AGENTS_AUTO) {
       console.log(capacityLine({
@@ -10131,6 +10141,16 @@ async function checkFeeTanks(state) {
           state._agentErrors.set(agentInfo.id, msg);
           console.error(`[FeeTank] 💸 ${agentInfo.id}: ${msg}`);
           if (state.emitEvent) state.emitEvent('fee_tank_empty', { agentId: agentInfo.id, rAddress, selfFundable: false });
+          continue;
+        }
+        if (plan.reason === 'below-floor-unfunded') {
+          const writes = writesAffordable(s.feeSats);
+          // LOW is not EMPTY. Retract a stale EMPTY so /health is not degraded
+          // by a tank that can still write (tester: 32 writes / floor 100).
+          if (String(state._agentErrors.get(agentInfo.id) || '').startsWith(FEE_TANK_ERROR_PREFIX)) {
+            state._agentErrors.delete(agentInfo.id);
+          }
+          console.warn(`[FeeTank] ${agentInfo.id}: FEE TANK LOW (${writes}/${cfg.floorWrites} writes) — not empty`);
           continue;
         }
         // A deferred sweep is otherwise a silent `continue`, so a wedged agent

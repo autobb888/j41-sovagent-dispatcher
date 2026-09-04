@@ -71,6 +71,13 @@ test('an empty tank with nothing to sweep is an alert, not a silent no-op', () =
   assert.strictEqual(p.reason, 'needs-external-funding');
 });
 
+test('below the floor with remaining writes and nothing to sweep is LOW, not EMPTY', () => {
+  // Tester 2.0: 32 writes / floor 100, no i-address earnings. Not empty.
+  const p = planFeeSweep({ feeSats: 32 * FEE_SATS, sweepableSats: 0 });
+  assert.strictEqual(p.sweep, false);
+  assert.strictEqual(p.reason, 'below-floor-unfunded');
+});
+
 test('does not burn a whole fee to move dust', () => {
   const p = planFeeSweep({ feeSats: 0, sweepableSats: DEFAULT_MIN_SWEEP_SATS - 1 });
   assert.strictEqual(p.sweep, false);

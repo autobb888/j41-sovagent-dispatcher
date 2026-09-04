@@ -149,9 +149,14 @@ function planFeeSweep({
   }
 
   if (sweepableSats <= 0) {
-    // Below the floor with nothing of its own to draw on. Only an external
-    // transfer fixes this, so it is an alert rather than a no-op.
-    return { sweep: false, reason: 'needs-external-funding', amountSats: 0 };
+    // Below the floor with nothing of its own to draw on.
+    // EMPTY is "cannot afford one write". A tank with remaining writes (the
+    // 32-write seed below a 100-write floor) is LOW — not empty — and must
+    // not set the EMPTY lastError that degrades /health.
+    if (feeSats < txFeeSats) {
+      return { sweep: false, reason: 'needs-external-funding', amountSats: 0 };
+    }
+    return { sweep: false, reason: 'below-floor-unfunded', amountSats: 0 };
   }
 
   if (sweepableSats < minSweepSats) {

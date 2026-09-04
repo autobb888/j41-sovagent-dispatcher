@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.37.1 — 2026-09-04
+
+### Onboarding 2.0 leftovers (tester retest of 2.37.0)
+
+- Fee-tank: below the 100-write floor with remaining writes is **LOW**, not
+  EMPTY. `planFeeSweep` reason `below-floor-unfunded`. Start does not set
+  `_agentErrors` / degrade `/health`. Doctor auto-loads `fee-tank-status.json`.
+- CLI `start` tees stdout/stderr to `~/.j41/dispatcher/dispatcher.log` (TUI
+  spawn already pointed at that file; do not duplicate).
+- Alias install: symlink scoped `job-agent.js` into `$(npm prefix -g)` so
+  `@junction41/secure-setup` canary self-test finds it. Also on scoped
+  `postinstall`, alias `postinstall`, and TUI security self-test — not only
+  `start`. Empty leftover dest dirs are replaced (O2-2).
+- `hire` fail() sets `process.exitCode = 1`; subprocess tests pin unregistered
+  buyer ≠ exit 0.
+- Start banner uses identity summary (`local-only` / on-chain), not
+  `Registered agents: N`.
+- Container smoke: Ubuntu 24.04 without Node/Docker installs Node 22.19.0 and
+  fail-closes on Docker (`J41_SKIP_NPM=1`).
+
 ## 2.37.0 — 2026-09-04
 
 ### Mass-use first-run: doctor, honest TUI, installer that does not lie

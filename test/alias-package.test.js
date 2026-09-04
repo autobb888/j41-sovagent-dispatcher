@@ -21,4 +21,13 @@ test('alias bin and postinstall files exist', () => {
   assert.ok(fs.existsSync(path.join(ALIAS, 'bin', 'postinstall.js')));
   const bin = fs.readFileSync(path.join(ALIAS, 'bin', 'j41-dispatcher.js'), 'utf8');
   assert.match(bin, /@junction41\/dispatcher\/src\/cli\.js/);
+  const post = fs.readFileSync(path.join(ALIAS, 'bin', 'postinstall.js'), 'utf8');
+  assert.match(post, /ensureJobAgentVisibleToSecureSetup/);
+});
+
+test('scoped package postinstall links job-agent.js for secure-setup', () => {
+  assert.equal(scoped.scripts.postinstall, 'node scripts/postinstall.js');
+  const post = fs.readFileSync(path.join(ROOT, 'scripts', 'postinstall.js'), 'utf8');
+  assert.match(post, /ensureJobAgentVisibleToSecureSetup/);
+  assert.match(post, /never fail npm install/);
 });

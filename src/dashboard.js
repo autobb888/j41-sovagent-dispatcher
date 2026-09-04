@@ -3057,6 +3057,7 @@ async function securityScreen(inquirer) {
   }
 
   try {
+    try { require('./job-agent-path').ensureJobAgentVisibleToSecureSetup(); } catch { /* canary path */ }
     const secureSetup = require('@junction41/secure-setup');
     switch (action) {
       case 'setup': {

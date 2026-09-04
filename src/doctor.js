@@ -244,6 +244,17 @@ async function probeClock(deps, apiUrl) {
   return { status: 'pass', detail: `ok  (skew ${(abs / 1000).toFixed(1)}s)`, skewMs };
 }
 
+function loadFeeTankRows(dispatcherDir, fsImpl) {
+  const f = fsImpl || fs;
+  try {
+    const doc = JSON.parse(f.readFileSync(path.join(dispatcherDir, 'fee-tank-status.json'), 'utf8'));
+    if (!doc || !Array.isArray(doc.agents)) return null;
+    return doc.agents;
+  } catch {
+    return null;
+  }
+}
+
 function applyFeeTank(identities, rows) {
   const byId = new Map((rows || []).map((r) => [r.agentId, r]));
   for (const idn of identities) {
@@ -293,7 +304,10 @@ async function runDoctor(opts = {}) {
   const dispatcherDir = path.join(deps.homedir, '.j41', 'dispatcher');
   const agentsDir = path.join(dispatcherDir, 'agents');
   const identities = classifyIdentities(agentsDir, deps);
-  if (deps.feeTankRows) applyFeeTank(identities, deps.feeTankRows);
+  const feeTankRows = deps.feeTankRows !== undefined
+    ? deps.feeTankRows
+    : loadFeeTankRows(dispatcherDir, deps.fs);
+  if (feeTankRows) applyFeeTank(identities, feeTankRows);
 
   const checks = [];
 
@@ -660,4 +674,5 @@ module.exports = {
   classifyIdentities,
   detectOs,
   dockerAdviceFromError,
+  loadFeeTankRows,
 };

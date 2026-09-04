@@ -1028,3 +1028,32 @@ Storage; CLAUDE.md Quick Reference + data dirs. SDK clock:
   no network. GitHub 404 of `junction41/j41-sovagent-dispatcher` is the live
   test already recorded plus the URL mismatch with `package.json` `repository`;
   not re-fetched.
+
+---
+
+## onboarding-2-leftovers — 2026-09-04 — DONE
+
+Artifacts: `AUDIT/onboarding-2-leftovers.md`, `AUDIT/onboarding-2-leftovers-claims.md`.
+Spec: `docs/superpowers/specs/2026-09-04-onboarding-2-leftovers-design.md`.
+
+**Counts by severity:** crit 0 · high 0 · med 1 · low 1 · total 2
+
+Follow-up same day: **O2-1 and O2-2 fixed in tree** (postinstall + TUI + empty-dir/dangling-symlink replace). secure-setup 0.3.0 still hardcodes paths; we satisfy them at install time.
+
+| Sev | Finding |
+|---|---|
+| med | O2-1 — canary symlink is start-only — **FIXED** (scoped + alias postinstall, TUI securityScreen) |
+| low | O2-2 — empty dest dir blocks symlink — **FIXED** (rmdir empty / unlink dangling, then symlink) |
+
+**Claims:** 16 VERIFIED · 0 DRIFT · 0 MISSING. A5 qualified: LOW does not degrade; EMPTY lastError after startupComplete still does (pre-existing). E1 qualified: container smoke used `J41_SKIP_NPM=1`.
+
+**Files read:** `src/fee-tank.js` (planFeeSweep), `src/doctor.js` (loadFeeTankRows, runDoctor), `src/cli.js` (start attach, checkFeeTanks LOW, hire fail, banner), `src/dispatcher-log.js`, `src/job-agent-path.js`, `src/control.js` (health lastError), `src/dashboard.js` (doctorScreen omit feeTankRows), `scripts/install.sh`, `test/install-container-smoke.test.js`, `node_modules/@junction41/secure-setup/lib/self-test.js` getDispatcherPaths.
+
+### Deliberately NOT covered
+
+- Publishing 2.37.1 / alias bump.
+- Patching and publishing `@junction41/secure-setup`.
+- Bare-metal stock Ubuntu VM (docker `ubuntu:24.04` used).
+- `inspect` “No services registered”.
+- Pre-existing `test/sign-channel-precreate.test.js` “replaced host slot” failure (untouched this pass; fails in isolation on this host).
+- Re-litigating 2.37 Wave 0–2 (alias, installer rewrite, doctor existence).

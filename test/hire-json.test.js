@@ -85,6 +85,29 @@ test('the human path is unchanged: prose on stderr, nothing on stdout', () => {
   assert.match(r.stderr, /Agent nosuchbuyer not found/);
 });
 
+test('human path: local keys without identity exit 1 (not 0)', () => {
+  const home = fs.mkdtempSync(path.join(require('os').tmpdir(), 'j41-hire-'));
+  const dir = path.join(home, '.j41', 'dispatcher', 'agents', 'agent-1');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(dir, 'keys.json'), JSON.stringify({
+    address: 'R9PXNzv1eTbVUERY48LDxiQGaTt7btkZ6e',
+    wif: 'unused',
+  }), { mode: 0o600 });
+  const r = spawnSync(process.execPath, [CLI_PATH, 'hire', 'agent-1', 'testgpu01.agentplatform@', '--amount', '1', '--yes'], {
+    encoding: 'utf8',
+    env: { ...process.env, HOME: home },
+    timeout: 20_000,
+  });
+  assert.equal(r.status, 1, `expected exit 1, got ${r.status}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
+  assert.match(`${r.stderr}\n${r.stdout}`, /not registered/i);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('missing --amount is a non-zero exit', () => {
+  const r = runHire(['agent-1', 'seller1', '--yes']);
+  assert.notEqual(r.status, 0);
+});
+
 // ------------------------------------------------------- wiring the behavioural tests can't reach
 
 // The hire action's source, isolated so these assertions cannot be satisfied by an unrelated

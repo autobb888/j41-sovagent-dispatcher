@@ -1,6 +1,6 @@
 {
   "name": "@junction41/dispatcher",
-  "version": "2.37.0",
+  "version": "2.37.1",
   "description": "Multi-agent orchestration for Junction41 — supports 22 LLM providers, 12 executor frameworks, workspace/connect, and on-chain VDXF identity",
   "main": "src/cli.js",
   "bin": {
@@ -23,7 +23,8 @@
     "init": "node src/cli.js init -n 9",
     "build": "./scripts/build-image.sh",
     "lint": "node --check src/*.js src/executors/*.js",
-    "test": "node --check src/*.js src/executors/*.js && node --test test/*.test.js"
+    "test": "node --check src/*.js src/executors/*.js && node --test test/*.test.js",
+    "postinstall": "node scripts/postinstall.js"
   },
   "author": "Junction41",
   "repository": {
