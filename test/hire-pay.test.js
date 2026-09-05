@@ -36,3 +36,19 @@ test('hire create-only copy does not say Pay later with --pay; CLI has pay compl
   assert.match(cli, /\.command\('review <buyer-agent-id> <job-id>'\)/);
   assert.match(cli, /REVIEW_NOT_CANONICAL/);
 });
+
+test('hire --pay gates wallet-pending BEFORE createJob (no unpaid leftover on PAY_PENDING)', () => {
+  const cli = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
+  const start = cli.indexOf(".command('hire <buyer-agent-id> <seller>')");
+  const end = cli.indexOf(".command('buyers')", start);
+  const hireSrc = cli.slice(start, end);
+  const plan = hireSrc.indexOf('planHirePayment(');
+  const create = hireSrc.indexOf('createJob(');
+  assert.ok(plan > -1, 'hire no longer calls planHirePayment');
+  assert.ok(create > -1, 'hire no longer calls createJob');
+  assert.ok(plan < create, 'planHirePayment must run BEFORE createJob so PAY_PENDING cannot mint an unpaid job');
+  assert.match(hireSrc, /\.option\('--wait'/);
+  const afterCreate = hireSrc.slice(create);
+  assert.doesNotMatch(afterCreate, /planHirePayment\(/,
+    'a second planHirePayment after createJob reintroduces the leftover-job bug');
+});

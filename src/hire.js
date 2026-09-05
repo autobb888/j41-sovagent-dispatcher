@@ -106,6 +106,65 @@ function defaultServiceTypeForKind(kind) {
   return undefined;
 }
 
+function listingNext(gate) {
+  if (gate && gate.ok) return 'hire';
+  if (gate && gate.code === 'MODEL_NOT_A_LABOUR_JOB') return 'access';
+  return 'browse';
+}
+
+function listingRowFromService(s) {
+  const kind = s.kind || 'agent';
+  const serviceType = s.serviceType || 'agent';
+  const gate = assertHireAllowed({
+    sellerKind: kind,
+    serviceType,
+    serviceId: s.id,
+  });
+  return {
+    hireable: !!gate.ok,
+    refuseCode: gate.ok ? null : gate.code,
+    next: listingNext(gate),
+    kind,
+    seller: s.verusId || s.agentId,
+    qualifiedName: s.qualifiedName || s.agentName || null,
+    serviceId: s.id,
+    serviceType,
+    price: s.price,
+    currency: s.currency || null,
+    name: s.name || null,
+  };
+}
+
+function listingRowFromDataAgent(a) {
+  return {
+    hireable: false,
+    refuseCode: 'DATA_NOT_HIREABLE',
+    next: 'browse',
+    kind: 'data',
+    seller: a.id || a.verusId,
+    qualifiedName: a.qualifiedName || a.name || null,
+    serviceId: null,
+    serviceType: null,
+    price: null,
+    currency: null,
+    name: a.name || null,
+  };
+}
+
+async function fetchDataAgentRows({ base, lim, doFetch }) {
+  const u = new URL(`${base}/v1/agents`);
+  u.searchParams.set('status', 'active');
+  u.searchParams.set('kind', 'data');
+  u.searchParams.set('limit', String(lim));
+  const res = await doFetch(u);
+  if (!res.ok) throw new Error(`listings HTTP ${res.status}`);
+  const body = await res.json();
+  return {
+    rows: (body.data || []).map(listingRowFromDataAgent),
+    total: body.meta && body.meta.total,
+  };
+}
+
 async function fetchMarketplaceListings({
   apiUrl, kind, serviceType, q, limit = 100, fetchImpl,
 } = {}) {
@@ -121,25 +180,8 @@ async function fetchMarketplaceListings({
     throw new Error('INVALID_SERVICE_TYPE: serviceType must be agent, gpu-rental, or api-endpoint');
   }
   if (k === 'data') {
-    const u = new URL(`${base}/v1/agents`);
-    u.searchParams.set('status', 'active');
-    u.searchParams.set('kind', 'data');
-    u.searchParams.set('limit', String(lim));
-    const res = await doFetch(u);
-    if (!res.ok) throw new Error(`listings HTTP ${res.status}`);
-    const body = await res.json();
-    const rows = (body.data || []).map((a) => ({
-      hireable: false,
-      kind: 'data',
-      seller: a.id || a.verusId,
-      qualifiedName: a.qualifiedName || a.name || null,
-      serviceId: null,
-      serviceType: null,
-      price: null,
-      currency: null,
-      name: a.name || null,
-    }));
-    return { rows, total: body.meta && body.meta.total, browseOnly: true };
+    const data = await fetchDataAgentRows({ base, lim, doFetch });
+    return { rows: data.rows, total: data.total, browseOnly: true };
   }
 
   const u = new URL(`${base}/v1/services`);
@@ -152,18 +194,27 @@ async function fetchMarketplaceListings({
   const res = await doFetch(u);
   if (!res.ok) throw new Error(`listings HTTP ${res.status}`);
   const body = await res.json();
-  const rows = (body.data || []).map((s) => ({
-    hireable: true,
-    kind: s.kind || 'agent',
-    seller: s.verusId || s.agentId,
-    qualifiedName: s.qualifiedName || s.agentName || null,
-    serviceId: s.id,
-    serviceType: s.serviceType || 'agent',
-    price: s.price,
-    currency: s.currency || null,
-    name: s.name || null,
-  }));
-  return { rows, total: body.meta && body.meta.total, browseOnly: false };
+  const serviceRows = (body.data || []).map(listingRowFromService);
+
+  if (!k) {
+    let dataRows = [];
+    let dataTotal = 0;
+    try {
+      const data = await fetchDataAgentRows({ base, lim, doFetch });
+      dataRows = data.rows;
+      dataTotal = data.total != null ? data.total : dataRows.length;
+    } catch {
+      dataRows = [];
+    }
+    const serviceTotal = body.meta && body.meta.total;
+    return {
+      rows: serviceRows.concat(dataRows),
+      total: (serviceTotal != null ? serviceTotal : serviceRows.length) + dataTotal,
+      browseOnly: false,
+    };
+  }
+
+  return { rows: serviceRows, total: body.meta && body.meta.total, browseOnly: false };
 }
 
 module.exports = {
@@ -174,5 +225,7 @@ module.exports = {
   defaultServiceTypeForKind,
   parseServiceType,
   SERVICE_TYPES,
+  listingRowFromService,
+  listingRowFromDataAgent,
   fetchMarketplaceListings,
 };

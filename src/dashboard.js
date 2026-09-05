@@ -2213,8 +2213,8 @@ async function computeProviderScreen(inquirer, agentId) {
 async function hireScreen(inquirer) {
   console.clear();
   console.log('\n  ═══ Hire a listing ═══\n');
-  console.log('  This fleet identity is the BUYER. The seller is any J41 listing');
-  console.log('  (agent / compute gpu-rental / model api-endpoint). Data is browse-only.\n');
+  console.log('  This fleet identity is the BUYER. Labour and GPU use hire.');
+  console.log('  Models use access/chat (not hire). Data is browse-only.\n');
 
   const agents = getAgents().filter(a => a.identity && a.iAddress && a.wif);
   if (agents.length === 0) {
@@ -2255,9 +2255,9 @@ async function hireScreen(inquirer) {
       type: 'list', name: 'kindPick',
       message: 'Kind:',
       choices: [
-        { name: '  agent     labour jobs', value: 'agent' },
-        { name: '  compute   gpu-rental', value: 'compute' },
-        { name: '  model     api-endpoint', value: 'model' },
+        { name: '  agent     labour jobs (hire)', value: 'agent' },
+        { name: '  compute   gpu-rental (hire)', value: 'compute' },
+        { name: '  model     metered inference (access/chat, not hire)', value: 'model' },
         { name: '  data      browse only (not hireable)', value: 'data' },
       ],
     }]);
@@ -2285,11 +2285,28 @@ async function hireScreen(inquirer) {
       await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
       return;
     }
+    if (kindPick === 'model' || result.rows.every((r) => r.next === 'access')) {
+      console.log('\n  Models are metered inference — hire is refused (MODEL_NOT_A_LABOUR_JOB).');
+      console.log(`  Access: j41-dispatcher access ${buyerId} <seller>`);
+      console.log(`  Chat:   j41-dispatcher chat ${buyerId} <seller> --message "..."\n`);
+      for (const r of result.rows) {
+        console.log(`    ${r.qualifiedName || r.seller}  ${r.serviceId || ''}`);
+      }
+      console.log('');
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+      return;
+    }
+    const hireRows = result.rows.filter((r) => r.hireable);
+    if (!hireRows.length) {
+      console.log('\n  No hireable listings of that kind.\n');
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+      return;
+    }
     const { rowKey } = await promptWithEsc(inquirer, [{
       type: 'list', pageSize: 16, name: 'rowKey',
       message: 'Hire:',
       choices: [
-        ...result.rows.map((r, i) => ({
+        ...hireRows.map((r, i) => ({
           name: `  ${(r.qualifiedName || r.seller || '').toString().slice(0, 28).padEnd(28)} ${(r.serviceType || '').padEnd(12)} ${r.price} ${r.currency || ''}`,
           value: String(i),
         })),
@@ -2298,7 +2315,7 @@ async function hireScreen(inquirer) {
       ],
     }]);
     if (rowKey === '__back' || rowKey == null) return;
-    const row = result.rows[Number(rowKey)];
+    const row = hireRows[Number(rowKey)];
     sellerId = row.seller;
     prePickedService = row;
   } else {
@@ -2339,6 +2356,13 @@ async function hireScreen(inquirer) {
   console.log(`\n  Seller kind: ${kind}  ${listing.qualifiedName || listing.name || sellerId}`);
   if (kind === 'data') {
     console.log('  Data listings are browse-only — POST /v1/jobs is refused.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+  if (kind === 'model') {
+    console.log('  Models are metered inference — hire is refused (MODEL_NOT_A_LABOUR_JOB).');
+    console.log(`  Access: j41-dispatcher access ${buyerId} ${sellerId}`);
+    console.log(`  Chat:   j41-dispatcher chat ${buyerId} ${sellerId} --message "..."\n`);
     await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
     return;
   }

@@ -2828,6 +2828,7 @@ program
   .option('--description <text>', 'Job description')
   .option('--currency <c>', 'Payment currency', NATIVE_COIN)
   .option('--pay', 'Broadcast dual payment (seller + platform fee) after create')
+  .option('--wait', 'With --pay: poll until wallet-pending clears (max 180s) then create+pay')
   .option('--force', 'Ignore wallet-pending.json and broadcast anyway (same as wallet --force)')
   .option('--yes', 'Skip the interactive confirmation (--pay on mainnet still requires a TTY retype)')
   .option('--json', 'Emit the result as one JSON object on stdout. Non-interactive, so it requires --yes.')
@@ -2909,6 +2910,28 @@ program
           '--yes cannot skip hire payment confirmation on mainnet without a TTY. ' +
           'Set J41_HEADLESS_MAINNET_PAY=1 to authorise headless mainnet payment.');
       }
+
+      // Gate spend BEFORE createJob. 2.37.2 ran planHirePayment after mint, so
+      // PAY_PENDING left unpaid marketplace rows (tester fb6c7f62-…).
+      if (options.pay) {
+        let pending = loadWalletPending(buyerAgentId);
+        if (options.wait && !options.force) {
+          const deadline = Date.now() + 180000;
+          while (Date.now() < deadline) {
+            const p = planHirePayment({ pending, now: Date.now(), force: false });
+            if (p.ok) break;
+            await new Promise((r) => setTimeout(r, process.env.NODE_ENV === 'test' ? 0 : 5000));
+            pending = await resolveWalletPending(agent.client, buyerAgentId, loadWalletPending(buyerAgentId));
+          }
+        }
+        const pendingPlan = planHirePayment({
+          pending: loadWalletPending(buyerAgentId),
+          now: Date.now(),
+          force: !!options.force,
+        });
+        if (!pendingPlan.ok) fail(pendingPlan.code, pendingPlan.reason);
+      }
+
       if (!options.yes) {
         const ok = await confirmHire({ amountText: String(options.amount), pay: !!options.pay });
         if (!ok) {
@@ -2929,12 +2952,6 @@ program
       let txid = null;
       let outputs = [];
       if (options.pay) {
-        const pendingPlan = planHirePayment({
-          pending: loadWalletPending(buyerAgentId),
-          now: Date.now(),
-          force: !!options.force,
-        });
-        if (!pendingPlan.ok) fail(pendingPlan.code, pendingPlan.reason, { jobId: job.id });
         outputs = paymentOutputs(job, amount);
 
         // `hire --pay` is the ONLY money-broadcast site in the dispatcher with no spend gate
@@ -3082,22 +3099,32 @@ program
       if (result.browseOnly) {
         console.log('\n  Data listings (browse only — hire is refused)\n');
       } else {
-        console.log('\n  Hireable marketplace listings\n');
+        console.log('\n  Marketplace listings\n');
       }
-      console.log(`  ${'KIND'.padEnd(8)} ${'SELLER-ID (hire arg)'.padEnd(38)} ${'SERVICE-ID (--service)'.padEnd(38)} TYPE         PRICE`);
+      console.log(`  ${'KIND'.padEnd(8)} ${'HIRE'.padEnd(6)} ${'NEXT'.padEnd(8)} ${'SELLER-ID'.padEnd(38)} ${'SERVICE-ID'.padEnd(38)} TYPE         PRICE`);
       for (const r of result.rows) {
         const price = r.price == null ? '' : `${r.price} ${r.currency || ''}`.trim();
         const name = r.qualifiedName ? `  ${r.qualifiedName}` : '';
-        console.log(`  ${String(r.kind).padEnd(8)} ${String(r.seller || '').padEnd(38)} ${String(r.serviceId || '—').padEnd(38)} ${String(r.serviceType || '—').padEnd(12)} ${price}${name}`);
+        console.log(`  ${String(r.kind).padEnd(8)} ${String(r.hireable ? 'yes' : 'no').padEnd(6)} ${String(r.next || '').padEnd(8)} ${String(r.seller || '').padEnd(38)} ${String(r.serviceId || '—').padEnd(38)} ${String(r.serviceType || '—').padEnd(12)} ${price}${name}`);
       }
       if (!result.rows.length) console.log('  (none)');
       if (result.total != null) console.log(`\n  ${result.rows.length} shown / ${result.total} total`);
-      if (!result.browseOnly && result.rows[0]) {
-        console.log('\n  Hire: j41-dispatcher hire <buyer-id> <seller> --service <service-id> --amount <n> [--pay]');
-        console.log('  Buyer ids: j41-dispatcher buyers\n');
-      } else {
-        console.log('');
+      const hasHire = result.rows.some((r) => r.hireable);
+      const hasAccess = result.rows.some((r) => r.next === 'access');
+      const hasData = result.rows.some((r) => r.kind === 'data');
+      if (hasHire) {
+        console.log('\n  Hire labour/GPU: j41-dispatcher hire <buyer-id> <seller> --service <service-id> --amount <n> [--pay]');
       }
+      if (hasAccess) {
+        console.log('  Models are metered inference, not labour. Do not hire.');
+        console.log('  Access: j41-dispatcher access <buyer-id> <seller>');
+        console.log('  Chat:   j41-dispatcher chat <buyer-id> <seller> --message "..."');
+      }
+      if (hasData) {
+        console.log('  Data identities are browse-only (DATA_NOT_HIREABLE) even with 0 services.');
+      }
+      if (hasHire) console.log('  Buyer ids: j41-dispatcher buyers\n');
+      else console.log('');
     } catch (e) {
       console.error(`❌ ${e.message}`);
       process.exit(1);
@@ -3276,6 +3303,106 @@ program
           'Platform review bytes are not J41-…; backend must emit J41-REVIEW|. Review on the website or retry after that fix. Dispatcher will not sign Junction41 Review.');
       }
       fail('REVIEW_FAILED', msg);
+    }
+  });
+
+program
+  .command('access <buyer-agent-id> <seller>')
+  .description('Request ECDH API access from a model / api-endpoint seller (not a labour hire)')
+  .option('--json', 'One JSON object on stdout (includes apiKey). Requires --yes.')
+  .option('--yes', 'Required with --json')
+  .action(async (buyerAgentId, seller, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    const {
+      requestAndOpenAccess, saveAccessGrant, redactApiKey,
+    } = require('./buyer-access');
+    const sdk = require('@junction41/sovagent-sdk/dist/index.js');
+    const cfgSigner = (cfg.platform && cfg.platform.signer) || process.env.J41_PLATFORM_SIGNER;
+    const opened = await requestAndOpenAccess({
+      agent,
+      keys,
+      seller,
+      network: J41_NETWORK,
+      apiUrl: J41_API_URL,
+      signer: cfgSigner,
+      sdk,
+    });
+    if (!opened.ok) fail(opened.code, opened.message, { testnetSigner: opened.testnetSigner || null });
+    const grant = saveAccessGrant(AGENTS_DIR, buyerAgentId, seller, opened.payload);
+    if (opened.signerDefaulted && opened.signerMessage) say(`   ${opened.signerMessage}`);
+    say(`✅ Access granted for ${seller}`);
+    say(`   endpoint ${grant.endpointUrl}`);
+    say(`   expires  ${grant.expiresAt || '—'}`);
+    say(`   apiKey   ${redactApiKey(grant.apiKey)}  (full key only in --json)`);
+    say(`   Chat: j41-dispatcher chat ${buyerAgentId} ${seller} --message "..."`);
+    if (options.json) {
+      console.log(JSON.stringify({
+        ok: true,
+        seller,
+        endpointUrl: grant.endpointUrl,
+        expiresAt: grant.expiresAt,
+        models: grant.models,
+        apiKey: grant.apiKey,
+        signerDefaulted: !!opened.signerDefaulted,
+      }, null, 2));
+    }
+  });
+
+program
+  .command('chat <buyer-agent-id> <seller>')
+  .description('OpenAI-compatible chat against a model grant (runs access if none saved)')
+  .requiredOption('--message <text>', 'User message')
+  .option('--model <id>', 'Model id from the grant (default: first listed)')
+  .option('--json', 'One JSON object on stdout')
+  .action(async (buyerAgentId, seller, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    const {
+      requestAndOpenAccess, saveAccessGrant, loadAccessGrant, chatCompletions,
+    } = require('./buyer-access');
+    let grant = loadAccessGrant(AGENTS_DIR, buyerAgentId, seller);
+    if (!grant) {
+      const sdk = require('@junction41/sovagent-sdk/dist/index.js');
+      const cfgSigner = (cfg.platform && cfg.platform.signer) || process.env.J41_PLATFORM_SIGNER;
+      const opened = await requestAndOpenAccess({
+        agent,
+        keys,
+        seller,
+        network: J41_NETWORK,
+        apiUrl: J41_API_URL,
+        signer: cfgSigner,
+        sdk,
+      });
+      if (!opened.ok) fail(opened.code, opened.message, { testnetSigner: opened.testnetSigner || null });
+      grant = saveAccessGrant(AGENTS_DIR, buyerAgentId, seller, opened.payload);
+      if (opened.signerDefaulted && opened.signerMessage) say(`   ${opened.signerMessage}`);
+    }
+    const chat = await chatCompletions({
+      client: agent.client,
+      grant,
+      message: options.message,
+      model: options.model,
+    });
+    if (!chat.ok) fail(chat.code, chat.message);
+    const body = chat.result && chat.result.body;
+    const text = body && body.choices && body.choices[0] && body.choices[0].message
+      ? body.choices[0].message.content
+      : null;
+    if (text) say(text);
+    else say(JSON.stringify(body, null, 2));
+    if (options.json) {
+      console.log(JSON.stringify({
+        ok: true,
+        seller,
+        model: chat.model,
+        body,
+        sessionId: chat.result && chat.result.sessionId,
+        creditRemaining: chat.result && chat.result.creditRemaining,
+      }, null, 2));
     }
   });
 

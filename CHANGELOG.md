@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.37.3 — 2026-09-05
+
+### Buyer retest holes (tester 2026-09-05 afternoon, live 2.37.2)
+
+- `hire --pay` runs `planHirePayment` **before** `createJob`. `PAY_PENDING` no
+  longer mints an unpaid marketplace row. `--wait` on hire matches `pay --wait`.
+- `listings` sets `hireable` from `assertHireAllowed`. Models / `api-endpoint`
+  are `next: access`, not hire. Default browse also includes kind=data
+  identities with 0 services (`DATA_NOT_HIREABLE`).
+- `access <buyer> <seller>` and `chat <buyer> <seller> --message` wrap SDK
+  `requestApiAccess` + `openAccessEnvelope` + `callProxied`. Calls
+  `getIdentityKeys` first so `PLATFORM_SIGNER_REQUIRED` / `KEYS_BAD_SIGNATURE`
+  are not swallowed into "Could not resolve seller primary R-addresses".
+- Testnet keys-endpoint pin for `api.junction41.io` is
+  `RBgxQwD7mMLCfciTN68RjBQHsH68vcnUKb`. The fee-tank R
+  `RAWwNeTLRg9urgnDPQtPyZ6NRycsmSY2J2` is refused (`PLATFORM_SIGNER_NOT_FEE`).
+- Still fail-closed: review until backend `J41-REVIEW|`; no buyer VDXF write;
+  GPU RFC1918 is a seller tunnel, not a buyer verb.
+
 ## 2.37.2 — 2026-09-05
 
 ### Buyer lifecycle + first-run polish (tester 2026-09-05)

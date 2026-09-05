@@ -125,12 +125,64 @@ test('listings default limit is 100; TUI browse does not cap at 24', async () =>
   const calls = [];
   const fetchImpl = async (url) => {
     calls.push(String(url));
+    if (String(url).includes('/v1/agents')) {
+      return { ok: true, json: async () => ({ data: [], meta: { total: 0 } }) };
+    }
     return { ok: true, json: async () => ({ data: new Array(27).fill(0).map((_, i) => ({
       id: `s${i}`, verusId: `i${i}`, kind: 'agent', serviceType: 'agent', price: 1,
     })), meta: { total: 27 } }) };
   };
   const result = await fetchMarketplaceListings({ apiUrl: 'https://api.example', fetchImpl });
-  assert.equal(result.rows.length, 27);
-  assert.equal(result.total, 27);
+  assert.equal(result.rows.filter((r) => r.kind !== 'data').length, 27);
   assert.match(calls[0], /limit=100/);
+});
+
+test('listings do not mark models hireable; default browse includes data identities', async () => {
+  const fetchImpl = async (url) => {
+    const u = String(url);
+    if (u.includes('/v1/agents')) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: [{ id: 'iData', qualifiedName: 'pippinapples.agentplatform@', name: 'pippinapples' }],
+          meta: { total: 1 },
+        }),
+      };
+    }
+    const all = [
+      { id: 'svc-agent', verusId: 'iAgent', kind: 'agent', serviceType: 'agent', price: 1 },
+      { id: 'svc-model', verusId: 'iModel', kind: 'model', serviceType: 'api-endpoint', price: 0.01, qualifiedName: 'duskseek.agentplatform@' },
+    ];
+    const kind = new URL(u).searchParams.get('kind');
+    const data = kind ? all.filter((s) => s.kind === kind) : all;
+    return {
+      ok: true,
+      json: async () => ({ data, meta: { total: data.length } }),
+    };
+  };
+  const mixed = await fetchMarketplaceListings({ apiUrl: 'https://api.example', fetchImpl });
+  const agent = mixed.rows.find((r) => r.kind === 'agent');
+  const model = mixed.rows.find((r) => r.kind === 'model');
+  const data = mixed.rows.find((r) => r.kind === 'data');
+  assert.equal(agent.hireable, true);
+  assert.equal(agent.next, 'hire');
+  assert.equal(model.hireable, false);
+  assert.equal(model.refuseCode, 'MODEL_NOT_A_LABOUR_JOB');
+  assert.equal(model.next, 'access');
+  assert.equal(data.hireable, false);
+  assert.equal(data.refuseCode, 'DATA_NOT_HIREABLE');
+  assert.equal(data.qualifiedName, 'pippinapples.agentplatform@');
+
+  const modelsOnly = await fetchMarketplaceListings({ apiUrl: 'https://api.example', kind: 'model', fetchImpl });
+  assert.equal(modelsOnly.rows.every((r) => r.hireable === false), true);
+  assert.equal(modelsOnly.rows.every((r) => r.next === 'access'), true);
+});
+
+test('CLI has access/chat; TUI does not hire models', () => {
+  const cli = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
+  const dash = fs.readFileSync(path.join(__dirname, '../src/dashboard.js'), 'utf8');
+  assert.match(cli, /\.command\('access <buyer-agent-id> <seller>'\)/);
+  assert.match(cli, /\.command\('chat <buyer-agent-id> <seller>'\)/);
+  assert.match(dash, /j41-dispatcher access/);
+  assert.match(dash, /MODEL_NOT_A_LABOUR_JOB/);
 });
