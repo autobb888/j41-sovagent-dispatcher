@@ -48,7 +48,7 @@ async function bootRental({ jobTimeoutMin, amount = 2, now = NOW } = {}) {
   };
   await startRentalJob({
     state,
-    job: { id: 'job-1', jobHash: 'h', serviceType: 'gpu-rental', amount },
+    job: { id: 'job-1', jobHash: 'h', serviceType: 'gpu-rental', amount, payment: { verified: true } },
     agentInfo: { id: 'gpu-1' },
     controller, provider: stubProvider(), client,
     signDeliver: ({ hash }) => ({ signature: 's', timestamp: 1, hash }),

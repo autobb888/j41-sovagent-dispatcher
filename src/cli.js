@@ -26,6 +26,9 @@ const {
   classifyIdentities,
   dockerAdviceFromError,
 } = require('./doctor');
+const { isIndexerLagError, retryRegisterWithJ41, INDEXER_LAG_HINT, planOnboardingAfterProfile } = require('./indexer-lag');
+const { jobPaymentReady } = require('./job-payment');
+const { planHirePayment, buyerOwnsJob, jobAlreadyPaid } = require('./hire-pay');
 const rq = require('./reactivation-queue.js');
 const {
   isDeadLettered,
@@ -1232,7 +1235,8 @@ function createFinalizeHooks(agentId, identityName, profile, services = [], disp
         await agent.client.refreshAgent(keys.iAddress || identityName);
         console.log('   ✅ Backend refreshed — marketplace updated');
       } catch (e) {
-        console.log(`   ⚠️  Backend refresh failed: ${e.message.slice(0, 60)}`);
+        console.log('   ⚠️  Could not refresh identity from chain (indexer). On-chain write succeeded — inspect later.');
+        if (e && e.message) console.log(`   ↳ ${String(e.message).slice(0, 80)}`);
       }
     },
     verifyVdxf: async () => {
@@ -1734,53 +1738,70 @@ program
       }
 
       console.log(`\n→ Registering agent profile on J41 platform...`);
+      let profileAttempt = { ok: false, indexerLag: false, error: null, result: null };
       try {
-        // Re-create agent with identity info for platform registration
         const profileAgent = new J41Agent({
           apiUrl: J41_API_URL,
           wif: keys.wif,
           identityName: keys.identity,
           iAddress: keys.iAddress,
         });
-        const regResult = await profileAgent.registerWithJ41(profileData);
-        console.log(`✅ Agent profile registered! (agentId: ${regResult.agentId})`);
-
-        // Register services
-        if (serviceData.length > 0) {
-          for (const svc of serviceData) {
-            try {
-              await profileAgent.registerService(svc);
-              console.log(`✅ Service registered: ${svc.name}`);
-            } catch (svcErr) {
-              console.error(`⚠️  Service "${svc.name}" registration failed: ${svcErr.message}`);
+        profileAttempt = await retryRegisterWithJ41(() => profileAgent.registerWithJ41(profileData));
+        if (!profileAttempt.ok) {
+          if (profileAttempt.indexerLag) {
+            console.error(`⚠️  ${INDEXER_LAG_HINT.replace('<agent-id>', agentId)}`);
+          } else {
+            console.error(`⚠️  Profile registration failed: ${profileAttempt.error.message}`);
+            console.error(`   You can retry later with: j41-dispatcher finalize ${agentId}`);
+          }
+        } else {
+          console.log(`✅ Agent profile registered! (agentId: ${profileAttempt.result.agentId})`);
+          if (serviceData.length > 0) {
+            for (const svc of serviceData) {
+              try {
+                await profileAgent.registerService(svc);
+                console.log(`✅ Service registered: ${svc.name}`);
+              } catch (svcErr) {
+                console.error(`⚠️  Service "${svc.name}" registration failed: ${svcErr.message}`);
+              }
             }
           }
         }
       } catch (profileErr) {
-        console.error(`⚠️  Profile registration failed: ${profileErr.message}`);
-        console.error(`   You can retry later with: j41-dispatcher finalize ${agentId}`);
+        profileAttempt = { ok: false, indexerLag: isIndexerLagError(profileErr), error: profileErr };
+        if (profileAttempt.indexerLag) {
+          console.error(`⚠️  ${INDEXER_LAG_HINT.replace('<agent-id>', agentId)}`);
+        } else {
+          console.error(`⚠️  Profile registration failed: ${profileErr.message}`);
+          console.error(`   You can retry later with: j41-dispatcher finalize ${agentId}`);
+        }
       }
 
-      if (options.finalize) {
+      const afterProfile = planOnboardingAfterProfile({ mintOk: true, profile: profileAttempt });
+      if (options.finalize && afterProfile.runFinalize) {
         const { finalizeOnboarding } = require('@junction41/sovagent-sdk/dist/index.js');
         const finalizeStatePath = path.join(AGENTS_DIR, agentId, FINALIZE_STATE_FILENAME);
         console.log(`\n→ Finalizing onboarding (${options.interactive ? 'interactive' : 'headless'})...`);
-
-        // Reuse the profile/services this same invocation already collected
-        // above (interactively or from flags) rather than re-deriving from
-        // options — the old re-derivation dropped the interactively-collected
-        // profile entirely, publishing an empty on-chain update (B1).
-        const finalizeResult = await finalizeOnboarding({
-          agent,
-          statePath: finalizeStatePath,
-          mode: options.interactive ? 'interactive' : 'headless',
-          profile: profileData,
-          services: serviceData,
-          hooks: createFinalizeHooks(agentId, keys.identity, profileData, serviceData, disputePolicyData),
-        });
-
-        console.log(`✅ Finalize stage: ${finalizeResult.stage}`);
-        console.log(`   State file: ${finalizeStatePath}`);
+        try {
+          const finalizeResult = await finalizeOnboarding({
+            agent,
+            statePath: finalizeStatePath,
+            mode: options.interactive ? 'interactive' : 'headless',
+            profile: profileData,
+            services: serviceData,
+            hooks: createFinalizeHooks(agentId, keys.identity, profileData, serviceData, disputePolicyData),
+          });
+          console.log(`✅ Finalize stage: ${finalizeResult.stage}`);
+          console.log(`   State file: ${finalizeStatePath}`);
+        } catch (finErr) {
+          if (isIndexerLagError(finErr)) {
+            console.error(`⚠️  ${INDEXER_LAG_HINT.replace('<agent-id>', agentId)}`);
+          } else {
+            throw finErr;
+          }
+        }
+      } else if (options.finalize && !afterProfile.runFinalize) {
+        console.error(`⚠️  ${INDEXER_LAG_HINT.replace('<agent-id>', agentId)}`);
       }
     } catch (e) {
       console.error(`\n❌ Registration failed: ${e.message}`);
@@ -2807,6 +2828,7 @@ program
   .option('--description <text>', 'Job description')
   .option('--currency <c>', 'Payment currency', NATIVE_COIN)
   .option('--pay', 'Broadcast dual payment (seller + platform fee) after create')
+  .option('--force', 'Ignore wallet-pending.json and broadcast anyway (same as wallet --force)')
   .option('--yes', 'Skip the interactive confirmation (--pay on mainnet still requires a TTY retype)')
   .option('--json', 'Emit the result as one JSON object on stdout. Non-interactive, so it requires --yes.')
   .action(async (buyerAgentId, seller, options) => {
@@ -2907,6 +2929,12 @@ program
       let txid = null;
       let outputs = [];
       if (options.pay) {
+        const pendingPlan = planHirePayment({
+          pending: loadWalletPending(buyerAgentId),
+          now: Date.now(),
+          force: !!options.force,
+        });
+        if (!pendingPlan.ok) fail(pendingPlan.code, pendingPlan.reason, { jobId: job.id });
         outputs = paymentOutputs(job, amount);
 
         // `hire --pay` is the ONLY money-broadcast site in the dispatcher with no spend gate
@@ -2952,6 +2980,7 @@ program
         }
 
         txid = await agent.sendMultiPayment(outputs);
+        saveWalletPending(buyerAgentId, { txid, at: Date.now(), kind: 'hire-pay' });
         await agent.client.recordPaymentCombined(job.id, txid);
         if (autonomous) {
           recordSendOutcome({
@@ -2963,9 +2992,11 @@ program
           });
         }
         say(`✅ Payment broadcast ${String(txid).substring(0, 16)}… (${outputs.length} output${outputs.length === 1 ? '' : 's'})`);
-        say('   Wait for confirmations; seller accept may already be stacked.');
+        say('   Wait until wallet show drops the spent UTXO before another pay (~one block).');
+        say('   A second pay in this block will be refused (PAY_PENDING) or rejected by the network.');
       } else {
-        say('   Pay later with --pay, or from the website. Seller cannot start until payment verifies.');
+        say(`   Pay later: j41-dispatcher pay ${buyerAgentId} ${job.id} [--yes]`);
+        say('   or from the website. Seller cannot start work until payment verifies.');
       }
 
       if (options.json) {
@@ -3028,7 +3059,7 @@ program
   .option('--kind <kind>', 'agent | compute | data | model')
   .option('--service-type <type>', 'agent | gpu-rental | api-endpoint')
   .option('-q, --query <text>', 'Search')
-  .option('--limit <n>', 'Max rows', '20')
+  .option('--limit <n>', 'Max rows', '100')
   .option('--json', 'Raw JSON')
   .action(async (options) => {
     const { fetchMarketplaceListings } = require('./hire.js');
@@ -3070,6 +3101,181 @@ program
     } catch (e) {
       console.error(`❌ ${e.message}`);
       process.exit(1);
+    }
+  });
+
+function buyerCliFail(options, code, message, extra = {}) {
+  if (options && options.json) console.log(JSON.stringify({ ok: false, code, message, ...extra }, null, 2));
+  else console.error(`❌ ${message}`);
+  process.exitCode = 1;
+  process.exit(1);
+}
+
+async function loadBuyerSession(buyerAgentId, options) {
+  const keys = loadAgentKeys(buyerAgentId);
+  if (!keys) buyerCliFail(options, 'BUYER_NOT_FOUND', `Buyer ${buyerAgentId} not found.`);
+  if (!keys.identity || !keys.wif || !keys.address) {
+    buyerCliFail(options, 'BUYER_NOT_REGISTERED', `Buyer ${buyerAgentId} is not registered.`);
+  }
+  const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+  const agent = new J41Agent({
+    apiUrl: J41_API_URL,
+    wif: keys.wif,
+    identityName: keys.identity,
+    iAddress: keys.iAddress,
+  });
+  await agent.authenticate();
+  return { keys, agent };
+}
+
+program
+  .command('pay <buyer-agent-id> <job-id>')
+  .description('Pay an existing job (dual seller + platform fee). Honours wallet-pending.json.')
+  .option('--yes', 'Skip the interactive confirmation (mainnet --yes still needs a TTY or J41_HEADLESS_MAINNET_PAY=1)')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
+  .option('--wait', 'Poll until wallet-pending clears (max 180s) then pay')
+  .option('--force', 'Ignore wallet-pending.json and broadcast anyway')
+  .action(async (buyerAgentId, jobId, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    const headlessMainnetPay = process.env.J41_HEADLESS_MAINNET_PAY === '1';
+    if (IS_MAINNET && options.yes && !process.stdin.isTTY && !headlessMainnetPay) {
+      fail('MAINNET_TTY_REQUIRED',
+        '--yes cannot skip payment confirmation on mainnet without a TTY. Set J41_HEADLESS_MAINNET_PAY=1.');
+    }
+    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    const job = await agent.client.getJob(jobId);
+    if (!job || !job.id) fail('PAY_NOT_PAYABLE', `Job ${jobId} not found.`);
+    if (!buyerOwnsJob(keys, job)) fail('PAY_NOT_BUYER', 'This identity is not the buyer on that job.');
+    if (jobAlreadyPaid(job)) fail('PAY_ALREADY_PAID', 'Job is already paid.', { jobId: job.id });
+    const st = String(job.status || '');
+    if (['cancelled', 'refunded', 'disputed'].includes(st)) {
+      fail('PAY_NOT_PAYABLE', `Job status ${st} is not payable.`, { jobId: job.id, status: st });
+    }
+    let pending = loadWalletPending(buyerAgentId);
+    if (options.wait && !options.force) {
+      const deadline = Date.now() + 180000;
+      while (Date.now() < deadline) {
+        const p = planHirePayment({ pending, now: Date.now(), force: false });
+        if (p.ok) break;
+        await new Promise((r) => setTimeout(r, process.env.NODE_ENV === 'test' ? 0 : 5000));
+        pending = await resolveWalletPending(agent.client, buyerAgentId, loadWalletPending(buyerAgentId));
+      }
+    }
+    const pendingPlan = planHirePayment({ pending: loadWalletPending(buyerAgentId), now: Date.now(), force: !!options.force });
+    if (!pendingPlan.ok) fail(pendingPlan.code, pendingPlan.reason, { jobId: job.id });
+    const amount = job.amount;
+    const { paymentOutputs } = require('./hire.js');
+    const outputs = paymentOutputs(job, amount);
+    if (!options.yes) {
+      const ok = await confirmHire({ amountText: String(amount), pay: true });
+      if (!ok) { console.log('Cancelled.'); process.exit(0); }
+    }
+    const autonomous = !!(options.json || headlessMainnetPay);
+    if (autonomous) {
+      const sellerId = job.sellerVerusId || job.seller;
+      let payInfo = null;
+      try { payInfo = await agent.client.getAgentPaymentAddress(sellerId); }
+      catch (e) { fail('RECIPIENT_UNRESOLVED', `Cannot resolve seller address: ${e.message}`, { jobId: job.id }); }
+      const expected = [payInfo && payInfo.address, payInfo && payInfo.iAddress]
+        .filter((a) => typeof a === 'string' && a.length > 0);
+      if (!expected.length) fail('RECIPIENT_UNRESOLVED', 'No on-chain address for the seller.', { jobId: job.id });
+      const g = gateExternalSend({
+        jobId: job.id, toAddress: job.payment && job.payment.address, amount, jobPrice: amount,
+        kind: 'payment', expectedRecipients: expected,
+      });
+      if (!g.allowed) fail('SPEND_DENIED', g.reason, { jobId: job.id, retryable: !!g.retryable });
+    }
+    const txid = await agent.sendMultiPayment(outputs);
+    saveWalletPending(buyerAgentId, { txid, at: Date.now(), kind: 'hire-pay' });
+    await agent.client.recordPaymentCombined(job.id, txid);
+    if (autonomous) {
+      recordSendOutcome({ kind: 'payment', jobId: job.id, toAddress: job.payment && job.payment.address, amount, txid });
+    }
+    say(`✅ Payment broadcast ${String(txid).substring(0, 16)}…`);
+    say('   Wait until wallet show drops the spent UTXO before another pay.');
+    if (options.json) console.log(JSON.stringify({ ok: true, jobId: job.id, txid, outputs }, null, 2));
+  });
+
+program
+  .command('complete <buyer-agent-id> <job-id>')
+  .description('Buyer confirms delivery (SDK completeJob). Prints getJobWitness; does not write buyer VDXF.')
+  .option('--yes', 'Skip confirmation')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
+  .action(async (buyerAgentId, jobId, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    const job = await agent.client.getJob(jobId);
+    if (!job || !job.id) fail('COMPLETE_NOT_DELIVERED', `Job ${jobId} not found.`);
+    if (!buyerOwnsJob(keys, job)) fail('PAY_NOT_BUYER', 'This identity is not the buyer on that job.');
+    if (job.status === 'completed') fail('COMPLETE_ALREADY', 'Job is already completed.', { jobId: job.id });
+    if (job.status !== 'delivered') {
+      fail('COMPLETE_NOT_DELIVERED', `Job status is ${job.status}, not delivered.`, { jobId: job.id, status: job.status });
+    }
+    if (!options.yes) {
+      const ok = await confirmHire({ amountText: `complete ${job.id}`, pay: false });
+      if (!ok) { console.log('Cancelled.'); process.exit(0); }
+    }
+    const done = await agent.completeJob(job.id);
+    say(`✅ Job ${job.id} completed (status=${done.status || 'completed'})`);
+    let witness = null;
+    try {
+      witness = await agent.client.getJobWitness(job.id);
+    } catch (e) {
+      say(`   Witness not ready yet (${e.message}). Retry inspect later.`);
+    }
+    if (witness && !options.json) {
+      const rec = witness.data || witness;
+      say(`   Witness signedByName=${(rec.witness && rec.witness.signedByName) || rec.signedByName || '—'}`);
+    }
+    if (options.json) console.log(JSON.stringify({ ok: true, jobId: job.id, status: done.status, witness }, null, 2));
+  });
+
+program
+  .command('review <buyer-agent-id> <job-id>')
+  .description('Submit a review after completed. Fail-closed unless platform bytes start with J41-.')
+  .requiredOption('--rating <n>', '1-5')
+  .option('--message <text>', 'Review text')
+  .option('--yes', 'Skip confirmation')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
+  .action(async (buyerAgentId, jobId, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    const rating = parseInt(String(options.rating), 10);
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      fail('REVIEW_BAD_RATING', '--rating must be an integer 1-5.');
+    }
+    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    const job = await agent.client.getJob(jobId);
+    if (!job || !job.id) fail('REVIEW_NOT_COMPLETED', `Job ${jobId} not found.`);
+    if (!buyerOwnsJob(keys, job)) fail('PAY_NOT_BUYER', 'This identity is not the buyer on that job.');
+    if (job.status !== 'completed') {
+      fail('REVIEW_NOT_COMPLETED', `Job status is ${job.status}, not completed.`, { jobId: job.id, status: job.status });
+    }
+    if (!options.yes) {
+      const ok = await confirmHire({ amountText: `review ${job.id} rating ${rating}`, pay: false });
+      if (!ok) { console.log('Cancelled.'); process.exit(0); }
+    }
+    try {
+      const result = await agent.submitReview({
+        agentVerusId: job.sellerVerusId || job.seller,
+        jobHash: job.jobHash,
+        rating,
+        message: options.message || '',
+      });
+      say(`✅ Review submitted (${result && (result.inboxId || result.id) || 'ok'})`);
+      if (options.json) console.log(JSON.stringify({ ok: true, jobId: job.id, rating, result }, null, 2));
+    } catch (e) {
+      const msg = String(e.message || e);
+      if (/do not start with J41-/i.test(msg) || /Junction41 Review/i.test(msg)) {
+        fail('REVIEW_NOT_CANONICAL',
+          'Platform review bytes are not J41-…; backend must emit J41-REVIEW|. Review on the website or retry after that fix. Dispatcher will not sign Junction41 Review.');
+      }
+      fail('REVIEW_FAILED', msg);
     }
   });
 
@@ -3716,20 +3922,39 @@ program
       services = buildServiceFromOptions(options, profileData.description);
     }
 
+    let profileAttempt = { ok: false, indexerLag: false, error: null, result: null };
     try {
-      const regResult = await profileAgent.registerWithJ41(profileData);
-      console.log(`  ✓ Profile registered (${regResult.agentId || 'ok'})`);
-
-      for (const svc of services) {
-        try {
-          await profileAgent.registerService(svc);
-          console.log(`  ✓ Service registered: ${svc.name}`);
-        } catch (svcErr) {
-          console.error(`  ⚠️  Service "${svc.name}": ${svcErr.message}`);
+      profileAttempt = await retryRegisterWithJ41(() => profileAgent.registerWithJ41(profileData));
+      if (!profileAttempt.ok) {
+        if (profileAttempt.indexerLag) {
+          console.error(`  ⚠️  ${INDEXER_LAG_HINT.replace('<agent-id>', agentId)}`);
+        } else {
+          console.error(`  ⚠️  Profile: ${profileAttempt.error.message}`);
+        }
+      } else {
+        console.log(`  ✓ Profile registered (${profileAttempt.result.agentId || 'ok'})`);
+        for (const svc of services) {
+          try {
+            await profileAgent.registerService(svc);
+            console.log(`  ✓ Service registered: ${svc.name}`);
+          } catch (svcErr) {
+            console.error(`  ⚠️  Service "${svc.name}": ${svcErr.message}`);
+          }
         }
       }
     } catch (e) {
-      console.error(`  ⚠️  Profile: ${e.message}`);
+      profileAttempt = { ok: false, indexerLag: isIndexerLagError(e), error: e };
+      if (profileAttempt.indexerLag) {
+        console.error(`  ⚠️  ${INDEXER_LAG_HINT.replace('<agent-id>', agentId)}`);
+      } else {
+        console.error(`  ⚠️  Profile: ${e.message}`);
+      }
+    }
+
+    const afterProfile = planOnboardingAfterProfile({ mintOk: true, profile: profileAttempt });
+    if (!afterProfile.runFinalize) {
+      console.error(`\n  Identity is on-chain. ${INDEXER_LAG_HINT.replace('<agent-id>', agentId)}`);
+      return;
     }
 
     // ── Step 4: Finalize (VDXF on-chain + service registration) ──
@@ -3753,13 +3978,10 @@ program
       });
       console.log(`  ✓ Finalize: ${finalizeResult.stage}`);
     } catch (e) {
-      // F1 (follow-up) — 2.21.0 made publishVdxf throw so the SDK stops marking a
-      // step that did not happen. That fixed the state machine but NOT the headline
-      // claim: this catch swallowed the throw and the "Setup Complete" banner printed
-      // regardless, so the operator still walked away believing a fresh, unfunded
-      // agent was ready. `runtime.require_finalize` defaults to false, so `start`
-      // would then happily run it over an empty on-chain identity. One warning line
-      // scrolling past is not a failure report.
+      if (isIndexerLagError(e)) {
+        console.error(`  ⚠️  ${INDEXER_LAG_HINT.replace('<agent-id>', agentId)}`);
+        return;
+      }
       console.error(`\n  ❌ Finalize did not complete: ${e.message}`);
       console.error('');
       console.error('  ╔══════════════════════════════════════════╗');
@@ -4435,6 +4657,12 @@ program
 
     console.log(`Runtime: ${RUNTIME} mode`);
     console.log(`Agents: ${formatIdentitySummary(classifyIdentities(AGENTS_DIR))}`);
+    for (const id of agents) {
+      const saved = (() => { try { return loadSavedProfile(id); } catch { return null; } })();
+      if (!saved || !saved.profile) continue;
+      const n = Array.isArray(saved.services) ? saved.services.length : 0;
+      if (n === 0) console.log(`${id} has a profile but no service — buyers cannot hire it.`);
+    }
     console.log(`Max concurrent: ${MAX_AGENTS}${MAX_AGENTS_AUTO ? ' (auto)' : ' (owner override)'}`);
     if (MAX_AGENTS_AUTO) {
       console.log(capacityLine({
@@ -9025,10 +9253,7 @@ async function pollForJobs(state) {
         // accepted + no payment object = platform doesn't enforce payment (let it through)
         const allowUnpriced = process.env.J41_ALLOW_UNPRICED_JOBS === '1';
         if (allowUnpriced && !job.payment) console.warn(`[Payment] Admitting job ${job.id} with NO payment record (J41_ALLOW_UNPRICED_JOBS=1)`);
-        const isPaid = job.status === 'in_progress' ||
-          (job.payment && job.payment.verified === true) ||
-          (job.payment && (job.payment.status === 'confirmed' || job.payment.status === 'completed')) ||
-          (allowUnpriced && !job.payment); // explicit opt-in required — bare no-payment no longer trusted (M8)
+        const isPaid = jobPaymentReady(job, { allowUnpriced });
 
         if (!isPaid) {
           if (!state.pendingPayment.has(job.id)) {
@@ -9407,6 +9632,11 @@ async function handleWebhookEvent(state, agentId, payload) {
       try {
         const agent = await getAgentSession(state, agentInfo);
         const job = await agent.client.getJob(jobId);
+        const allowUnpriced = process.env.J41_ALLOW_UNPRICED_JOBS === '1';
+        if (!jobPaymentReady(job, { allowUnpriced })) {
+          console.log(`[Webhook] ⏳ Job ${jobId.substring(0, 8)} — awaiting payment (status: ${job.status})`);
+          return;
+        }
         if (state.active.size >= MAX_AGENTS) {
           queueInsertByPriority(state.queue, { ...job, assignedAgent: agentInfo });
           console.log(`[Webhook] Job ${jobId.substring(0, 8)} queued (priority, ${job.amount || '?'} ${job.currency || NATIVE_COIN})`);
@@ -11493,6 +11723,11 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
 
 // Unified dispatch — routes to Docker or local based on runtime config
 async function startJob(state, job, agentInfo) {
+  const allowUnpriced = process.env.J41_ALLOW_UNPRICED_JOBS === '1';
+  if (!jobPaymentReady(job, { allowUnpriced })) {
+    console.log(`⏳ Job ${job && job.id} — awaiting payment (refusing labour start)`);
+    return;
+  }
   if (RUNTIME === 'docker') {
     await startJobContainer(state, job, agentInfo);
   } else {
@@ -11501,6 +11736,11 @@ async function startJob(state, job, agentInfo) {
 }
 
 async function startRentalJobWired(state, job, agentInfo) {
+  const allowUnpriced = process.env.J41_ALLOW_UNPRICED_JOBS === '1';
+  if (!jobPaymentReady(job, { allowUnpriced })) {
+    console.log(`⏳ Job ${job && job.id} — awaiting payment (refusing rental start)`);
+    return;
+  }
   const cfgNow = loadDispatcherConfig();
   const { provider, providerName } = resolveRentalProvider(cfgNow, agentInfo.id);
   const controller = await ensureComputeController(state, cfgNow);
@@ -11527,6 +11767,11 @@ async function startRentalJobWired(state, job, agentInfo) {
 }
 
 async function startJobOrRental(state, job, agentInfo) {
+  const allowUnpriced = process.env.J41_ALLOW_UNPRICED_JOBS === '1';
+  if (!jobPaymentReady(job, { allowUnpriced })) {
+    console.log(`⏳ Job ${job && job.id} — awaiting payment (refusing start)`);
+    return;
+  }
   const services = servicesForAgent(state, agentInfo, loadAgentConfig);
   if (isGpuRentalJob(job, services) || (services || []).some((s) => s && s.serviceType === 'gpu-rental')) {
     await startRentalJobWired(state, job, agentInfo);
@@ -13949,7 +14194,7 @@ program
 
 if (process.env.NODE_ENV === 'test') {
   module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, shouldWriteChainActiveOnActivate, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState, untrusted, untrustedField, requireInteractiveConfirm, printFundingInstructions, handleWebhookEvent, stopJobContainer, stopJobLocal, _cleanupCompletedJobs, jobImageExists, JOB_IMAGE, jailImageExists, JAIL_IMAGE, NATIVE_COIN,
-    saveProfile, loadSavedProfile, createFinalizeHooks,
+    saveProfile, loadSavedProfile, createFinalizeHooks, jobPaymentReady, isIndexerLagError, retryRegisterWithJ41, planHirePayment,
     // Execution-harness seam: `program` so a test can drive the REAL `start`
     // action through commander, and `__getState` so it can then assert on what
     // that action actually did. See test/helpers/dispatcher-harness.js.

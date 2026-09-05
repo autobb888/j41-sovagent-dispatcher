@@ -15,6 +15,8 @@ const {
   formatIdentitySummary,
   classifyDockerError,
   classifyIdentities,
+  dockerAdviceFromError,
+  firstPasteCommand,
 } = require('../src/doctor');
 
 function tmpHome() {
@@ -127,6 +129,10 @@ test('Darwin 22 (macOS 13): os fail, gpuOffered false', async () => {
   assert.equal(report.gpuOffered, false);
   assert.equal(check(report, 'gpu.nvidia').status, 'skip');
   assert.equal(check(report, 'gpu.storage').status, 'skip');
+  assert.equal(report.nextCommand, 'j41-dispatcher doctor');
+  const next = nextSection(formatDoctorTable(report));
+  assert.doesNotMatch(next, /macOS 14\+/);
+  assert.doesNotMatch(next, /Start Docker/);
 });
 
 test('Darwin 23+ Docker Desktop sock: os pass, gpu skip', async () => {
@@ -308,6 +314,9 @@ test('linux overlayfs + compute configured: gpu.storage fail', async () => {
   assert.equal(report.gpuOffered, true);
   assert.equal(check(report, 'gpu.storage').status, 'fail');
   assert.match(check(report, 'gpu.storage').detail, /overlay2|prjquota|overlayfs/i);
+  assert.equal(report.nextCommand, 'j41-dispatcher doctor');
+  const next = nextSection(formatDoctorTable(report));
+  assert.doesNotMatch(next, /Linux NVIDIA hosts only/);
 });
 
 test('darwin doctor JSON: gpu checks skip, not fail', async () => {
@@ -363,4 +372,87 @@ test('formatDoctorTable never recommends runtime local', async () => {
   const table = formatDoctorTable(report);
   assert.doesNotMatch(table, /config --runtime local/);
   assert.match(table, /Next:/);
+});
+
+function nextSection(table) {
+  const after = String(table).split('Next:')[1] || '';
+  return after.split('Copy-paste:')[0];
+}
+
+test('darwin no Docker CLI: nextCommand is open -a Docker, Next is not start', async () => {
+  const report = await runDoctor(baseOpts({
+    platform: 'darwin',
+    arch: 'arm64',
+    release: '23.6.0',
+    execSync: () => { throw new Error('command not found: docker'); },
+  }));
+  assert.equal(check(report, 'docker.cli').status, 'fail');
+  assert.match(report.nextCommand, /open -a Docker/);
+  const next = nextSection(formatDoctorTable(report));
+  assert.doesNotMatch(next, /j41-dispatcher start/);
+  assert.doesNotMatch(next, /Start Docker Desktop/);
+  assert.match(next, /open -a Docker/);
+});
+
+test('darwin ENOENT sock: sock detail is Desktop path, nextCommand open -a Docker', async () => {
+  const home = tmpHome();
+  const err = new Error('connect ENOENT /var/run/docker.sock');
+  err.code = 'ENOENT';
+  const report = await runDoctor(baseOpts({
+    homedir: home,
+    platform: 'darwin',
+    arch: 'arm64',
+    release: '23.6.0',
+    execSync: dockerExec({ infoOk: false, infoErr: err, images: {} }),
+    dockerSockExists: () => false,
+  }));
+  const sock = check(report, 'docker.sock');
+  assert.equal(sock.status, 'fail');
+  assert.match(sock.detail, /\.docker\/run\/docker\.sock/);
+  assert.match(report.nextCommand, /open -a Docker/);
+  const next = nextSection(formatDoctorTable(report));
+  assert.doesNotMatch(next, /j41-dispatcher start/);
+  assert.doesNotMatch(next, /Start Docker Desktop/);
+});
+
+test('darwin GPU human table: exactly one GPU line, not three linux NVIDIA chapter lines', async () => {
+  const report = await runDoctor(baseOpts({
+    platform: 'darwin',
+    arch: 'arm64',
+    release: '23.6.0',
+  }));
+  assert.equal(check(report, 'gpu.nvidia').status, 'skip');
+  assert.equal(check(report, 'gpu.storage').status, 'skip');
+  const table = formatDoctorTable(report);
+  const gpuLines = table.split('\n').filter((l) => /\bGPU\b/.test(l));
+  assert.equal(gpuLines.length, 1, table);
+  assert.match(gpuLines[0], /Linux NVIDIA hosts only/);
+  assert.doesNotMatch(table, /linux NVIDIA chapter/);
+});
+
+test('win32 no Docker CLI: nextCommand is wsl.exe, not Start Docker Desktop', async () => {
+  const report = await runDoctor(baseOpts({
+    platform: 'win32',
+    dockerDesktopWSL2: true,
+    execSync: () => { throw new Error('not found'); },
+  }));
+  assert.equal(check(report, 'docker.cli').status, 'fail');
+  assert.match(report.nextCommand, /wsl\.exe -e docker info/);
+  const next = nextSection(formatDoctorTable(report));
+  assert.doesNotMatch(next, /j41-dispatcher start/);
+  assert.doesNotMatch(next, /Start Docker Desktop/);
+});
+
+test('firstPasteCommand allowlists argv only', () => {
+  assert.equal(firstPasteCommand('Linux NVIDIA hosts only.\nopen -a Docker'), 'open -a Docker');
+  assert.equal(firstPasteCommand('macOS 14+ (Sonoma) and Docker Desktop are required.'), null);
+  assert.equal(firstPasteCommand('sudo apt install docker.io'), 'sudo apt install docker.io');
+});
+
+test('dockerAdviceFromError darwin eacces does not claim /var/run/docker.sock', () => {
+  const err = Object.assign(new Error('permission denied'), { code: 'EACCES' });
+  const advice = dockerAdviceFromError(err, 'darwin');
+  assert.doesNotMatch(advice.message, /\/var\/run\/docker\.sock/);
+  assert.doesNotMatch(advice.message, /group docker/);
+  assert.equal(advice.nextCommand, 'open -a Docker');
 });

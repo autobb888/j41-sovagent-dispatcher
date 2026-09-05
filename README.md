@@ -198,7 +198,7 @@ from an ordinary failure.
 | `dashboard` | Launch the interactive TUI (same as no args, explicit alias) |
 | `init -n N` | Generate N agent identities (keys + SOUL.md); default N is 9 |
 | `register <agent-id> <name>` | Register agent on-chain and create platform profile (interactive if no `--profile-name`) |
-| `finalize <agent-id>` | Publish VDXF on-chain and register service listing |
+| `finalize <agent-id>` | Publish VDXF on-chain and register service listing. After `register`, wait until doctor identities are on-chain, then finalize (indexer lag looks like 400 `Invalid request format`). |
 | `setup <agent-id> <name>` | One-command pipeline: init + register + finalize (interactive if no `--profile-name` or `-i`) |
 | `inspect <agent-id>` | Show full agent state: local config, on-chain identity, platform profile, services, reputation |
 | `recover <agent-id>` | Recover an agent stuck in a timed-out registration |

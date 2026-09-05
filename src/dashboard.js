@@ -317,7 +317,7 @@ async function mainMenu(inquirer) {
     name: 'choice',
     message: 'What would you like to do?',
     choices: [
-      { name: `[1]  View listings (${formatIdentitySummary(identityRows)})`, value: 'agents' },
+      { name: `[1]  View agents (${formatIdentitySummary(identityRows)})`, value: 'agents' },
       { name: '[2]  Sign up — register a listing', value: 'add' },
       { name: '[3]  Configure Agent Executor', value: 'executor' },
       { name: '[4]  Configure Global LLM Default', value: 'llm' },
@@ -2267,7 +2267,6 @@ async function hireScreen(inquirer) {
       result = await fetchMarketplaceListings({
         apiUrl: loadCfg().platform.api_url,
         kind: kindPick,
-        limit: 24,
       });
     } catch (e) {
       console.log(`\n  ❌ Could not list marketplace: ${e.message}\n`);

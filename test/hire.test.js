@@ -19,11 +19,16 @@ test('hire gate matches platform: agent labour ok, data refused', () => {
   assert.equal(data.code, 'DATA_NOT_HIREABLE');
 });
 
-test('compute requires gpu-rental + serviceId; model requires api-endpoint', () => {
+test('compute requires gpu-rental; model and api-endpoint are not labour jobs', () => {
   assert.equal(assertHireAllowed({ sellerKind: 'compute', serviceType: 'gpu-rental', serviceId: 's1' }).ok, true);
   assert.equal(assertHireAllowed({ sellerKind: 'compute', serviceType: 'api-endpoint', serviceId: 's1' }).ok, false);
-  assert.equal(assertHireAllowed({ sellerKind: 'model', serviceType: 'api-endpoint', serviceId: 's1' }).ok, true);
+  const model = assertHireAllowed({ sellerKind: 'model', serviceType: 'api-endpoint', serviceId: 's1' });
+  assert.equal(model.ok, false);
+  assert.equal(model.code, 'MODEL_NOT_A_LABOUR_JOB');
   assert.equal(assertHireAllowed({ sellerKind: 'model', serviceType: 'gpu-rental', serviceId: 's1' }).ok, false);
+  const api = assertHireAllowed({ sellerKind: 'agent', serviceType: 'api-endpoint', serviceId: 's1' });
+  assert.equal(api.ok, false);
+  assert.equal(api.code, 'MODEL_NOT_A_LABOUR_JOB');
 });
 
 test('paymentOutputs refuses missing/malformed addresses and implausible fees', () => {
@@ -108,4 +113,24 @@ test('CLI buyers and listings commands exist; TUI can browse marketplace ids', (
   assert.match(cli, /\.command\('listings'\)/);
   assert.match(dash, /Browse marketplace/);
   assert.match(dash, /fetchMarketplaceListings/);
+});
+
+test('listings default limit is 100; TUI browse does not cap at 24', async () => {
+  const cli = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
+  const dash = fs.readFileSync(path.join(__dirname, '../src/dashboard.js'), 'utf8');
+  const listings = cli.slice(cli.indexOf(".command('listings')"), cli.indexOf(".command('listings')") + 1200);
+  assert.match(listings, /\.option\('--limit <n>', 'Max rows', '100'\)/);
+  assert.doesNotMatch(dash, /limit:\s*24/);
+
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(String(url));
+    return { ok: true, json: async () => ({ data: new Array(27).fill(0).map((_, i) => ({
+      id: `s${i}`, verusId: `i${i}`, kind: 'agent', serviceType: 'agent', price: 1,
+    })), meta: { total: 27 } }) };
+  };
+  const result = await fetchMarketplaceListings({ apiUrl: 'https://api.example', fetchImpl });
+  assert.equal(result.rows.length, 27);
+  assert.equal(result.total, 27);
+  assert.match(calls[0], /limit=100/);
 });

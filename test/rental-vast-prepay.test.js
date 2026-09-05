@@ -21,8 +21,14 @@ test('Vast acquire refused until payment_verified', () => {
   assert.doesNotThrow(() => assertPaidBeforePaidProvision({ job: { payment: { verified: true } }, provider: vastLike }));
 });
 
-test('home-gpu may acquire without payment_verified (no outbound USD)', () => {
-  assert.doesNotThrow(() => assertPaidBeforePaidProvision({ job: { payment: { verified: false } }, provider: homeLike }));
+test('home-gpu refuses acquire without payment_verified', () => {
+  assert.throws(
+    () => assertPaidBeforePaidProvision({ job: { payment: { verified: false } }, provider: homeLike }),
+    /PREPAY_REQUIRED/,
+  );
+  assert.doesNotThrow(() => assertPaidBeforePaidProvision({
+    job: { payment: { verified: true } }, provider: homeLike,
+  }));
 });
 
 test('Vast postpay ack allows acquire before pay (Alice risk)', () => {

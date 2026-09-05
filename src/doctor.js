@@ -166,12 +166,36 @@ function redact(s) {
     .replace(/\bUw[A-Za-z0-9]{20,}/g, '[redacted]');
 }
 
+const PASTE_ARGV_PREFIXES = [
+  'j41-dispatcher ',
+  'sudo ',
+  'nvm ',
+  'open -a ',
+  'wsl.exe',
+  'newgrp ',
+  'docker ',
+];
+
+function firstPasteCommand(block) {
+  for (const row of String(block || '').split('\n')) {
+    const t = row.trim();
+    if (!t || t.startsWith('#')) continue;
+    if (PASTE_ARGV_PREFIXES.some((p) => t.startsWith(p))) return t;
+  }
+  return null;
+}
+
 function pickNext(checks) {
   const fails = checks.filter((c) => c.status === 'fail');
   const warns = checks.filter((c) => c.status === 'warn');
   const hit = fails[0] || warns.find((c) => ['llm', 'identity', 'image.job-agent', 'fee-tank'].includes(c.id)) || warns[0];
   if (!hit) return { nextCommand: 'j41-dispatcher start', copyPasteBlock: null };
-  return { nextCommand: hit.nextCommand, copyPasteBlock: hit.copyPasteBlock };
+  let nextCommand = hit.nextCommand || firstPasteCommand(hit.copyPasteBlock) || 'j41-dispatcher doctor';
+  const dockerFail = fails.some((c) => String(c.id).startsWith('docker.'));
+  if (dockerFail && /j41-dispatcher start/.test(String(nextCommand))) {
+    nextCommand = 'j41-dispatcher doctor';
+  }
+  return { nextCommand, copyPasteBlock: hit.copyPasteBlock };
 }
 
 function dockerCandidates(deps, osInfo) {
@@ -191,6 +215,17 @@ function sockExists(p, deps) {
   if (typeof deps.dockerSockExists === 'function') return deps.dockerSockExists(p);
   if (p.startsWith('//./pipe/')) return true;
   try { return deps.fs.existsSync(p); } catch { return false; }
+}
+
+function defaultSockDetail(deps, osInfo, dockerHost) {
+  if (dockerHost) return dockerHost;
+  if (osInfo.platform === 'win32') return '//./pipe/docker_engine';
+  const cands = dockerCandidates(deps, osInfo);
+  if (osInfo.platform === 'darwin') {
+    const found = cands.find((p) => sockExists(p, deps));
+    return found || cands[0];
+  }
+  return '/var/run/docker.sock';
 }
 
 function runExec(deps, cmd, extraEnv) {
@@ -318,7 +353,7 @@ async function runDoctor(opts = {}) {
   } else if (osInfo.platform === 'darwin' && !osInfo.supported) {
     checks.push(mkCheck('os', 'OS', 'fail',
       `macOS ${osInfo.macOSMajor != null ? osInfo.macOSMajor : '?'} (need 14 / Darwin 23+)`,
-      null,
+      'j41-dispatcher doctor',
       'macOS 14+ (Sonoma) and Docker Desktop are required. Current Docker Desktop does not support this macOS.'));
   } else if (osInfo.platform === 'win32' && !osInfo.supported) {
     checks.push(mkCheck('os', 'OS', 'fail',
@@ -367,12 +402,16 @@ async function runDoctor(opts = {}) {
     checks.push(mkCheck('docker.cli', 'Docker CLI', 'pass', ver.split('\n')[0]));
   } catch {
     const block = osInfo.platform === 'darwin'
-      ? 'Install Docker Desktop: https://docs.docker.com/desktop/setup/install/mac-install/\nOpen Docker.app and wait until docker info works.'
+      ? 'Install Docker Desktop: https://docs.docker.com/desktop/setup/install/mac-install/\nopen -a Docker\n# wait until docker info works'
       : osInfo.platform === 'win32'
-        ? 'Install Docker Desktop with the WSL2 backend. Start it, then retry.'
+        ? 'Install Docker Desktop with the WSL2 backend. Start it, then retry.\nwsl.exe -e docker info'
         : 'sudo apt install docker.io   # or the distro block from docs/plans/2026-09-04-distro-operability.md\nsudo usermod -aG docker "$USER"\n# then open a new terminal';
-    checks.push(mkCheck('docker.cli', 'Docker CLI', 'fail', 'not found',
-      osInfo.platform === 'linux' ? 'sudo apt install docker.io' : null, block));
+    const next = osInfo.platform === 'darwin'
+      ? 'open -a Docker'
+      : osInfo.platform === 'win32'
+        ? 'wsl.exe -e docker info'
+        : 'sudo apt install docker.io';
+    checks.push(mkCheck('docker.cli', 'Docker CLI', 'fail', 'not found', next, block));
   }
 
   if (cliOk) {
@@ -400,7 +439,7 @@ async function runDoctor(opts = {}) {
       checks.push(mkCheck('docker.daemon', 'Docker daemon', 'pass',
         dockerHost ? `running  (${dockerHost})` : 'running'));
       checks.push(mkCheck('docker.sock', 'Docker sock', 'pass',
-        dockerHost || (osInfo.platform === 'win32' ? '//./pipe/docker_engine' : '/var/run/docker.sock')));
+        defaultSockDetail(deps, osInfo, dockerHost)));
       if (osInfo.platform === 'linux') {
         checks.push(mkCheck('docker.group', 'Docker group', 'pass', 'can talk to the daemon'));
       } else {
@@ -409,29 +448,45 @@ async function runDoctor(opts = {}) {
       dockerClass = 'ok';
     } else if (info.class === 'eacces') {
       dockerClass = 'eacces';
+      const sockPath = defaultSockDetail(deps, osInfo, dockerHost);
       checks.push(mkCheck('docker.daemon', 'Docker daemon', 'pass', 'installed; this session cannot use the socket'));
-      checks.push(mkCheck('docker.sock', 'Docker sock', 'pass', '/var/run/docker.sock exists (permission denied)'));
-      checks.push(mkCheck('docker.group', 'Docker group', 'fail',
-        'this login is not in group docker (EACCES). A new terminal or `newgrp docker` is required — Docker is not missing.',
-        'newgrp docker',
-        'id -nG   # must list docker\nnewgrp docker\n# or close this terminal and open a new one, then:\nj41-dispatcher doctor'));
+      if (osInfo.platform === 'linux') {
+        checks.push(mkCheck('docker.sock', 'Docker sock', 'pass', `${sockPath} exists (permission denied)`));
+        checks.push(mkCheck('docker.group', 'Docker group', 'fail',
+          'this login is not in group docker (EACCES). A new terminal or `newgrp docker` is required — Docker is not missing.',
+          'newgrp docker',
+          'id -nG   # must list docker\nnewgrp docker\n# or close this terminal and open a new one, then:\nj41-dispatcher doctor'));
+      } else {
+        const next = osInfo.platform === 'darwin' ? 'open -a Docker' : 'wsl.exe -e docker info';
+        checks.push(mkCheck('docker.sock', 'Docker sock', 'fail',
+          `${sockPath} permission denied`, next, next));
+        checks.push(mkCheck('docker.group', 'Docker group', 'skip', `n/a (${osInfo.platform})`));
+      }
     } else if (info.class === 'enoent') {
       dockerClass = 'enoent';
+      const sockPath = defaultSockDetail(deps, osInfo, dockerHost);
       const hint = osInfo.platform === 'darwin'
-        ? 'Start Docker Desktop and wait until the whale is steady.'
+        ? 'open -a Docker'
         : osInfo.platform === 'win32'
-          ? 'Start Docker Desktop (WSL2 backend).'
+          ? 'wsl.exe -e docker info'
           : 'sudo systemctl enable --now docker';
-      checks.push(mkCheck('docker.daemon', 'Docker daemon', 'fail', 'not running or sock missing', hint, hint));
+      const paste = osInfo.platform === 'darwin'
+        ? 'open -a Docker\ndocker info'
+        : osInfo.platform === 'win32'
+          ? 'wsl.exe -e docker info'
+          : hint;
+      checks.push(mkCheck('docker.daemon', 'Docker daemon', 'fail', 'not running or sock missing', hint, paste));
       checks.push(mkCheck('docker.sock', 'Docker sock', 'fail',
-        'ENOENT on the Docker socket', hint, hint));
-      checks.push(mkCheck('docker.group', 'Docker group', osInfo.platform === 'linux' ? 'skip' : 'skip',
+        `${sockPath} missing (ENOENT)`, hint, paste));
+      checks.push(mkCheck('docker.group', 'Docker group', 'skip',
         'n/a until the daemon is listening'));
     } else {
       dockerClass = 'daemon-down';
       const hint = osInfo.platform === 'darwin'
-        ? 'Start Docker Desktop.'
-        : 'sudo systemctl start docker';
+        ? 'open -a Docker'
+        : osInfo.platform === 'win32'
+          ? 'wsl.exe -e docker info'
+          : 'sudo systemctl start docker';
       checks.push(mkCheck('docker.daemon', 'Docker daemon', 'fail',
         redact(info.err && info.err.message) || 'docker info failed', hint, hint));
       checks.push(mkCheck('docker.sock', 'Docker sock', 'fail', 'could not reach the engine', hint, hint));
@@ -586,7 +641,7 @@ async function runDoctor(opts = {}) {
       const driver = deps.dockerDriver || 'unknown';
       checks.push(mkCheck('gpu.storage', 'GPU storage', 'fail',
         `host docker cannot cap disk_gb (driver ${driver}; need overlay2 over XFS -o prjquota, or btrfs/zfs)`,
-        null,
+        'j41-dispatcher doctor',
         'Linux NVIDIA hosts only. Do not auto-rewrite daemon.json from install.\nNeed classic overlay2 + XFS prjquota (or btrfs/zfs), and Docker 29 must set\n  "storage-driver": "overlay2"\n  "features": { "containerd-snapshotter": false }\nSee docs/plans/2026-09-04-distro-operability.md'));
     }
   }
@@ -611,18 +666,13 @@ async function runDoctor(opts = {}) {
 function formatDoctorTable(report) {
   const icon = { pass: '✓', warn: '⚠', fail: '✗', skip: ' ' };
   const lines = ['j41-dispatcher doctor', ''];
-  const show = report.checks.filter((c) => c.status !== 'skip' || c.id.startsWith('gpu.'));
-  const nameWidth = Math.max(18, ...show.map((c) => c.name.length));
+  const show = report.checks.filter((c) => c.status !== 'skip');
+  const nameWidth = Math.max(18, ...show.map((c) => c.name.length), 3);
   for (const c of show) {
-    if (c.status === 'skip' && c.id.startsWith('gpu.') && report.os && report.os.platform === 'linux' && !report.gpuOffered) {
-      // still show a one-line GPU skip on non-linux in the summary below
-    }
-    if (c.status === 'skip' && !c.id.startsWith('gpu.')) continue;
-    if (c.status === 'skip' && c.id.startsWith('gpu.') && report.os && report.os.platform === 'linux') continue;
     lines.push(`  ${c.name.padEnd(nameWidth)} ${c.detail}`);
   }
   if (report.os && report.os.platform !== 'linux') {
-    lines.push(`  ${'GPU'.padEnd(nameWidth)} skipped (linux NVIDIA chapter)`);
+    lines.push(`  ${'GPU'.padEnd(nameWidth)} skipped (Linux NVIDIA hosts only — Mac/Windows cannot sell Cat-1)`);
   }
   lines.push('');
   for (const c of report.checks) {
@@ -631,7 +681,10 @@ function formatDoctorTable(report) {
   }
   lines.push('');
   lines.push('Next:');
-  lines.push(`  ${report.nextCommand || 'j41-dispatcher start'}`);
+  const dockerFail = (report.checks || []).some((c) => c.status === 'fail' && String(c.id).startsWith('docker.'));
+  let next = report.nextCommand || 'j41-dispatcher doctor';
+  if (dockerFail && /j41-dispatcher start/.test(String(next))) next = 'j41-dispatcher doctor';
+  lines.push(`  ${next}`);
   if (report.copyPasteBlock) {
     lines.push('');
     lines.push('Copy-paste:');
@@ -643,6 +696,20 @@ function formatDoctorTable(report) {
 function dockerAdviceFromError(err, platform) {
   const cls = classifyDockerError(err);
   if (cls === 'eacces') {
+    if (platform === 'darwin') {
+      return {
+        class: cls,
+        message: 'Docker is installed but this session cannot use the Desktop socket. Run: open -a Docker',
+        nextCommand: 'open -a Docker',
+      };
+    }
+    if (platform === 'win32') {
+      return {
+        class: cls,
+        message: 'Docker is installed but this session cannot use the engine. Retry: wsl.exe -e docker info',
+        nextCommand: 'wsl.exe -e docker info',
+      };
+    }
     return {
       class: cls,
       message: 'Docker is installed but this session cannot use /var/run/docker.sock (not in group docker). Open a new terminal or run: newgrp docker',
@@ -650,17 +717,18 @@ function dockerAdviceFromError(err, platform) {
     };
   }
   if (cls === 'enoent') {
-    const msg = platform === 'darwin'
-      ? 'Docker socket missing — start Docker Desktop.'
-      : platform === 'win32'
-        ? 'Docker engine not reachable — start Docker Desktop (WSL2 backend).'
-        : 'Docker daemon is not running. Start it with: sudo systemctl start docker';
-    return { class: cls, message: msg, nextCommand: platform === 'linux' ? 'sudo systemctl start docker' : null };
+    if (platform === 'darwin') {
+      return { class: cls, message: 'Docker socket missing — run: open -a Docker', nextCommand: 'open -a Docker' };
+    }
+    if (platform === 'win32') {
+      return { class: cls, message: 'Docker engine not reachable — retry: wsl.exe -e docker info', nextCommand: 'wsl.exe -e docker info' };
+    }
+    return { class: cls, message: 'Docker daemon is not running. Start it with: sudo systemctl start docker', nextCommand: 'sudo systemctl start docker' };
   }
   return {
     class: cls,
     message: `Docker error: ${err && err.message ? err.message : err}. Do not switch to local mode for public jobs.`,
-    nextCommand: null,
+    nextCommand: platform === 'darwin' ? 'open -a Docker' : platform === 'win32' ? 'wsl.exe -e docker info' : 'j41-dispatcher doctor',
   };
 }
 
@@ -675,4 +743,5 @@ module.exports = {
   detectOs,
   dockerAdviceFromError,
   loadFeeTankRows,
+  firstPasteCommand,
 };

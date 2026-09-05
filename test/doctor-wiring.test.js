@@ -30,6 +30,11 @@ test('dashboard header does not say N registered', () => {
   assert.doesNotMatch(DASH, /View listings \(\$\{agents\.length\} registered\)/);
 });
 
+test('TUI [1] is View agents (local fleet), not View listings (marketplace)', () => {
+  assert.match(DASH, /View agents \(/);
+  assert.doesNotMatch(DASH, /View listings \(/);
+});
+
 test('dashboard Start does not log to /tmp/dispatcher.log', () => {
   assert.doesNotMatch(DASH, /openSync\('\/tmp\/dispatcher\.log'/);
   assert.match(DASH, /dispatcher\.log/);

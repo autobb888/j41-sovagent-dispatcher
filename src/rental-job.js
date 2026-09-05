@@ -27,13 +27,15 @@ function assertProviderCanSsh(provider) {
 // Vast (canProvision && isElastic) starts billing Alice on acquire. Refuse until
 // the buyer payment is verified, unless she persisted rentalAckPostpayVastRisk.
 // home-gpu is canProvision true, isElastic false → skip (no outbound USD).
-function assertPaidBeforePaidProvision({ job, provider, ackPostpayVastRisk }) {
-  const paid = !!(job && job.payment && job.payment.verified);
-  const outbound = !!(provider && provider.capabilities && provider.capabilities.canProvision && provider.capabilities.isElastic);
-  if (!outbound) return;
-  if (paid) return;
+function assertPaidBeforePaidProvision({ job, provider, ackPostpayVastRisk, allowUnpriced }) {
+  const { jobPaymentReady } = require('./job-payment');
+  if (jobPaymentReady(job, { allowUnpriced: !!allowUnpriced })) return;
   if (ackPostpayVastRisk) return;
-  throw new Error('VAST_PREPAY_REQUIRED: refusing Vast acquire before payment_verified');
+  const outbound = !!(provider && provider.capabilities && provider.capabilities.canProvision && provider.capabilities.isElastic);
+  if (outbound) {
+    throw new Error('VAST_PREPAY_REQUIRED: refusing Vast acquire before payment_verified');
+  }
+  throw new Error('PREPAY_REQUIRED: refusing rental acquire before payment_verified');
 }
 
 function hasSshCredential(ssh) {

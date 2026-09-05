@@ -34,15 +34,12 @@ function assertHireAllowed({ sellerKind, serviceType, serviceId }) {
     }
     return { ok: true };
   }
-  if (kind === 'model') {
-    if (!serviceId || serviceType !== 'api-endpoint') {
-      return {
-        ok: false,
-        code: 'MODEL_REQUIRES_API_ENDPOINT',
-        message: 'Model listings are hired as api-endpoint (metered inference), not labour jobs.',
-      };
-    }
-    return { ok: true };
+  if (kind === 'model' || serviceType === 'api-endpoint') {
+    return {
+      ok: false,
+      code: 'MODEL_NOT_A_LABOUR_JOB',
+      message: 'Model / api-endpoint listings are metered inference, not labour jobs. Use POST /v1/proxy/access/:sellerVerusId — dispatcher hire will not POST /v1/jobs.',
+    };
   }
   return { ok: true };
 }
@@ -110,11 +107,11 @@ function defaultServiceTypeForKind(kind) {
 }
 
 async function fetchMarketplaceListings({
-  apiUrl, kind, serviceType, q, limit = 20, fetchImpl,
+  apiUrl, kind, serviceType, q, limit = 100, fetchImpl,
 } = {}) {
   const base = String(apiUrl || '').replace(/\/+$/, '');
   if (!base) throw new Error('API URL missing');
-  const lim = Math.min(Math.max(parseInt(String(limit), 10) || 20, 1), 100);
+  const lim = Math.min(Math.max(parseInt(String(limit), 10) || 100, 1), 100);
   const doFetch = fetchImpl || globalThis.fetch;
   if (typeof doFetch !== 'function') throw new Error('fetch is not available');
 
