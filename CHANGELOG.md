@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.37.2 — 2026-09-05
+
+### Buyer lifecycle + first-run polish (tester 2026-09-05)
+
+- `j41-dispatcher pay <buyer> <job-id>` for jobs created without `--pay`.
+  `hire --pay` stamps `wallet-pending.json` and refuses `PAY_PENDING` until
+  the spent UTXO drops (`--force` / `pay --wait`).
+- `complete` and `review --rating N`. Review is fail-closed until the
+  platform emits `J41-REVIEW|` (`reviews.j41-review-v2`). Prints
+  `getJobWitness`; does not write buyer VDXF.
+- Unpaid `accepted` does **not** start labour or a GPU jail
+  (`jobPaymentReady` on poll, webhook, `startJob` / `startRentalJobWired`;
+  home-gpu acquire throws `PREPAY_REQUIRED`). Stacked accept without coins
+  stays allowed.
+- Model / `api-endpoint` listings refuse `POST /v1/jobs`
+  (`MODEL_NOT_A_LABOUR_JOB`).
+- Darwin doctor Next is a real command (`open -a Docker`), never
+  `Start Docker Desktop` / `j41-dispatcher start` on a docker fail. GPU
+  table is one skip line on Mac/Windows. `listings` default `--limit` 100.
+  TUI `[1]` is View agents. `setup` exits 0 on indexer lag after mint
+  (wait then `finalize`).
+
 ## 2.37.1 — 2026-09-04
 
 ### Onboarding 2.0 leftovers (tester retest of 2.37.0)
