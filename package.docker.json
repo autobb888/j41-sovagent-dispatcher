@@ -10,6 +10,13 @@
     "@iarna/toml": "^2.2.5",
     "@junction41/sovagent-sdk": "2.14.1",
     "bn.js": "^5.2.0",
+    "json-canonicalize": "2.0.0",
     "undici": "^5.29.0"
+  },
+  "resolutions": {
+    "json-canonicalize": "2.0.0"
+  },
+  "overrides": {
+    "json-canonicalize": "2.0.0"
   }
 }
