@@ -148,8 +148,16 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
         res.end(JSON.stringify(envelope));
       } catch (e) {
         console.error(`[Discovery] Access request failed: ${e.message}`);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Access request failed' }));
+        const code = e && e.code;
+        let status = 500;
+        if (code === 'ACCESS_NOT_API_ENDPOINT') status = 400;
+        else if (code === 'ENVELOPE_NO_PUBLIC_URL' || code === 'ENVELOPE_UPSTREAM_URL' || code === 'ENVELOPE_BAD_PUBLIC_URL') status = 503;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        if (status === 500) {
+          res.end(JSON.stringify({ error: 'Access request failed' }));
+        } else {
+          res.end(JSON.stringify({ error: e.message || 'Access request failed', code }));
+        }
       }
       return;
     }

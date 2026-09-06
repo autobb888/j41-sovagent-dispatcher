@@ -11,6 +11,26 @@
 const fs = require('fs');
 const path = require('path');
 const { planPlatformSigner, applyPlatformSigner } = require('./platform-signer');
+const { assertAccessAllowed } = require('./hire');
+const {
+  isDispatcherProxyBase,
+  resolveListingDispatcherBase,
+  callProxiedPath,
+} = require('./buyer-proxy-url');
+
+const GRANT_UPSTREAM_MESSAGE = 'Grant endpointUrl is the upstream, not the seller proxy. Re-run: j41-dispatcher access <buyer> <seller>';
+
+function listingPublicUrlHint(listing) {
+  if (!listing || typeof listing !== 'object') return null;
+  const endpoints = listing.networkEndpoints
+    || (listing.network && listing.network.endpoints)
+    || (listing.profile && listing.profile.network && listing.profile.network.endpoints);
+  if (Array.isArray(endpoints) && endpoints[0]) return String(endpoints[0]);
+  const website = listing.website
+    || (listing.profile && listing.profile.website)
+    || (listing.profile && listing.profile.profile && listing.profile.profile.website);
+  return website ? String(website) : null;
+}
 
 function errorCode(err) {
   if (!err) return 'ACCESS_FAILED';
@@ -69,6 +89,9 @@ async function requestAndOpenAccess({
   apiUrl,
   signer,
   sdk,
+  services,
+  sellerKind,
+  serviceType,
 } = {}) {
   const plan = applyPlatformSigner(planPlatformSigner({
     apiUrl,
@@ -93,6 +116,9 @@ async function requestAndOpenAccess({
   if (!keys || !keys.wif) {
     return { ok: false, code: 'BUYER_NOT_REGISTERED', message: 'Buyer WIF is required to sign the access request.' };
   }
+
+  const gate = assertAccessAllowed({ sellerKind, services, serviceType });
+  if (!gate.ok) return gate;
 
   const eph = generateEphemeralKeypair();
   const request = buildAccessRequest(keys.wif, seller, eph.publicKey, network);
@@ -144,7 +170,19 @@ async function requestAndOpenAccess({
   }
 }
 
-async function chatCompletions({ client, grant, message, model, timeoutMs } = {}) {
+async function chatCompletions({
+  client,
+  grant,
+  message,
+  model,
+  timeoutMs,
+  publicUrlHint,
+  listing,
+  agentsDir,
+  buyerId,
+  seller,
+  fetchImpl,
+} = {}) {
   if (!grant || !grant.apiKey || !grant.endpointUrl) {
     return { ok: false, code: 'ACCESS_GRANT_MISSING', message: 'No decrypted access grant. Run access first.' };
   }
@@ -154,11 +192,35 @@ async function chatCompletions({ client, grant, message, model, timeoutMs } = {}
   if (!client || typeof client.callProxied !== 'function') {
     return { ok: false, code: 'ACCESS_CLIENT_MISSING', message: 'Authenticated client is required.' };
   }
-  const useModel = model || (grant.models && grant.models[0]) || 'default';
+
+  let working = grant;
+  if (!isDispatcherProxyBase(working.endpointUrl)) {
+    const hint = publicUrlHint || listingPublicUrlHint(listing);
+    if (!hint) {
+      return { ok: false, code: 'ACCESS_GRANT_UPSTREAM', message: GRANT_UPSTREAM_MESSAGE };
+    }
+    let minted;
+    try {
+      minted = await resolveListingDispatcherBase(hint, {
+        grant: working,
+        fetchImpl,
+        failCode: 'ACCESS_GRANT_UPSTREAM',
+      });
+    } catch {
+      return { ok: false, code: 'ACCESS_GRANT_UPSTREAM', message: GRANT_UPSTREAM_MESSAGE };
+    }
+    working = { ...working, endpointUrl: minted };
+    if (agentsDir && buyerId && seller) {
+      try { saveAccessGrant(agentsDir, buyerId, seller, working); } catch { /* proceed in memory */ }
+    }
+  }
+
+  const useModel = model || (working.models && working.models[0]) || 'default';
   try {
     const result = await client.callProxied({
-      endpointUrl: grant.endpointUrl,
-      apiKey: grant.apiKey,
+      endpointUrl: working.endpointUrl,
+      apiKey: working.apiKey,
+      path: callProxiedPath(working.endpointUrl),
       body: {
         model: useModel,
         messages: [{ role: 'user', content: String(message) }],
@@ -167,6 +229,24 @@ async function chatCompletions({ client, grant, message, model, timeoutMs } = {}
     });
     return { ok: true, model: useModel, result };
   } catch (e) {
+    if (e && e.statusCode === 402) {
+      const body = (e.responseBody && typeof e.responseBody === 'object') ? e.responseBody : {};
+      const headers = e.responseHeaders || {};
+      const suggested = headers['x-j41-credit-suggestedtopup']
+        || headers['X-J41-Credit-SuggestedTopup']
+        || body.suggestedTopup
+        || null;
+      return {
+        ok: false,
+        code: 'CHAT_NEEDS_DEPOSIT',
+        message: e.message || 'Insufficient credit. Deposit VRSC to the seller i-address then retry chat.',
+        topupAddress: body.topupAddress || null,
+        estimatedCost: body.estimatedCost,
+        balance: body.balance,
+        suggestedTopup: suggested,
+        depositArgv: 'j41-dispatcher deposit <buyer> <seller> --amount <n>',
+      };
+    }
     return { ok: false, code: 'CHAT_FAILED', message: e.message || String(e) };
   }
 }
@@ -176,6 +256,7 @@ module.exports = {
   saveAccessGrant,
   loadAccessGrant,
   redactApiKey,
+  listingPublicUrlHint,
   requestAndOpenAccess,
   chatCompletions,
 };

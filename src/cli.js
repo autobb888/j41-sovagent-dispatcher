@@ -3316,6 +3316,23 @@ program
     const say = (line) => { if (!options.json) console.log(line); };
     if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
     const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    const { assertAccessAllowed } = require('./hire.js');
+    let services = [];
+    let sellerKind = null;
+    try {
+      const listing = await agent.client.getAgent(seller);
+      sellerKind = listing && (listing.kind || listing.listingKind);
+      if (listing && Array.isArray(listing.services)) services = listing.services;
+      if (typeof agent.client.getAgentServices === 'function') {
+        const svcResp = await agent.client.getAgentServices(
+          (listing && (listing.id || listing.iAddress || listing.verusId)) || seller,
+        );
+        const data = svcResp && (svcResp.data || svcResp);
+        if (Array.isArray(data)) services = data;
+      }
+    } catch { /* fail closed via assertAccessAllowed */ }
+    const gate = assertAccessAllowed({ sellerKind, services });
+    if (!gate.ok) fail(gate.code, gate.message);
     const {
       requestAndOpenAccess, saveAccessGrant, redactApiKey,
     } = require('./buyer-access');
@@ -3329,6 +3346,8 @@ program
       apiUrl: J41_API_URL,
       signer: cfgSigner,
       sdk,
+      services,
+      sellerKind,
     });
     if (!opened.ok) fail(opened.code, opened.message, { testnetSigner: opened.testnetSigner || null });
     const grant = saveAccessGrant(AGENTS_DIR, buyerAgentId, seller, opened.payload);
@@ -3365,7 +3384,25 @@ program
       requestAndOpenAccess, saveAccessGrant, loadAccessGrant, chatCompletions,
     } = require('./buyer-access');
     let grant = loadAccessGrant(AGENTS_DIR, buyerAgentId, seller);
+    let listing = null;
+    let services = [];
+    let sellerKind = null;
+    try {
+      listing = await agent.client.getAgent(seller);
+      sellerKind = listing && (listing.kind || listing.listingKind);
+      if (listing && Array.isArray(listing.services)) services = listing.services;
+      if (typeof agent.client.getAgentServices === 'function') {
+        const svcResp = await agent.client.getAgentServices(
+          (listing && (listing.id || listing.iAddress || listing.verusId)) || seller,
+        );
+        const data = svcResp && (svcResp.data || svcResp);
+        if (Array.isArray(data)) services = data;
+      }
+    } catch { /* listing hint is best-effort for stale NVIDIA grants */ }
     if (!grant) {
+      const { assertAccessAllowed } = require('./hire.js');
+      const gate = assertAccessAllowed({ sellerKind, services });
+      if (!gate.ok) fail(gate.code, gate.message);
       const sdk = require('@junction41/sovagent-sdk/dist/index.js');
       const cfgSigner = (cfg.platform && cfg.platform.signer) || process.env.J41_PLATFORM_SIGNER;
       const opened = await requestAndOpenAccess({
@@ -3376,6 +3413,8 @@ program
         apiUrl: J41_API_URL,
         signer: cfgSigner,
         sdk,
+        services,
+        sellerKind,
       });
       if (!opened.ok) fail(opened.code, opened.message, { testnetSigner: opened.testnetSigner || null });
       grant = saveAccessGrant(AGENTS_DIR, buyerAgentId, seller, opened.payload);
@@ -3386,8 +3425,20 @@ program
       grant,
       message: options.message,
       model: options.model,
+      listing,
+      agentsDir: AGENTS_DIR,
+      buyerId: buyerAgentId,
+      seller,
     });
-    if (!chat.ok) fail(chat.code, chat.message);
+    if (!chat.ok) {
+      fail(chat.code, chat.message, {
+        topupAddress: chat.topupAddress,
+        estimatedCost: chat.estimatedCost,
+        balance: chat.balance,
+        suggestedTopup: chat.suggestedTopup,
+        depositArgv: chat.depositArgv,
+      });
+    }
     const body = chat.result && chat.result.body;
     const text = body && body.choices && body.choices[0] && body.choices[0].message
       ? body.choices[0].message.content
@@ -5352,6 +5403,7 @@ program
         const { mintAccessEnvelope, verifyAccessRequest } = require('@junction41/sovagent-sdk/dist/crypto/envelope.js');
         const { validateEnvelope, canonicalBytes, verifyCanonicalSignatures, CanonicalError } = require('@junction41/sovagent-sdk/dist/crypto/canonical.js');
         const { mintApiKey } = require('./api-key-manager');
+        const { mintBuyerProxyBase, hostsEqual, codedError } = require('./buyer-proxy-url');
 
         const agentConfigs = new Map();
         for (const a of apiAgents) {
@@ -5379,8 +5431,21 @@ program
             // failed with no indication why. Accept both names; `apiEndpointAuth` is
             // what `api-setup --upstream-auth` writes.
             const upstreamAuth = apiSvc.upstreamAuth || localCfg.upstreamAuth || localCfg.apiEndpointAuth || '';
+            const profile = cap && cap.profile;
+            const vdxfEndpoints = profile && profile.network && profile.network.endpoints;
+            const vdxfWebsite = profile && profile.profile && profile.profile.website;
+            let publicUrl;
+            for (const c of [
+              localCfg.publicUrl,
+              options.webhookUrl,
+              Array.isArray(vdxfEndpoints) ? vdxfEndpoints[0] : null,
+              vdxfWebsite,
+            ]) {
+              if (c != null && String(c).trim()) { publicUrl = String(c).trim(); break; }
+            }
             agentConfigs.set(a.id, {
               endpointUrl: apiSvc.endpointUrl,
+              publicUrl,
               modelPricing,
               rateLimits,
               identity: a.identity,
@@ -5388,7 +5453,17 @@ program
               payAddress: a.iAddress || a.address,
               upstreamAuth,
             });
-            console.log(`  API Proxy: ${a.id} (${a.identity}) → ${apiSvc.endpointUrl} (${modelPricing.length} model(s) priced)`);
+            let egressHost = apiSvc.endpointUrl || '';
+            try { egressHost = new URL(apiSvc.endpointUrl).hostname; } catch {}
+            let buyerUrl = null;
+            if (publicUrl) {
+              try { buyerUrl = mintBuyerProxyBase(publicUrl); } catch { buyerUrl = null; }
+            }
+            if (buyerUrl) {
+              console.log(`  API Proxy: ${a.id} (${a.identity}) egress ${egressHost}  buyer ${buyerUrl}`);
+            } else {
+              console.log(`  API Proxy: ${a.id} (${a.identity}) egress ${egressHost}  buyer UNREACHABLE — set publicUrl / --webhook-url; refusing to mint`);
+            }
           }
         }
 
@@ -5445,8 +5520,18 @@ program
               a.iAddress === accessRequest.sellerVerusId || a.identity === accessRequest.sellerVerusId
             );
             if (!sellerAgent) throw new Error('Seller not found on this dispatcher');
+            const cap = state.capabilities.get(sellerAgent.id);
+            const api = (cap && cap.services || []).some((s) => s && s.serviceType === 'api-endpoint');
+            if (!api) throw codedError('ACCESS_NOT_API_ENDPOINT', 'Seller has no api-endpoint service');
             const cfg = agentConfigs.get(sellerAgent.id);
-            if (!cfg) throw new Error('Seller has no api-endpoint service');
+            if (!cfg) throw codedError('ACCESS_NOT_API_ENDPOINT', 'Seller has no api-endpoint service');
+            if (!cfg.publicUrl) {
+              throw codedError('ENVELOPE_NO_PUBLIC_URL', 'publicUrl is required to mint a buyer proxy envelope; set agent-config publicUrl or --webhook-url');
+            }
+            const minted = mintBuyerProxyBase(cfg.publicUrl);
+            if (hostsEqual(minted, cfg.endpointUrl)) {
+              throw codedError('ENVELOPE_UPSTREAM_URL', 'publicUrl host is the upstream');
+            }
 
             // Verify buyer's signature locally. Fail-closed, no escape hatch, no trust delegation.
             //
@@ -5490,7 +5575,7 @@ program
             // Build encrypted envelope
             const payload = {
               apiKey: keyRecord.key,
-              endpointUrl: cfg.endpointUrl,
+              endpointUrl: minted,
               expiresAt: keyRecord.expiresAt,
               models: (cfg.modelPricing || []).map(p => p.model),
               modelPricing: cfg.modelPricing,
