@@ -1203,7 +1203,7 @@ async function _reconcileLocked(agentId, client, now, emit) {
     // of a credit that was never reversed. Keep the dedup entry; the reversed
     // ledger row still records what happened, and _recheckReversals already
     // refuses to auto-restore a `debited !== true` entry for the same reason.
-    fresh.reversed = fresh.reversed || [];
+    if (!Array.isArray(fresh.reversed)) fresh.reversed = [];
     fresh.reversed.push({
       txid: live.txid,
       buyerVerusId: live.buyerVerusId,
