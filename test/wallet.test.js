@@ -11,6 +11,7 @@ const {
   planManualSweep,
   planFleetSend,
   executeSend,
+  txConfirmations,
 } = require('../src/wallet.js');
 
 const {
@@ -599,4 +600,33 @@ test('the refusal is what stops the drain: a disputed address never reaches summ
 
   // ...which is exactly why the address must never get that far.
   assert.strictEqual(resolveOwnRAddress({ derived: R, platformAddress: OTHER }).ok, false);
+});
+
+// ---------------------------------------------------------------------------
+// txConfirmations — coerce getTxStatus shapes; never unlink on confirmed+0
+// ---------------------------------------------------------------------------
+
+test('txConfirmations: confirmed+0 is still unconfirmed', () => {
+  assert.strictEqual(txConfirmations({ confirmations: 0, confirmed: true }), 0);
+});
+
+test('txConfirmations: string confirmations coerce', () => {
+  assert.strictEqual(txConfirmations({ confirmations: '2' }), 2);
+});
+
+test('txConfirmations: confirmed:true with no confirmations key counts as 1', () => {
+  assert.strictEqual(txConfirmations({ confirmed: true }), 1);
+});
+
+test('txConfirmations: nested data unwrap when the outer object has no confirmations key', () => {
+  assert.strictEqual(txConfirmations({ data: { confirmations: 3 } }), 3);
+});
+
+test('txConfirmations: garbage and missing status are 0 (fail closed)', () => {
+  assert.strictEqual(txConfirmations(null), 0);
+  assert.strictEqual(txConfirmations(undefined), 0);
+  assert.strictEqual(txConfirmations('3'), 0);
+  assert.strictEqual(txConfirmations({}), 0);
+  assert.strictEqual(txConfirmations({ confirmations: '' }), 0);
+  assert.strictEqual(txConfirmations({ confirmations: 'nope' }), 0);
 });
