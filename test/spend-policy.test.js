@@ -198,3 +198,64 @@ test('B2: a payment does not deplete the same job\'s refund budget', () => {
   const r = SP.gateExternalSend({ jobId: 'sharedjob', toAddress: 'iBuyerB2', amount: 0.5, jobPrice: 1, kind: 'refund' });
   assert.equal(r.allowed, true, 'the refund budget must be independent of payments to the same job');
 });
+
+test('deposit kind is known/external and expectedRecipients is i-address only', () => {
+  SP._resetDispatcherRateLimit(false);
+  assert.equal(SP.EXTERNAL_KINDS.has('deposit'), true);
+  const iAddr = 'iSellerDepositAddr';
+  const rAddr = 'RSellerDepositAddr';
+  const ok = SP.gateExternalSend({
+    jobId: 'seller.agentplatform@',
+    toAddress: iAddr,
+    amount: 1,
+    jobPrice: 1,
+    kind: 'deposit',
+    expectedRecipients: [iAddr],
+  });
+  assert.equal(ok.allowed, true);
+  assert.equal(ok.checks.counterparty, 'pass');
+  const rDeny = SP.gateExternalSend({
+    jobId: 'seller.agentplatform@',
+    toAddress: rAddr,
+    amount: 1,
+    jobPrice: 1,
+    kind: 'deposit',
+    expectedRecipients: [iAddr],
+  });
+  assert.equal(rDeny.allowed, false);
+  assert.equal(rDeny.checks.counterparty, 'fail');
+});
+
+test('deposit limiter key is deposit:<sellerId> so it cannot burn a job-pay budget', () => {
+  SP._resetDispatcherRateLimit(false);
+  const iAddr = 'iDepSeller';
+  const now = Date.now();
+  for (let i = 0; i < 3; i++) {
+    const t = now - (3 - i) * 60_000;
+    const g = SP.gateExternalSend({
+      jobId: 'seller@',
+      toAddress: iAddr,
+      amount: 1,
+      jobPrice: 10,
+      kind: 'deposit',
+      expectedRecipients: [iAddr],
+      now: t,
+    });
+    assert.equal(g.allowed, true, `deposit ${i} should pass`);
+    SP.recordSendOutcome({
+      kind: 'deposit', jobId: 'seller@', toAddress: iAddr, amount: 1,
+      now: t,
+    });
+  }
+  const fourth = SP.gateExternalSend({
+    jobId: 'seller@', toAddress: iAddr, amount: 1, jobPrice: 10,
+    kind: 'deposit', expectedRecipients: [iAddr],
+  });
+  assert.equal(fourth.allowed, false, 'fourth deposit to the same seller hits the per-key cap');
+
+  const pay = SP.gateExternalSend({
+    jobId: 'job-pay-1', toAddress: iAddr, amount: 1, jobPrice: 1,
+    kind: 'payment', expectedRecipients: [iAddr],
+  });
+  assert.equal(pay.allowed, true, 'a job payment must not share the deposit:<seller> budget');
+});

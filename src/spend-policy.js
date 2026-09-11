@@ -491,8 +491,8 @@ function _resetDispatcherRateLimit(suspended = false) {
 // they are only ledgered, via recordSendOutcome. Routing them through the gate would
 // newly subject an operator's fleet transfer / fee sweep to the financial kill
 // switch, which they have never been subject to. See recordSendOutcome.
-const EXTERNAL_KINDS = new Set(['refund', 'payment']);
-const KNOWN_KINDS = new Set(['refund', 'payment', 'fleet_transfer', 'fee_sweep']);
+const EXTERNAL_KINDS = new Set(['refund', 'payment', 'deposit']);
+const KNOWN_KINDS = new Set(['refund', 'payment', 'fleet_transfer', 'fee_sweep', 'deposit']);
 
 // ── Compiled hard ceilings (P2) ──────────────────────────────────────────────
 //

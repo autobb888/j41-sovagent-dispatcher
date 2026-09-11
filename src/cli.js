@@ -3486,6 +3486,212 @@ program
     }
   });
 
+async function confirmDeposit({ amountText, seller, reportOnly }) {
+  const readline = require('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const q = reportOnly
+      ? `Report ${amountText} VRSC deposit to ${seller}? (y/N) `
+      : `Broadcast ${amountText} VRSC to ${seller} i-address as API credit? This spends the buyer's wallet. (y/N) `;
+    const answer = await new Promise((resolve) => rl.question(q, resolve));
+    const a = String(answer || '').trim().toLowerCase();
+    return a === 'y' || a === 'yes';
+  } finally {
+    rl.close();
+  }
+}
+
+async function buyerDepositReportAndWait({
+  options, keys, agent, seller, amount, txid, reportUrl,
+}) {
+  const {
+    buildSignedDepositReport, waitForDepositCredit, postDepositReport,
+    DEPOSIT_WAIT_TIMEOUT_MS, DEPOSIT_POLL_INTERVAL_MS,
+  } = require('./buyer-deposit');
+  const { signMessage, buildDepositReportMessage } = require('@junction41/sovagent-sdk/dist/index.js');
+  return waitForDepositCredit({
+    txid,
+    amount,
+    wait: !!options.wait,
+    timeoutMs: DEPOSIT_WAIT_TIMEOUT_MS,
+    intervalMs: process.env.NODE_ENV === 'test' ? 0 : DEPOSIT_POLL_INTERVAL_MS,
+    getTxStatus: (id) => agent.client.getTxStatus(id),
+    buildReport: async () => buildSignedDepositReport({
+      buyerVerusId: keys.identity,
+      sellerVerusId: seller,
+      txid,
+      amount,
+      wif: keys.wif,
+      network: J41_NETWORK,
+      signMessage,
+      buildMessage: buildDepositReportMessage,
+    }),
+    postReport: (body) => postDepositReport(reportUrl, body),
+  });
+}
+
+program
+  .command('deposit <buyer-id> <seller>')
+  .description('Send VRSC to the seller i-address and POST /j41/deposit/report (API credit)')
+  .requiredOption('--amount <n>', 'Positive decimal VRSC (no silent top-up default)')
+  .option('--yes', 'Skip the interactive confirmation (mainnet --yes still needs a TTY or J41_HEADLESS_MAINNET_PAY=1)')
+  .option('--wait', 'POST once, poll local getTxStatus, then POST a freshly signed report (max 180s)')
+  .option('--force', 'Ignore wallet-pending.json and broadcast anyway')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
+  .action(async (buyerAgentId, seller, options) => {
+    const fail = (code, message, extra = {}) => {
+      process.exitCode = 1;
+      buyerCliFail(options, code, message, extra);
+    };
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    const {
+      parseDepositAmount, resolveDepositDestination, planBuyerDeposit,
+      resolveDepositReportUrl,
+    } = require('./buyer-deposit');
+    const parsed = parseDepositAmount(options.amount);
+    if (!parsed.ok) fail(parsed.code, parsed.reason);
+    const amount = parsed.amount;
+    const amountNumber = parsed.sats / 1e8;
+    const headlessMainnetPay = process.env.J41_HEADLESS_MAINNET_PAY === '1';
+    if (IS_MAINNET && options.yes && !process.stdin.isTTY && !headlessMainnetPay) {
+      fail('MAINNET_TTY_REQUIRED',
+        '--yes cannot skip deposit confirmation on mainnet without a TTY. Set J41_HEADLESS_MAINNET_PAY=1.');
+    }
+    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    const { loadAccessGrant } = require('./buyer-access');
+    const grant = loadAccessGrant(AGENTS_DIR, buyerAgentId, seller);
+    let listing = null;
+    try { listing = await agent.client.getAgent(seller); } catch { listing = null; }
+    const urlRes = await resolveDepositReportUrl({
+      grant, listing, buyerId: buyerAgentId, seller,
+    });
+    if (!urlRes.ok) fail(urlRes.code || 'DEPOSIT_NO_PUBLIC_URL', urlRes.message);
+    let payInfo = null;
+    try {
+      const sellerId = (listing && (listing.id || listing.verusId || listing.iAddress)) || seller;
+      payInfo = await agent.client.getAgentPaymentAddress(sellerId);
+    } catch (e) {
+      fail('DEPOSIT_NOT_SELLER', `Cannot resolve seller i-address: ${e.message}`);
+    }
+    const dest = resolveDepositDestination({ payInfo, listing });
+    if (!dest.ok) fail(dest.code || 'DEPOSIT_NOT_SELLER', dest.reason);
+    if (options.wait && !options.force) {
+      let pending = loadWalletPending(buyerAgentId);
+      const deadline = Date.now() + 180000;
+      while (Date.now() < deadline) {
+        const p = planBuyerDeposit({ pending, now: Date.now(), force: false });
+        if (p.ok) break;
+        await new Promise((r) => setTimeout(r, process.env.NODE_ENV === 'test' ? 0 : 5000));
+        pending = await resolveWalletPending(agent.client, buyerAgentId, loadWalletPending(buyerAgentId));
+      }
+    }
+    const pendingPlan = planBuyerDeposit({
+      pending: loadWalletPending(buyerAgentId),
+      now: Date.now(),
+      force: !!options.force,
+      toAddress: dest.toAddress,
+      iAddress: dest.iAddress,
+      sellerRAddress: payInfo && payInfo.address,
+    });
+    if (!pendingPlan.ok) fail(pendingPlan.code || 'PAY_PENDING', pendingPlan.reason);
+    if (!options.yes) {
+      const ok = await confirmDeposit({ amountText: amount, seller });
+      if (!ok) { console.log('Cancelled.'); process.exit(0); }
+    }
+    const autonomous = !!(options.json || headlessMainnetPay);
+    if (autonomous) {
+      const g = gateExternalSend({
+        jobId: seller,
+        toAddress: dest.toAddress,
+        amount: amountNumber,
+        jobPrice: amountNumber,
+        kind: 'deposit',
+        expectedRecipients: dest.expectedRecipients,
+      });
+      if (!g.allowed) fail('SPEND_DENIED', g.reason, { retryable: !!g.retryable });
+    }
+    const txid = await agent.sendMultiPayment([{ address: dest.toAddress, amount: amountNumber }]);
+    saveWalletPending(buyerAgentId, { txid, at: Date.now(), kind: 'deposit' });
+    if (autonomous) {
+      recordSendOutcome({
+        kind: 'deposit', jobId: seller, toAddress: dest.toAddress, amount: amountNumber, txid,
+      });
+    }
+    say(`✅ Deposit broadcast ${String(txid).substring(0, 16)}…`);
+    const result = await buyerDepositReportAndWait({
+      options, keys, agent, seller, amount, txid, reportUrl: urlRes.url,
+    });
+    if (!result.ok) fail(result.code || 'DEPOSIT_REPLAY', result.message, { txid });
+    if (result.code === 'DEPOSIT_WAIT_TIMEOUT') {
+      console.warn('DEPOSIT_WAIT_TIMEOUT: deposit broadcast but seller has not credited yet.');
+      if (options.json) {
+        console.log(JSON.stringify({ ok: true, txid, credited: false, pending: true }, null, 2));
+      }
+      return;
+    }
+    if (result.credited) say(`✅ Deposit ${String(txid).substring(0, 16)}… credited`);
+    else say(`✅ Deposit ${String(txid).substring(0, 16)}… reported`);
+    if (options.json) {
+      console.log(JSON.stringify({
+        ok: true, txid, credited: !!result.credited, amount, seller, toAddress: dest.toAddress,
+        ...(options.wait ? { pending: !!result.pending } : {}),
+      }, null, 2));
+    }
+  });
+
+program
+  .command('report-deposit <buyer-id> <seller>')
+  .description('POST a signed J41-DEPOSIT-REPORT to the seller /j41/deposit/report (no broadcast)')
+  .requiredOption('--txid <txid>', 'Funding transaction id')
+  .requiredOption('--amount <n>', 'Positive decimal VRSC that was sent')
+  .option('--yes', 'Skip the interactive confirmation')
+  .option('--wait', 'POST once, poll local getTxStatus, then POST a freshly signed report (max 180s)')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
+  .action(async (buyerAgentId, seller, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    const { parseDepositAmount, resolveDepositReportUrl } = require('./buyer-deposit');
+    const parsed = parseDepositAmount(options.amount);
+    if (!parsed.ok) fail(parsed.code, parsed.reason);
+    const amount = parsed.amount;
+    const txid = String(options.txid || '').trim();
+    if (!txid) fail('BAD_TXID', '--txid is required.');
+    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    const { loadAccessGrant } = require('./buyer-access');
+    const grant = loadAccessGrant(AGENTS_DIR, buyerAgentId, seller);
+    let listing = null;
+    try { listing = await agent.client.getAgent(seller); } catch { listing = null; }
+    const urlRes = await resolveDepositReportUrl({
+      grant, listing, buyerId: buyerAgentId, seller,
+    });
+    if (!urlRes.ok) fail(urlRes.code, urlRes.message);
+    if (!options.yes) {
+      const ok = await confirmDeposit({ amountText: amount, seller, reportOnly: true });
+      if (!ok) { console.log('Cancelled.'); process.exit(0); }
+    }
+    const result = await buyerDepositReportAndWait({
+      options, keys, agent, seller, amount, txid, reportUrl: urlRes.url,
+    });
+    if (!result.ok) fail(result.code || 'DEPOSIT_REPLAY', result.message, { txid });
+    if (result.code === 'DEPOSIT_WAIT_TIMEOUT') {
+      console.warn('DEPOSIT_WAIT_TIMEOUT: deposit broadcast but seller has not credited yet.');
+      if (options.json) {
+        console.log(JSON.stringify({ ok: true, txid, credited: false, pending: true }, null, 2));
+      }
+      return;
+    }
+    if (result.credited) say(`✅ Deposit ${String(txid).substring(0, 16)}… credited`);
+    else say(`✅ Deposit ${String(txid).substring(0, 16)}… reported`);
+    if (options.json) {
+      console.log(JSON.stringify({
+        ok: true, txid, credited: !!result.credited, amount, seller,
+        ...(options.wait ? { pending: !!result.pending } : {}),
+      }, null, 2));
+    }
+  });
+
 async function confirmHire({ amountText, pay }) {
   const readline = require('readline');
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
