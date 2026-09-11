@@ -4006,7 +4006,7 @@ program
 
 program
   .command('job-chat <buyer-agent-id> <job-id>')
-  .description('Signed labour job chat (not model grant chat). Signs J41-CHAT| and POSTs sendChatMessage.')
+  .description('Signed labour job chat (not model grant chat). POST { content, signature, timestamp } over J41-CHAT|.')
   .requiredOption('--message <text>', 'Chat message')
   .option('--wait', 'Poll getChatMessages until a seller line (max 180s)')
   .option('--json', 'One JSON object on stdout')

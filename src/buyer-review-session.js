@@ -1,8 +1,9 @@
 'use strict';
 /**
  * Buyer API-session review (model grants). Job `review` stays on submitReview.
- * Always signs J41-REVIEW|…; never rewrites platform `Junction41 Review`.
- * POST /v1/reviews/api-session 404 → REVIEW_SESSION_UNSUPPORTED (backend).
+ * Sign GET /v1/reviews/message?sessionId=…  J41-REVIEW-SESSION|… only.
+ * Homemade J41-REVIEW|Session: is a 401 — never send it.
+ * Until reviews.j41-review-v2, GET cannot return that line → REVIEW_SESSION_UNSUPPORTED.
  */
 const { loadAccessGrant, persistGrantSession } = require('./buyer-access');
 
@@ -33,16 +34,43 @@ function parseRating(raw) {
   return rating;
 }
 
-function isHttp404(err) {
-  if (!err) return false;
-  const status = err.statusCode || err.status;
-  if (Number(status) === 404) return true;
-  if (err.error && Number(err.error.statusCode) === 404) return true;
-  return false;
+function httpStatus(err) {
+  if (!err) return 0;
+  const n = Number(err.statusCode || err.status || (err.error && err.error.statusCode));
+  return Number.isFinite(n) ? n : 0;
 }
 
-function isNonCanonicalReview(message) {
-  return typeof message !== 'string' || !/^J41-/.test(message);
+function isHttp404(err) {
+  return httpStatus(err) === 404;
+}
+
+function isSessionMessageUnsupported(err) {
+  if (!err) return false;
+  const status = httpStatus(err);
+  if (status === 404 || status === 400) return true;
+  const msg = String(err.message || err.code || '');
+  return /MISSING_PARAMS/i.test(msg) || /jobHash/i.test(msg);
+}
+
+function isSessionCanonical(message) {
+  return typeof message === 'string' && message.startsWith('J41-REVIEW-SESSION|');
+}
+
+async function getSessionReviewMessage(client, params) {
+  if (!client || typeof client.request !== 'function') {
+    const err = new Error('Client cannot GET /v1/reviews/message?sessionId= (SDK getReviewMessage requires jobHash).');
+    err.statusCode = 400;
+    err.code = 'MISSING_PARAMS';
+    throw err;
+  }
+  const query = new URLSearchParams();
+  query.set('agentVerusId', params.agentVerusId);
+  query.set('sessionId', params.sessionId);
+  query.set('rating', String(params.rating));
+  if (params.message) query.set('message', params.message);
+  if (params.timestamp != null) query.set('timestamp', String(params.timestamp));
+  const res = await client.request('GET', `/v1/reviews/message?${query}`);
+  return (res && res.data !== undefined) ? res.data : res;
 }
 
 function resolveSessionId({ sessionId, grant, agentsDir, buyerId, seller }) {
@@ -97,55 +125,49 @@ async function submitBuyerApiSessionReview({
 
   const timestamp = Number.isFinite(Number(now)) ? Number(now) : Math.floor(Date.now() / 1000);
   const text = message == null ? '' : String(message);
-  let toSign = `J41-REVIEW|Session:${sid}|Rating:${rating}|Ts:${timestamp}|${text}`;
-  let signedTimestamp = timestamp;
+  const fetchMessage = typeof getReviewMessage === 'function'
+    ? getReviewMessage
+    : (params) => getSessionReviewMessage(client, params);
 
-  if (typeof getReviewMessage === 'function') {
-    let msgResult;
-    try {
-      msgResult = await getReviewMessage({
-        agentVerusId: seller,
-        sessionId: sid,
-        rating,
-        message: text,
-        timestamp,
-      });
-    } catch (e) {
-      if (isHttp404(e)) {
-        return fail(
-          'REVIEW_SESSION_UNSUPPORTED',
-          'Platform has no API-session review message endpoint (HTTP 404). Backend.',
-          { seller, sessionId: sid },
-        );
-      }
-      return fail('REVIEW_FAILED', e.message || String(e), { seller, sessionId: sid });
-    }
-    const platformBytes = msgResult && msgResult.message;
-    if (isNonCanonicalReview(platformBytes) || /Junction41 Review/i.test(String(platformBytes || ''))) {
+  let msgResult;
+  try {
+    msgResult = await fetchMessage({
+      agentVerusId: seller,
+      sessionId: sid,
+      rating,
+      message: text,
+      timestamp,
+    });
+  } catch (e) {
+    if (isSessionMessageUnsupported(e)) {
       return fail(
-        'REVIEW_NOT_CANONICAL',
-        'Platform review bytes are not J41-…; backend must emit J41-REVIEW|. Review on the website or retry after that fix. Dispatcher will not sign Junction41 Review.',
+        'REVIEW_SESSION_UNSUPPORTED',
+        'GET /v1/reviews/message cannot return J41-REVIEW-SESSION| yet (gate on reviews.j41-review-v2).',
         { seller, sessionId: sid },
       );
     }
-    if (canonicalNotBound(platformBytes, sid, rating)) {
-      return fail(
-        'REVIEW_NOT_CANONICAL',
-        'Refusing to sign review bytes that do not bind our sessionId + rating.',
-        { seller, sessionId: sid },
-      );
-    }
-    toSign = platformBytes;
-    if (Number.isFinite(Number(msgResult.timestamp))) signedTimestamp = Number(msgResult.timestamp);
+    return fail('REVIEW_FAILED', e.message || String(e), { seller, sessionId: sid });
   }
-
-  if (isNonCanonicalReview(toSign)) {
+  const platformBytes = msgResult && msgResult.message;
+  if (!isSessionCanonical(platformBytes)
+      || /Junction41 Review/i.test(String(platformBytes || ''))
+      || /Junction41 API Session Review/i.test(String(platformBytes || ''))) {
     return fail(
-      'REVIEW_NOT_CANONICAL',
-      'Refusing to sign platform-supplied bytes that do not start with J41-.',
+      'REVIEW_SESSION_UNSUPPORTED',
+      'Platform session-review bytes are not J41-REVIEW-SESSION|. Homemade J41-REVIEW|Session: will 401. Gate on reviews.j41-review-v2.',
       { seller, sessionId: sid },
     );
   }
+  if (canonicalNotBound(platformBytes, sid, rating)) {
+    return fail(
+      'REVIEW_NOT_CANONICAL',
+      'Refusing to sign review bytes that do not bind our sessionId + rating.',
+      { seller, sessionId: sid },
+    );
+  }
+  const toSign = platformBytes;
+  let signedTimestamp = timestamp;
+  if (Number.isFinite(Number(msgResult.timestamp))) signedTimestamp = Number(msgResult.timestamp);
 
   let signature;
   try {
@@ -205,4 +227,5 @@ module.exports = {
   submitBuyerApiSessionReview,
   persistGrantSession,
   parseRating,
+  getSessionReviewMessage,
 };

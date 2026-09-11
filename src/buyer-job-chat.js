@@ -3,8 +3,8 @@
  * Buyer labour job-chat. Model inference is `chat` (grant + callProxied);
  * this module POSTs a signed REST line to an existing hire job.
  *
- * Backend may still store signed:false — we still sign. Unsigned REST is not
- * a dispatcher feature to skip signing.
+ * Backend verifies J41-CHAT from POST { content, signature, timestamp }.
+ * SDK 2.16.1 sendChatMessage omits timestamp — wrap via client.request.
  */
 const crypto = require('crypto');
 const { buyerOwnsJob } = require('./hire-pay');
@@ -72,6 +72,23 @@ function resolveSignMessage(signFn) {
   return signMessage;
 }
 
+function unwrapRequestData(res) {
+  if (res && typeof res === 'object' && res.data !== undefined) return res.data;
+  return res;
+}
+
+async function postSignedJobChat(client, jobId, body) {
+  if (typeof client.postJobChat === 'function') {
+    return client.postJobChat(jobId, body);
+  }
+  const res = await client.request(
+    'POST',
+    `/v1/jobs/${encodeURIComponent(jobId)}/messages`,
+    body,
+  );
+  return unwrapRequestData(res);
+}
+
 async function sendBuyerJobChat({
   client,
   keys,
@@ -90,8 +107,9 @@ async function sendBuyerJobChat({
   if (!text.trim()) {
     return { ok: false, code: 'JOB_CHAT_EMPTY', message: '--message is required.' };
   }
-  if (!client || typeof client.getJob !== 'function' || typeof client.sendChatMessage !== 'function') {
-    return { ok: false, code: 'JOB_CHAT_CLIENT_MISSING', message: 'Authenticated client is required.' };
+  const canPost = client && (typeof client.request === 'function' || typeof client.postJobChat === 'function');
+  if (!client || typeof client.getJob !== 'function' || !canPost) {
+    return { ok: false, code: 'JOB_CHAT_CLIENT_MISSING', message: 'Authenticated client is required (POST { content, signature, timestamp }).' };
   }
   if (!keys || !keys.wif) {
     return { ok: false, code: 'BUYER_NOT_REGISTERED', message: 'Buyer WIF is required to sign job-chat.' };
@@ -138,9 +156,10 @@ async function sendBuyerJobChat({
     return { ok: false, code: 'JOB_CHAT_UNSIGNED', message: 'Refusing to send unsigned job-chat.' };
   }
 
+  const body = { content: text, signature, timestamp };
   let sent;
   try {
-    sent = await client.sendChatMessage(job.id, text, signature);
+    sent = await postSignedJobChat(client, job.id, body);
   } catch (e) {
     return { ok: false, code: 'JOB_CHAT_FAILED', message: e.message || String(e) };
   }
@@ -188,6 +207,7 @@ async function sendBuyerJobChat({
 module.exports = {
   buildJobChatMessage,
   sendBuyerJobChat,
+  postSignedJobChat,
   isSellerChatLine,
   isTerminalJobStatus,
   JOB_CHAT_TERMINAL,

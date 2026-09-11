@@ -44,14 +44,15 @@ test('buildJobChatMessage is J41-CHAT|Job|Ts|sha256(utf8 content)', () => {
   assert.equal(msg.includes(content), false, 'raw content is hashed, not concatenated');
 });
 
-test('sendBuyerJobChat signs J41-CHAT| and passes the signature as sendChatMessage third arg', async () => {
+test('sendBuyerJobChat signs J41-CHAT| and POSTs { content, signature, timestamp }', async () => {
   const sent = [];
   const signed = [];
   const client = {
     getJob: async () => JOB,
-    sendChatMessage: async function sendChatMessage(jobId, content, signature) {
-      sent.push({ jobId, content, signature, argc: arguments.length });
-      return { id: 'm1', content, senderVerusId: BUYER.identity };
+    sendChatMessage: async () => { throw new Error('SDK sendChatMessage omits timestamp — must wrap'); },
+    request: async (method, path, body) => {
+      sent.push({ method, path, body });
+      return { data: { id: 'm1', content: body.content, senderVerusId: BUYER.identity } };
     },
     getChatMessages: async () => { throw new Error('must not poll without --wait'); },
   };
@@ -76,13 +77,28 @@ test('sendBuyerJobChat signs J41-CHAT| and passes the signature as sendChatMessa
   );
   assert.equal(signed[0].network, 'verustest');
   assert.equal(sent.length, 1);
-  assert.equal(sent[0].jobId, JOB.id);
-  assert.equal(sent[0].content, 'hello seller');
-  assert.equal(sent[0].argc, 3, 'sendChatMessage must be called with a third arg');
-  assert.equal(sent[0].signature, 'sig-from-buyer-wif');
-  assert.notEqual(sent[0].signature, undefined);
-  assert.notEqual(sent[0].signature, null);
-  assert.notEqual(sent[0].signature, '');
+  assert.equal(sent[0].method, 'POST');
+  assert.equal(sent[0].path, `/v1/jobs/${JOB.id}/messages`);
+  assert.equal(sent[0].body.content, 'hello seller');
+  assert.equal(sent[0].body.signature, 'sig-from-buyer-wif');
+  assert.equal(sent[0].body.timestamp, 1_700_000_111);
+  assert.equal(typeof sent[0].body.timestamp, 'number');
+});
+
+test('SDK sendChatMessage-only client cannot POST timestamp — JOB_CHAT_CLIENT_MISSING', async () => {
+  const r = await sendBuyerJobChat({
+    client: {
+      getJob: async () => JOB,
+      sendChatMessage: async () => ({ id: 'nope' }),
+    },
+    keys: BUYER,
+    jobId: JOB.id,
+    content: 'hello seller',
+    signMessage: () => 'sig',
+    now: 1,
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'JOB_CHAT_CLIENT_MISSING');
 });
 
 test('unsigned REST is not a skip: empty/missing signature is never sent', async () => {
@@ -90,8 +106,8 @@ test('unsigned REST is not a skip: empty/missing signature is never sent', async
   const r = await sendBuyerJobChat({
     client: {
       getJob: async () => JOB,
-      sendChatMessage: async (jobId, content, signature) => {
-        sent.push({ jobId, content, signature });
+      request: async (_m, _p, body) => {
+        sent.push(body);
         return {};
       },
     },
@@ -106,11 +122,11 @@ test('unsigned REST is not a skip: empty/missing signature is never sent', async
   assert.equal(sent.length, 0);
 });
 
-test('not the buyer or a terminal job never calls sendChatMessage', async () => {
+test('not the buyer or a terminal job never POSTs messages', async () => {
   let sent = 0;
-  const send = async () => { sent += 1; };
+  const request = async () => { sent += 1; };
   const stranger = await sendBuyerJobChat({
-    client: { getJob: async () => JOB, sendChatMessage: send },
+    client: { getJob: async () => JOB, request },
     keys: { identity: 'eve.agentplatform@', iAddress: 'iEve', address: 'Reve', wif: 'WIF' },
     jobId: JOB.id,
     content: 'hi',
@@ -122,7 +138,7 @@ test('not the buyer or a terminal job never calls sendChatMessage', async () => 
   const done = await sendBuyerJobChat({
     client: {
       getJob: async () => ({ ...JOB, status: 'completed' }),
-      sendChatMessage: send,
+      request,
     },
     keys: BUYER,
     jobId: JOB.id,
@@ -140,9 +156,10 @@ test('--wait polls getChatMessages until a non-buyer line exists', async () => {
   const r = await sendBuyerJobChat({
     client: {
       getJob: async () => JOB,
-      sendChatMessage: async (jobId, content, signature) => {
-        assert.equal(signature, 'sig');
-        return { id: 'm1', content, senderVerusId: BUYER.identity };
+      request: async (_m, _p, body) => {
+        assert.equal(body.signature, 'sig');
+        assert.equal(typeof body.timestamp, 'number');
+        return { data: { id: 'm1', content: body.content, senderVerusId: BUYER.identity } };
       },
       getChatMessages: async () => {
         polls += 1;
@@ -178,9 +195,10 @@ test('--wait timeout is exit-0: ok true, sellerReply null', async () => {
   const r = await sendBuyerJobChat({
     client: {
       getJob: async () => JOB,
-      sendChatMessage: async (_id, content, signature) => {
-        assert.ok(signature);
-        return { id: 'm1', content, senderVerusId: BUYER.identity };
+      request: async (_m, _p, body) => {
+        assert.ok(body.signature);
+        assert.equal(typeof body.timestamp, 'number');
+        return { data: { id: 'm1', content: body.content, senderVerusId: BUYER.identity } };
       },
       getChatMessages: async () => ({
         data: [{ senderVerusId: BUYER.identity, role: 'buyer', content: 'hello' }],

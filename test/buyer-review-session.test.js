@@ -17,7 +17,11 @@ const BUYER = {
   wif: 'WIF-MUST-NOT-PRINT',
 };
 const SELLER = 'duskseek.agentplatform@';
-const SESSION_ID = 'sess-after-chat-abc';
+const SESSION_ID = '11111111-1111-1111-1111-111111111111';
+
+function sessionCanonical({ rating = 5, text = '', ts = 1700000000 } = {}) {
+  return `J41-REVIEW-SESSION|Agent:${SELLER}|Session:${SESSION_ID}|Rating:${rating}|Msg:${text}|Ts:${ts}|I submit this review for an API session.`;
+}
 
 function stringifyNoWif(value) {
   return JSON.stringify(value);
@@ -34,18 +38,22 @@ function http404(message) {
   return err;
 }
 
-test('review-session source signs J41-REVIEW| and calls submitApiSessionReview', () => {
+test('review-session source GETs J41-REVIEW-SESSION| and never homemade J41-REVIEW|Session:', () => {
   const src = fs.readFileSync(path.join(__dirname, '../src/buyer-review-session.js'), 'utf8');
   assert.match(src, /submitApiSessionReview/);
-  assert.match(src, /J41-REVIEW\|/);
+  assert.match(src, /J41-REVIEW-SESSION\|/);
   assert.match(src, /REVIEW_SESSION_UNSUPPORTED/);
-  assert.match(src, /sovagent-sdk\/dist\//);
+  assert.match(src, /\/v1\/reviews\/message\?/);
+  assert.doesNotMatch(src, /toSign = `J41-REVIEW\|Session:/);
+  assert.doesNotMatch(src, /J41-REVIEW\|Session:\$\{/);
   assert.doesNotMatch(src, /reviews shipped/i);
 });
 
-test('submitBuyerApiSessionReview calls submitApiSessionReview when sessionId exists', async () => {
+test('submitBuyerApiSessionReview signs GET J41-REVIEW-SESSION| and POSTs sessionId', async () => {
   const signed = [];
   const sent = [];
+  const got = [];
+  const canonical = sessionCanonical({ rating: 5, text: 'good model', ts: 1_700_000_222 });
   const r = await submitBuyerApiSessionReview({
     client: {
       submitApiSessionReview: async (payload) => {
@@ -60,16 +68,22 @@ test('submitBuyerApiSessionReview calls submitApiSessionReview when sessionId ex
     message: 'good model',
     network: 'verustest',
     now: 1_700_000_222,
+    getReviewMessage: async (params) => {
+      got.push(params);
+      return { message: canonical, timestamp: 1_700_000_222 };
+    },
     signMessage: (wif, message, network) => {
       signed.push({ message, network, wifLen: String(wif || '').length });
       return 'sig-from-buyer-wif';
     },
   });
   assert.equal(r.ok, true);
+  assert.equal(got.length, 1);
+  assert.equal(got[0].sessionId, SESSION_ID);
   assert.equal(signed.length, 1);
-  assert.ok(signed[0].message.startsWith('J41-REVIEW|'));
-  assert.match(signed[0].message, /Session:sess-after-chat-abc/);
-  assert.match(signed[0].message, /Rating:5/);
+  assert.equal(signed[0].message, canonical);
+  assert.ok(signed[0].message.startsWith('J41-REVIEW-SESSION|'));
+  assert.match(signed[0].message, /Msg:good model/);
   assert.equal(signed[0].network, 'verustest');
   assert.equal(sent.length, 1);
   assert.equal(sent[0].sessionId, SESSION_ID);
@@ -83,6 +97,7 @@ test('submitBuyerApiSessionReview calls submitApiSessionReview when sessionId ex
 
 test('grant sessionId after chat is enough — no extra --session-id required', async () => {
   const sent = [];
+  const canonical = sessionCanonical({ rating: 4, ts: 1_700_000_333 });
   const r = await submitBuyerApiSessionReview({
     client: {
       submitApiSessionReview: async (payload) => {
@@ -96,6 +111,7 @@ test('grant sessionId after chat is enough — no extra --session-id required', 
     rating: 4,
     network: 'verustest',
     now: 1_700_000_333,
+    getReviewMessage: async () => ({ message: canonical, timestamp: 1_700_000_333 }),
     signMessage: () => 'sig',
   });
   assert.equal(r.ok, true);
@@ -120,11 +136,12 @@ test('missing sessionId is REVIEW_SESSION_NO_SESSION and never submits', async (
   assert.equal(called, 0);
 });
 
-test('404 on /v1/reviews/api-session is REVIEW_SESSION_UNSUPPORTED', async () => {
+test('no GET / missing reviews.j41-review-v2 is REVIEW_SESSION_UNSUPPORTED and never homemade', async () => {
+  let submitted = 0;
   let signed = 0;
   const r = await submitBuyerApiSessionReview({
     client: {
-      submitApiSessionReview: async () => { throw http404('Not Found'); },
+      submitApiSessionReview: async () => { submitted += 1; return { id: 'nope' }; },
     },
     keys: BUYER,
     seller: SELLER,
@@ -136,36 +153,60 @@ test('404 on /v1/reviews/api-session is REVIEW_SESSION_UNSUPPORTED', async () =>
   });
   assert.equal(r.ok, false);
   assert.equal(r.code, 'REVIEW_SESSION_UNSUPPORTED');
-  assert.equal(signed, 1);
+  assert.equal(submitted, 0);
+  assert.equal(signed, 0);
 });
 
-test('platform Junction41 Review bytes are REVIEW_NOT_CANONICAL and never submitted', async () => {
-  let submitted = 0;
+test('404 on /v1/reviews/api-session is REVIEW_SESSION_UNSUPPORTED', async () => {
   let signed = 0;
+  const canonical = sessionCanonical({ ts: 1_700_000_444 });
   const r = await submitBuyerApiSessionReview({
     client: {
-      submitApiSessionReview: async () => { submitted += 1; return { id: 'nope' }; },
+      submitApiSessionReview: async () => { throw http404('Not Found'); },
     },
     keys: BUYER,
     seller: SELLER,
     sessionId: SESSION_ID,
     rating: 5,
-    getReviewMessage: async () => ({
-      message: 'Junction41 Review\nPlease sign this human block',
-      timestamp: 1700000555,
-    }),
+    network: 'verustest',
+    now: 1_700_000_444,
+    getReviewMessage: async () => ({ message: canonical, timestamp: 1_700_000_444 }),
     signMessage: () => { signed += 1; return 'sig'; },
   });
   assert.equal(r.ok, false);
-  assert.equal(r.code, 'REVIEW_NOT_CANONICAL');
+  assert.equal(r.code, 'REVIEW_SESSION_UNSUPPORTED');
+  assert.equal(signed, 1);
+});
+
+test('live Junction41 API Session Review / homemade J41-REVIEW|Session: never submitted', async () => {
+  let submitted = 0;
+  let signed = 0;
+  for (const message of [
+    'Junction41 API Session Review\nPlease sign this human block',
+    `J41-REVIEW|Session:${SESSION_ID}|Rating:5|Ts:1700000555|nope`,
+  ]) {
+    const r = await submitBuyerApiSessionReview({
+      client: {
+        submitApiSessionReview: async () => { submitted += 1; return { id: 'nope' }; },
+      },
+      keys: BUYER,
+      seller: SELLER,
+      sessionId: SESSION_ID,
+      rating: 5,
+      getReviewMessage: async () => ({ message, timestamp: 1700000555 }),
+      signMessage: () => { signed += 1; return 'sig'; },
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, 'REVIEW_SESSION_UNSUPPORTED');
+  }
   assert.equal(submitted, 0);
   assert.equal(signed, 0);
 });
 
-test('platform J41-REVIEW| bytes that bind sessionId+rating are signed as-is', async () => {
+test('platform J41-REVIEW-SESSION| bytes that bind sessionId+rating are signed as-is', async () => {
   const signed = [];
   const sent = [];
-  const canonical = `J41-REVIEW|Session:${SESSION_ID}|Rating:3|Ts:1700000666|ok`;
+  const canonical = sessionCanonical({ rating: 3, text: 'ok', ts: 1700000666 });
   const r = await submitBuyerApiSessionReview({
     client: {
       submitApiSessionReview: async (payload) => {
