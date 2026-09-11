@@ -3406,6 +3406,42 @@ program
     }
   });
 
+program
+  .command('job-chat <buyer-agent-id> <job-id>')
+  .description('Signed labour job chat (not model grant chat). Signs J41-CHAT| and POSTs sendChatMessage.')
+  .requiredOption('--message <text>', 'Chat message')
+  .option('--wait', 'Poll getChatMessages until a seller line (max 180s)')
+  .option('--json', 'One JSON object on stdout')
+  .action(async (buyerAgentId, jobId, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    const { sendBuyerJobChat } = require('./buyer-job-chat');
+    const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
+    const result = await sendBuyerJobChat({
+      client: agent.client,
+      keys,
+      jobId,
+      content: options.message,
+      signMessage,
+      network: J41_NETWORK,
+      wait: !!options.wait,
+    });
+    if (!result.ok) fail(result.code, result.message, { jobId: result.jobId, status: result.status });
+    const reply = result.sellerReply && (result.sellerReply.content || result.sellerReply.message);
+    say(`✅ Sent signed job-chat on ${result.jobId}`);
+    if (options.wait && result.timedOut) say('⚠ No seller reply within 180s');
+    else if (reply) say(reply);
+    if (options.json) {
+      console.log(JSON.stringify({
+        ok: true,
+        jobId: result.jobId,
+        sellerReply: result.sellerReply || null,
+        timedOut: !!result.timedOut,
+      }, null, 2));
+    }
+  });
+
 async function confirmHire({ amountText, pay }) {
   const readline = require('readline');
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
