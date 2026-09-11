@@ -80,3 +80,18 @@ test('hire --pay --wait also waits after broadcast; planHirePayment stays before
   assert.ok(waitAfter > save, 'hire --pay --wait must poll the NEW tx after saveWalletPending');
   assert.match(hireSrc, /PAY_WAIT_TIMEOUT/);
 });
+
+test('extend source plans hire payment BEFORE sendMultiPayment', () => {
+  const ext = fs.readFileSync(path.join(__dirname, '../src/buyer-extend.js'), 'utf8');
+  const plan = ext.indexOf('planHirePayment(');
+  const send = ext.indexOf('sendMultiPayment(');
+  assert.ok(plan > -1, 'extend no longer calls planHirePayment');
+  assert.ok(send > -1, 'extend no longer calls sendMultiPayment');
+  assert.ok(plan < send, 'planHirePayment must run BEFORE sendMultiPayment');
+  assert.match(ext, /kind:\s*'extension'/);
+  assert.match(ext, /payExtension\(/);
+  assert.match(ext, /requestExtension\(/);
+  const req = ext.indexOf('requestExtension(');
+  const pay = ext.indexOf('payExtension(');
+  assert.ok(req > -1 && pay > -1 && req < pay, 'requestExtension then payExtension');
+});
