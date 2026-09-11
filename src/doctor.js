@@ -19,7 +19,10 @@ const CHECK_IDS = Object.freeze([
   'image.job-agent', 'image.gpu-jail',
   'clock', 'runtime', 'llm', 'identity', 'fee-tank',
   'gpu.nvidia', 'gpu.storage',
+  'rental.ssh_public', 'model.public_url', 'model.webhook', 'image.canonicalize',
 ]);
+
+const CANONICALIZE_PIN = '2.0.0';
 
 function mkCheck(id, name, status, detail, nextCommand = null, copyPasteBlock = null) {
   return { id, name, status, detail: String(detail || '').slice(0, 400), nextCommand, copyPasteBlock };
@@ -185,6 +188,119 @@ function firstPasteCommand(block) {
   return null;
 }
 
+function loadLocalAgentConfig(agentsDir, agentId, fss) {
+  try {
+    const p = path.join(agentsDir, agentId, 'agent-config.json');
+    if (!fss.existsSync(p)) return {};
+    const raw = JSON.parse(fss.readFileSync(p, 'utf8'));
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+function isApiEndpointAgent(row, agentCfg) {
+  if (row && (row.kind === 'model' || row.kind === 'api-endpoint')) return true;
+  if (!agentCfg || typeof agentCfg !== 'object') return false;
+  if (agentCfg.serviceType === 'api-endpoint') return true;
+  if (agentCfg.apiEndpointUrl || agentCfg.endpointUrl) return true;
+  return false;
+}
+
+function isComputeAgent(row, agentId, cfg) {
+  if (row && row.kind === 'compute') return true;
+  try {
+    const { providerCfgForAgent } = require('./rental-setup');
+    return !!providerCfgForAgent(cfg || {}, agentId);
+  } catch {
+    return false;
+  }
+}
+
+function agentPublicUrl(agentCfg) {
+  const u = agentCfg && (agentCfg.publicUrl || agentCfg.webhookUrl);
+  return u != null && String(u).trim() !== '' ? String(u).trim() : '';
+}
+
+function webhookBindActive(cfg, webhookUrl) {
+  const u = webhookUrl != null && String(webhookUrl).trim() !== ''
+    ? webhookUrl
+    : (cfg && cfg.runtime && cfg.runtime.webhook_url);
+  return u != null && String(u).trim() !== '';
+}
+
+function inspectJobAgentCanonicalize(deps, dockerUsable) {
+  if (!dockerUsable) {
+    return { status: 'warn', detail: 'cannot confirm job-agent image (docker missing)', inspectable: false, ok: false };
+  }
+  try {
+    runExec(deps, 'docker image inspect j41/job-agent:latest');
+  } catch {
+    return { status: 'warn', detail: 'cannot confirm job-agent image', inspectable: false, ok: false };
+  }
+  let pkgRaw = deps.jobAgentPackageJson;
+  if (pkgRaw == null) {
+    try {
+      pkgRaw = runExec(deps, 'docker run --rm --entrypoint cat j41/job-agent:latest /app/package.json');
+    } catch {
+      return { status: 'warn', detail: 'cannot confirm job-agent image (pin unread)', inspectable: false, ok: false };
+    }
+  }
+  let pin = null;
+  try {
+    const pkg = typeof pkgRaw === 'string' ? JSON.parse(pkgRaw) : pkgRaw;
+    pin = pkg && pkg.dependencies && pkg.dependencies['json-canonicalize'];
+    if (!pin && pkg && pkg.overrides) pin = pkg.overrides['json-canonicalize'];
+  } catch {
+    return { status: 'warn', detail: 'cannot confirm job-agent image (package.json)', inspectable: false, ok: false };
+  }
+  const ver = String(pin || '').replace(/^json-canonicalize@/, '');
+  const ok = ver === CANONICALIZE_PIN;
+  return { inspectable: true, ok, pin: ver, status: ok ? 'pass' : 'fail' };
+}
+
+function listingAdvertiseRefusal({
+  agentId,
+  keys,
+  cfg,
+  agentsDir,
+  webhookUrl,
+  fs: fss,
+  canonicalizeStatus,
+} = {}) {
+  const { parseListingKind, kindFromIdentityName } = require('./listing-kind');
+  const row = {
+    id: agentId,
+    kind: parseListingKind(keys && keys.kind) || kindFromIdentityName(keys && keys.identity) || (keys && keys.kind) || 'agent',
+  };
+  const agentCfg = agentsDir ? loadLocalAgentConfig(agentsDir, agentId, fss || fs) : {};
+  const compute = isComputeAgent(row, agentId, cfg);
+  const model = isApiEndpointAgent(row, agentCfg);
+
+  if (compute) {
+    try {
+      require('./ssh-host').assertRentalHostPublic(agentId, cfg);
+    } catch (e) {
+      if (e && (e.code === 'RENTAL_LAN_HOST' || /RENTAL_LAN_HOST/.test(String(e.message || e)))) {
+        return { code: 'rental.ssh_public', message: e.message || 'RENTAL_LAN_HOST' };
+      }
+      throw e;
+    }
+  }
+  if (model) {
+    if (!agentPublicUrl(agentCfg)) {
+      return { code: 'model.public_url', message: 'model.public_url: api-endpoint missing publicUrl — run tunnel-setup or api-setup --public-url' };
+    }
+    if (!webhookBindActive(cfg, webhookUrl)) {
+      return { code: 'model.webhook', message: 'model.webhook: api-endpoint listed but webhook bind is not active — set runtime.webhook_url or start --webhook-url' };
+    }
+  }
+  if ((compute || model) && canonicalizeStatus === 'fail') {
+    return { code: 'image.canonicalize', message: 'image.canonicalize: job-agent image is missing json-canonicalize@2.0.0 — run j41-dispatcher build-image' };
+  }
+  return null;
+}
+
 function pickNext(checks) {
   const fails = checks.filter((c) => c.status === 'fail');
   const warns = checks.filter((c) => c.status === 'warn');
@@ -333,6 +449,9 @@ async function runDoctor(opts = {}) {
     dockerDriver: opts.dockerDriver,
     supportsStorageOpt: opts.supportsStorageOpt,
     feeTankRows: opts.feeTankRows,
+    cfg: opts.cfg,
+    jobAgentPackageJson: opts.jobAgentPackageJson,
+    webhookUrl: opts.webhookUrl,
   };
 
   const osInfo = detectOs(deps);
@@ -646,6 +765,80 @@ async function runDoctor(opts = {}) {
     }
   }
 
+  let cfg = deps.cfg;
+  if (!cfg) {
+    try {
+      const TOML = require('@iarna/toml');
+      cfg = TOML.parse(deps.fs.readFileSync(path.join(dispatcherDir, 'config.toml'), 'utf8'));
+    } catch { cfg = {}; }
+  }
+
+  const computeRows = identities.filter((r) => isComputeAgent(r, r.id, cfg));
+  if (computeRows.length === 0) {
+    checks.push(mkCheck('rental.ssh_public', 'Rental SSH', 'skip', 'no compute listing'));
+  } else {
+    const { assertRentalHostPublic } = require('./ssh-host');
+    const lan = [];
+    for (const row of computeRows) {
+      try {
+        assertRentalHostPublic(row.id, cfg);
+      } catch (e) {
+        if (e && (e.code === 'RENTAL_LAN_HOST' || /RENTAL_LAN_HOST/.test(String(e.message || e)))) {
+          lan.push(row.id);
+        } else {
+          throw e;
+        }
+      }
+    }
+    if (lan.length) {
+      const { sshHostnameForAgent } = require('./ssh-host');
+      const host = sshHostnameForAgent(lan[0], cfg) || '';
+      checks.push(mkCheck('rental.ssh_public', 'Rental SSH', 'fail',
+        `RENTAL_LAN_HOST: ${lan[0]} ssh_hostname ${host} is RFC1918/LAN — named TCP tunnel required`,
+        `j41-dispatcher tunnel-setup ${lan[0]} --http-host <dns> --ssh-host <dns>`,
+        `j41-dispatcher tunnel-setup ${lan[0]} --http-host <dns> --ssh-host <dns>\n# or set J41_ALLOW_LAN_RENTAL=1 (dev only)`));
+    } else {
+      checks.push(mkCheck('rental.ssh_public', 'Rental SSH', 'pass', 'ssh_hostname is public'));
+    }
+  }
+
+  const modelRows = identities.filter((r) => isApiEndpointAgent(r, loadLocalAgentConfig(agentsDir, r.id, deps.fs)));
+  if (modelRows.length === 0) {
+    checks.push(mkCheck('model.public_url', 'Model publicUrl', 'skip', 'no api-endpoint listing'));
+    checks.push(mkCheck('model.webhook', 'Model webhook', 'skip', 'no api-endpoint listing'));
+  } else {
+    const missingUrl = modelRows.filter((r) => !agentPublicUrl(loadLocalAgentConfig(agentsDir, r.id, deps.fs)));
+    if (missingUrl.length) {
+      checks.push(mkCheck('model.public_url', 'Model publicUrl', 'fail',
+        `${missingUrl[0].id} missing publicUrl`,
+        `j41-dispatcher tunnel-setup ${missingUrl[0].id} --http-host <dns> --ssh-host <dns>`,
+        `j41-dispatcher api-setup ${missingUrl[0].id} --public-url https://<dns> …\n# or: j41-dispatcher tunnel-setup ${missingUrl[0].id} --http-host <dns> --ssh-host <dns>`));
+    } else {
+      checks.push(mkCheck('model.public_url', 'Model publicUrl', 'pass', 'publicUrl set'));
+    }
+    if (!webhookBindActive(cfg, deps.webhookUrl)) {
+      checks.push(mkCheck('model.webhook', 'Model webhook', 'fail',
+        'api-endpoint listed but webhook bind would not be active',
+        'j41-dispatcher start --webhook-url https://<dns>',
+        'Set runtime.webhook_url in config.toml, or start with --webhook-url.\nAPI proxy is webhook-mode-only.'));
+    } else {
+      checks.push(mkCheck('model.webhook', 'Model webhook', 'pass', 'webhook bind active'));
+    }
+  }
+
+  const pin = inspectJobAgentCanonicalize(deps, dockerUsable);
+  const labourOrCompute = identities.some((r) => r.kind === 'agent' || r.kind === 'compute' || r.kind === 'model');
+  if (pin.ok) {
+    checks.push(mkCheck('image.canonicalize', 'Canonicalize pin', 'pass', `json-canonicalize@${pin.pin || CANONICALIZE_PIN}`));
+  } else if (pin.inspectable && !pin.ok && osInfo.platform === 'linux' && labourOrCompute) {
+    checks.push(mkCheck('image.canonicalize', 'Canonicalize pin', 'fail',
+      `job-agent image missing json-canonicalize@${CANONICALIZE_PIN}`,
+      'j41-dispatcher build-image',
+      'j41-dispatcher build-image'));
+  } else {
+    checks.push(mkCheck('image.canonicalize', 'Canonicalize pin', 'warn', pin.detail || 'cannot confirm job-agent image'));
+  }
+
   const { nextCommand, copyPasteBlock } = pickNext(checks);
   const ok = checks.every((c) => c.status !== 'fail');
   const generatedAt = new Date(typeof deps.now === 'function' ? deps.now() : Date.now()).toISOString();
@@ -735,6 +928,7 @@ function dockerAdviceFromError(err, platform) {
 module.exports = {
   CHECK_IDS,
   CLOCK_SKEW_MS,
+  CANONICALIZE_PIN,
   runDoctor,
   formatDoctorTable,
   formatIdentitySummary,
@@ -744,4 +938,7 @@ module.exports = {
   dockerAdviceFromError,
   loadFeeTankRows,
   firstPasteCommand,
+  listingAdvertiseRefusal,
+  webhookBindActive,
+  inspectJobAgentCanonicalize,
 };

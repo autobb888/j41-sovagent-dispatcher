@@ -25,6 +25,7 @@ const {
   formatIdentitySummary,
   classifyIdentities,
   dockerAdviceFromError,
+  listingAdvertiseRefusal,
 } = require('./doctor');
 const { isIndexerLagError, retryRegisterWithJ41, INDEXER_LAG_HINT, planOnboardingAfterProfile } = require('./indexer-lag');
 const { jobPaymentReady } = require('./job-payment');
@@ -1292,8 +1293,10 @@ function getActiveJobs() {
 function doctorLiveInputs() {
   let llm = { configured: false, provider: '' };
   let computeEnabled = false;
+  let cfg;
   try {
     const c = loadDispatcherConfig();
+    cfg = c;
     const provider = (c.llm && c.llm.provider) || '';
     const keys = c.provider_keys || {};
     const hasKey = !!(c.llm && c.llm.api_key && String(c.llm.api_key).trim())
@@ -1308,7 +1311,7 @@ function doctorLiveInputs() {
     });
     nvidiaRuntime = /nvidia/i.test(out);
   } catch { /* no docker */ }
-  return { llm, computeEnabled, nvidiaRuntime };
+  return { llm, computeEnabled, nvidiaRuntime, cfg };
 }
 
 program
@@ -4519,6 +4522,7 @@ program
   .option('--upstream-url <url>', 'Your LLM server URL (e.g. http://localhost:11434/v1)')
   .option('--upstream-auth <token>', 'Bearer token for upstream server (optional)')
   .option('--public-url <url>', 'Your public dispatcher URL (e.g. https://myagent.example.com)')
+  .option('--webhook-url <url>', 'Public dispatcher URL (alias of --public-url)')
   .option('--model <spec...>', 'Model pricing: "model:inputPer1M:outputPer1M" (repeatable)')
   .option('--rpm <n>', 'Rate limit: requests/min/buyer', '60')
   .option('--tpm <n>', 'Rate limit: tokens/min/buyer', '100000')
@@ -4554,6 +4558,20 @@ program
     if (!options.upstreamUrl) { console.error('✗ --upstream-url is required'); process.exit(1); }
     if (!options.model || options.model.length === 0) { console.error('✗ at least one --model is required'); process.exit(1); }
 
+    const configPathEarlyUrl = path.join(agentDir, 'agent-config.json');
+    let existingPublic = '';
+    try {
+      if (fs.existsSync(configPathEarlyUrl)) {
+        const earlyCfg = JSON.parse(fs.readFileSync(configPathEarlyUrl, 'utf8'));
+        existingPublic = (earlyCfg && (earlyCfg.publicUrl || earlyCfg.webhookUrl)) || '';
+      }
+    } catch {}
+    const publicUrl = options.publicUrl || options.webhookUrl || existingPublic;
+    if (!publicUrl) {
+      console.error('✗ --public-url or --webhook-url is required (model.public_url)');
+      process.exit(1);
+    }
+
     const modelPricing = [];
     for (const spec of options.model) {
       const parts = spec.split(':');
@@ -4578,7 +4596,7 @@ program
     try { if (fs.existsSync(configPath)) config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch {}
     config.apiEndpointUrl = options.upstreamUrl;
     if (options.upstreamAuth) config.apiEndpointAuth = options.upstreamAuth.startsWith('Bearer ') ? options.upstreamAuth : `Bearer ${options.upstreamAuth}`;
-    if (options.publicUrl) config.publicUrl = options.publicUrl;
+    config.publicUrl = publicUrl;
     config.modelPricing = modelPricing;
     config.rateLimits = rateLimits;
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
@@ -4762,6 +4780,53 @@ program
       process.exit(1);
     } finally {
       try { agent.stop?.(); } catch {}
+    }
+  });
+
+program
+  .command('tunnel-setup <agent-id>')
+  .description('Write named Cloudflare HTTP+TCP tunnel config (publicUrl + ssh_hostname)')
+  .requiredOption('--http-host <dns>', 'Public DNS name for HTTP (webhook + proxy)')
+  .requiredOption('--ssh-host <dns>', 'Public DNS name for TCP SSH')
+  .option('--ssh-port <port>', 'Loopback port the TCP tunnel targets (default 2222)', '2222')
+  .option('--write-config', 'Persist publicUrl and ssh_hostname (always written)')
+  .option('--run', 'Run cloudflared if it is on PATH (default: print-only)')
+  .action(async (agentId, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
+    ensureDirs();
+    const { runTunnelSetup } = require('./tunnel-setup');
+    const { saveDispatcherConfig } = require('./config-loader.js');
+    try {
+      const result = await runTunnelSetup({
+        agentId,
+        httpHost: options.httpHost,
+        sshHost: options.sshHost,
+        sshPort: options.sshPort,
+        run: !!options.run,
+        keys: loadAgentKeys(agentId),
+        cfg: loadDispatcherConfig(),
+        saveDispatcherConfig,
+        apiUrl: J41_API_URL,
+        network: J41_NETWORK,
+      });
+      console.log(`✓ Wrote ${result.yamlPath} (mode 0600)`);
+      console.log(`  publicUrl:     ${result.publicUrl}`);
+      console.log(`  ssh_hostname:  ${result.sshHostname}`);
+      console.log(`  ssh_tunnel_port: ${result.sshTunnelPort}`);
+      console.log('');
+      console.log('Operator commands (dispatcher does not create the Cloudflare account):');
+      for (const cmd of result.commands) console.log(`  ${cmd}`);
+      if (!result.ran) {
+        console.log('');
+        console.log('Print-only. Pass --run to exec cloudflared if it is on PATH.');
+      }
+      if (result.profile && result.profile.skipped) {
+        console.log('');
+        console.log(`Next: j41-dispatcher update-profile ${agentId} --profile-website ${result.publicUrl} --network-endpoints ${result.publicUrl}`);
+      }
+    } catch (e) {
+      console.error(`✗ ${e.message}`);
+      process.exit(1);
     }
   });
 
@@ -5161,6 +5226,17 @@ program
     // Check which agents are registered and ACTIVE on the platform
     const enforceFinalize = cfg.runtime.require_finalize;
     const skipStatusCheck = cfg.runtime.skip_status_check;
+    let canonicalizeStatus;
+    if (process.env.NODE_ENV !== 'test') {
+      try {
+        const { inspectJobAgentCanonicalize } = require('./doctor');
+        const pin = inspectJobAgentCanonicalize(
+          { execSync: require('child_process').execSync },
+          RUNTIME !== 'local',
+        );
+        canonicalizeStatus = pin.ok ? 'pass' : (pin.inspectable && !pin.ok ? 'fail' : 'warn');
+      } catch { canonicalizeStatus = 'warn'; }
+    }
     const readyAgents = [];
     // Agents our own last shutdown turned off, and which this start restores.
     const _shutdownDeactivated = readShutdownDeactivated();
@@ -5203,6 +5279,21 @@ program
         console.log(`⚠️  ${agentId}: not registered on platform (fix: j41-dispatcher register ${agentId} <name>)`);
         _unregisteredAgents.push(agentId);
         continue;
+      }
+
+      {
+        const refuse = listingAdvertiseRefusal({
+          agentId,
+          keys,
+          cfg: startCfg,
+          agentsDir: AGENTS_DIR,
+          webhookUrl: options.webhookUrl || (startCfg.runtime && startCfg.runtime.webhook_url) || '',
+          canonicalizeStatus,
+        });
+        if (refuse) {
+          console.error(`[${refuse.code}] ${agentId}: ${refuse.message} — not advertising`);
+          continue;
+        }
       }
 
       if (enforceFinalize && !isFinalizedReady(agentId)) {

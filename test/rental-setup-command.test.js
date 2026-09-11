@@ -30,21 +30,25 @@ test('rental-setup fails closed without a TCP-tunnel hostname on home-gpu', () =
   assert.throws(() => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay' }), /HOME_GPU_NO_TUNNEL/);
 });
 
-test('rental-setup warns on RFC1918 ssh_hostname but still writes config', () => {
+test('rental-setup fails closed on RFC1918 ssh_hostname unless J41_ALLOW_LAN_RENTAL=1', () => {
   const cfg = { compute: { enabled: true, providers: { card0: { type: 'home-gpu', agent_id: 'gpu-1', ssh_hostname: '192.168.1.69', ssh_tunnel_port: 2222, memory_mb: 8192, disk_gb: 40 } } } };
-  const warns = [];
-  const orig = console.warn;
+  const prevLan = process.env.J41_ALLOW_LAN_RENTAL;
   const prevEnv = process.env.NODE_ENV;
   process.env.NODE_ENV = 'test';
-  console.warn = (...a) => warns.push(a.join(' '));
+  delete process.env.J41_ALLOW_LAN_RENTAL;
   try {
+    assert.throws(
+      () => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay' }),
+      /RENTAL_LAN_HOST/,
+    );
+    process.env.J41_ALLOW_LAN_RENTAL = '1';
     assert.doesNotThrow(() => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay' }));
   } finally {
-    console.warn = orig;
+    if (prevLan === undefined) delete process.env.J41_ALLOW_LAN_RENTAL;
+    else process.env.J41_ALLOW_LAN_RENTAL = prevLan;
     if (prevEnv === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = prevEnv;
   }
-  assert.match(warns.join('\n'), /192\.168\.1\.69|RFC1918|LAN/i);
 });
 
 test('rental-setup refuses local provider (canSsh false)', () => {

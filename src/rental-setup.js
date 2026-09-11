@@ -37,6 +37,7 @@ function assertRentalSetupAllowed({ agentId, cfg, services, paymentTerms, ackPos
   // Tunnel/resource checks before createProvider so HOME_GPU_NO_TUNNEL / HOME_GPU_NO_RAM win over a dockerode constructor error.
   if (pcfg.type === 'home-gpu') {
     assertTunnelHostname(pcfg.ssh_hostname);
+    require('./ssh-host').assertPublicSshHost(pcfg.ssh_hostname);
     assertTunnelPort(pcfg.ssh_tunnel_port);
     assertJailResources(pcfg);
     const { assertHomeGpuHostReady } = require('./docker-host');
