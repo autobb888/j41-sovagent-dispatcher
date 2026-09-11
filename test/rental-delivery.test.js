@@ -97,3 +97,57 @@ test('deliverSealed does not call deliverJob when postRentalSecret throws', asyn
   );
   assert.equal(delivered, false);
 });
+
+const lan = {
+  ssh: { host: '192.168.1.69', port: 2222, user: 'renter', password: 's3cret' },
+  expiresAt: 1755500000000,
+  disclosure: 'all-or-nothing',
+};
+
+test('deliverSealed RFC1918 throws RENTAL_LAN_HOST and does not postRentalSecret', async () => {
+  let posted = false;
+  let delivered = false;
+  const prev = process.env.J41_ALLOW_LAN_RENTAL;
+  delete process.env.J41_ALLOW_LAN_RENTAL;
+  try {
+    await assert.rejects(
+      () => deliverSealed({
+        client: {
+          async postRentalSecret() { posted = true; },
+          async deliverJob() { delivered = true; },
+        },
+        signDeliver: ({ hash }) => ({ signature: 'sig', timestamp: 1, hash }),
+        job: { id: 'job-1', jobHash: 'abcd' },
+        deliverable: lan,
+      }),
+      /RENTAL_LAN_HOST/,
+    );
+    assert.equal(posted, false);
+    assert.equal(delivered, false);
+  } finally {
+    if (prev === undefined) delete process.env.J41_ALLOW_LAN_RENTAL;
+    else process.env.J41_ALLOW_LAN_RENTAL = prev;
+  }
+});
+
+test('deliverSealed RFC1918 is allowed when J41_ALLOW_LAN_RENTAL=1', async () => {
+  const prev = process.env.J41_ALLOW_LAN_RENTAL;
+  process.env.J41_ALLOW_LAN_RENTAL = '1';
+  const calls = { secret: null };
+  try {
+    await deliverSealed({
+      client: {
+        async postRentalSecret(jobId, body) { calls.secret = { jobId, body }; },
+        async deliverJob() { return { ok: true }; },
+      },
+      signDeliver: ({ hash }) => ({ signature: 'sig', timestamp: 1, hash }),
+      job: { id: 'job-1', jobHash: 'abcd' },
+      deliverable: lan,
+    });
+    assert.equal(calls.secret.body.ssh.host, '192.168.1.69');
+    assert.equal(calls.secret.body.ssh.password, 's3cret');
+  } finally {
+    if (prev === undefined) delete process.env.J41_ALLOW_LAN_RENTAL;
+    else process.env.J41_ALLOW_LAN_RENTAL = prev;
+  }
+});

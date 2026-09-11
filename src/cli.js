@@ -107,6 +107,12 @@ const { encryptAllKeys, decryptAllKeys, listPlaintextKeys } = require('./keys-mi
 const { preflightAllowsAccept } = require('./preflight-gate.js');
 const { isGpuRentalJob, startRentalJob, stopRentalJob, shouldTeardownRental, servicesForAgent, resolveRentalProvider, ensureComputeController, decideRentalExtension, applyRentalExtension, adoptLiveRentals } = require('./rental-worker.js');
 const {
+  assertRentalHostPublic,
+  shouldRefuseLanGpuRental,
+  completeRentalHonesty,
+  formatBuyerCompleteOutput,
+} = require('./ssh-host');
+const {
   decideAutoAccept,
   loadBuyerAllowlist,
   addBuyerAllowlistEntry,
@@ -2806,6 +2812,16 @@ program
         console.error('❌ Job is missing jobHash or buyerVerusId — cannot sign accept');
         process.exit(1);
       }
+      const { slotServicesFromAgentConfig } = require('./rental-setup');
+      const rentalSvcs = slotServicesFromAgentConfig(loadAgentConfig(agentId));
+      if (isGpuRentalJob(fullJob, rentalSvcs) || (rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
+        try {
+          assertRentalHostPublic(agentId);
+        } catch (lanErr) {
+          console.error(`❌ RENTAL_LAN_HOST: ${lanErr.message}`);
+          process.exit(1);
+        }
+      }
       const timestamp = Math.floor(Date.now() / 1000);
       const sig = signMessage(keys.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
       await agent.client.acceptJob(jobId, sig, timestamp, keys.address);
@@ -3247,18 +3263,33 @@ program
       if (!ok) { console.log('Cancelled.'); process.exit(0); }
     }
     const done = await agent.completeJob(job.id);
-    say(`✅ Job ${job.id} completed (status=${done.status || 'completed'})`);
+    let warning;
+    if (job.serviceType === 'gpu-rental' || job.kind === 'compute') {
+      let access = null;
+      try {
+        access = await agent.client.getRentalAccess(job.id);
+      } catch { access = null; }
+      const honesty = await completeRentalHonesty(access);
+      warning = honesty.warning;
+    }
     let witness = null;
     try {
       witness = await agent.client.getJobWitness(job.id);
     } catch (e) {
-      say(`   Witness not ready yet (${e.message}). Retry inspect later.`);
+      if (!warning) say(`   Witness not ready yet (${e.message}). Retry inspect later.`);
     }
-    if (witness && !options.json) {
+    const out = formatBuyerCompleteOutput({
+      jobId: job.id,
+      status: done.status || 'completed',
+      warning,
+      witness,
+    });
+    say(out.human);
+    if (witness && !options.json && !warning) {
       const rec = witness.data || witness;
       say(`   Witness signedByName=${(rec.witness && rec.witness.signedByName) || rec.signedByName || '—'}`);
     }
-    if (options.json) console.log(JSON.stringify({ ok: true, jobId: job.id, status: done.status, witness }, null, 2));
+    if (options.json) console.log(JSON.stringify(out.json, null, 2));
   });
 
 program
@@ -9293,6 +9324,7 @@ async function pollForJobs(state) {
             const fullJob = await agent.client.getJob(job.id);
             if (fullJob?.jobHash && fullJob?.buyerVerusId) {
               const _rentalSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
+              if (shouldRefuseLanGpuRental(agentInfo.id, fullJob, _rentalSvcs)) continue;
               if (!isGpuRentalJob(fullJob, _rentalSvcs) && !(_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
                 if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
                   console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${job.id.substring(0, 8)}, buyer not charged`);
@@ -9398,6 +9430,9 @@ async function pollForJobs(state) {
 
         console.log(`📥 New job: ${job.id} (${job.amount} ${job.currency})`);
 
+        const _startSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
+        if (shouldRefuseLanGpuRental(agentInfo.id, job, _startSvcs)) continue;
+
         // Mark seen BEFORE starting to prevent duplicate spawns from concurrent polls
         state.seen.set(job.id, Date.now());
         saveSeenJobs(state.seen);
@@ -9433,8 +9468,13 @@ async function pollForJobs(state) {
       const lastStatus = state._lastSentStatus.get(jobId);
       if (currentJob.status === lastStatus) continue; // Already sent this status
       if (currentJob.status === 'completed') {
-        sendToJobAgent(activeInfo, { type: 'job.completed', data: { jobId } });
-        state.emitEvent?.('job.completed', { jobId, agentId: activeInfo.agentInfo?.id });
+        if (activeInfo.kind === 'gpu-rental') {
+          console.log('[Rental] credentials delivered; jail runs until expiresAt');
+          state.emitEvent?.('job.delivered', { jobId, kind: 'gpu-rental', expiresAt: activeInfo.expiresAt });
+        } else {
+          sendToJobAgent(activeInfo, { type: 'job.completed', data: { jobId } });
+          state.emitEvent?.('job.completed', { jobId, agentId: activeInfo.agentInfo?.id });
+        }
         state._lastSentStatus.set(jobId, currentJob.status);
       } else if (currentJob.status === 'disputed') {
         await queueDisputedJobForRespawn(state, jobId, { agentId: activeInfo.agentInfo?.id, reason: currentJob.dispute?.reason });
@@ -9446,10 +9486,15 @@ async function pollForJobs(state) {
         sendToJobAgent(activeInfo, { type: 'dispute.rework_accepted', data: { jobId } });
         state._lastSentStatus.set(jobId, currentJob.status);
       } else if (currentJob.status === 'delivered' && lastStatus !== 'delivered') {
-        // Auto-deliver detected via poll (pause_ttl_expired)
-        console.log(`[Poll] Job ${jobId.substring(0, 8)} auto-delivered`);
-        sendToJobAgent(activeInfo, { type: 'end_session_request', jobId });
-        state.emitEvent?.('job.delivered', { jobId, agentId: activeInfo.agentInfo?.id });
+        if (activeInfo.kind === 'gpu-rental') {
+          console.log('[Rental] credentials delivered; jail runs until expiresAt');
+          state.emitEvent?.('job.delivered', { jobId, kind: 'gpu-rental', expiresAt: activeInfo.expiresAt });
+        } else {
+          // Auto-deliver detected via poll (pause_ttl_expired)
+          console.log(`[Poll] Job ${jobId.substring(0, 8)} auto-delivered`);
+          sendToJobAgent(activeInfo, { type: 'end_session_request', jobId });
+          state.emitEvent?.('job.delivered', { jobId, agentId: activeInfo.agentInfo?.id });
+        }
         state._lastSentStatus.set(jobId, currentJob.status);
       }
 
@@ -9679,6 +9724,7 @@ async function handleWebhookEvent(state, agentId, payload) {
         const fullJob = await agent.client.getJob(jobId);
         if (fullJob?.jobHash && fullJob?.buyerVerusId) {
           const _rentalSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
+          if (shouldRefuseLanGpuRental(agentInfo.id, fullJob, _rentalSvcs)) return;
           if (!isGpuRentalJob(fullJob, _rentalSvcs) && !(_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
             if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
               console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${jobId.substring(0, 8)}, buyer not charged`);
@@ -9764,6 +9810,8 @@ async function handleWebhookEvent(state, agentId, payload) {
           console.log(`[Webhook] ⏳ Job ${jobId.substring(0, 8)} — awaiting payment (status: ${job.status})`);
           return;
         }
+        const _startSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
+        if (shouldRefuseLanGpuRental(agentInfo.id, job, _startSvcs)) return;
         if (state.active.size >= MAX_AGENTS) {
           queueInsertByPriority(state.queue, { ...job, assignedAgent: agentInfo });
           console.log(`[Webhook] Job ${jobId.substring(0, 8)} queued (priority, ${job.amount || '?'} ${job.currency || NATIVE_COIN})`);
@@ -9879,7 +9927,10 @@ async function handleWebhookEvent(state, agentId, payload) {
     case 'job.completed': {
       console.log(`[Webhook] ✅ Job ${jobId?.substring(0, 8)} completed`);
       const completedJob = state.active.get(jobId);
-      if (completedJob) {
+      if (completedJob && completedJob.kind === 'gpu-rental') {
+        console.log('[Rental] credentials delivered; jail runs until expiresAt');
+        state.emitEvent?.('job.delivered', { jobId, kind: 'gpu-rental', expiresAt: completedJob.expiresAt });
+      } else if (completedJob) {
         sendToJobAgent(completedJob, { type: 'job.completed', data });
       } else {
         // Job not active — just mark as seen
@@ -10010,7 +10061,10 @@ async function handleWebhookEvent(state, agentId, payload) {
       const deliverReason = data?.auto ? ` (auto: ${data.reason || 'pause_ttl'})` : '';
       console.log(`[Webhook] Job ${jobId?.substring(0, 8)} delivered${deliverReason}`);
       const deliverInfo = state.active.get(jobId);
-      if (deliverInfo) {
+      if (deliverInfo && deliverInfo.kind === 'gpu-rental') {
+        console.log('[Rental] credentials delivered; jail runs until expiresAt');
+        state.emitEvent?.('job.delivered', { jobId, kind: 'gpu-rental', expiresAt: deliverInfo.expiresAt });
+      } else if (deliverInfo) {
         // Tell container to clean up workspace and finalize
         sendToJobAgent(deliverInfo, { type: 'end_session_request', jobId });
       }
@@ -11863,6 +11917,9 @@ async function startJob(state, job, agentInfo) {
 }
 
 async function startRentalJobWired(state, job, agentInfo) {
+  if (shouldRefuseLanGpuRental(agentInfo && agentInfo.id, job, [{ serviceType: 'gpu-rental' }])) {
+    return;
+  }
   const allowUnpriced = process.env.J41_ALLOW_UNPRICED_JOBS === '1';
   if (!jobPaymentReady(job, { allowUnpriced })) {
     console.log(`⏳ Job ${job && job.id} — awaiting payment (refusing rental start)`);
@@ -14325,7 +14382,8 @@ if (process.env.NODE_ENV === 'test') {
     // Execution-harness seam: `program` so a test can drive the REAL `start`
     // action through commander, and `__getState` so it can then assert on what
     // that action actually did. See test/helpers/dispatcher-harness.js.
-    program, __getState: () => _liveState };
+    program, __getState: () => _liveState,
+    pollForJobs, startRentalJobWired };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
