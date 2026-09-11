@@ -35,6 +35,9 @@ test('hire create-only copy does not say Pay later with --pay; CLI has pay compl
   assert.match(cli, /\.command\('complete <buyer-agent-id> <job-id>'\)/);
   assert.match(cli, /\.command\('review <buyer-agent-id> <job-id>'\)/);
   assert.match(cli, /REVIEW_NOT_CANONICAL/);
+  assert.match(cli, /\.command\('review-session <buyer-agent-id> <seller>'\)/);
+  assert.match(cli, /REVIEW_SESSION_UNSUPPORTED/);
+  assert.match(cli, /submitBuyerApiSessionReview/);
 });
 
 test('hire --pay gates wallet-pending BEFORE createJob (no unpaid leftover on PAY_PENDING)', () => {

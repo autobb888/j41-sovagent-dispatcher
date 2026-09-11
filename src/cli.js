@@ -3411,6 +3411,46 @@ program
   });
 
 program
+  .command('review-session <buyer-agent-id> <seller>')
+  .description('Submit a model-grant session review. Fail-closed unless bytes start with J41-; 404 is REVIEW_SESSION_UNSUPPORTED.')
+  .requiredOption('--rating <n>', '1-5')
+  .option('--message <text>', 'Review text')
+  .option('--yes', 'Skip confirmation')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
+  .action(async (buyerAgentId, seller, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    const { submitBuyerApiSessionReview } = require('./buyer-review-session');
+    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    if (!options.yes) {
+      const ok = await confirmHire({ amountText: `review-session ${seller} rating ${options.rating}`, pay: false });
+      if (!ok) { console.log('Cancelled.'); process.exit(0); }
+    }
+    const result = await submitBuyerApiSessionReview({
+      client: agent.client,
+      keys,
+      seller,
+      rating: options.rating,
+      message: options.message || '',
+      agentsDir: AGENTS_DIR,
+      buyerId: buyerAgentId,
+      network: J41_NETWORK,
+    });
+    if (!result.ok) fail(result.code, result.message, { seller: result.seller, sessionId: result.sessionId });
+    say(`✅ Session review submitted (${result.result && (result.result.inboxId || result.result.id) || 'ok'})`);
+    if (options.json) {
+      console.log(JSON.stringify({
+        ok: true,
+        seller,
+        sessionId: result.sessionId,
+        rating: result.rating,
+        result: result.result,
+      }, null, 2));
+    }
+  });
+
+program
   .command('extend <buyer-agent-id> <job-id>')
   .description('Request a job extension and dual-pay it (labour in_progress/paused; GPU Cat-1 including delivered)')
   .requiredOption('--amount <n>', 'Extension amount in the listing currency')
@@ -3643,7 +3683,7 @@ program
     const say = (line) => { if (!options.json) console.log(line); };
     const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
     const {
-      requestAndOpenAccess, saveAccessGrant, loadAccessGrant, chatCompletions,
+      requestAndOpenAccess, saveAccessGrant, loadAccessGrant, persistGrantSession, chatCompletions,
     } = require('./buyer-access');
     let grant = loadAccessGrant(AGENTS_DIR, buyerAgentId, seller);
     let listing = null;
@@ -3700,6 +3740,9 @@ program
         suggestedTopup: chat.suggestedTopup,
         depositArgv: chat.depositArgv,
       });
+    }
+    if (chat.result && chat.result.sessionId) {
+      persistGrantSession(AGENTS_DIR, buyerAgentId, seller, chat.result.sessionId);
     }
     const body = chat.result && chat.result.body;
     const text = body && body.choices && body.choices[0] && body.choices[0].message

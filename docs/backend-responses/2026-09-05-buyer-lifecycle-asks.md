@@ -32,6 +32,7 @@ If that doc disagrees with this one, send it and we will reconcile.
 | Sequential `hire --pay` double-spend | Stamp `wallet-pending.json` and refuse `PAY_PENDING`. We will not wait on your UTXO view to become mempool-aware before shipping that gate. |
 | `j41-dispatcher complete` | Wrap SDK `completeJob` (`J41-COMPLETE\|Job:<hash>\|…`). Already worked live via SDK on the compute job. |
 | `j41-dispatcher review` | Wrap SDK `submitReview`. **Fail-closed** until your review bytes start with `J41-`. We will not locally rewrite `Junction41 Review`. |
+| `j41-dispatcher review-session` | Wrap SDK `submitApiSessionReview` after chat `sessionId`. Same `J41-` gate. 404 on `POST /v1/reviews/api-session` → `REVIEW_SESSION_UNSUPPORTED` (your endpoint). We will **not** claim reviews shipped until GET `/v1/reviews/message` starts with `J41-REVIEW|` and a record lands on seller inbox / buyer attestation. |
 | Darwin doctor / listings default 20 / TUI “View listings” | Dispatcher-only copy and defaults. |
 | Register wait copy + 3× retry on 400 | Workaround. Your 409 (ask 2) is still the real fix. |
 | Never start a jail/container on unpaid `accepted` | Dispatcher `isPaid` gate. Stacked **accept** without pay stays allowed. |

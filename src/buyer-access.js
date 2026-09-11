@@ -73,6 +73,7 @@ function saveAccessGrant(agentsDir, buyerId, seller, payload) {
     models: payload.models || [],
     savedAt: new Date().toISOString(),
   };
+  if (payload.sessionId) rec.sessionId = String(payload.sessionId);
   const tmp = `${p}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(rec, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, p);
@@ -91,6 +92,13 @@ function loadAccessGrant(agentsDir, buyerId, seller, now = Date.now()) {
     if (Number.isFinite(exp) && exp <= now) return null;
   }
   return rec;
+}
+
+function persistGrantSession(agentsDir, buyerId, seller, sessionId) {
+  if (!sessionId) return loadAccessGrant(agentsDir, buyerId, seller);
+  const rec = loadAccessGrant(agentsDir, buyerId, seller);
+  if (!rec) return null;
+  return saveAccessGrant(agentsDir, buyerId, seller, { ...rec, sessionId: String(sessionId) });
 }
 
 function redactApiKey(key) {
@@ -295,6 +303,7 @@ module.exports = {
   grantPath,
   saveAccessGrant,
   loadAccessGrant,
+  persistGrantSession,
   redactApiKey,
   listingPublicUrlHint,
   requestAndOpenAccess,
