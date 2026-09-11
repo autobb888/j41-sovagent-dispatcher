@@ -27,6 +27,7 @@ fs.mkdirSync(AGENTS_DIR, { recursive: true });
 const {
   walletList, walletShow, walletSweep, walletSend,
   loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks,
+  waitWalletPendingUnlink,
 } = require('../src/cli.js');
 
 const { FEE_SATS, DEFAULT_FLOOR_WRITES, SWEEP_PENDING_BACKSTOP_MS } = require('../src/fee-tank.js');
@@ -459,11 +460,25 @@ test('show reports the pending stamp and never fabricates balances', async () =>
   clearStamps();
   saveWalletPending('agent-2', { txid: '4e4f3bf7cafe', at: Date.now() - 120000, kind: 'sweep' });
   const { state } = sendState({ utxos: [rUtxo(13490000), iUtxo(49990000)] });
+  state._testAgentSession.client.getTxStatus = async () => ({ confirmations: 0 });
   const { text } = await capture(() => walletShow(state, 'agent-2', {}));
   assert.match(text, /0\.13490000/);
   assert.match(text, /0\.49990000/);
   assert.match(text, /Pending sweep 4e4f3bf7cafe/);
   assert.match(text, /2m ago/);
+  assert.doesNotMatch(text, /could not query tx status/);
+  assert.equal(fs.existsSync(walletPendingPath('agent-2')), true, 'unconfirmed stamp stays');
+  clearStamps();
+});
+
+test('show says stamp kept when the client cannot query tx status', async () => {
+  clearStamps();
+  saveWalletPending('agent-2', { txid: '4e4f3bf7cafe', at: Date.now() - 120000, kind: 'sweep' });
+  const { state } = sendState({ utxos: [rUtxo(13490000)] });
+  // makeState client has getUtxos/broadcast only — no getTxStatus.
+  const { text } = await capture(() => walletShow(state, 'agent-2', {}));
+  assert.match(text, /pending \(could not query tx status — stamp kept\)/i);
+  assert.equal(fs.existsSync(walletPendingPath('agent-2')), true, 'cannot query → keep');
   clearStamps();
 });
 
@@ -595,6 +610,69 @@ test('a malformed or txid-less stamp is passed through untouched, not cleared', 
   assert.equal(await resolveWalletPending(client, 'agent-2', bad), bad, 'malformed survives');
   const noTxid = { at: Date.now(), kind: 'sweep' };
   assert.equal(await resolveWalletPending(client, 'agent-2', noTxid), noTxid, 'no txid → cannot verify → keep');
+});
+
+test('resolveWalletPending unlinks only when txConfirmations > 0', async () => {
+  const cases = [
+    ['string confirmations', { confirmations: '2' }, true],
+    ['nested data.confirmations', { data: { confirmations: 3 } }, true],
+    ['confirmed:true, no confirmations key', { confirmed: true }, true],
+    ['confirmed:true AND confirmations:0 keeps', { confirmed: true, confirmations: 0 }, false],
+    ['numeric zero keeps', { confirmations: 0 }, false],
+  ];
+  for (const [label, st, unlinks] of cases) {
+    saveWalletPending('agent-2', stampFor(`tx-${label}`));
+    const client = { getTxStatus: async () => st };
+    const out = await resolveWalletPending(client, 'agent-2', loadWalletPending('agent-2'));
+    if (unlinks) {
+      assert.equal(out, null, `${label}: must unlink`);
+      assert.equal(fs.existsSync(walletPendingPath('agent-2')), false, `${label}: stamp file removed`);
+    } else {
+      assert.ok(out && out.txid, `${label}: must keep the guard`);
+      assert.equal(fs.existsSync(walletPendingPath('agent-2')), true, `${label}: stamp file kept`);
+      fs.unlinkSync(walletPendingPath('agent-2'));
+    }
+  }
+});
+
+test('waitWalletPendingUnlink polls getTxStatus until confirmations > 0 then unlinks', async () => {
+  saveWalletPending('agent-2', stampFor('new-pay-tx'));
+  let n = 0;
+  const client = {
+    getTxStatus: async () => {
+      n += 1;
+      return n >= 3 ? { confirmations: 1 } : { confirmations: 0 };
+    },
+  };
+  let t = 0;
+  const out = await waitWalletPendingUnlink(client, 'agent-2', {
+    timeoutMs: 180000,
+    intervalMs: 5000,
+    now: () => t,
+    sleep: async (ms) => { t += ms; },
+  });
+  assert.equal(out.cleared, true);
+  assert.equal(fs.existsSync(walletPendingPath('agent-2')), false);
+  assert.ok(n >= 3, `must poll more than once, got ${n}`);
+  assert.ok(t >= 10000, 'clock must advance by the poll interval, not wall-clock 180s');
+});
+
+test('waitWalletPendingUnlink timeout keeps the stamp — does not spend again', async () => {
+  saveWalletPending('agent-2', stampFor('still-mempool'));
+  let lookups = 0;
+  const client = { getTxStatus: async () => { lookups += 1; return { confirmations: 0 }; } };
+  let t = 0;
+  const out = await waitWalletPendingUnlink(client, 'agent-2', {
+    timeoutMs: 180000,
+    intervalMs: 5000,
+    now: () => t,
+    sleep: async (ms) => { t += ms; },
+  });
+  assert.equal(out.cleared, false);
+  assert.equal(out.pending && out.pending.txid, 'still-mempool');
+  assert.equal(fs.existsSync(walletPendingPath('agent-2')), true, 'timeout must not unlink');
+  assert.ok(lookups >= 2, 'must have polled');
+  fs.unlinkSync(walletPendingPath('agent-2'));
 });
 
 // ---------------------------------------------------------------------------
