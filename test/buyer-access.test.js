@@ -146,6 +146,7 @@ test('chatCompletions posts OpenAI-compatible body through callProxied', async (
   const r = await chatCompletions({
     grant: { apiKey: 'sk-test', endpointUrl: 'https://proxy.example/j41/proxy/v1', models: ['duskseek'] },
     message: 'hello',
+    fetchImpl: async () => ({ ok: true, json: async () => ({ service: 'dispatcher' }) }),
     client: {
       callProxied: async (opts) => {
         bodies.push(opts.body);
@@ -286,6 +287,7 @@ test('chatCompletions joins /chat/completions onto a /v1 proxy base (no /v1/v1)'
   const r = await chatCompletions({
     grant: { apiKey: 'sk-test', endpointUrl: 'https://foo.example/j41/proxy/v1', models: ['m'] },
     message: 'hi',
+    fetchImpl: async () => ({ ok: true, json: async () => ({ service: 'dispatcher' }) }),
     client: {
       callProxied: async (opts) => {
         calls.push(opts);
@@ -522,6 +524,7 @@ test('chat 402 maps to CHAT_NEEDS_DEPOSIT from statusCode/responseBody', async (
   const r = await chatCompletions({
     grant: { apiKey: 'sk-test', endpointUrl: 'https://foo.example/j41/proxy/v1' },
     message: 'hi',
+    fetchImpl: async () => ({ ok: true, json: async () => ({ service: 'dispatcher' }) }),
     client: { callProxied: async () => { throw err; } },
   });
   assert.equal(r.ok, false);
@@ -540,11 +543,130 @@ test('non-402 proxy errors stay CHAT_FAILED', async () => {
   const r = await chatCompletions({
     grant: { apiKey: 'sk-test', endpointUrl: 'https://foo.example/j41/proxy/v1' },
     message: 'hi',
+    fetchImpl: async () => ({ ok: true, json: async () => ({ service: 'dispatcher' }) }),
     client: { callProxied: async () => { throw err; } },
   });
   assert.equal(r.ok, false);
   assert.equal(r.code, 'CHAT_FAILED');
 });
+
+function grantFile(dir, seller) {
+  const safe = String(seller).replace(/[^A-Za-z0-9._-]+/g, '_');
+  return path.join(dir, 'agent-1', 'access', `${safe}.json`);
+}
+
+test('stale dispatcher grant origin 404s health then listing hint rewrites and callProxied uses new origin', async () => {
+  const dir = tmpDir();
+  const seller = 'duskseek.agentplatform@';
+  try {
+    saveAccessGrant(dir, 'agent-1', seller, {
+      apiKey: 'sk-test',
+      endpointUrl: 'https://old-tunnel.trycloudflare.com/j41/proxy/v1',
+      expiresAt: '2099-01-01T00:00:00Z',
+      models: ['m'],
+    });
+    const health = [];
+    const calls = [];
+    const r = await chatCompletions({
+      grant: loadAccessGrant(dir, 'agent-1', seller),
+      message: 'hi',
+      listing: { website: 'https://new-tunnel.example/', description: 'ignore me' },
+      agentsDir: dir,
+      buyerId: 'agent-1',
+      seller,
+      fetchImpl: async (url) => {
+        health.push(String(url));
+        if (String(url).includes('old-tunnel.trycloudflare.com')) {
+          return { ok: false, status: 404 };
+        }
+        return { ok: true, json: async () => ({ service: 'dispatcher', status: 'ok' }) };
+      },
+      client: {
+        callProxied: async (opts) => {
+          calls.push(opts);
+          return { ok: true, status: 200, body: {} };
+        },
+      },
+    });
+    assert.equal(r.ok, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].endpointUrl, 'https://new-tunnel.example/j41/proxy/v1');
+    assert.ok(health.some((u) => u === 'https://old-tunnel.trycloudflare.com/j41/health'));
+    assert.ok(health.some((u) => u === 'https://new-tunnel.example/j41/health'));
+    const p = grantFile(dir, seller);
+    assert.equal(fs.statSync(p).mode & 0o077, 0);
+    const rec = JSON.parse(fs.readFileSync(p, 'utf8'));
+    assert.equal(rec.endpointUrl, 'https://new-tunnel.example/j41/proxy/v1');
+    assert.doesNotMatch(rec.endpointUrl, /old-tunnel/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('stale dispatcher grant + listing hint without dispatcher health is ACCESS_GRANT_STALE; file unchanged', async () => {
+  const dir = tmpDir();
+  const seller = 'duskseek.agentplatform@';
+  try {
+    saveAccessGrant(dir, 'agent-1', seller, {
+      apiKey: 'sk-test',
+      endpointUrl: 'https://old-tunnel.trycloudflare.com/j41/proxy/v1',
+      expiresAt: '2099-01-01T00:00:00Z',
+    });
+    const before = fs.readFileSync(grantFile(dir, seller), 'utf8');
+    let called = false;
+    const r = await chatCompletions({
+      grant: loadAccessGrant(dir, 'agent-1', seller),
+      message: 'hi',
+      listing: { website: 'https://marketing.example/', endpoints: [{ url: 'https://pages.example/' }] },
+      agentsDir: dir,
+      buyerId: 'agent-1',
+      seller,
+      fetchImpl: async (url) => {
+        if (String(url).includes('old-tunnel.trycloudflare.com')) return { ok: false, status: 404 };
+        return { ok: true, json: async () => ({ service: 'pages' }) };
+      },
+      client: { callProxied: async () => { called = true; } },
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, 'ACCESS_GRANT_STALE');
+    assert.equal(called, false);
+    const after = fs.readFileSync(grantFile(dir, seller), 'utf8');
+    assert.equal(after, before);
+    assert.match(after, /old-tunnel\.trycloudflare\.com/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('stale dispatcher grant with no listing hint is ACCESS_GRANT_STALE; file unchanged', async () => {
+  const dir = tmpDir();
+  const seller = 'duskseek.agentplatform@';
+  try {
+    saveAccessGrant(dir, 'agent-1', seller, {
+      apiKey: 'sk-test',
+      endpointUrl: 'https://old-tunnel.trycloudflare.com/j41/proxy/v1',
+      expiresAt: '2099-01-01T00:00:00Z',
+    });
+    const before = fs.readFileSync(grantFile(dir, seller), 'utf8');
+    let called = false;
+    const r = await chatCompletions({
+      grant: loadAccessGrant(dir, 'agent-1', seller),
+      message: 'hi',
+      agentsDir: dir,
+      buyerId: 'agent-1',
+      seller,
+      fetchImpl: async () => ({ ok: false, status: 404 }),
+      client: { callProxied: async () => { called = true; } },
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, 'ACCESS_GRANT_STALE');
+    assert.equal(called, false);
+    assert.equal(fs.readFileSync(grantFile(dir, seller), 'utf8'), before);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 
 test('listingPublicUrlHint prefers networkEndpoints[0] over website', () => {
   assert.equal(

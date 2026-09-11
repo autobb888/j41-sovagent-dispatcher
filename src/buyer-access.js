@@ -15,6 +15,7 @@ const { assertAccessAllowed } = require('./hire');
 const {
   isDispatcherProxyBase,
   resolveListingDispatcherBase,
+  refreshStaleDispatcherBase,
   callProxiedPath,
 } = require('./buyer-proxy-url');
 
@@ -229,6 +230,28 @@ async function chatCompletions({
     working = { ...working, endpointUrl: minted };
     if (agentsDir && buyerId && seller) {
       try { saveAccessGrant(agentsDir, buyerId, seller, working); } catch { /* proceed in memory */ }
+    }
+  } else {
+    const hint = publicUrlHint || listingPublicUrlHint(listing);
+    let nextUrl;
+    try {
+      nextUrl = await refreshStaleDispatcherBase(working.endpointUrl, hint, {
+        grant: working,
+        fetchImpl,
+        failCode: 'ACCESS_GRANT_STALE',
+      });
+    } catch (e) {
+      return {
+        ok: false,
+        code: (e && e.code) || 'ACCESS_GRANT_STALE',
+        message: (e && e.message) || 'Saved grant origin failed /j41/health.',
+      };
+    }
+    if (nextUrl !== working.endpointUrl) {
+      working = { ...working, endpointUrl: nextUrl };
+      if (agentsDir && buyerId && seller) {
+        try { saveAccessGrant(agentsDir, buyerId, seller, working); } catch { /* proceed in memory */ }
+      }
     }
   }
 
