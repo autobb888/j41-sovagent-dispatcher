@@ -491,8 +491,8 @@ function _resetDispatcherRateLimit(suspended = false) {
 // they are only ledgered, via recordSendOutcome. Routing them through the gate would
 // newly subject an operator's fleet transfer / fee sweep to the financial kill
 // switch, which they have never been subject to. See recordSendOutcome.
-const EXTERNAL_KINDS = new Set(['refund', 'payment']);
-const KNOWN_KINDS = new Set(['refund', 'payment', 'fleet_transfer', 'fee_sweep']);
+const EXTERNAL_KINDS = new Set(['refund', 'payment', 'deposit']);
+const KNOWN_KINDS = new Set(['refund', 'payment', 'fleet_transfer', 'fee_sweep', 'deposit']);
 
 // ── Compiled hard ceilings (P2) ──────────────────────────────────────────────
 //
@@ -655,6 +655,21 @@ function _rateCheckField(checks, reason) {
 }
 
 /**
+ * Prepaid top-up is repeat-by-design. The job-pay 1.1x ceiling treats `jobPrice`
+ * as "this one payment", so `jobPrice === amount` denies a second similar
+ * deposit (`totalSent + amount > amount * 1.1`). Size the budget so
+ * `maxSendsPerJob` deposits of this amount fit; the per-job send cap, hourly
+ * cap, cooldown, and absolute per-tx cap still bind. An explicit wider
+ * `jobPrice` is kept.
+ */
+function depositScopedJobPrice(amount, jobPrice) {
+  const LIM = effectiveLimits();
+  const scoped = amount * LIM.maxSendsPerJob;
+  const given = Number.isFinite(jobPrice) && jobPrice > 0 ? jobPrice : 0;
+  return Math.max(given, scoped);
+}
+
+/**
  * The single gate before an outbound broadcast.
  * @returns {{allowed:boolean, retryable:boolean, reason?:string, checks:object}}
  *   `retryable` distinguishes "wait and retry" from "needs operator action";
@@ -722,7 +737,8 @@ function gateExternalSend({ jobId, toAddress, amount, amountSats, jobPrice, kind
 
   // 2. Suspension + rate family.
   if (external) {
-    const rl = checkDispatcherRateLimit(limiterKey, amtNum, jobPrice, now);
+    const priceForLimit = kind === 'deposit' ? depositScopedJobPrice(amtNum, jobPrice) : jobPrice;
+    const rl = checkDispatcherRateLimit(limiterKey, amtNum, priceForLimit, now);
     if (!rl.allowed) { _rateCheckField(checks, rl.reason); return finish(false, rl.retryable, rl.reason); }
     checks.suspension = 'pass';
     checks.perJobCap = 'pass'; checks.valueCeiling = 'pass';
