@@ -3774,6 +3774,35 @@ program
     }
   });
 
+program
+  .command('browse <seller>')
+  .description('GET a data listing website/endpoints (not a hire)')
+  .option('--path <path>', 'Append when the listing URL has no path')
+  .option('--json', 'One JSON object on stdout')
+  .action(async (seller, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const { browseSeller } = require('./buyer-browse');
+    const r = await browseSeller({
+      seller,
+      path: options.path,
+      apiUrl: J41_API_URL,
+    });
+    if (!r.ok) fail(r.code, r.message, { url: r.url, status: r.status });
+    if (!options.json) {
+      const text = r.body == null ? '' : String(r.body);
+      process.stdout.write(text);
+      if (text && !text.endsWith('\n')) process.stdout.write('\n');
+    } else {
+      console.log(JSON.stringify({
+        ok: true,
+        seller,
+        url: r.url,
+        status: r.status,
+        body: r.body,
+      }, null, 2));
+    }
+  });
+
 async function confirmHire({ amountText, pay }) {
   const readline = require('readline');
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });

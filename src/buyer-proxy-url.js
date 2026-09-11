@@ -80,6 +80,26 @@ async function resolveListingDispatcherBase(hint, { grant, fetchImpl, failCode }
   return minted;
 }
 
+async function refreshStaleDispatcherBase(endpointUrl, hint, { grant, fetchImpl, failCode } = {}) {
+  const code = failCode || 'ACCESS_GRANT_STALE';
+  let healthy = false;
+  try {
+    await assertDispatcherHealth(originOf(endpointUrl), fetchImpl, code);
+    healthy = true;
+  } catch {
+    healthy = false;
+  }
+  if (healthy) return endpointUrl;
+  if (!hint) {
+    throw codedError(code, 'saved grant origin failed /j41/health and no listing URL is published');
+  }
+  return resolveListingDispatcherBase(hint, {
+    grant: grant || { endpointUrl },
+    fetchImpl,
+    failCode: code,
+  });
+}
+
 module.exports = {
   codedError,
   originOf,
@@ -90,4 +110,5 @@ module.exports = {
   isDispatcherProxyBase,
   assertDispatcherHealth,
   resolveListingDispatcherBase,
+  refreshStaleDispatcherBase,
 };

@@ -11,6 +11,7 @@ const {
   isDispatcherProxyBase,
   assertDispatcherHealth,
   resolveListingDispatcherBase,
+  refreshStaleDispatcherBase,
 } = require('../src/buyer-proxy-url');
 
 test('codedError attaches a stable code', () => {
@@ -105,5 +106,38 @@ test('assertDispatcherHealth default failCode is ENVELOPE_NO_PUBLIC_URL', async 
   await assert.rejects(
     () => assertDispatcherHealth('https://foo.example', async () => ({ ok: false })),
     (e) => e.code === 'ENVELOPE_NO_PUBLIC_URL',
+  );
+});
+
+test('refreshStaleDispatcherBase keeps a live grant origin and rewrites after health fail', async () => {
+  const kept = await refreshStaleDispatcherBase(
+    'https://live.example/j41/proxy/v1',
+    'https://other.example/',
+    { fetchImpl: async () => ({ ok: true, json: async () => ({ service: 'dispatcher' }) }) },
+  );
+  assert.equal(kept, 'https://live.example/j41/proxy/v1');
+
+  const urls = [];
+  const minted = await refreshStaleDispatcherBase(
+    'https://dead.example/j41/proxy/v1',
+    'https://fresh.example/',
+    {
+      fetchImpl: async (url) => {
+        urls.push(String(url));
+        if (String(url).includes('dead.example')) return { ok: false, status: 404 };
+        return { ok: true, json: async () => ({ service: 'dispatcher' }) };
+      },
+      failCode: 'ACCESS_GRANT_STALE',
+    },
+  );
+  assert.equal(minted, 'https://fresh.example/j41/proxy/v1');
+  assert.ok(urls.includes('https://dead.example/j41/health'));
+  assert.ok(urls.includes('https://fresh.example/j41/health'));
+
+  await assert.rejects(
+    () => refreshStaleDispatcherBase('https://dead.example/j41/proxy/v1', null, {
+      fetchImpl: async () => ({ ok: false, status: 404 }),
+    }),
+    (e) => e.code === 'ACCESS_GRANT_STALE',
   );
 });
