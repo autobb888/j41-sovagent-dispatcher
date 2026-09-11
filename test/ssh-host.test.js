@@ -10,6 +10,7 @@ const {
   isLanSshHost,
   shouldRefuseLanGpuRental,
   completeRentalHonesty,
+  leftoverCompleteHonesty,
   formatBuyerCompleteOutput,
 } = require('../src/ssh-host');
 
@@ -175,6 +176,42 @@ test('isLanSshHost ignores J41_ALLOW_LAN_RENTAL (buyer complete stays honest)', 
   } finally {
     restoreLanEnv(prev);
   }
+});
+
+test('isLanSshHost strips :port, [ipv6]:port, and trailing FQDN dot before isPrivateIp', () => {
+  assert.equal(isLanSshHost('192.168.1.69:2222'), true);
+  assert.equal(isLanSshHost('192.168.1.69.'), true);
+  assert.equal(isLanSshHost('10.0.0.1:22'), true);
+  assert.equal(isLanSshHost('127.0.0.1:22'), true);
+  assert.equal(isLanSshHost('[fd00::1]:2222'), true);
+  assert.equal(isLanSshHost('[::1]:22'), true);
+  assert.equal(isLanSshHost('gpu.local:22'), true);
+  assert.equal(isLanSshHost('localhost:22'), true);
+  assert.equal(isLanSshHost('gpu.example.com:22'), false);
+  assert.equal(isLanSshHost('1.1.1.1:22'), false);
+  assert.equal(isLanSshHost('1.1.1.1.'), false);
+  assert.throws(() => assertPublicSshHost('192.168.1.69:2222'), /RENTAL_LAN_HOST/);
+  assert.throws(() => assertPublicSshHost('192.168.1.69.'), /RENTAL_LAN_HOST/);
+});
+
+test('leftoverCompleteHonesty runs honesty when getRentalAccess has ssh.host, even without job.serviceType', async () => {
+  const r = await leftoverCompleteHonesty(
+    async () => ({ ssh: { host: '192.168.1.69', port: 2222 } }),
+    'e70731db-leftover',
+  );
+  assert.equal(r.warning, 'COMPLETE_LAN_ONLY');
+});
+
+test('leftoverCompleteHonesty 404 is labour (no warning, so the checkmark may print)', async () => {
+  const r = await leftoverCompleteHonesty(
+    async () => {
+      const e = new Error('not found');
+      e.statusCode = 404;
+      throw e;
+    },
+    'labour-job',
+  );
+  assert.equal(r.warning, null);
 });
 
 test('probeSshHost connects to a live listener', async () => {

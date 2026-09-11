@@ -19,7 +19,14 @@ function logLanOverrideOnce() {
 
 function normalizeSshHost(host) {
   let h = String(host == null ? '' : host).trim().toLowerCase();
-  if (h.startsWith('[') && h.endsWith(']')) h = h.slice(1, -1);
+  const bracket = h.match(/^\[([^\]]+)\](?::(\d+))?$/);
+  if (bracket) {
+    h = bracket[1];
+  } else {
+    const ipv4OrNamePort = h.match(/^([^:]+):(\d+)$/);
+    if (ipv4OrNamePort) h = ipv4OrNamePort[1];
+  }
+  while (h.endsWith('.')) h = h.slice(0, -1);
   return h;
 }
 
@@ -129,6 +136,28 @@ function rentalSshFromAccess(access) {
   return { host: ssh.host, port: ssh.port };
 }
 
+function rentalAccessNotFound(err) {
+  if (!err) return false;
+  const status = Number(err.statusCode || err.status || (err.response && err.response.status));
+  return status === 404;
+}
+
+// Buyer leftover complete: observe rental the way GET /v1/jobs/:id actually
+// looks (serviceId, not serviceType). Try getRentalAccess; ssh.host → honesty;
+// 404 / no host → labour (caller may print the success checkmark).
+async function leftoverCompleteHonesty(getRentalAccess, jobId, opts) {
+  let access = null;
+  try {
+    access = await getRentalAccess(jobId);
+  } catch (e) {
+    if (rentalAccessNotFound(e)) return { warning: null };
+    access = null;
+  }
+  const { host } = rentalSshFromAccess(access);
+  if (host == null || String(host).trim() === '') return { warning: null };
+  return completeRentalHonesty(access, opts);
+}
+
 async function completeRentalHonesty(access, { probe = probeSshHost } = {}) {
   if (!access || typeof access !== 'object') {
     return {
@@ -184,6 +213,7 @@ module.exports = {
   shouldRefuseLanGpuRental,
   probeSshHost,
   rentalSshFromAccess,
+  leftoverCompleteHonesty,
   completeRentalHonesty,
   formatBuyerCompleteOutput,
 };

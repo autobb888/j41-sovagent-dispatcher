@@ -98,15 +98,19 @@ test('bounty acceptJob is not LAN-gated unless isGpuRentalJob', () => {
 });
 
 test('complete leftover GPU path uses getRentalAccess + honesty helper; checkmark is gated on warning', () => {
-  const start = CLI_SRC.indexOf(".command('complete <buyer-agent-id> <job-id>')");
-  const next = CLI_SRC.indexOf('\n  .command(', start + 1);
+  const start = CLI_SRC.indexOf('async function runBuyerComplete');
+  assert.ok(start > -1, 'complete leftover lives in runBuyerComplete');
+  const next = CLI_SRC.indexOf('\nprogram', start + 1);
   const body = CLI_SRC.slice(start, next === -1 ? start + 5000 : next);
   assert.match(body, /getRentalAccess/);
-  assert.match(body, /completeRentalHonesty|formatBuyerCompleteOutput/);
-  assert.match(body, /COMPLETE_LAN_ONLY|warning/);
-  const check = body.indexOf('✅ Job ${job.id} completed');
-  assert.ok(check === -1 || /warning/.test(body.slice(Math.max(0, check - 400), check)),
-    'checkmark must not print unconditionally on leftover LAN complete');
+  assert.match(body, /leftoverCompleteHonesty|completeRentalHonesty|formatBuyerCompleteOutput/);
+  assert.doesNotMatch(body, /job\.serviceType === 'gpu-rental'/);
+  assert.doesNotMatch(body, /job\.kind === 'compute'/);
+  const cmd = CLI_SRC.indexOf(".command('complete <buyer-agent-id> <job-id>')");
+  assert.ok(cmd > start, 'complete command must call runBuyerComplete');
+  const cmdNext = CLI_SRC.indexOf('\n  .command(', cmd + 1);
+  const cmdBody = CLI_SRC.slice(cmd, cmdNext === -1 ? cmd + 2000 : cmdNext);
+  assert.match(cmdBody, /runBuyerComplete/);
 });
 
 test('job.completed / delivered gpu-rental does not sendToJobAgent', () => {
@@ -129,12 +133,25 @@ const {
   handleWebhookEvent,
   startRentalJobWired,
   pollForJobs,
+  runBuyerComplete,
 } = require('../src/cli.js');
+
+// Real WIF so signMessage succeeds; a missing LAN accept gate must then
+// reach acceptJob. Dummy/invalid wif would throw inside signMessage and
+// hide a missing gate (accepted.length stays 0 for the wrong reason).
+const { generateKeypair } = require('@junction41/sovagent-sdk/dist/index.js');
+const GPU_KEYS = generateKeypair('verustest');
 
 function rentalWebhookState({ status = 'requested' } = {}) {
   const accepted = [];
   const acquired = [];
-  const agentInfo = { id: 'gpu-1', identity: 'gpu-1@', address: 'Rgpu', iAddress: 'iGpu' };
+  const agentInfo = {
+    id: 'gpu-1',
+    identity: 'gpu-1@',
+    address: 'Rgpu',
+    iAddress: 'iGpu',
+    wif: GPU_KEYS.wif,
+  };
   const job = {
     id: 'job-lan',
     status,
@@ -196,4 +213,64 @@ test('poll does not acceptJob or seen.set on LAN gpu-rental', async () => {
   await pollForJobs(state);
   assert.equal(accepted.length, 0);
   assert.equal(state.seen.has('job-lan'), false);
+});
+
+test('webhook job.requested does acceptJob when J41_ALLOW_LAN_RENTAL=1 (fixture can reach accept)', async () => {
+  const prev = process.env.J41_ALLOW_LAN_RENTAL;
+  process.env.J41_ALLOW_LAN_RENTAL = '1';
+  try {
+    const { state, accepted } = rentalWebhookState();
+    await handleWebhookEvent(state, 'gpu-1', {
+      event: 'job.requested',
+      data: { jobId: 'job-lan' },
+    });
+    assert.equal(accepted.length, 1, 'override must reach acceptJob so a missing LAN gate cannot hide behind signMessage');
+  } finally {
+    if (prev === undefined) delete process.env.J41_ALLOW_LAN_RENTAL;
+    else process.env.J41_ALLOW_LAN_RENTAL = prev;
+  }
+});
+
+test('complete leftover getJob without serviceType still honesty-checks LAN getRentalAccess', async () => {
+  const logs = [];
+  const origLog = console.log;
+  const origExit = process.exit;
+  console.log = (...a) => { logs.push(a.map(String).join(' ')); };
+  process.exit = (code) => { throw new Error(`unexpected exit ${code}: ${logs.join('\n')}`); };
+  const keys = {
+    identity: 'buyer.agentplatform@',
+    iAddress: 'iBuyer',
+    address: 'Rbuyer',
+    wif: 'x',
+  };
+  // SDK Job has serviceId, not serviceType/kind. buyerVerusId is only for buyerOwnsJob.
+  const job = { id: 'e70731db-leftover', status: 'delivered', serviceId: 'svc-gpu-1', buyerVerusId: 'buyer.agentplatform@' };
+  const agent = {
+    async completeJob() { return { status: 'completed' }; },
+    client: {
+      async getJob() { return job; },
+      async getRentalAccess() {
+        return { ssh: { host: '192.168.1.69', port: 2222, password: 's3cret' } };
+      },
+      async getJobWitness() { return null; },
+    },
+  };
+  try {
+    await runBuyerComplete(keys, agent, job.id, { yes: true });
+    const human = logs.join('\n');
+    assert.doesNotMatch(human, /✅ Job .* completed/);
+    assert.match(human, /RFC1918/);
+    assert.doesNotMatch(human, /SSH ready/i);
+
+    logs.length = 0;
+    await runBuyerComplete(keys, agent, job.id, { yes: true, json: true });
+    const raw = logs.join('\n');
+    assert.doesNotMatch(raw, /✅ Job .* completed/);
+    const parsed = JSON.parse(raw);
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.warning, 'COMPLETE_LAN_ONLY');
+  } finally {
+    console.log = origLog;
+    process.exit = origExit;
+  }
 });

@@ -109,7 +109,7 @@ const { isGpuRentalJob, startRentalJob, stopRentalJob, shouldTeardownRental, ser
 const {
   assertRentalHostPublic,
   shouldRefuseLanGpuRental,
-  completeRentalHonesty,
+  leftoverCompleteHonesty,
   formatBuyerCompleteOutput,
 } = require('./ssh-host');
 const {
@@ -3241,6 +3241,49 @@ program
     if (options.json) console.log(JSON.stringify({ ok: true, jobId: job.id, txid, outputs }, null, 2));
   });
 
+async function runBuyerComplete(keys, agent, jobId, options) {
+  const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+  const say = (line) => { if (!options.json) console.log(line); };
+  const job = await agent.client.getJob(jobId);
+  if (!job || !job.id) fail('COMPLETE_NOT_DELIVERED', `Job ${jobId} not found.`);
+  if (!buyerOwnsJob(keys, job)) fail('PAY_NOT_BUYER', 'This identity is not the buyer on that job.');
+  if (job.status === 'completed') fail('COMPLETE_ALREADY', 'Job is already completed.', { jobId: job.id });
+  if (job.status !== 'delivered') {
+    fail('COMPLETE_NOT_DELIVERED', `Job status is ${job.status}, not delivered.`, { jobId: job.id, status: job.status });
+  }
+  if (!options.yes) {
+    const ok = await confirmHire({ amountText: `complete ${job.id}`, pay: false });
+    if (!ok) { console.log('Cancelled.'); process.exit(0); }
+  }
+  const done = await agent.completeJob(job.id);
+  // Observe rental the way the buyer can: try getRentalAccess. ssh.host →
+  // honesty (LAN leftover must not print the success checkmark). 404 / no host
+  // → labour. Do not gate on job.serviceType / job.kind — SDK Job has serviceId.
+  const honesty = await leftoverCompleteHonesty(
+    (id) => agent.client.getRentalAccess(id),
+    job.id,
+  );
+  const warning = honesty && honesty.warning;
+  let witness = null;
+  try {
+    witness = await agent.client.getJobWitness(job.id);
+  } catch (e) {
+    if (!warning) say(`   Witness not ready yet (${e.message}). Retry inspect later.`);
+  }
+  const out = formatBuyerCompleteOutput({
+    jobId: job.id,
+    status: done.status || 'completed',
+    warning,
+    witness,
+  });
+  say(out.human);
+  if (witness && !options.json && !warning) {
+    const rec = witness.data || witness;
+    say(`   Witness signedByName=${(rec.witness && rec.witness.signedByName) || rec.signedByName || '—'}`);
+  }
+  if (options.json) console.log(JSON.stringify(out.json, null, 2));
+}
+
 program
   .command('complete <buyer-agent-id> <job-id>')
   .description('Buyer confirms delivery (SDK completeJob). Prints getJobWitness; does not write buyer VDXF.')
@@ -3248,48 +3291,9 @@ program
   .option('--json', 'One JSON object on stdout. Requires --yes.')
   .action(async (buyerAgentId, jobId, options) => {
     const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
-    const say = (line) => { if (!options.json) console.log(line); };
     if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
     const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
-    const job = await agent.client.getJob(jobId);
-    if (!job || !job.id) fail('COMPLETE_NOT_DELIVERED', `Job ${jobId} not found.`);
-    if (!buyerOwnsJob(keys, job)) fail('PAY_NOT_BUYER', 'This identity is not the buyer on that job.');
-    if (job.status === 'completed') fail('COMPLETE_ALREADY', 'Job is already completed.', { jobId: job.id });
-    if (job.status !== 'delivered') {
-      fail('COMPLETE_NOT_DELIVERED', `Job status is ${job.status}, not delivered.`, { jobId: job.id, status: job.status });
-    }
-    if (!options.yes) {
-      const ok = await confirmHire({ amountText: `complete ${job.id}`, pay: false });
-      if (!ok) { console.log('Cancelled.'); process.exit(0); }
-    }
-    const done = await agent.completeJob(job.id);
-    let warning;
-    if (job.serviceType === 'gpu-rental' || job.kind === 'compute') {
-      let access = null;
-      try {
-        access = await agent.client.getRentalAccess(job.id);
-      } catch { access = null; }
-      const honesty = await completeRentalHonesty(access);
-      warning = honesty.warning;
-    }
-    let witness = null;
-    try {
-      witness = await agent.client.getJobWitness(job.id);
-    } catch (e) {
-      if (!warning) say(`   Witness not ready yet (${e.message}). Retry inspect later.`);
-    }
-    const out = formatBuyerCompleteOutput({
-      jobId: job.id,
-      status: done.status || 'completed',
-      warning,
-      witness,
-    });
-    say(out.human);
-    if (witness && !options.json && !warning) {
-      const rec = witness.data || witness;
-      say(`   Witness signedByName=${(rec.witness && rec.witness.signedByName) || rec.signedByName || '—'}`);
-    }
-    if (options.json) console.log(JSON.stringify(out.json, null, 2));
+    await runBuyerComplete(keys, agent, jobId, options);
   });
 
 program
@@ -14383,7 +14387,7 @@ if (process.env.NODE_ENV === 'test') {
     // action through commander, and `__getState` so it can then assert on what
     // that action actually did. See test/helpers/dispatcher-harness.js.
     program, __getState: () => _liveState,
-    pollForJobs, startRentalJobWired };
+    pollForJobs, startRentalJobWired, runBuyerComplete };
 } else if (process.argv.length <= 2) {
   // No command — launch interactive dashboard
   require('./dashboard.js');
