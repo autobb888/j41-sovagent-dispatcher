@@ -4089,7 +4089,7 @@ program
       services = buildServiceFromOptions(options, profileData.description);
     }
 
-    assertDataDescriptions(options.kind || keys.kind, keys.identity, [
+    assertDataDescriptions(keys.kind || options.kind, keys.identity, [
       options.profileDescription,
       options.serviceDescription,
       profileData && profileData.description,
@@ -9334,7 +9334,9 @@ async function pollForJobs(state) {
         }
         // Webhooks are best-effort. A job poll finds first is not proof the
         // platform missed the POST — the webhook may still be in flight.
-        if (state.webhookMode) {
+        // pendingPayment means webhook (or an earlier poll) already accepted
+        // and we are waiting for payment — do not claim a miss every 60s.
+        if (state.webhookMode && !state.pendingPayment.has(job.id)) {
           console.log(`[Poll] recovered job ${job.id} (no webhook)`);
         }
 
@@ -9807,9 +9809,15 @@ async function handleWebhookEvent(state, agentId, payload) {
           if (buyerPayAddr) {
             addActiveJobToAllowlist(jobId, buyerPayAddr);
           }
+
+          state.pendingPayment.set(jobId, { accepted: true, agentInfo });
         }
       } catch (e) {
-        if (!e.message?.includes('already')) console.error(`[Webhook] Accept failed: ${e.message}`);
+        if (e.message?.includes('already')) {
+          state.pendingPayment.set(jobId, { accepted: true, agentInfo });
+        } else {
+          console.error(`[Webhook] Accept failed: ${e.message}`);
+        }
       }
       break;
     }

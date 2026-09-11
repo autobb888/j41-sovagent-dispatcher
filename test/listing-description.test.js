@@ -93,6 +93,16 @@ test('register/setup/finalize/update-profile call the data-description gate', ()
   }
 });
 
+test('setup post-profile gate prefers stored keys.kind over commander --kind default', () => {
+  const setupAt = CLI.indexOf(".command('setup <agent-id>");
+  const setup = CLI.slice(setupAt, CLI.indexOf(".command('start')", setupAt));
+  const postProfile = setup.slice(setup.indexOf('Step 3/4'));
+  assert.match(postProfile, /assertDataDescriptions\(keys\.kind\s*\|\|\s*options\.kind/,
+    're-running setup on a data listing without --kind data must still refuse DESCRIPTION_EPHEMERAL_URL');
+  assert.equal(/assertDataDescriptions\(options\.kind\s*\|\|\s*keys\.kind/.test(postProfile), false,
+    'options.kind defaults to agent, so stored kind must come first');
+});
+
 test('TUI Configure Services refuses ephemeral URLs on data listings', () => {
   const screen = DASH.slice(DASH.indexOf('async function configureServicesScreen'), DASH.indexOf('async function bountiesMenuScreen'));
   assert.match(screen, /descriptionHasEphemeralUrl|refuseDataListingDescriptions/);

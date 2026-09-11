@@ -693,6 +693,53 @@ test('webhook-mode poll logs recovered job when unseen at poll start', async (t)
   assert.ok(r.logged('[Poll] recovered job job-no-webhook (no webhook)'));
 });
 
+test('webhook-mode poll does not log recovered job already in pendingPayment', async (t) => {
+  const jobs = { data: [] };
+  const r = await started({
+    agents: fleet(1),
+    argv: ['--webhook-url', 'https://example.trycloudflare.com'],
+    sdk: { responses: { getMyJobs: () => jobs } },
+  });
+  t.after(() => r.teardown());
+
+  // Webhook job.requested accepted and is waiting for payment — poll must not
+  // tell the operator the webhook never arrived, every 60s, until paid.
+  r.state.pendingPayment.set('job-webhooked', { accepted: true, agentInfo: r.state.agents[0] });
+  jobs.data = [{ id: 'job-webhooked', status: 'accepted', amount: 1, currency: 'VRSCTEST' }];
+  r.clock.advance(60_000);
+  await flushPoll();
+  assert.ok(!r.logged('recovered job job-webhooked'),
+    'poll must not claim a webhook miss for a job the webhook already accepted');
+});
+
+test('webhook-mode poll logs recovered job only the first time poll discovers it', async (t) => {
+  const jobs = { data: [] };
+  const r = await started({
+    agents: fleet(1),
+    argv: ['--webhook-url', 'https://example.trycloudflare.com'],
+    sdk: { responses: { getMyJobs: () => jobs } },
+  });
+  t.after(() => r.teardown());
+
+  let recovered = 0;
+  const inner = console.log;
+  console.log = (...args) => {
+    if (args.map(String).join(' ').includes('[Poll] recovered job job-repeat (no webhook)')) recovered++;
+    return inner(...args);
+  };
+
+  jobs.data = [{ id: 'job-repeat', status: 'requested', amount: 1, currency: 'VRSCTEST' }];
+  r.clock.advance(60_000);
+  await flushPoll();
+  assert.equal(recovered, 1, 'first poll that finds the job is the discoverer');
+  assert.ok(r.state.pendingPayment.has('job-repeat'),
+    'first poll must record pendingPayment so later polls do not re-claim a miss');
+
+  r.clock.advance(60_000);
+  await flushPoll();
+  assert.equal(recovered, 1, 'subsequent polls must not re-log (no webhook) for the same unpaid job');
+});
+
 test('poll mode does not log recovered job (no webhook)', async (t) => {
   const r = await started({
     agents: fleet(1),
