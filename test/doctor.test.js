@@ -10,6 +10,7 @@ const fs = require('fs');
 const os = require('os');
 
 const {
+  CHECK_IDS,
   runDoctor,
   formatDoctorTable,
   formatIdentitySummary,
@@ -17,6 +18,7 @@ const {
   classifyIdentities,
   dockerAdviceFromError,
   firstPasteCommand,
+  listingAdvertiseRefusal,
 } = require('../src/doctor');
 
 function tmpHome() {
@@ -455,4 +457,195 @@ test('dockerAdviceFromError darwin eacces does not claim /var/run/docker.sock', 
   assert.doesNotMatch(advice.message, /\/var\/run\/docker\.sock/);
   assert.doesNotMatch(advice.message, /group docker/);
   assert.equal(advice.nextCommand, 'open -a Docker');
+});
+
+function writeAgentConfig(home, id, config) {
+  const dir = path.join(home, '.j41', 'dispatcher', 'agents', id);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'agent-config.json'), JSON.stringify(config), { mode: 0o600 });
+}
+
+test('CHECK_IDS includes rental.ssh_public, model.public_url, model.webhook, image.canonicalize', () => {
+  for (const id of ['rental.ssh_public', 'model.public_url', 'model.webhook', 'image.canonicalize']) {
+    assert.ok(CHECK_IDS.includes(id), id);
+  }
+});
+
+test('compute agent RFC1918 ssh_hostname: rental.ssh_public fail', async () => {
+  const prev = process.env.J41_ALLOW_LAN_RENTAL;
+  delete process.env.J41_ALLOW_LAN_RENTAL;
+  try {
+    const home = tmpHome();
+    writeKeys(home, 'gpu-1', { identity: 'g.sovcompute@', iAddress: 'iABC', kind: 'compute' });
+    const report = await runDoctor(baseOpts({
+      homedir: home,
+      computeEnabled: true,
+      nvidiaRuntime: true,
+      supportsStorageOpt: () => true,
+      execSync: dockerExec({ images: { 'job-agent': true, 'gpu-jail': true } }),
+      cfg: {
+        compute: {
+          enabled: true,
+          providers: {
+            card0: { type: 'home-gpu', agent_id: 'gpu-1', ssh_hostname: '192.168.1.69', ssh_tunnel_port: 2222 },
+          },
+        },
+      },
+    }));
+    assert.equal(check(report, 'rental.ssh_public').status, 'fail');
+    assert.match(check(report, 'rental.ssh_public').detail, /RENTAL_LAN_HOST|192\.168\.1\.69/);
+    assert.equal(report.ok, false);
+  } finally {
+    if (prev === undefined) delete process.env.J41_ALLOW_LAN_RENTAL;
+    else process.env.J41_ALLOW_LAN_RENTAL = prev;
+  }
+});
+
+test('compute agent public ssh_hostname: rental.ssh_public pass', async () => {
+  const home = tmpHome();
+  writeKeys(home, 'gpu-1', { identity: 'g.sovcompute@', iAddress: 'iABC', kind: 'compute' });
+  const report = await runDoctor(baseOpts({
+    homedir: home,
+    computeEnabled: true,
+    nvidiaRuntime: true,
+    supportsStorageOpt: () => true,
+    execSync: dockerExec({ images: { 'job-agent': true, 'gpu-jail': true } }),
+    cfg: {
+      compute: {
+        enabled: true,
+        providers: {
+          card0: { type: 'home-gpu', agent_id: 'gpu-1', ssh_hostname: 'gpu.example.com', ssh_tunnel_port: 2222 },
+        },
+      },
+    },
+  }));
+  assert.equal(check(report, 'rental.ssh_public').status, 'pass');
+});
+
+test('api-endpoint agent missing publicUrl: model.public_url fail', async () => {
+  const home = tmpHome();
+  writeKeys(home, 'model-1', { identity: 'm.sovmodel@', iAddress: 'iMDL', kind: 'model' });
+  writeAgentConfig(home, 'model-1', { serviceType: 'api-endpoint', apiEndpointUrl: 'http://127.0.0.1:11434/v1' });
+  const report = await runDoctor(baseOpts({ homedir: home }));
+  assert.equal(check(report, 'model.public_url').status, 'fail');
+  assert.equal(report.ok, false);
+});
+
+test('api-endpoint agent with publicUrl: model.public_url pass', async () => {
+  const home = tmpHome();
+  writeKeys(home, 'model-1', { identity: 'm.sovmodel@', iAddress: 'iMDL', kind: 'model' });
+  writeAgentConfig(home, 'model-1', {
+    serviceType: 'api-endpoint',
+    apiEndpointUrl: 'http://127.0.0.1:11434/v1',
+    publicUrl: 'https://proxy.example.com',
+  });
+  const report = await runDoctor(baseOpts({
+    homedir: home,
+    cfg: { runtime: { webhook_url: 'https://proxy.example.com' } },
+  }));
+  assert.equal(check(report, 'model.public_url').status, 'pass');
+});
+
+test('api-endpoint listed without webhook bind: model.webhook fail', async () => {
+  const home = tmpHome();
+  writeKeys(home, 'model-1', { identity: 'm.sovmodel@', iAddress: 'iMDL', kind: 'model' });
+  writeAgentConfig(home, 'model-1', {
+    serviceType: 'api-endpoint',
+    publicUrl: 'https://proxy.example.com',
+  });
+  const report = await runDoctor(baseOpts({
+    homedir: home,
+    cfg: { runtime: { webhook_url: '' } },
+  }));
+  assert.equal(check(report, 'model.webhook').status, 'fail');
+});
+
+test('api-endpoint listed with webhook_url: model.webhook pass', async () => {
+  const home = tmpHome();
+  writeKeys(home, 'model-1', { identity: 'm.sovmodel@', iAddress: 'iMDL', kind: 'model' });
+  writeAgentConfig(home, 'model-1', {
+    serviceType: 'api-endpoint',
+    publicUrl: 'https://proxy.example.com',
+  });
+  const report = await runDoctor(baseOpts({
+    homedir: home,
+    cfg: { runtime: { webhook_url: 'https://proxy.example.com' } },
+  }));
+  assert.equal(check(report, 'model.webhook').status, 'pass');
+});
+
+test('no compute/model listings: rental.ssh_public and model checks skip', async () => {
+  const home = tmpHome();
+  writeKeys(home, 'agent-1', { identity: 'a.agentplatform@', iAddress: 'iAAA', kind: 'agent' });
+  const report = await runDoctor(baseOpts({ homedir: home }));
+  assert.equal(check(report, 'rental.ssh_public').status, 'skip');
+  assert.equal(check(report, 'model.public_url').status, 'skip');
+  assert.equal(check(report, 'model.webhook').status, 'skip');
+});
+
+test('image.canonicalize warns when docker is missing', async () => {
+  const report = await runDoctor(baseOpts({
+    execSync: () => { throw new Error('command not found: docker'); },
+  }));
+  assert.equal(check(report, 'docker.cli').status, 'fail');
+  assert.equal(check(report, 'image.canonicalize').status, 'warn');
+});
+
+test('image.canonicalize fails on linux labour host when pin is missing', async () => {
+  const home = tmpHome();
+  writeKeys(home, 'agent-1', { identity: 'a.agentplatform@', iAddress: 'iAAA', kind: 'agent' });
+  const report = await runDoctor(baseOpts({
+    homedir: home,
+    jobAgentPackageJson: JSON.stringify({ dependencies: { undici: '^5.29.0' } }),
+    execSync: dockerExec({ images: { 'job-agent': true } }),
+  }));
+  assert.equal(check(report, 'image.canonicalize').status, 'fail');
+});
+
+test('image.canonicalize passes when json-canonicalize@2.0.0 is pinned', async () => {
+  const home = tmpHome();
+  writeKeys(home, 'agent-1', { identity: 'a.agentplatform@', iAddress: 'iAAA', kind: 'agent' });
+  const report = await runDoctor(baseOpts({
+    homedir: home,
+    jobAgentPackageJson: JSON.stringify({
+      dependencies: { 'json-canonicalize': '2.0.0' },
+    }),
+    execSync: dockerExec({ images: { 'job-agent': true } }),
+  }));
+  assert.equal(check(report, 'image.canonicalize').status, 'pass');
+});
+
+test('listingAdvertiseRefusal skips labour; refuses LAN compute and model without publicUrl', () => {
+  const prev = process.env.J41_ALLOW_LAN_RENTAL;
+  delete process.env.J41_ALLOW_LAN_RENTAL;
+  try {
+    assert.equal(listingAdvertiseRefusal({
+      agentId: 'agent-1',
+      keys: { identity: 'a.agentplatform@', kind: 'agent' },
+      cfg: {},
+      agentsDir: '/tmp/nope',
+    }), null);
+
+    const lan = listingAdvertiseRefusal({
+      agentId: 'gpu-1',
+      keys: { identity: 'g.sovcompute@', kind: 'compute' },
+      cfg: {
+        compute: { providers: { card0: { type: 'home-gpu', agent_id: 'gpu-1', ssh_hostname: '192.168.1.69' } } },
+      },
+    });
+    assert.equal(lan.code, 'rental.ssh_public');
+
+    const home = tmpHome();
+    writeAgentConfig(home, 'model-1', { serviceType: 'api-endpoint' });
+    const missing = listingAdvertiseRefusal({
+      agentId: 'model-1',
+      keys: { identity: 'm.sovmodel@', kind: 'model' },
+      cfg: { runtime: { webhook_url: 'https://proxy.example.com' } },
+      agentsDir: path.join(home, '.j41', 'dispatcher', 'agents'),
+    });
+    assert.equal(missing.code, 'model.public_url');
+  } finally {
+    if (prev === undefined) delete process.env.J41_ALLOW_LAN_RENTAL;
+    else process.env.J41_ALLOW_LAN_RENTAL = prev;
+  }
 });

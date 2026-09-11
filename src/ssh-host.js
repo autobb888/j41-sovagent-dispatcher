@@ -211,6 +211,7 @@ module.exports = {
   assertPublicSshHost,
   assertRentalHostPublic,
   shouldRefuseLanGpuRental,
+  sshHostnameForAgent,
   probeSshHost,
   rentalSshFromAccess,
   leftoverCompleteHonesty,
