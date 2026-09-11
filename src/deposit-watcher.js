@@ -312,7 +312,7 @@ function loadDeposits(agentId) {
   try {
     if (fs.existsSync(p)) return _normalizeDeposits(JSON.parse(fs.readFileSync(p, 'utf8')));
   } catch {}
-  return { processed: [], pending: [], creditedTxids: [] };
+  return _normalizeDeposits({});
 }
 
 function saveDeposits(agentId, data) {
@@ -706,7 +706,7 @@ async function _chainInfo(client) {
  */
 function _settleReversedForTxid(deposits, txid, reason) {
   let touched = false;
-  for (const r of deposits.reversed || []) {
+  for (const r of Array.isArray(deposits.reversed) ? deposits.reversed : []) {
     if (r && r.txid === txid && !r.restoredAt) {
       r.restoredAt = new Date().toISOString();
       r.resolvedBy = reason;
@@ -733,7 +733,7 @@ function _settleReversedForTxid(deposits, txid, reason) {
 function _findAnomaly(deposits, txid) {
   const p = deposits.processed.find((r) => r && r.txid === txid && _isUnresolvedAnomaly(r));
   if (p) return { entry: p, where: 'processed' };
-  const r = deposits.reversed.find((x) => x && x.txid === txid && _isUnresolvedAnomaly(x));
+  const r = (Array.isArray(deposits.reversed) ? deposits.reversed : []).find((x) => x && x.txid === txid && _isUnresolvedAnomaly(x));
   if (r) return { entry: r, where: 'reversed' };
   return null;
 }
@@ -863,7 +863,7 @@ function reconcileMeterAgainstLedger(agentId, buyerVerusId) {
   const credited = d.processed
     .filter((r) => r && r.buyerVerusId === buyerVerusId && !r.crediting)
     .reduce((n, r) => n + (Number(r.amount) || 0), 0);
-  const debited = d.reversed
+  const debited = (Array.isArray(d.reversed) ? d.reversed : [])
     .filter((r) => r && r.buyerVerusId === buyerVerusId && r.debited === true && !r.restoredAt)
     .reduce((n, r) => n + (Number(r.amount) || 0), 0);
 
@@ -1203,7 +1203,7 @@ async function _reconcileLocked(agentId, client, now, emit) {
     // of a credit that was never reversed. Keep the dedup entry; the reversed
     // ledger row still records what happened, and _recheckReversals already
     // refuses to auto-restore a `debited !== true` entry for the same reason.
-    fresh.reversed = fresh.reversed || [];
+    if (!Array.isArray(fresh.reversed)) fresh.reversed = [];
     fresh.reversed.push({
       txid: live.txid,
       buyerVerusId: live.buyerVerusId,
@@ -1260,7 +1260,7 @@ async function _recheckReversals(agentId, client, now = Date.now(), emit) {
   // without this it would be terminal and invisible, which is the exact failure
   // the intent stamp was introduced to prevent.
   let flagged = false;
-  for (const r of d.reversed) {
+  for (const r of Array.isArray(d.reversed) ? d.reversed : []) {
     if (r && r.restoring && !r.needsOperator) {
       r.needsOperator = `restore was interrupted (stamped ${r.restoringAt}) — ` +
         `check whether ${r.buyerVerusId} received ${r.amount} back`;
@@ -1272,7 +1272,7 @@ async function _recheckReversals(agentId, client, now = Date.now(), emit) {
   }
   if (flagged) saveDeposits(agentId, d);
 
-  const candidates = (d.reversed || []).filter((r) => {
+  const candidates = (Array.isArray(d.reversed) ? d.reversed : []).filter((r) => {
     if (!r || r.restoredAt || r.restoring || !r.txid) return false;
     const at = Date.parse(r.reversedAt || '');
     return Number.isFinite(at) && now - at <= REVERSAL_RECHECK_WINDOW_MS;
@@ -1288,7 +1288,7 @@ async function _recheckReversals(agentId, client, now = Date.now(), emit) {
     // treatment, because we cannot tell.
     if (cand.debited !== true) {
       const fresh0 = loadDeposits(agentId);
-      const e0 = (fresh0.reversed || []).find((r) => r && r.txid === cand.txid && !r.restoredAt);
+      const e0 = (Array.isArray(fresh0.reversed) ? fresh0.reversed : []).find((r) => r && r.txid === cand.txid && !r.restoredAt);
       if (e0 && !e0.needsOperator) {
         e0.needsOperator = 'reversed without a certain debit, and the tx later confirmed — ' +
           `check whether ${e0.buyerVerusId} is owed ${e0.amount}`;
@@ -1309,7 +1309,7 @@ async function _recheckReversals(agentId, client, now = Date.now(), emit) {
     if (confs === null || confs < 1) continue;
 
     const fresh = loadDeposits(agentId);
-    const live = (fresh.reversed || []).find((r) => r && r.txid === cand.txid && !r.restoredAt && !r.restoring);
+    const live = (Array.isArray(fresh.reversed) ? fresh.reversed : []).find((r) => r && r.txid === cand.txid && !r.restoredAt && !r.restoring);
     if (!live) continue;
 
     // Intent, money, settle — the same three-step the credit path uses.
@@ -1340,7 +1340,7 @@ async function _recheckReversals(agentId, client, now = Date.now(), emit) {
     creditDeposit(agentId, live.buyerVerusId, live.amount, live.txid);
 
     const settle = loadDeposits(agentId);
-    const entry = (settle.reversed || []).find((r) => r && r.txid === cand.txid && r.restoring);
+    const entry = (Array.isArray(settle.reversed) ? settle.reversed : []).find((r) => r && r.txid === cand.txid && r.restoring);
     if (entry) {
       delete entry.restoring;
       delete entry.restoringAt;
@@ -1527,7 +1527,7 @@ function listDepositAnomaliesForAgent(agentId) {
       where: 'processed',
       reason: r.needsOperator || _stuckCreditingReason(r),
     })),
-    ...d.reversed.filter((r) => _isUnresolvedAnomaly(r)).map((r) => ({
+    ...(Array.isArray(d.reversed) ? d.reversed : []).filter((r) => _isUnresolvedAnomaly(r)).map((r) => ({
       txid: r.txid,
       buyerVerusId: r.buyerVerusId || null,
       amount: r.amount ?? null,
@@ -1536,7 +1536,7 @@ function listDepositAnomaliesForAgent(agentId) {
     })),
   ];
 
-  const reversed = d.reversed
+  const reversed = (Array.isArray(d.reversed) ? d.reversed : [])
     .slice(-25)
     .map((r) => ({
       txid: r.txid,
@@ -1955,4 +1955,4 @@ async function notifyJ41CreditLow(sellerWif, sellerVerusId, buyerVerusId, balanc
   }
 }
 
-module.exports = { networkCurrency, retryPendingNotifies, _pendingNotifies, NOTIFY_MAX_ATTEMPTS, STUCK_CREDITING_MS, reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, listDepositAnomalies, listDepositAnomaliesForAgent, creditDepositAnomaly, dismissDepositAnomaly, reconcileMeterAgainstLedger, withDepositLock, _recheckReversals, _settleReversedForTxid, _classifyLookupFailure, _syncedView, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_MIN_ADVANCE_BLOCKS, REVERSAL_RECHECK_WINDOW_MS, REVERSAL_BUDGET_MAX_DEFAULT, PROCESSED_AUDIT_CAP, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS };
+module.exports = { networkCurrency, retryPendingNotifies, _pendingNotifies, NOTIFY_MAX_ATTEMPTS, STUCK_CREDITING_MS, reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, listDepositAnomalies, listDepositAnomaliesForAgent, creditDepositAnomaly, dismissDepositAnomaly, reconcileMeterAgainstLedger, withDepositLock, _recheckReversals, _settleReversedForTxid, _classifyLookupFailure, _syncedView, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_MIN_ADVANCE_BLOCKS, REVERSAL_RECHECK_WINDOW_MS, REVERSAL_BUDGET_MAX_DEFAULT, PROCESSED_AUDIT_CAP, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS, loadDeposits };
