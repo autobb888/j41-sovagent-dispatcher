@@ -291,7 +291,7 @@ const {
   SEND_HISTORY_PATH, loadSendHistory,
   FINANCIAL_SUSPENDED_PATH, isFinanciallySuspended, setFinancialSuspended,
   checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit,
-  gateExternalSend, recordSendOutcome,
+  gateExternalSend, recordSendOutcome, effectiveLimits,
 } = _spendPolicy;
 
 // ── Dispatcher-side allowlist sweep timer ──
@@ -3601,11 +3601,16 @@ program
     }
     const autonomous = !!(options.json || headlessMainnetPay);
     if (autonomous) {
+      // Deposit is repeat-by-design (402 → top-up loop). Do not share the
+      // single-pay job ceiling (`jobPrice === amount` → 1.1x blocks a second
+      // similar send). Size the budget so maxSendsPerJob deposits of this
+      // amount fit; the per-seller send cap / cooldown / absolute cap still bind.
+      const depositBudget = amountNumber * effectiveLimits().maxSendsPerJob;
       const g = gateExternalSend({
         jobId: seller,
         toAddress: dest.toAddress,
         amount: amountNumber,
-        jobPrice: amountNumber,
+        jobPrice: depositBudget,
         kind: 'deposit',
         expectedRecipients: dest.expectedRecipients,
       });
@@ -3636,6 +3641,7 @@ program
       console.log(JSON.stringify({
         ok: true, txid, credited: !!result.credited, amount, seller, toAddress: dest.toAddress,
         ...(options.wait ? { pending: !!result.pending } : {}),
+        ...(result.alreadyReported ? { alreadyReported: true } : {}),
       }, null, 2));
     }
   });
@@ -3676,7 +3682,7 @@ program
     });
     if (!result.ok) fail(result.code || 'DEPOSIT_REPLAY', result.message, { txid });
     if (result.code === 'DEPOSIT_WAIT_TIMEOUT') {
-      console.warn('DEPOSIT_WAIT_TIMEOUT: deposit broadcast but seller has not credited yet.');
+      console.warn('DEPOSIT_WAIT_TIMEOUT: seller has not credited the deposit yet.');
       if (options.json) {
         console.log(JSON.stringify({ ok: true, txid, credited: false, pending: true }, null, 2));
       }
@@ -3688,6 +3694,7 @@ program
       console.log(JSON.stringify({
         ok: true, txid, credited: !!result.credited, amount, seller,
         ...(options.wait ? { pending: !!result.pending } : {}),
+        ...(result.alreadyReported ? { alreadyReported: true } : {}),
       }, null, 2));
     }
   });

@@ -259,3 +259,46 @@ test('deposit limiter key is deposit:<sellerId> so it cannot burn a job-pay budg
   });
   assert.equal(pay.allowed, true, 'a job payment must not share the deposit:<seller> budget');
 });
+
+test('deposit kind allows a second similar top-up when jobPrice equals this send', () => {
+  SP._resetDispatcherRateLimit(false);
+  const iAddr = 'iDepRepeat';
+  const now = Date.now();
+  const g1 = SP.gateExternalSend({
+    jobId: 'seller-repeat@',
+    toAddress: iAddr,
+    amount: 1,
+    jobPrice: 1,
+    kind: 'deposit',
+    expectedRecipients: [iAddr],
+    now,
+  });
+  assert.equal(g1.allowed, true);
+  SP.recordSendOutcome({
+    kind: 'deposit', jobId: 'seller-repeat@', toAddress: iAddr, amount: 1, now,
+  });
+  const g2 = SP.gateExternalSend({
+    jobId: 'seller-repeat@',
+    toAddress: iAddr,
+    amount: 1,
+    jobPrice: 1,
+    kind: 'deposit',
+    expectedRecipients: [iAddr],
+    now: now + 60_000,
+  });
+  assert.equal(g2.allowed, true, 'second similar autonomous deposit must be allowed');
+
+  const pay1 = SP.gateExternalSend({
+    jobId: 'job-once', toAddress: iAddr, amount: 1, jobPrice: 1,
+    kind: 'payment', expectedRecipients: [iAddr], now,
+  });
+  assert.equal(pay1.allowed, true);
+  SP.recordSendOutcome({
+    kind: 'payment', jobId: 'job-once', toAddress: iAddr, amount: 1, now,
+  });
+  const pay2 = SP.gateExternalSend({
+    jobId: 'job-once', toAddress: iAddr, amount: 1, jobPrice: 1,
+    kind: 'payment', expectedRecipients: [iAddr], now: now + 60_000,
+  });
+  assert.equal(pay2.allowed, false, 'payment still uses the single-pay 1.1x ceiling');
+});

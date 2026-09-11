@@ -244,18 +244,31 @@ async function waitForDepositCredit({
       code: 'DEPOSIT_WAIT_TIMEOUT',
       credited: false,
       pending: true,
-      message: 'DEPOSIT_WAIT_TIMEOUT: deposit broadcast but seller has not credited yet.',
+      message: 'DEPOSIT_WAIT_TIMEOUT: seller has not credited the deposit yet.',
     };
   }
-  if (second.kind === 'credited' || second.kind === 'already_processed' || second.kind === 'replay') {
+  if (second.kind === 'credited' || second.kind === 'already_processed') {
     return { ok: true, code: null, credited: true, pending: false, report: second };
+  }
+  if (second.kind === 'replay') {
+    // Spec: success (exit 0, do not re-spend) after an accepted report this
+    // invocation — not a claim that the meter credited. First POST may have
+    // been only pending / waiting-for-confs.
+    return {
+      ok: true,
+      code: null,
+      credited: false,
+      pending: false,
+      alreadyReported: true,
+      report: second,
+    };
   }
   return {
     ok: true,
     code: 'DEPOSIT_WAIT_TIMEOUT',
     credited: false,
     pending: true,
-    message: 'DEPOSIT_WAIT_TIMEOUT: deposit broadcast but seller has not credited yet.',
+    message: 'DEPOSIT_WAIT_TIMEOUT: seller has not credited the deposit yet.',
     report: second,
   };
 }

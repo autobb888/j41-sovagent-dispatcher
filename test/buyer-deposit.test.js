@@ -307,6 +307,9 @@ test('REPLAY after an accepted report this invocation is success', async () => {
   });
   assert.equal(r.ok, true);
   assert.equal(r.code, null);
+  assert.equal(r.credited, false, 'REPLAY after a pending first POST is not a meter credit');
+  assert.equal(r.alreadyReported, true);
+  assert.equal(r.pending, false);
   assert.equal(posts.length, 2);
   assert.notEqual(posts[0].nonce, posts[1].nonce);
 });
@@ -438,6 +441,9 @@ test('deposit broadcasts sendMultiPayment single i-address output, not wallet se
   const gateCall = dep.slice(gate, send);
   assert.match(gateCall, /kind:\s*'deposit'/);
   assert.match(gateCall, /expectedRecipients/);
+  assert.match(dep, /effectiveLimits\(\)\.maxSendsPerJob/);
+  assert.doesNotMatch(gateCall, /jobPrice:\s*amountNumber\s*,/,
+    'autonomous deposit must not share the single-pay jobPrice === amount ceiling');
 });
 
 test('deposit JSON keeps the full txid; human line truncates to 16', () => {
@@ -456,6 +462,14 @@ test('DEPOSIT_WAIT_TIMEOUT warns and does not set exitCode 1', () => {
   assert.doesNotMatch(after, /exitCode\s*=\s*1/);
   assert.match(CLI, /credited:\s*false/);
   assert.match(CLI, /pending:\s*true/);
+});
+
+test('report-deposit timeout copy does not claim a broadcast', () => {
+  const rep = reportDepositSrc();
+  assert.match(rep, /DEPOSIT_WAIT_TIMEOUT/);
+  assert.doesNotMatch(rep, /deposit broadcast but seller/);
+  assert.match(BUYER_DEPOSIT_SRC, /alreadyReported:\s*true/);
+  assert.match(BUYER_DEPOSIT_SRC, /seller has not credited the deposit yet/);
 });
 
 test('fail paths set exitCode 1: REPLAY / NO_PUBLIC_URL / NOT_SELLER / PAY_PENDING', () => {
