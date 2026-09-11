@@ -3307,6 +3307,85 @@ program
   });
 
 program
+  .command('cancel <buyer-agent-id> <job-id>')
+  .description('Buyer cancels a job that is still requested (SDK cancelJob).')
+  .option('--yes', 'Skip confirmation')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
+  .action(async (buyerAgentId, jobId, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    const { cancelBuyerJob } = require('./buyer-dispute');
+    if (!options.yes) {
+      const ok = await confirmHire({ amountText: `cancel ${jobId}`, pay: false });
+      if (!ok) { console.log('Cancelled.'); process.exit(0); }
+    }
+    const result = await cancelBuyerJob({ client: agent.client, keys, jobId });
+    if (!result.ok) fail(result.code, result.message, { jobId: result.jobId, status: result.status });
+    say(`✅ Job ${result.jobId} cancelled (status=${result.status})`);
+    if (options.json) console.log(JSON.stringify({ ok: true, jobId: result.jobId, status: result.status }, null, 2));
+  });
+
+program
+  .command('dispute <buyer-agent-id> <job-id>')
+  .description('Buyer raises a signed J41-DISPUTE| on a job (SDK disputeJob).')
+  .requiredOption('--reason <text>', 'Dispute reason')
+  .option('--yes', 'Skip confirmation')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
+  .action(async (buyerAgentId, jobId, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    const { disputeBuyerJob } = require('./buyer-dispute');
+    const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
+    if (!options.yes) {
+      const ok = await confirmHire({ amountText: `dispute ${jobId}`, pay: false });
+      if (!ok) { console.log('Cancelled.'); process.exit(0); }
+    }
+    const result = await disputeBuyerJob({
+      client: agent.client,
+      keys,
+      jobId,
+      reason: options.reason,
+      signMessage,
+      network: J41_NETWORK,
+    });
+    if (!result.ok) fail(result.code, result.message, { jobId: result.jobId, status: result.status });
+    say(`✅ Dispute opened on ${result.jobId} (status=${result.status})`);
+    if (options.json) console.log(JSON.stringify({ ok: true, jobId: result.jobId, status: result.status }, null, 2));
+  });
+
+program
+  .command('rework-accept <buyer-agent-id> <job-id>')
+  .description('Buyer accepts a seller rework offer (SDK acceptRework).')
+  .option('--yes', 'Skip confirmation')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
+  .action(async (buyerAgentId, jobId, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    const { acceptBuyerRework } = require('./buyer-dispute');
+    const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
+    if (!options.yes) {
+      const ok = await confirmHire({ amountText: `rework-accept ${jobId}`, pay: false });
+      if (!ok) { console.log('Cancelled.'); process.exit(0); }
+    }
+    const result = await acceptBuyerRework({
+      client: agent.client,
+      keys,
+      jobId,
+      signMessage,
+      network: J41_NETWORK,
+    });
+    if (!result.ok) fail(result.code, result.message, { jobId: result.jobId, status: result.status });
+    say(`✅ Rework accepted on ${result.jobId} (status=${result.status})`);
+    if (options.json) console.log(JSON.stringify({ ok: true, jobId: result.jobId, status: result.status }, null, 2));
+  });
+
+program
   .command('access <buyer-agent-id> <seller>')
   .description('Request ECDH API access from a model / api-endpoint seller (not a labour hire)')
   .option('--json', 'One JSON object on stdout (includes apiKey). Requires --yes.')
@@ -3581,14 +3660,36 @@ program
     }
   });
 
-// Inspect command — show everything about an agent
+// Inspect command — agent dump, or with <job-id> a buyer job (status/dispute/refund_txid)
 program
-  .command('inspect <agent-id>')
-  .description('Show full agent state: local files, on-chain identity, platform profile, and services')
+  .command('inspect <agent-id> [job-id]')
+  .description('Show full agent state, or with <job-id> print that job status / dispute / refund_txid')
   .option('--json', 'Output raw JSON instead of formatted text')
-  .action(async (agentId, options) => {
+  .action(async (agentId, jobId, options) => {
     await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
+
+    if (jobId) {
+      const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+      const { keys, agent } = await loadBuyerSession(agentId, options);
+      const { inspectBuyerJob } = require('./buyer-dispute');
+      const snap = await inspectBuyerJob({ client: agent.client, keys, jobId });
+      if (!snap.ok) fail(snap.code, snap.message, { jobId: snap.jobId, status: snap.status });
+      if (options.json) {
+        console.log(JSON.stringify({
+          ok: true,
+          jobId: snap.jobId,
+          status: snap.status,
+          dispute: snap.disputeAction,
+          refund_txid: snap.refundTxid,
+        }, null, 2));
+        return;
+      }
+      console.log(`  status: ${snap.status}`);
+      if (snap.disputeAction) console.log(`  dispute: ${snap.disputeAction}`);
+      if (snap.refundTxid) console.log(`  refund_txid: ${snap.refundTxid}`);
+      return;
+    }
 
     const keys = loadAgentKeys(agentId);
     if (!keys) {
