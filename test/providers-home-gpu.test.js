@@ -50,6 +50,18 @@ test('assertTunnelHostname refuses loopback, wildcard, and HTTP webhook URLs', (
   assert.equal(assertTunnelHostname('gpu.alice.example.com'), 'gpu.alice.example.com');
 });
 
+test('assertTunnelHostname warns on RFC1918 but does not block writing config', () => {
+  const warns = [];
+  const orig = console.warn;
+  console.warn = (...a) => warns.push(a.join(' '));
+  try {
+    assert.equal(assertTunnelHostname('192.168.1.69'), '192.168.1.69');
+  } finally {
+    console.warn = orig;
+  }
+  assert.match(warns.join('\n'), /192\.168\.1\.69|RFC1918|LAN/i);
+});
+
 test('assertTunnelPort requires integer 1-65535', () => {
   assert.throws(() => assertTunnelPort(undefined), /HOME_GPU_NO_TUNNEL/);
   assert.throws(() => assertTunnelPort(0), /HOME_GPU_NO_TUNNEL/);

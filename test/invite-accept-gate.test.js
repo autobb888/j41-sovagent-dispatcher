@@ -53,6 +53,20 @@ test('accept-job does not consult decideAutoAccept', () => {
   assert.match(body, /buyerPayAddress \|\| .*\.payAddress/);
 });
 
+test('accept-job refuses RFC1918 gpu-rental before acceptJob', () => {
+  const start = CLI.indexOf(".command('accept-job <agent-id> <job-id>')");
+  const next = CLI.indexOf('\n  .command(', start + 1);
+  const body = CLI.slice(start, next === -1 ? start + 4000 : next);
+  const gate = Math.min(
+    ...['assertRentalHostPublic', 'shouldRefuseLanGpuRental']
+      .map((n) => body.indexOf(n))
+      .filter((i) => i >= 0),
+  );
+  assert.ok(gate >= 0, 'accept-job must call the public-host helper');
+  assert.ok(gate < body.indexOf('acceptJob'));
+  assert.match(body, /RENTAL_LAN_HOST/);
+});
+
 test('poll and webhook fail closed on unread/unparseable chain status', () => {
   const poll = CLI.slice(CLI.indexOf("job.status === 'requested'"), CLI.indexOf('Step 2: Check if ready'));
   assert.match(poll, /inspectChainSalesStatus/);

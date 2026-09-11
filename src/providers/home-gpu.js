@@ -15,6 +15,14 @@ function assertTunnelHostname(host) {
   if (h.startsWith('http://') || h.startsWith('https://')) {
     throw new Error('HOME_GPU_NO_TUNNEL: webhook URL is HTTP, not SSH');
   }
+  // RFC1918 is warn-only here so rental-setup / TUI can still write config.
+  // Accept and deliverSealed refuse unless J41_ALLOW_LAN_RENTAL=1.
+  try {
+    const { isLanSshHost } = require('../ssh-host');
+    if (isLanSshHost(host)) {
+      console.warn(`HOME_GPU_LAN_HOST: ssh_hostname ${host.trim()} is RFC1918/LAN — gpu-rental jobs will not be accepted until a named TCP tunnel is set or J41_ALLOW_LAN_RENTAL=1`);
+    }
+  } catch { /* warn is best-effort */ }
   return host.trim();
 }
 

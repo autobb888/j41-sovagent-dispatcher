@@ -14,12 +14,15 @@ for (const ev of ['job.accepted', 'job.completed', 'job.delivered']) {
   });
 }
 
-test('job.delivered is not emitted inside the webhook case handler (no double with the generic emit)', () => {
+test('job.delivered is not emitted inside the webhook case handler for labour (no double with the generic emit)', () => {
   const start = CLI.indexOf("case 'job.delivered':");
   assert.ok(start > -1);
   const next = CLI.indexOf('case ', start + 20);
   const block = CLI.slice(start, next === -1 ? start + 1200 : next);
-  assert.equal(/emitEvent/.test(block), false, 'case job.delivered still emits (double with generic path)');
+  const labourSend = block.indexOf("sendToJobAgent(deliverInfo, { type: 'end_session_request'");
+  const labourSlice = labourSend === -1 ? block : block.slice(labourSend);
+  assert.equal(/emitEvent/.test(labourSlice), false, 'labour job.delivered still emits (double with generic path)');
+  assert.match(block, /kind === 'gpu-rental'/);
 });
 
 test('job.accepted and job.delivered are emitted in the poll path (before handleWebhookEvent)', () => {

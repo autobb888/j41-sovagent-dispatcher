@@ -83,6 +83,8 @@ async function deliverSealed({ client, signDeliver, signer, job, deliverable }) 
   if (typeof sign !== 'function') throw new Error('RENTAL_NO_SIGNER: cannot sign delivery');
 
   // Fail closed: never fall through to stuffing ssh into deliverJob.
+  const { assertPublicSshHost } = require('./ssh-host');
+  assertPublicSshHost(deliverable && deliverable.ssh && deliverable.ssh.host);
   await postRentalSecret(client, job.id, deliverable);
 
   const hash = hashRentalDeliverable(deliverable);

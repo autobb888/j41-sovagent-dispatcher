@@ -130,6 +130,18 @@ test('startRentalJobWired reads rentalAckPostpayVastRisk from agent-config', () 
   assert.match(wired, /ackPostpayVastRisk/);
 });
 
+test('startRentalJobWired asserts public SSH host before acquire', () => {
+  const cli = fs.readFileSync(require.resolve('../src/cli.js'), 'utf8');
+  const wired = cli.slice(cli.indexOf('async function startRentalJobWired'), cli.indexOf('async function startJobOrRental'));
+  const gate = Math.min(
+    ...['assertRentalHostPublic', 'shouldRefuseLanGpuRental']
+      .map((n) => wired.indexOf(n))
+      .filter((i) => i >= 0),
+  );
+  assert.ok(gate >= 0, 'startRentalJobWired must gate LAN at the top');
+  assert.ok(gate < wired.indexOf('startRentalJob('));
+});
+
 test('rental acquire on default-interruptible Vast omits bid price and seals a renter privateKey', async () => {
   const { VastProvider } = require('../src/providers/vast');
   const { createSupplyController } = require('../src/compute-supply');
