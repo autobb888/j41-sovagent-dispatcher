@@ -271,6 +271,7 @@ test('mint payload uses mintBuyerProxyBase(publicUrl) and never cfg.endpointUrl'
   assert.match(cfg, /localCfg\.publicUrl/);
   assert.match(cfg, /endpointUrl:\s*apiSvc\.endpointUrl/);
   assert.match(cfg, /buyer UNREACHABLE/);
+  assert.match(cfg, /hostsEqual\(buyerUrl,\s*apiSvc\.endpointUrl\)/);
   assert.doesNotMatch(cfg, /endpointUrl:\s*mintBuyerProxyBase/);
 });
 
@@ -429,6 +430,85 @@ test('listing hint with dispatcher health rewrites grant 0600 and proceeds', asy
   }
 });
 
+test('listing with only endpoints[].url rewrites NVIDIA grant after dispatcher health', async () => {
+  const dir = tmpDir();
+  try {
+    saveAccessGrant(dir, 'agent-1', 'duskseek.agentplatform@', {
+      apiKey: 'sk-test',
+      endpointUrl: 'https://integrate.api.nvidia.com/v1',
+      expiresAt: '2099-01-01T00:00:00Z',
+      models: ['m'],
+    });
+    const calls = [];
+    const health = [];
+    const r = await chatCompletions({
+      grant: loadAccessGrant(dir, 'agent-1', 'duskseek.agentplatform@'),
+      message: 'hi',
+      listing: {
+        endpoints: [{ url: 'https://seller.example/j41/proxy/v1', protocol: 'https', public: true }],
+      },
+      agentsDir: dir,
+      buyerId: 'agent-1',
+      seller: 'duskseek.agentplatform@',
+      fetchImpl: async (url) => {
+        health.push(url);
+        return { ok: true, json: async () => ({ service: 'dispatcher', status: 'ok' }) };
+      },
+      client: {
+        callProxied: async (opts) => {
+          calls.push(opts);
+          return { ok: true, status: 200, body: {} };
+        },
+      },
+    });
+    assert.equal(r.ok, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].endpointUrl, 'https://seller.example/j41/proxy/v1');
+    assert.equal(calls[0].path, '/chat/completions');
+    assert.ok(health.some((u) => String(u).includes('/j41/health')));
+    const p = path.join(dir, 'agent-1', 'access', 'duskseek.agentplatform@.json'.replace(/[^A-Za-z0-9._-]+/g, '_'));
+    assert.equal(fs.statSync(p).mode & 0o077, 0);
+    const rec = JSON.parse(fs.readFileSync(p, 'utf8'));
+    assert.equal(rec.endpointUrl, 'https://seller.example/j41/proxy/v1');
+    assert.doesNotMatch(rec.endpointUrl, /nvidia/i);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('typed endpoints[].url pathname is not proof of a dispatcher', async () => {
+  const dir = tmpDir();
+  try {
+    saveAccessGrant(dir, 'agent-1', 'duskseek.agentplatform@', {
+      apiKey: 'sk-test',
+      endpointUrl: 'https://integrate.api.nvidia.com/v1',
+      expiresAt: '2099-01-01T00:00:00Z',
+    });
+    let called = false;
+    let fetched = false;
+    const r = await chatCompletions({
+      grant: loadAccessGrant(dir, 'agent-1', 'duskseek.agentplatform@'),
+      message: 'hi',
+      listing: {
+        endpoints: [{ url: 'https://integrate.api.nvidia.com/j41/proxy/v1', protocol: 'https', public: true }],
+      },
+      agentsDir: dir,
+      buyerId: 'agent-1',
+      seller: 'duskseek.agentplatform@',
+      fetchImpl: async () => { fetched = true; return { ok: true, json: async () => ({ service: 'dispatcher' }) }; },
+      client: { callProxied: async () => { called = true; } },
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, 'ACCESS_GRANT_UPSTREAM');
+    assert.equal(called, false);
+    assert.equal(fetched, false);
+    const rec = JSON.parse(fs.readFileSync(path.join(dir, 'agent-1', 'access', 'duskseek.agentplatform@.json'.replace(/[^A-Za-z0-9._-]+/g, '_')), 'utf8'));
+    assert.equal(rec.endpointUrl, 'https://integrate.api.nvidia.com/v1');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('chat 402 maps to CHAT_NEEDS_DEPOSIT from statusCode/responseBody', async () => {
   const err = new Error('Proxy call failed: Insufficient credit');
   err.statusCode = 402;
@@ -476,6 +556,31 @@ test('listingPublicUrlHint prefers networkEndpoints[0] over website', () => {
     'https://vdxf.example',
   );
   assert.equal(listingPublicUrlHint({ website: 'https://web.example' }), 'https://web.example');
+});
+
+test('listingPublicUrlHint reads typed endpoints[].url and skips non-http(s)', () => {
+  assert.equal(
+    listingPublicUrlHint({
+      endpoints: [{ url: 'https://seller.example/j41/proxy/v1', protocol: 'https', public: true }],
+    }),
+    'https://seller.example/j41/proxy/v1',
+  );
+  assert.equal(
+    listingPublicUrlHint({
+      endpoints: [
+        { url: 'ssh://gpu.example', protocol: 'ssh', public: false },
+        { url: 12 },
+        'https://not-an-object.example',
+        { url: 'https://seller.example/' },
+      ],
+    }),
+    'https://seller.example/',
+  );
+  assert.equal(
+    listingPublicUrlHint({ endpoints: [{ url: 'not-a-url' }], website: 'https://web.example' }),
+    'https://web.example',
+  );
+  assert.equal(listingPublicUrlHint({ endpoints: [] }), null);
 });
 
 test('discovery maps ACCESS_NOT_API_ENDPOINT to 400 and envelope codes to 503', async () => {

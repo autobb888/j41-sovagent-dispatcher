@@ -5459,6 +5459,7 @@ program
             if (publicUrl) {
               try { buyerUrl = mintBuyerProxyBase(publicUrl); } catch { buyerUrl = null; }
             }
+            if (buyerUrl && hostsEqual(buyerUrl, apiSvc.endpointUrl)) buyerUrl = null;
             if (buyerUrl) {
               console.log(`  API Proxy: ${a.id} (${a.identity}) egress ${egressHost}  buyer ${buyerUrl}`);
             } else {

@@ -20,12 +20,29 @@ const {
 
 const GRANT_UPSTREAM_MESSAGE = 'Grant endpointUrl is the upstream, not the seller proxy. Re-run: j41-dispatcher access <buyer> <seller>';
 
+function httpUrlString(value) {
+  if (typeof value !== 'string' || !value) return null;
+  try {
+    const u = new URL(value);
+    if (!/^https?:$/i.test(u.protocol)) return null;
+    return value;
+  } catch {
+    return null;
+  }
+}
+
 function listingPublicUrlHint(listing) {
   if (!listing || typeof listing !== 'object') return null;
   const endpoints = listing.networkEndpoints
     || (listing.network && listing.network.endpoints)
     || (listing.profile && listing.profile.network && listing.profile.network.endpoints);
   if (Array.isArray(endpoints) && endpoints[0]) return String(endpoints[0]);
+  if (Array.isArray(listing.endpoints)) {
+    for (const ep of listing.endpoints) {
+      const url = ep && httpUrlString(ep.url);
+      if (url) return url;
+    }
+  }
   const website = listing.website
     || (listing.profile && listing.profile.website)
     || (listing.profile && listing.profile.profile && listing.profile.profile.website);
