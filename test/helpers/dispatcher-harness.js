@@ -326,6 +326,18 @@ async function runStart(scenario = {}) {
           },
         };
       }
+      if (request === './webhook-server' || request === './webhook-server.js') {
+        // Webhook-mode start binds a real HTTP port. Stub the listener so a
+        // harnessed `--webhook-url` scenario can assert poll wiring without
+        // leaking a socket past teardown.
+        return {
+          startWebhookServer: (...args) => {
+            sideEffects.push({ call: 'startWebhookServer', args });
+            return { close(cb) { if (typeof cb === 'function') cb(); }, on() { return this; } };
+          },
+          readBody: async () => null,
+        };
+      }
       if (request === 'dockerode') return DockerStub;
       if (request === 'child_process') {
         const real = realLoad.call(this, request, parent, isMain);

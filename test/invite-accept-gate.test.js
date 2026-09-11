@@ -117,6 +117,40 @@ test('sales-mode writes invite or active VDXF and clears sales-status cache', ()
   assert.match(body, /pendingWrites|pending inbox/);
 });
 
+test('activate-all prints activated, not result.status', () => {
+  const all = CLI.slice(CLI.indexOf(".command('activate-all')"), CLI.indexOf(".command('deactivate-all')"));
+  assert.match(all, /— activated/);
+  assert.doesNotMatch(all, /\$\{result\.status\}/);
+  assert.match(all, /warnIfPlatformDisagrees/);
+  assert.match(CLI, /platform still reports/);
+});
+
+test('deactivate-all prints deactivated, not result.status', () => {
+  const all = CLI.slice(CLI.indexOf(".command('deactivate-all')"), CLI.indexOf('async function resolveAllowlistIdentity'));
+  assert.match(all, /— deactivated/);
+  assert.doesNotMatch(all, /\$\{result\.status\}/);
+  assert.match(all, /warnIfPlatformDisagrees/);
+});
+
+test('single-agent activate/deactivate second line is the verb, not Platform status: result.status', () => {
+  const act = CLI.slice(CLI.indexOf(".command('activate <agent-id>')"), CLI.indexOf(".command('activate-all')"));
+  assert.match(act, /Agent activated/);
+  assert.match(act, /activated/);
+  assert.doesNotMatch(act, /Platform status: \$\{result\.status\}/);
+
+  const deact = CLI.slice(CLI.indexOf(".command('deactivate <agent-id>')"), CLI.indexOf(".command('activate <agent-id>')"));
+  assert.match(deact, /Agent deactivated/);
+  assert.doesNotMatch(deact, /Platform status: \$\{result\.status\}/);
+});
+
+test('TUI activate/deactivate-all print the verb, not result.status', () => {
+  const dash = fs.readFileSync(path.join(__dirname, '../src/dashboard.js'), 'utf8');
+  const screen = dash.slice(dash.indexOf('async function batchActivateScreen'), dash.indexOf('async function bountiesMenuScreen'));
+  assert.match(screen, /— activated/);
+  assert.match(screen, /— deactivated/);
+  assert.doesNotMatch(screen, /\$\{result\.status\}/);
+});
+
 test('dashboard offers preferAllowlist confirm, not a VDXF write', () => {
   const DASH = fs.readFileSync(path.join(__dirname, '../src/dashboard.js'), 'utf8');
   assert.match(DASH, /Prefer allowlist even when open\?/);

@@ -270,6 +270,26 @@ const {
   listingsCollide,
   listingIdPrefix,
 } = require('./listing-kind.js');
+const { refuseDataListingDescriptions } = require('./listing-description.js');
+
+function assertDataDescriptions(kind, identity, descriptions) {
+  const err = refuseDataListingDescriptions({ kind, identity, descriptions });
+  if (err) {
+    console.error(`❌ ${err.message}`);
+    process.exit(1);
+  }
+}
+
+async function warnIfPlatformDisagrees(client, iAddress, expected) {
+  try {
+    const me = await client.getAgent(iAddress);
+    const reported = me && (me.platformStatus || me.status
+      || (me.data && (me.data.platformStatus || me.data.status)));
+    if (reported && reported !== expected) {
+      console.warn(`   platform still reports ${reported} — inspect later`);
+    }
+  } catch { /* best-effort; the verb already printed */ }
+}
 
 function requireListingKind(raw, fallback = 'agent') {
   const kind = parseListingKind(raw) || (raw == null || raw === '' ? parseListingKind(fallback) : null);
@@ -1666,6 +1686,7 @@ program
 
     const kind = requireListingKind(options.kind);
     const preview = advertisedIdentity(identityName, kind);
+    assertDataDescriptions(kind, preview, [options.profileDescription, options.serviceDescription]);
     const allAgents = listRegisteredAgents();
     for (const other of allAgents) {
       if (other === agentId) continue;
@@ -1726,6 +1747,11 @@ program
         serviceData = result.services;
         disputePolicyData = result.disputePolicy;
       }
+
+      assertDataDescriptions(kind, keys.identity || preview, [
+        profileData && profileData.description,
+        ...(serviceData || []).map((s) => s && s.description),
+      ]);
 
       // Persist so a later standalone `finalize <agent-id>` (the documented
       // two-step onboarding flow) can find the profile this command just
@@ -1917,6 +1943,13 @@ program
         services = flagServices;
       }
     }
+
+    assertDataDescriptions(keys.kind, keys.identity, [
+      options.profileDescription,
+      options.serviceDescription,
+      profile && profile.description,
+      ...(services || []).map((s) => s && s.description),
+    ]);
 
     try {
       saveProfile(agentId, profile, services, disputePolicy);
@@ -2326,7 +2359,8 @@ program
       try { await agent._client.refreshAgent(keys.iAddress); } catch {}
 
       console.log(`\n✅ Agent deactivated`);
-      console.log(`   Platform status: ${result.status}`);
+      console.log(`   deactivated`);
+      await warnIfPlatformDisagrees(agent._client, keys.iAddress, 'inactive');
       if (svcDeactivated > 0) console.log(`   Services deactivated: ${svcDeactivated}`);
       if (result.onChainTxid) {
         console.log(`   On-chain txid: ${result.onChainTxid}`);
@@ -2424,7 +2458,8 @@ program
       try { await agent._client.refreshAgent(keys.iAddress); } catch {}
 
       console.log(`\n✅ Agent activated`);
-      console.log(`   Platform status: ${result.status}`);
+      console.log(`   activated`);
+      await warnIfPlatformDisagrees(agent._client, keys.iAddress, 'active');
       if (svcCount > 0) console.log(`   Services reactivated: ${svcCount}`);
       if (result.onChainTxid) {
         console.log(`   On-chain txid: ${result.onChainTxid}`);
@@ -2513,7 +2548,8 @@ program
           }
         } catch {}
         try { await agent._client.refreshAgent(keys.iAddress); } catch {}
-        console.log(`  ✓ ${agentId} (${keys.identity}) — ${result.status}${result.onChainTxid ? ' tx:' + result.onChainTxid.substring(0, 12) + '...' : ''}`);
+        console.log(`  ✓ ${agentId} (${keys.identity}) — activated${result.onChainTxid ? ' tx:' + result.onChainTxid.substring(0, 12) + '...' : ''}`);
+        await warnIfPlatformDisagrees(agent._client, keys.iAddress, 'active');
 
         // Update finalize state
         const finalizePath = path.join(AGENTS_DIR, agentId, FINALIZE_STATE_FILENAME);
@@ -2582,12 +2618,13 @@ program
             }
           } catch {}
         }
-        const result = await agent.deactivate({
+        await agent.deactivate({
           onChain: !options.platformOnly,
           removeServices: false, // we set inactive above, don't delete
         });
         try { await agent._client.refreshAgent(keys.iAddress); } catch {}
-        console.log(`  ✓ ${agentId} (${keys.identity}) — ${result.status}`);
+        console.log(`  ✓ ${agentId} (${keys.identity}) — deactivated`);
+        await warnIfPlatformDisagrees(agent._client, keys.iAddress, 'inactive');
 
         // Update finalize state
         const finalizePath = path.join(AGENTS_DIR, agentId, FINALIZE_STATE_FILENAME);
@@ -3489,6 +3526,8 @@ program
       process.exit(1);
     }
 
+    assertDataDescriptions(keys.kind, keys.identity, [options.description]);
+
     // Map CLI flags to VDXF field names
     const fieldsToUpdate = {};
     if (options.displayName) fieldsToUpdate.displayName = options.displayName;
@@ -3979,6 +4018,7 @@ program
     } else {
       const kind = requireListingKind(options.kind, keys.kind || 'agent');
       const setupPreview = advertisedIdentity(identityName, kind);
+      assertDataDescriptions(kind, setupPreview, [options.profileDescription, options.serviceDescription]);
       const setupAllAgents = listRegisteredAgents();
       for (const other of setupAllAgents) {
         if (other === agentId) continue;
@@ -4048,6 +4088,13 @@ program
       profileData = buildFullProfile(options, keys);
       services = buildServiceFromOptions(options, profileData.description);
     }
+
+    assertDataDescriptions(options.kind || keys.kind, keys.identity, [
+      options.profileDescription,
+      options.serviceDescription,
+      profileData && profileData.description,
+      ...services.map((s) => s && s.description),
+    ]);
 
     let profileAttempt = { ok: false, indexerLag: false, error: null, result: null };
     try {
@@ -5291,13 +5338,25 @@ program
       } catch (e) { console.error('  Compute: boot orphan-recovery failed:', e.message); }
     }
 
+    // Same interval in both modes. Webhook delivery is best-effort; poll is the
+    // source of truth. Computed once so webhook mode does not grow a second loop
+    // when already in poll mode.
+    const agentCount = state.agents.length;
+    const _cfgPoll = Number(loadDispatcherConfig().poll?.interval_ms) || 0;
+    const pollInterval = _cfgPoll > 0
+      ? Math.max(1000, _cfgPoll)
+      : Math.max(60000, agentCount * 1000);
+
     if (options.webhookUrl) {
       // ── WEBHOOK MODE ──
+      state.webhookMode = true;
       const webhookPort = parseInt(options.webhookPort) || 9841;
       const webhookUrl = options.webhookUrl.replace(/\/+$/, '');
       const { generateWebhookSecret } = require('@junction41/sovagent-sdk/dist/webhook/verify.js');
 
-      console.log(`Mode: WEBHOOK (event-driven)`);
+      const pollSecs = Math.round(pollInterval / 1000);
+      console.log(`Mode: WEBHOOK + poll (${pollSecs}s). J41 webhooks are best-effort; poll is the source of truth.`);
+      console.log('Named HTTP/TCP tunnels are operator infra — this process does not create them.');
       console.log(`  Base URL: ${webhookUrl}/webhook/<agent-id>`);
       console.log(`  Listen port: ${webhookPort}\n`);
 
@@ -5620,7 +5679,7 @@ program
       // path. J41 never POSTs /j41/api-access/revoke (that route stays for
       // direct callers); the signed platform event is the real channel.
       state.proxyContext = proxyContext;
-      startWebhookServer(webhookPort, agentWebhooks, async (agentId, payload) => {
+      state._webhookServer = startWebhookServer(webhookPort, agentWebhooks, async (agentId, payload) => {
         await handleWebhookEvent(state, agentId, payload);
       }, proxyContext);
 
@@ -5640,6 +5699,10 @@ program
           }
         }
       }, 300000, 'SafetyPoll');
+
+      // Cheap poll in addition to the HTTP receiver. Do not add this in poll
+      // mode — that branch already starts the 60s loop below.
+      safeInterval(() => pollForJobs(state), pollInterval, 'Poll');
 
     } else {
       // ── POLL MODE (default — works behind NAT) ──
@@ -5726,14 +5789,6 @@ program
       // 5 agents:  60s cycle (2.5s stagger total)
       // 50 agents: 60s cycle (25s stagger, fits within interval)
       // 100 agents: 90s cycle (50s stagger, needs wider interval)
-      const agentCount = state.agents.length;
-      // S1 — honour an explicit interval when the operator sets one. The auto value
-      // is a floor-based heuristic; a large fleet or a slow platform legitimately
-      // needs a longer cycle, and until now there was no way to ask for one.
-      const _cfgPoll = Number(loadDispatcherConfig().poll?.interval_ms) || 0;
-      const pollInterval = _cfgPoll > 0
-        ? Math.max(1000, _cfgPoll)
-        : Math.max(60000, agentCount * 1000);
       const reviewInterval = Math.max(60000, agentCount * 1000);
       console.log(`  Poll interval: ${Math.round(pollInterval / 1000)}s ` +
         `(${_cfgPoll > 0 ? 'configured' : `auto, ${agentCount} agent${agentCount !== 1 ? 's' : ''}`})`);
@@ -9276,6 +9331,11 @@ async function pollForJobs(state) {
         }
         if (state.queue.some(j => j.id === job.id)) {
           continue;
+        }
+        // Webhooks are best-effort. A job poll finds first is not proof the
+        // platform missed the POST — the webhook may still be in flight.
+        if (state.webhookMode) {
+          console.log(`[Poll] recovered job ${job.id} (no webhook)`);
         }
 
         // Skip jobs in terminal states (delivered, completed, cancelled, resolved)
