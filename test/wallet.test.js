@@ -622,6 +622,10 @@ test('txConfirmations: nested data unwrap when the outer object has no confirmat
   assert.strictEqual(txConfirmations({ data: { confirmations: 3 } }), 3);
 });
 
+test('txConfirmations: outer confirmations:0 wins over nested data', () => {
+  assert.strictEqual(txConfirmations({ confirmations: 0, data: { confirmations: 3 } }), 0);
+});
+
 test('txConfirmations: garbage and missing status are 0 (fail closed)', () => {
   assert.strictEqual(txConfirmations(null), 0);
   assert.strictEqual(txConfirmations(undefined), 0);
