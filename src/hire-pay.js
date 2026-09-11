@@ -42,4 +42,17 @@ function jobAlreadyPaid(job) {
   return false;
 }
 
-module.exports = { planHirePayment, buyerOwnsJob, jobAlreadyPaid };
+/**
+ * sendMultiPayment is one combined tx. payExtension wants agent + fee txids;
+ * when a fee output exists both share that txid (do not invent a second one).
+ */
+function dualPayTxids(outputs, txid) {
+  const id = txid == null || txid === '' ? '' : String(txid);
+  if (!id) return { agentTxid: undefined, feeTxid: undefined };
+  if (Array.isArray(outputs) && outputs.length > 1) {
+    return { agentTxid: id, feeTxid: id };
+  }
+  return { agentTxid: id, feeTxid: undefined };
+}
+
+module.exports = { planHirePayment, buyerOwnsJob, jobAlreadyPaid, dualPayTxids };

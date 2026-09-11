@@ -3411,6 +3411,84 @@ program
   });
 
 program
+  .command('extend <buyer-agent-id> <job-id>')
+  .description('Request a job extension and dual-pay it (labour in_progress/paused; GPU Cat-1 including delivered)')
+  .requiredOption('--amount <n>', 'Extension amount in the listing currency')
+  .option('--reason <text>', 'Why the extra time/budget is needed')
+  .option('--pay', 'Broadcast dual payment after request (default on)', true)
+  .option('--no-pay', 'Request the extension without broadcasting payment')
+  .option('--wait', 'With --pay: poll until wallet-pending clears (max 180s)')
+  .option('--force', 'Ignore wallet-pending.json and broadcast anyway')
+  .option('--yes', 'Skip the interactive confirmation (mainnet --yes still needs a TTY or J41_HEADLESS_MAINNET_PAY=1)')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
+  .action(async (buyerAgentId, jobId, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    const amount = Number(options.amount);
+    if (!Number.isFinite(amount) || amount <= 0) fail('BAD_AMOUNT', '--amount must be a positive number');
+    const pay = options.pay !== false;
+    const headlessMainnetPay = process.env.J41_HEADLESS_MAINNET_PAY === '1';
+    if (pay && IS_MAINNET && options.yes && !process.stdin.isTTY && !headlessMainnetPay) {
+      fail('MAINNET_TTY_REQUIRED',
+        '--yes cannot skip payment confirmation on mainnet without a TTY. Set J41_HEADLESS_MAINNET_PAY=1.');
+    }
+    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    const { runBuyerExtend } = require('./buyer-extend');
+    const result = await runBuyerExtend({
+      client: agent.client,
+      agent,
+      keys,
+      jobId,
+      amount,
+      reason: options.reason,
+      pay,
+      wait: !!options.wait,
+      force: !!options.force,
+      yes: !!options.yes,
+      autonomous: !!(options.json || headlessMainnetPay),
+      loadPending: () => loadWalletPending(buyerAgentId),
+      savePending: (rec) => saveWalletPending(buyerAgentId, rec),
+      resolvePending: (stamp) => resolveWalletPending(agent.client, buyerAgentId, stamp),
+      waitUnlink: (opts) => waitWalletPendingUnlink(agent.client, buyerAgentId, {
+        intervalMs: process.env.NODE_ENV === 'test' ? 0 : PAY_WAIT_INTERVAL_MS,
+        ...opts,
+      }),
+      confirm: () => confirmHire({ amountText: String(amount), pay }),
+      pollMs: process.env.NODE_ENV === 'test' ? 0 : PAY_WAIT_INTERVAL_MS,
+      gateExternalSend,
+      recordSendOutcome,
+    });
+    if (!result.ok) fail(result.code, result.message, {
+      jobId: result.jobId, extensionId: result.extensionId, status: result.status, gpu: result.gpu,
+    });
+    if (result.cancelled) {
+      console.log('Cancelled.');
+      process.exit(0);
+    }
+    say(`✅ Extension ${result.extensionId} on job ${result.jobId}${result.paid ? ' paid' : ' requested (unpaid)'}`);
+    if (result.txid) say(`   tx ${String(result.txid).substring(0, 16)}…`);
+    if (pay && options.wait && result.pending) {
+      console.warn('PAY_WAIT_TIMEOUT: payment broadcast but wallet-pending.json still in flight.');
+    } else if (pay && result.paid && !options.wait) {
+      say('   Wait until wallet show drops the spent UTXO before another pay (~one block).');
+    }
+    if (options.json) {
+      console.log(JSON.stringify({
+        ok: true,
+        jobId: result.jobId,
+        extensionId: result.extensionId,
+        amount: result.amount,
+        paid: !!result.paid,
+        txid: result.txid,
+        outputs: result.outputs,
+        gpu: !!result.gpu,
+        ...(options.wait ? { pending: !!result.pending } : {}),
+      }, null, 2));
+    }
+  });
+
+program
   .command('access <buyer-agent-id> <seller>')
   .description('Request ECDH API access from a model / api-endpoint seller (not a labour hire)')
   .option('--json', 'One JSON object on stdout (includes apiKey). Requires --yes.')
