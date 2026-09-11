@@ -3341,6 +3341,7 @@ program
   .requiredOption('--amount <n>', 'Extension amount in the listing currency')
   .option('--reason <text>', 'Why the extra time/budget is needed')
   .option('--pay', 'Broadcast dual payment after request (default on)', true)
+  .option('--no-pay', 'Request the extension without broadcasting payment')
   .option('--wait', 'With --pay: poll until wallet-pending clears (max 180s)')
   .option('--force', 'Ignore wallet-pending.json and broadcast anyway')
   .option('--yes', 'Skip the interactive confirmation (mainnet --yes still needs a TTY or J41_HEADLESS_MAINNET_PAY=1)')

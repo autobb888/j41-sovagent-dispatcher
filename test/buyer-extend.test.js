@@ -196,6 +196,58 @@ test('--no-pay requests but does not send or payExtension', async () => {
   assert.equal(sent, 0);
 });
 
+test('parsed --no-pay yields pay:false and does not send', async () => {
+  const { Command } = require('commander');
+  const cli = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
+  const start = cli.indexOf(".command('extend <buyer-agent-id> <job-id>')");
+  const next = cli.indexOf(".command('access <buyer-agent-id> <seller>')", start);
+  const extendSrc = cli.slice(start, next > -1 ? next : start + 2500);
+  assert.match(extendSrc, /\.option\('--pay', 'Broadcast dual payment after request \(default on\)', true\)/);
+  assert.match(extendSrc, /\.option\('--no-pay', 'Request the extension without broadcasting payment'\)/);
+
+  function parseExtend(argv) {
+    let captured;
+    const program = new Command();
+    program.exitOverride();
+    program.configureOutput({ writeErr() {}, writeOut() {} });
+    program
+      .command('extend <buyer-agent-id> <job-id>')
+      .requiredOption('--amount <n>', 'Extension amount in the listing currency')
+      .option('--pay', 'Broadcast dual payment after request (default on)', true)
+      .option('--no-pay', 'Request the extension without broadcasting payment')
+      .action((_buyerAgentId, _jobId, options) => {
+        captured = { pay: options.pay !== false, raw: options.pay };
+      });
+    program.parse(['node', 'cli', ...argv]);
+    return captured;
+  }
+
+  const noPay = parseExtend(['extend', 'agent-1', 'job-1', '--amount', '1', '--no-pay']);
+  assert.equal(noPay.raw, false);
+  assert.equal(noPay.pay, false);
+
+  const def = parseExtend(['extend', 'agent-1', 'job-1', '--amount', '1']);
+  assert.equal(def.pay, true);
+
+  const withPay = parseExtend(['extend', 'agent-1', 'job-1', '--amount', '1', '--pay']);
+  assert.equal(withPay.pay, true);
+
+  const client = mockClient({ ...LABOUR, status: 'in_progress' });
+  let sent = 0;
+  const r = await runBuyerExtend({
+    client,
+    keys: BUYER,
+    jobId: LABOUR.id,
+    amount: 1,
+    pay: noPay.pay,
+    yes: true,
+    sendMultiPayment: async () => { sent += 1; return 'x'; },
+  });
+  assert.equal(r.ok, true, r.message);
+  assert.equal(client.calls.map((c) => c.fn).join(','), 'requestExtension');
+  assert.equal(sent, 0);
+});
+
 test('dualPayTxids maps a combined sendMultiPayment onto agent+fee', () => {
   const one = dualPayTxids([{ address: PAY_ADDR, amount: 1 }], 'txid-a');
   assert.equal(one.agentTxid, 'txid-a');
@@ -242,7 +294,8 @@ test('CLI extend is a thin rind over buyer-extend; --pay default on', () => {
   assert.match(extendSrc, /runBuyerExtend/);
   assert.match(extendSrc, /\.requiredOption\('--amount/);
   assert.match(extendSrc, /\.option\('--reason/);
-  assert.match(extendSrc, /\.option\('--pay'/);
+  assert.match(extendSrc, /\.option\('--pay', 'Broadcast dual payment after request \(default on\)', true\)/);
+  assert.match(extendSrc, /\.option\('--no-pay', 'Request the extension without broadcasting payment'\)/);
   assert.match(extendSrc, /\.option\('--wait'/);
   assert.match(extendSrc, /\.option\('--yes'/);
   assert.match(extendSrc, /\.option\('--json'/);
