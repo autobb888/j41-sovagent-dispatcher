@@ -7,6 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const {
   assertHireAllowed,
+  assertAccessAllowed,
   paymentOutputs,
   localBuyers,
   fetchMarketplaceListings,
@@ -17,6 +18,18 @@ test('hire gate matches platform: agent labour ok, data refused', () => {
   const data = assertHireAllowed({ sellerKind: 'data', serviceType: 'agent', serviceId: 's1' });
   assert.equal(data.ok, false);
   assert.equal(data.code, 'DATA_NOT_HIREABLE');
+});
+
+test('access is allowed only when some service is api-endpoint', () => {
+  assert.equal(assertAccessAllowed({
+    sellerKind: 'model',
+    services: [{ serviceType: 'agent' }],
+  }).code, 'ACCESS_NOT_API_ENDPOINT');
+  assert.equal(assertAccessAllowed({ sellerKind: 'data', services: [] }).code, 'ACCESS_NOT_API_ENDPOINT');
+  assert.equal(assertAccessAllowed({
+    sellerKind: 'model',
+    services: [{ serviceType: 'api-endpoint' }],
+  }).ok, true);
 });
 
 test('compute requires gpu-rental; model and api-endpoint are not labour jobs', () => {

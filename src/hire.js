@@ -44,6 +44,18 @@ function assertHireAllowed({ sellerKind, serviceType, serviceId }) {
   return { ok: true };
 }
 
+function assertAccessAllowed({ sellerKind, services, serviceType } = {}) {
+  const list = Array.isArray(services) ? services : [];
+  const hasApi = list.some((s) => s && s.serviceType === 'api-endpoint')
+    || serviceType === 'api-endpoint';
+  if (hasApi) return { ok: true };
+  return {
+    ok: false,
+    code: 'ACCESS_NOT_API_ENDPOINT',
+    message: 'Seller has no api-endpoint service. Access is for metered model APIs, not labour or data.',
+  };
+}
+
 function isVerusAddr(s) {
   return typeof s === 'string' && /^[Ri][1-9A-HJ-NP-Za-km-z]{25,40}$/.test(s);
 }
@@ -219,6 +231,7 @@ async function fetchMarketplaceListings({
 
 module.exports = {
   assertHireAllowed,
+  assertAccessAllowed,
   paymentOutputs,
   isVerusAddr,
   localBuyers,
