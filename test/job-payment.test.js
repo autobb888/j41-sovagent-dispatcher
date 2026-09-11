@@ -26,6 +26,13 @@ test('cli startJobOrRental and webhook job.started gate on jobPaymentReady', () 
   assert.match(webhookStart, /jobPaymentReady/);
 });
 
+test('webhook job.requested records pendingPayment so poll does not claim a miss', () => {
+  const cli = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
+  const requested = cli.slice(cli.indexOf("case 'job.requested'"), cli.indexOf("case 'job.started'"));
+  assert.match(requested, /pendingPayment\.set/,
+    'webhook accept must stamp pendingPayment before poll can log (no webhook)');
+});
+
 test('start logs when a saved profile has no service', () => {
   const cli = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
   assert.match(cli, /has a profile but no service — buyers cannot hire it/);

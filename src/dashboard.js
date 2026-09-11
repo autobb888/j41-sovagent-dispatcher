@@ -33,6 +33,7 @@ const {
   listingsCollide,
   KIND_BLURB,
 } = require('./listing-kind.js');
+const { descriptionHasEphemeralUrl, isDataListing } = require('./listing-description.js');
 const {
   providerBoundToAgent,
   homeGpuProviderPartial,
@@ -1554,6 +1555,12 @@ async function configureServicesScreen(inquirer) {
     if (action === 'add') {
       const { svcName } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcName', message: 'Service name:', default: 'Code Review' }]);
       const { svcDesc } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcDesc', message: 'Description:' }]);
+      if (isDataListing(listingKindOf(keys), keys.identity) && descriptionHasEphemeralUrl(svcDesc)) {
+        console.log('\n  ❌ DESCRIPTION_EPHEMERAL_URL: data listing descriptions cannot hold tunnel or LAN URLs.');
+        console.log('     Put the live URL in website / network endpoints only.\n');
+        await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
+        continue;
+      }
       const { svcPrice } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcPrice', message: 'Price:', default: '0.5' }]);
       const { svcCurrency } = await promptWithEsc(inquirer, [{ type: 'input', name: 'svcCurrency', message: 'Currency:', default: NATIVE_COIN }]);
       const svcCategory = await pickCategory(inquirer, 'development');
@@ -1590,6 +1597,12 @@ async function configureServicesScreen(inquirer) {
       if (!apiName) { console.log('\n  Name required.\n'); continue; }
 
       const { apiDesc } = await promptWithEsc(inquirer, [{ type: 'input', name: 'apiDesc', message: 'Description:', default: 'OpenAI-compatible API access' }]);
+      if (isDataListing(listingKindOf(keys), keys.identity) && descriptionHasEphemeralUrl(apiDesc)) {
+        console.log('\n  ❌ DESCRIPTION_EPHEMERAL_URL: data listing descriptions cannot hold tunnel or LAN URLs.');
+        console.log('     Put the live URL in website / network endpoints only.\n');
+        await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
+        continue;
+      }
       const { apiUrl } = await promptWithEsc(inquirer, [{ type: 'input', name: 'apiUrl', message: 'Your backend URL (e.g. https://my-gpu.com/v1):' }]);
       if (!apiUrl) { console.log('\n  Endpoint URL required.\n'); continue; }
 
@@ -1706,6 +1719,12 @@ async function configureServicesScreen(inquirer) {
 
       const { newName } = await promptWithEsc(inquirer, [{ type: 'input', name: 'newName', message: 'Name:', default: svc.name }]);
       const { newDesc } = await promptWithEsc(inquirer, [{ type: 'input', name: 'newDesc', message: 'Description:', default: svc.description || '' }]);
+      if (isDataListing(listingKindOf(keys), keys.identity) && descriptionHasEphemeralUrl(newDesc)) {
+        console.log('\n  ❌ DESCRIPTION_EPHEMERAL_URL: data listing descriptions cannot hold tunnel or LAN URLs.');
+        console.log('     Put the live URL in website / network endpoints only.\n');
+        await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
+        continue;
+      }
       const { newPrice } = await promptWithEsc(inquirer, [{ type: 'input', name: 'newPrice', message: 'Price:', default: String(svc.price) }]);
       const newCategory = await pickCategory(inquirer, svc.category || 'development');
       const { newTurnaround } = await promptWithEsc(inquirer, [{ type: 'input', name: 'newTurnaround', message: 'Turnaround:', default: svc.turnaround || '15 minutes' }]);
@@ -3248,10 +3267,10 @@ async function batchActivateScreen(inquirer, activate) {
                 try { await agent.client.updateService(svc.id, { status: 'active' }); } catch {}
               }
             }
-            if (svcs.length > 0) console.log(`  ✓ ${agentId} (${agentKeys.identity}) — ${result.status}, ${svcs.length} service(s) activated`);
-            else console.log(`  ✓ ${agentId} (${agentKeys.identity}) — ${result.status}`);
+            if (svcs.length > 0) console.log(`  ✓ ${agentId} (${agentKeys.identity}) — activated, ${svcs.length} service(s) activated`);
+            else console.log(`  ✓ ${agentId} (${agentKeys.identity}) — activated`);
           } catch {
-            console.log(`  ✓ ${agentId} (${agentKeys.identity}) — ${result.status}${result.onChainTxid ? ' tx:' + result.onChainTxid.substring(0, 12) + '...' : ''}`);
+            console.log(`  ✓ ${agentId} (${agentKeys.identity}) — activated${result.onChainTxid ? ' tx:' + result.onChainTxid.substring(0, 12) + '...' : ''}`);
           }
         } else {
           // Deactivate services (set inactive, don't delete)
@@ -3264,8 +3283,8 @@ async function batchActivateScreen(inquirer, activate) {
               }
             }
           } catch {}
-          const result = await agent.deactivate({ onChain, removeServices: false });
-          console.log(`  ✓ ${agentId} (${agentKeys.identity}) — ${result.status}`);
+          await agent.deactivate({ onChain, removeServices: false });
+          console.log(`  ✓ ${agentId} (${agentKeys.identity}) — deactivated`);
         }
         // Tell J41 to re-read the identity from chain
         try {
