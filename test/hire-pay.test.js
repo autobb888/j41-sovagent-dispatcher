@@ -52,3 +52,31 @@ test('hire --pay gates wallet-pending BEFORE createJob (no unpaid leftover on PA
   assert.doesNotMatch(afterCreate, /planHirePayment\(/,
     'a second planHirePayment after createJob reintroduces the leftover-job bug');
 });
+
+test('pay --wait polls resolveWalletPending AFTER broadcast, not only before', () => {
+  const cli = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
+  const start = cli.indexOf(".command('pay <buyer-agent-id> <job-id>')");
+  const end = cli.indexOf(".command('complete <buyer-agent-id> <job-id>')", start);
+  const paySrc = cli.slice(start, end);
+  const save = paySrc.indexOf('saveWalletPending(');
+  assert.ok(save > -1, 'pay must stamp wallet-pending.json after broadcast');
+  const waitAfter = paySrc.indexOf('waitWalletPendingUnlink(', save);
+  assert.ok(waitAfter > save, 'pay --wait must poll the NEW tx after saveWalletPending');
+  assert.match(paySrc.slice(waitAfter), /PAY_WAIT_TIMEOUT/);
+  assert.match(paySrc.slice(waitAfter), /pending:\s*stillPending/);
+});
+
+test('hire --pay --wait also waits after broadcast; planHirePayment stays before createJob', () => {
+  const cli = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
+  const start = cli.indexOf(".command('hire <buyer-agent-id> <seller>')");
+  const end = cli.indexOf(".command('buyers')", start);
+  const hireSrc = cli.slice(start, end);
+  const plan = hireSrc.indexOf('planHirePayment(');
+  const create = hireSrc.indexOf('createJob(');
+  const save = hireSrc.indexOf('saveWalletPending(');
+  assert.ok(plan > -1 && plan < create, 'PAY_PENDING gate stays before createJob');
+  assert.ok(save > create, 'stamp is after create+broadcast');
+  const waitAfter = hireSrc.indexOf('waitWalletPendingUnlink(', save);
+  assert.ok(waitAfter > save, 'hire --pay --wait must poll the NEW tx after saveWalletPending');
+  assert.match(hireSrc, /PAY_WAIT_TIMEOUT/);
+});

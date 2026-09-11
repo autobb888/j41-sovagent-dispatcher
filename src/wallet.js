@@ -563,6 +563,26 @@ function formatEarned(n) {
   return s;
 }
 
+/**
+ * Coerce getTxStatus into a confirmation count.
+ *
+ * Responses disagree: number, decimal string, nested `.data`, or a bare
+ * `confirmed` flag. `typeof confirmations === 'number'` left string `'2'` and
+ * `{data:{confirmations:n}}` stamped forever. `confirmed:true` with
+ * `confirmations:0` is still mempool — the flag is not enough to unlink.
+ */
+function txConfirmations(st) {
+  const nested = st && st.data && typeof st.data === 'object' && !('confirmations' in st);
+  const s = nested ? st.data : st;
+  if (!s || typeof s !== 'object') return 0;
+  if (s.confirmations != null && s.confirmations !== '') {
+    const n = Number(s.confirmations);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+  if (s.confirmed === true) return 1;
+  return 0;
+}
+
 module.exports = {
   parseVrscAmount,
   formatVrsc,
@@ -573,4 +593,5 @@ module.exports = {
   planManualSweep,
   planFleetSend,
   executeSend,
+  txConfirmations,
 };

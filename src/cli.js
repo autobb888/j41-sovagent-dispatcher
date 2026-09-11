@@ -64,6 +64,7 @@ const {
   planManualSweep,
   planFleetSend,
   executeSend,
+  txConfirmations,
 } = require('./wallet.js');
 
 /**
@@ -2951,6 +2952,7 @@ program
 
       let txid = null;
       let outputs = [];
+      let stillPending = false;
       if (options.pay) {
         outputs = paymentOutputs(job, amount);
 
@@ -3009,8 +3011,18 @@ program
           });
         }
         say(`✅ Payment broadcast ${String(txid).substring(0, 16)}… (${outputs.length} output${outputs.length === 1 ? '' : 's'})`);
-        say('   Wait until wallet show drops the spent UTXO before another pay (~one block).');
-        say('   A second pay in this block will be refused (PAY_PENDING) or rejected by the network.');
+        if (options.wait) {
+          const waited = await waitWalletPendingUnlink(agent.client, buyerAgentId, {
+            intervalMs: process.env.NODE_ENV === 'test' ? 0 : PAY_WAIT_INTERVAL_MS,
+          });
+          stillPending = !waited.cleared;
+          if (stillPending) {
+            console.warn('PAY_WAIT_TIMEOUT: payment broadcast but wallet-pending.json still in flight.');
+          }
+        } else {
+          say('   Wait until wallet show drops the spent UTXO before another pay (~one block).');
+          say('   A second pay in this block will be refused (PAY_PENDING) or rejected by the network.');
+        }
       } else {
         say(`   Pay later: j41-dispatcher pay ${buyerAgentId} ${job.id} [--yes]`);
         say('   or from the website. Seller cannot start work until payment verifies.');
@@ -3033,6 +3045,7 @@ program
           paid: !!options.pay,
           txid, // FULL txid. The human line above truncates to 16 chars, which loses it entirely.
           outputs,
+          ...(options.pay && options.wait ? { pending: stillPending } : {}),
         }, null, 2));
       }
     } catch (e) {
@@ -3221,8 +3234,24 @@ program
       recordSendOutcome({ kind: 'payment', jobId: job.id, toAddress: job.payment && job.payment.address, amount, txid });
     }
     say(`✅ Payment broadcast ${String(txid).substring(0, 16)}…`);
-    say('   Wait until wallet show drops the spent UTXO before another pay.');
-    if (options.json) console.log(JSON.stringify({ ok: true, jobId: job.id, txid, outputs }, null, 2));
+    let stillPending = false;
+    if (options.wait) {
+      const waited = await waitWalletPendingUnlink(agent.client, buyerAgentId, {
+        intervalMs: process.env.NODE_ENV === 'test' ? 0 : PAY_WAIT_INTERVAL_MS,
+      });
+      stillPending = !waited.cleared;
+      if (stillPending) {
+        console.warn('PAY_WAIT_TIMEOUT: payment broadcast but wallet-pending.json still in flight.');
+      }
+    } else {
+      say('   Wait until wallet show drops the spent UTXO before another pay.');
+    }
+    if (options.json) {
+      console.log(JSON.stringify({
+        ok: true, jobId: job.id, txid, outputs,
+        ...(options.wait ? { pending: stillPending } : {}),
+      }, null, 2));
+    }
   });
 
 program
@@ -12959,7 +12988,6 @@ function loadWalletPending(agentId) {
   }
 }
 
-/** Record a broadcast. Atomic rename so a reader never sees a half-written stamp. */
 /**
  * Drop a pending stamp whose transaction has actually confirmed.
  *
@@ -12972,6 +13000,7 @@ function loadWalletPending(agentId) {
  *
  * Fails CLOSED: any doubt (no txid, lookup error, zero/absent confirmations) keeps
  * the stamp. Costs one getTxStatus, and only when a stamp is actually present.
+ * `confirmed:true` with `confirmations:0` is still mempool — see txConfirmations.
  */
 async function resolveWalletPending(client, agentId, stamp) {
   if (!stamp || stamp.malformed) return stamp;
@@ -12980,8 +13009,7 @@ async function resolveWalletPending(client, agentId, stamp) {
   if (!client || typeof client.getTxStatus !== 'function') return stamp;
   try {
     const st = await client.getTxStatus(txid);
-    const confs = st && typeof st.confirmations === 'number' ? st.confirmations : 0;
-    if (confs > 0) {
+    if (txConfirmations(st) > 0) {
       try { fs.unlinkSync(walletPendingPath(agentId)); } catch { /* already gone — fine */ }
       return null;
     }
@@ -12991,6 +13019,34 @@ async function resolveWalletPending(client, agentId, stamp) {
   return stamp;
 }
 
+/**
+ * After a successful broadcast, poll until the NEW stamp unlinks or 180s.
+ *
+ * pay --wait used to wait only BEFORE send, then stamp and exit — so the tx
+ * just broadcast was never the one being waited on. Timeout is a warning
+ * (PAY_WAIT_TIMEOUT, exit 0): the money already moved; retrying would
+ * double-spend. Inject `now`/`sleep` in tests so this does not sit on a
+ * wall clock.
+ */
+const PAY_WAIT_TIMEOUT_MS = 180000;
+const PAY_WAIT_INTERVAL_MS = 5000;
+
+async function waitWalletPendingUnlink(client, agentId, {
+  timeoutMs = PAY_WAIT_TIMEOUT_MS,
+  intervalMs = PAY_WAIT_INTERVAL_MS,
+  now = () => Date.now(),
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+} = {}) {
+  const deadline = now() + timeoutMs;
+  for (;;) {
+    const pending = await resolveWalletPending(client, agentId, loadWalletPending(agentId));
+    if (!pending) return { cleared: true, pending: null };
+    if (now() >= deadline) return { cleared: false, pending };
+    await sleep(intervalMs);
+  }
+}
+
+/** Record a broadcast. Atomic rename so a reader never sees a half-written stamp. */
 function saveWalletPending(agentId, record) {
   const p = walletPendingPath(agentId);
   fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
@@ -13338,6 +13394,7 @@ async function walletShow(state, agentId, opts = {}) {
   // reads before deciding whether to --force.
   let showClient = null;
   try { showClient = walletIsRegistered(a) ? (await getAgentSession(state, a)).client : null; } catch { showClient = null; }
+  const canQueryTx = !!(showClient && typeof showClient.getTxStatus === 'function');
   const pending = await resolveWalletPending(showClient, a.id, loadWalletPending(a.id));
 
   // Classify by asking summarizeUtxos, never by re-deriving the rule here: it
@@ -13373,6 +13430,7 @@ async function walletShow(state, agentId, opts = {}) {
   if (pending) {
     const age = typeof pending.at === 'number' ? `${Math.round((Date.now() - pending.at) / 60000)}m ago` : 'UNKNOWN AGE — treated as in flight';
     console.log(`\n  Pending ${pending.kind || 'tx'} ${String(pending.txid || '(no txid)').substring(0, 12)}, broadcast ${age}`);
+    if (!canQueryTx) console.log('  pending (could not query tx status — stamp kept)');
   }
   console.log('');
   return r;
@@ -14320,7 +14378,7 @@ program
 // ── Entry point ──
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, shouldWriteChainActiveOnActivate, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState, untrusted, untrustedField, requireInteractiveConfirm, printFundingInstructions, handleWebhookEvent, stopJobContainer, stopJobLocal, _cleanupCompletedJobs, jobImageExists, JOB_IMAGE, jailImageExists, JAIL_IMAGE, NATIVE_COIN,
+  module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, shouldWriteChainActiveOnActivate, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, waitWalletPendingUnlink, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState, untrusted, untrustedField, requireInteractiveConfirm, printFundingInstructions, handleWebhookEvent, stopJobContainer, stopJobLocal, _cleanupCompletedJobs, jobImageExists, JOB_IMAGE, jailImageExists, JAIL_IMAGE, NATIVE_COIN,
     saveProfile, loadSavedProfile, createFinalizeHooks, jobPaymentReady, isIndexerLagError, retryRegisterWithJ41, planHirePayment,
     // Execution-harness seam: `program` so a test can drive the REAL `start`
     // action through commander, and `__getState` so it can then assert on what
