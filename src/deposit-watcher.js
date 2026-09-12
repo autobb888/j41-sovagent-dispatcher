@@ -333,8 +333,26 @@ function saveDeposits(agentId, data) {
  */
 function extractVinAddress(verification) {
   if (!verification || typeof verification !== 'object') return null;
-  const raw = verification.senderAddress || verification.sender || verification.fromAddress || verification.from;
+  const raw = verification.senderAddress
+    || verification.sender
+    || verification.fromAddress
+    || verification.from
+    || (typeof verification.senderVerusId === 'string' && /^R[1-9A-HJ-NP-Za-km-z]{24,}$/.test(verification.senderVerusId)
+      ? verification.senderVerusId
+      : null);
   return typeof raw === 'string' && raw.length > 0 ? raw : null;
+}
+
+function logSenderMismatchRefuse(verification, buyerVerusId) {
+  const v = verification && typeof verification === 'object' ? verification : {};
+  console.warn('[Deposit] SENDER_MISMATCH refuse', {
+    verified: v.verified,
+    reason: v.reason,
+    senderVerified: v.senderVerified,
+    senderVerusId: v.senderVerusId,
+    senderAddress: v.senderAddress || v.sender || v.fromAddress || v.from || null,
+    buyerVerusId,
+  });
 }
 
 /**
@@ -526,7 +544,17 @@ async function _reportVerifiedDeposit(agentId, client, report, payAddress, netwo
     const normId = (s) => (typeof s === 'string' ? s.trim().toLowerCase().replace(/@+$/, '') : s);
     if (!senderAccepted && verification.senderVerified === true && verification.senderVerusId &&
         normId(verification.senderVerusId) !== normId(buyerVerusId)) {
-      return { credited: false, code: 'SENDER_MISMATCH', message: 'Funding transaction sender does not match the claiming buyer' };
+      // Live Mac 2026-09-12: platform returns verified+senderVerified true with a
+      // senderVerusId that is not the claiming id (R attributed elsewhere). Vin
+      // ownership of this identity still wins — run the same primary-R rescue.
+      const resolved = await resolveSenderViaPrimaryR(client, verification, buyerVerusId, verifyArgs);
+      verification = resolved.verification;
+      if (resolved.matched) {
+        senderAccepted = true;
+      } else {
+        logSenderMismatchRefuse(verification, buyerVerusId);
+        return { credited: false, code: 'SENDER_MISMATCH', message: 'Funding transaction sender does not match the claiming buyer' };
+      }
     }
     if (!senderAccepted && verification.senderVerified === undefined) {
       // Audit M-DISPATCHER-funds-1: without sender verification, anyone who

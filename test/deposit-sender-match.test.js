@@ -235,3 +235,64 @@ test('no-vin retry amount_too_low is not SENDER_MISMATCH', async () => {
   assert.deepEqual(expectedSenders, [buyerVerusId, kp.address]);
   assert.equal(getBalance(agentId, buyerVerusId), 0);
 });
+
+test('verified true + senderVerified true + disagreeing senderVerusId still credits primary R vin (live Mac)', async () => {
+  const kp = generateKeypair(NET);
+  const buyerVerusId = 'j41grokbuyer.agentplatform@';
+  const agentId = 'agent-sender-live-mac';
+  const txid = 'tx_' + crypto.randomBytes(8).toString('hex');
+  const amount = 0.05;
+
+  const client = baseClient(kp, buyerVerusId, {
+    async verifyPayment() {
+      return {
+        verified: true,
+        senderVerified: true,
+        senderVerusId: 'not-the-buyer.agentplatform@',
+        senderAddress: PRIMARY_R,
+        confirmedAmount: amount,
+        actualAmount: amount,
+      };
+    },
+  });
+
+  const res = await reportDeposit(
+    agentId, client,
+    signedReport(kp, buyerVerusId, 'duskseek.agentplatform@', txid, amount),
+    PAY_ADDR, NET,
+  );
+  assert.equal(res.credited, true, JSON.stringify(res));
+  assert.notEqual(res.code, 'SENDER_MISMATCH');
+  assert.equal(getBalance(agentId, buyerVerusId), amount);
+});
+
+test('verified true + senderVerified true + stranger vin stays SENDER_MISMATCH', async () => {
+  const kp = generateKeypair(NET);
+  const buyerVerusId = 'j41grokbuyer.agentplatform@';
+  const agentId = 'agent-sender-live-stranger';
+  const txid = 'tx_' + crypto.randomBytes(8).toString('hex');
+  const amount = 0.05;
+
+  const client = baseClient(kp, buyerVerusId, {
+    async verifyPayment() {
+      return {
+        verified: true,
+        senderVerified: true,
+        senderVerusId: 'not-the-buyer.agentplatform@',
+        senderAddress: STRANGER_R,
+        confirmedAmount: amount,
+        actualAmount: amount,
+      };
+    },
+  });
+
+  const res = await reportDeposit(
+    agentId, client,
+    signedReport(kp, buyerVerusId, 'duskseek.agentplatform@', txid, amount),
+    PAY_ADDR, NET,
+  );
+  assert.equal(res.credited, false);
+  assert.equal(res.code, 'SENDER_MISMATCH');
+  assert.match(res.message || '', /does not match the claiming buyer/);
+  assert.equal(getBalance(agentId, buyerVerusId), 0);
+});
