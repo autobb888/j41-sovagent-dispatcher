@@ -559,8 +559,24 @@ async function _reportVerifiedDeposit(agentId, client, report, payAddress, netwo
     // (`client.normalizeIdentity(form) → iAddress`). The simple normalizer
     // catches every Family-3 case seen in the 2026-05 backend audit.
     const normId = (s) => (typeof s === 'string' ? s.trim().toLowerCase().replace(/@+$/, '') : s);
+    const stripChain = (s) => String(s || '').replace(/\.(vrsctest|vrsc)@$/i, '@');
+    async function sameBuyerIdentity(a, b) {
+      if (!a || !b) return false;
+      if (normId(a) === normId(b)) return true;
+      if (normId(stripChain(a)) === normId(stripChain(b))) return true;
+      if (!client || typeof client.getIdentityKeys !== 'function') return false;
+      try {
+        const [ka, kb] = await Promise.all([client.getIdentityKeys(a), client.getIdentityKeys(b)]);
+        const ia = (ka && (ka.iaddress || ka.iAddress)) || '';
+        const ib = (kb && (kb.iaddress || kb.iAddress)) || '';
+        if (ia && ib && ia === ib) return true;
+        if (ia && (ia === b || normId(ia) === normId(b))) return true;
+        if (ib && (ib === a || normId(ib) === normId(a))) return true;
+      } catch { /* keep false */ }
+      return false;
+    }
     if (!senderAccepted && verification.senderVerified === true && verification.senderVerusId &&
-        normId(verification.senderVerusId) !== normId(buyerVerusId)) {
+        !(await sameBuyerIdentity(verification.senderVerusId, buyerVerusId))) {
       // Live Mac 2026-09-12: platform returns verified+senderVerified true with a
       // senderVerusId that is not the claiming id (R attributed elsewhere). Vin
       // ownership of this identity still wins — run the same primary-R rescue.

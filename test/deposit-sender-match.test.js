@@ -236,6 +236,41 @@ test('no-vin retry amount_too_low is not SENDER_MISMATCH', async () => {
   assert.equal(getBalance(agentId, buyerVerusId), 0);
 });
 
+test('FQN senderVerusId is the same buyer as short name / i-address (backend 2026-09-12)', async () => {
+  const kp = generateKeypair(NET);
+  const buyerVerusId = 'j41grokbuyer.agentplatform@';
+  const fqn = 'j41grokbuyer.agentplatform.VRSCTEST@';
+  const agentId = 'agent-sender-fqn';
+  const txid = 'tx_' + crypto.randomBytes(8).toString('hex');
+  const amount = 0.05;
+
+  const client = {
+    async getIdentityKeys(id) {
+      assert.ok(id === buyerVerusId || id === fqn || id === BUYER_I);
+      return { iaddress: BUYER_I, name: buyerVerusId, primaryAddresses: [kp.address, PRIMARY_R], minimumSignatures: 1 };
+    },
+    async verifyPayment() {
+      return {
+        verified: true,
+        senderVerified: true,
+        senderVerusId: fqn,
+        senderAddress: PRIMARY_R,
+        confirmedAmount: amount,
+        actualAmount: amount,
+      };
+    },
+    async getTxStatus() { return { confirmations: 10 }; },
+  };
+
+  const res = await reportDeposit(
+    agentId, client,
+    signedReport(kp, buyerVerusId, 'duskseek.agentplatform@', txid, amount),
+    PAY_ADDR, NET,
+  );
+  assert.equal(res.credited, true, JSON.stringify(res));
+  assert.notEqual(res.code, 'SENDER_MISMATCH');
+});
+
 test('verified true + senderVerified true + disagreeing senderVerusId still credits primary R vin (live Mac)', async () => {
   const kp = generateKeypair(NET);
   const buyerVerusId = 'j41grokbuyer.agentplatform@';
