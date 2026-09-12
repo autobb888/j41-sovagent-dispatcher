@@ -994,7 +994,19 @@ async function statusScreen(inquirer) {
   } catch {}
   if (backendVersion) {
     console.log(`  Reachable:  \x1b[32myes\x1b[0m (commit ${backendVersion.commit})`);
-    const want = ['signing.canonical-v1', 'service.api-endpoint-fields', 'auth.rpc-unavailable-code', 'reviews.api-session', 'proxy.forward-access'];
+    const want = [
+      'signing.canonical-v1',
+      'service.api-endpoint-fields',
+      'auth.rpc-unavailable-code',
+      'reviews.api-session',
+      'proxy.forward-access',
+      'reviews.j41-review-v2',
+      'platform.config-v1',
+      'buyer.inbox-attestation-v1',
+      'rental.public-host-v1',
+      'listings.data-service-v1',
+      'discovery.dispatcher-url-v1',
+    ];
     for (const f of want) {
       const present = backendVersion.features.includes(f);
       console.log(`    ${present ? '\x1b[32m✓\x1b[0m' : '\x1b[33m⚠\x1b[0m'}  ${f}${present ? '' : '  (missing)'}`);
