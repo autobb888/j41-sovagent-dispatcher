@@ -3903,7 +3903,16 @@ program
     const result = await buyerDepositReportAndWait({
       options, keys, agent, seller, amount, txid, reportUrl: urlRes.url,
     });
-    if (!result.ok) fail(result.code || 'DEPOSIT_REPLAY', result.message, { txid });
+    // Same as hire/pay --wait: unlink wallet-pending once confirmations > 0 so a
+    // SENDER_MISMATCH (or any report outcome) does not leave a blocking stamp.
+    if (options.wait) {
+      await waitWalletPendingUnlink(agent.client, buyerAgentId, {
+        intervalMs: process.env.NODE_ENV === 'test' ? 0 : PAY_WAIT_INTERVAL_MS,
+      });
+    }
+    if (!result.ok) {
+      fail(result.code || 'DEPOSIT_REPLAY', result.message, { txid, credited: false });
+    }
     if (result.code === 'DEPOSIT_WAIT_TIMEOUT') {
       console.warn('DEPOSIT_WAIT_TIMEOUT: deposit broadcast but seller has not credited yet.');
       if (options.json) {

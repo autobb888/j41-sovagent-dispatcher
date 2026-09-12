@@ -280,6 +280,63 @@ test('first POST REPLAY with no prior accepted report → DEPOSIT_REPLAY', async
   assert.equal(r.credited, false);
 });
 
+test('first POST 403 SENDER_MISMATCH → ok:false credited:false, not credited:true', async () => {
+  const r = await waitForDepositCredit({
+    txid: 'tx-mismatch',
+    amount: '0.05',
+    wait: true,
+    buildReport: async () => ({ nonce: 'n1', txid: 'tx-mismatch', amount: '0.05' }),
+    postReport: async () => ({
+      status: 403,
+      body: {
+        code: 'SENDER_MISMATCH',
+        message: 'Funding transaction sender does not match the claiming buyer',
+        credited: false,
+      },
+    }),
+    getTxStatus: async () => { throw new Error('should not poll after hard seller refuse'); },
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'SENDER_MISMATCH');
+  assert.equal(r.credited, false);
+  assert.notEqual(r.code, null);
+  assert.equal(!!r.credited, false);
+});
+
+test('second POST SENDER_MISMATCH is not swallowed as DEPOSIT_WAIT_TIMEOUT', async () => {
+  const posts = [];
+  const clock = makeClock();
+  let confs = 0;
+  const r = await waitForDepositCredit({
+    txid: 'tx-mismatch-2',
+    amount: '5',
+    wait: true,
+    timeoutMs: 180000,
+    intervalMs: 5000,
+    now: clock.now,
+    sleep: async (ms) => { confs = 1; await clock.sleep(ms); },
+    getTxStatus: async () => ({ confirmations: confs }),
+    requiredConfirmations: () => 1,
+    txConfirmations: (st) => Number(st.confirmations) || 0,
+    buildReport: async () => ({ nonce: `n${posts.length + 1}`, txid: 'tx-mismatch-2', amount: '5' }),
+    postReport: async (body) => {
+      posts.push(body);
+      if (posts.length === 1) {
+        return { status: 200, body: { credited: false, message: 'Waiting for 1 more confirmation(s) (0/1)' } };
+      }
+      return {
+        status: 403,
+        body: { code: 'SENDER_MISMATCH', message: 'Funding transaction sender does not match the claiming buyer', credited: false },
+      };
+    },
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'SENDER_MISMATCH');
+  assert.equal(r.credited, false);
+  assert.notEqual(r.code, 'DEPOSIT_WAIT_TIMEOUT');
+  assert.equal(posts.length, 2);
+});
+
 test('REPLAY after an accepted report this invocation is success', async () => {
   const posts = [];
   const clock = makeClock();
@@ -479,6 +536,32 @@ test('fail paths set exitCode 1: REPLAY / NO_PUBLIC_URL / NOT_SELLER / PAY_PENDI
   assert.match(dep, /DEPOSIT_NOT_SELLER/);
   assert.match(dep, /PAY_PENDING/);
   assert.match(dep, /process\.exitCode = 1/);
+});
+
+test('deposit --wait calls waitWalletPendingUnlink after saveWalletPending (clears stamp on confs)', () => {
+  const dep = depositSrc();
+  const save = dep.indexOf('saveWalletPending(');
+  assert.ok(save > -1, 'deposit must stamp wallet-pending.json after broadcast');
+  const waitAfter = dep.indexOf('waitWalletPendingUnlink(', save);
+  assert.ok(waitAfter > save, 'deposit --wait must poll the NEW tx after saveWalletPending');
+  // Unlink must run even when the seller report fails (SENDER_MISMATCH), before fail().
+  const failAfterReport = dep.indexOf('if (!result.ok)', save);
+  assert.ok(failAfterReport > waitAfter, 'waitWalletPendingUnlink must run before fail(result)');
+});
+
+test('SENDER_MISMATCH fail JSON keeps txid and credited:false (exit 1, no second send)', () => {
+  const dep = depositSrc();
+  // Fail after broadcast must pass credited:false with the txid — never pretend ok:true credited:true.
+  const failAt = dep.indexOf('if (!result.ok)');
+  assert.ok(failAt > -1, 'deposit must fail when report is not ok');
+  const failBlock = dep.slice(failAt, failAt + 220);
+  assert.match(failBlock, /fail\(/);
+  assert.match(failBlock, /txid/);
+  assert.match(failBlock, /credited:\s*false/);
+  // Source pin: do not force a second broadcast of the same amount on mismatch.
+  const send = dep.indexOf('sendMultiPayment(');
+  const secondSend = dep.indexOf('sendMultiPayment(', send + 1);
+  assert.equal(secondSend, -1, 'deposit must not second-send after SENDER_MISMATCH');
 });
 
 test('wallet send remains fleet-agent-id only and does not grow a deposit path', () => {

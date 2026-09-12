@@ -263,6 +263,18 @@ async function waitForDepositCredit({
       report: second,
     };
   }
+  // Seller hard refuse (SENDER_MISMATCH / BAD_SIGNATURE / …) must not look like
+  // a soft wait timeout — money moved, credit will not land from re-POSTing.
+  if (second.kind === 'error') {
+    return {
+      ok: false,
+      code: second.code || 'DEPOSIT_REPORT_FAILED',
+      credited: false,
+      pending: false,
+      message: second.message,
+      report: second,
+    };
+  }
   return {
     ok: true,
     code: 'DEPOSIT_WAIT_TIMEOUT',
