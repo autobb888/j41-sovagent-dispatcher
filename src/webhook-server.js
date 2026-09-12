@@ -150,7 +150,8 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
         console.error(`[Discovery] Access request failed: ${e.message}`);
         const code = e && e.code;
         let status = 500;
-        if (code === 'ACCESS_NOT_API_ENDPOINT') status = 400;
+        if (code === 'ACCESS_NOT_API_ENDPOINT' || code === 'ACCESS_SELLER_NOT_FOUND') status = 400;
+        else if (code === 'KEYS_UNSIGNED' || code === 'KEYS_BAD_SIGNATURE') status = 502;
         else if (code === 'ENVELOPE_NO_PUBLIC_URL' || code === 'ENVELOPE_UPSTREAM_URL' || code === 'ENVELOPE_BAD_PUBLIC_URL') status = 503;
         res.writeHead(status, { 'Content-Type': 'application/json' });
         if (status === 500) {

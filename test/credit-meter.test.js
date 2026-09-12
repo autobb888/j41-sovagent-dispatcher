@@ -8,7 +8,7 @@ const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-credit-test-'));
 process.env.HOME = TEST_HOME;
 os.homedir = () => TEST_HOME;
 
-const { reserveCredit, adjustCredit, refundReservation, creditDeposit, getBalance, calculateCost } =
+const { reserveCredit, adjustCredit, refundReservation, creditDeposit, getBalance, calculateCost, resolveBuyerKey } =
   require('../src/credit-meter');
 
 const AGENT = 'agent-1';
@@ -37,10 +37,8 @@ test('reserveCredit denies when balance is insufficient', () => {
 test('creditDeposit increases balance and is idempotent per txid', () => {
   creditDeposit(AGENT, BUYER, 10, 'tx-abc');
   assert.equal(getBalance(AGENT, BUYER), 10);
-  // Same txid should not double-credit (if idempotency is enforced)
-  const r2 = creditDeposit(AGENT, BUYER, 10, 'tx-abc');
-  // Either the API rejects the dup, or balance stays at 10. We accept either.
-  assert.ok(getBalance(AGENT, BUYER) === 10 || getBalance(AGENT, BUYER) === 20, 'balance should be 10 (idempotent) or 20 (no dedup)');
+  creditDeposit(AGENT, BUYER, 10, 'tx-abc');
+  assert.equal(getBalance(AGENT, BUYER), 10);
 });
 
 test('reserveCredit deducts upfront; adjustCredit corrects the difference', () => {
@@ -98,4 +96,20 @@ test('concurrent reserveCredit calls cannot overdraw (TOCTOU guard)', () => {
   assert.ok(denied > 0);
   // Balance must never go negative
   assert.ok(getBalance(AGENT, buyer) >= 0, `balance went negative: ${getBalance(AGENT, buyer)}`);
+});
+
+test('name@ / R / i-address share one 0.05; same txid does not double', () => {
+  const agent = 'agent-alias-1';
+  const iAddr = 'iDdjzshM51SLccyKcVvfpLZ1zaa2mW8gCW';
+  const name = 'j41grokbuyer.agentplatform@';
+  const rAddr = 'RE4dzh5Uv3N8NRJqgkm7zBs6R9isMPKRgt';
+  creditDeposit(agent, name, 0.05, 'tx-alias-1', { canonical: iAddr, aliases: [name, rAddr, iAddr] });
+  assert.equal(getBalance(agent, name), 0.05);
+  assert.equal(getBalance(agent, rAddr), 0.05);
+  assert.equal(getBalance(agent, iAddr), 0.05);
+  creditDeposit(agent, rAddr, 0.05, 'tx-alias-1', { canonical: iAddr, aliases: [name, rAddr, iAddr] });
+  assert.equal(getBalance(agent, iAddr), 0.05);
+  const data = JSON.parse(fs.readFileSync(path.join(TEST_HOME, '.j41/dispatcher/agents', agent, 'credit-meters.json'), 'utf8'));
+  assert.equal(resolveBuyerKey(data, name), iAddr);
+  assert.equal(resolveBuyerKey(data, rAddr), iAddr);
 });

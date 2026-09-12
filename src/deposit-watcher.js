@@ -343,6 +343,23 @@ function extractVinAddress(verification) {
   return typeof raw === 'string' && raw.length > 0 ? raw : null;
 }
 
+async function resolveCreditBuyerId(client, claimedId) {
+  const claimed = String(claimedId || '');
+  if (!client || typeof client.getIdentityKeys !== 'function' || !claimed) {
+    return { canonical: claimed, aliases: claimed ? [claimed] : [] };
+  }
+  try {
+    const keys = await client.getIdentityKeys(claimed);
+    const iAddr = (keys && (keys.iaddress || keys.iAddress)) || null;
+    const primary = (keys && Array.isArray(keys.primaryAddresses)) ? keys.primaryAddresses : [];
+    const canonical = iAddr || claimed;
+    const aliases = [claimed, iAddr, ...primary].filter((a) => typeof a === 'string' && a);
+    return { canonical, aliases };
+  } catch {
+    return { canonical: claimed, aliases: [claimed] };
+  }
+}
+
 function logSenderMismatchRefuse(verification, buyerVerusId) {
   const v = verification && typeof verification === 'object' ? verification : {};
   console.warn('[Deposit] SENDER_MISMATCH refuse', {
@@ -634,7 +651,8 @@ async function _reportVerifiedDeposit(agentId, client, report, payAddress, netwo
 
     let result;
     try {
-      result = creditDeposit(agentId, buyerVerusId, credited, txid);
+      const creditIds = await resolveCreditBuyerId(client, buyerVerusId);
+      result = creditDeposit(agentId, creditIds.canonical, credited, txid, creditIds);
     } catch (e) {
       // The intent is durable but the money did not move. Say exactly that:
       // the generic "Verification failed" this used to fall through to would
@@ -2091,4 +2109,4 @@ async function notifyJ41CreditLow(sellerWif, sellerVerusId, buyerVerusId, balanc
   }
 }
 
-module.exports = { networkCurrency, retryPendingNotifies, _pendingNotifies, NOTIFY_MAX_ATTEMPTS, STUCK_CREDITING_MS, reportDeposit, verifyDepositReport, senderMatchesBuyer, pollPendingDeposits, reconcileUnconfirmedDeposits, listDepositAnomalies, listDepositAnomaliesForAgent, creditDepositAnomaly, dismissDepositAnomaly, reconcileMeterAgainstLedger, withDepositLock, _recheckReversals, _settleReversedForTxid, _classifyLookupFailure, _syncedView, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_MIN_ADVANCE_BLOCKS, REVERSAL_RECHECK_WINDOW_MS, REVERSAL_BUDGET_MAX_DEFAULT, PROCESSED_AUDIT_CAP, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS, loadDeposits };
+module.exports = { networkCurrency, retryPendingNotifies, _pendingNotifies, NOTIFY_MAX_ATTEMPTS, STUCK_CREDITING_MS, reportDeposit, verifyDepositReport, senderMatchesBuyer, resolveCreditBuyerId, pollPendingDeposits, reconcileUnconfirmedDeposits, listDepositAnomalies, listDepositAnomaliesForAgent, creditDepositAnomaly, dismissDepositAnomaly, reconcileMeterAgainstLedger, withDepositLock, _recheckReversals, _settleReversedForTxid, _classifyLookupFailure, _syncedView, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_MIN_ADVANCE_BLOCKS, REVERSAL_RECHECK_WINDOW_MS, REVERSAL_BUDGET_MAX_DEFAULT, PROCESSED_AUDIT_CAP, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS, loadDeposits };

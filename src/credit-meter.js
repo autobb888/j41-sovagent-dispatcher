@@ -110,9 +110,65 @@ function withMeterLock(agentId, fn, opts = {}) {
   }
 }
 
+function resolveBuyerKey(data, buyerVerusId) {
+  if (!buyerVerusId) return buyerVerusId;
+  if (data.buyers && data.buyers[buyerVerusId]) return buyerVerusId;
+  const aliases = (data && data.aliases) || {};
+  const mapped = aliases[buyerVerusId];
+  if (mapped && data.buyers && data.buyers[mapped]) return mapped;
+  return buyerVerusId;
+}
+
+function linkBuyerAliases(data, canonical, aliases) {
+  if (!data || !canonical) return;
+  if (!data.aliases) data.aliases = {};
+  data.aliases[canonical] = canonical;
+  for (const a of aliases || []) {
+    if (typeof a === 'string' && a && a !== canonical) data.aliases[a] = canonical;
+  }
+}
+
+function linkBuyerAliasesForAgent(agentId, canonical, aliases) {
+  if (!canonical) return;
+  return withMeterLock(agentId, () => {
+    const data = loadMeters(agentId);
+    linkBuyerAliases(data, canonical, aliases);
+    saveMeters(agentId, data);
+  });
+}
+
+function applyBuyerAliases(data, canonical, aliases) {
+  if (!data) return;
+  if (!data.buyers) data.buyers = {};
+  linkBuyerAliases(data, canonical, aliases);
+  if (!canonical) return;
+  const canon = data.buyers[canonical] || {
+    balance: 0,
+    totalDeposited: 0,
+    totalSpent: 0,
+    lastActivity: new Date().toISOString(),
+    usage: {},
+  };
+  data.buyers[canonical] = canon;
+  for (const a of aliases || []) {
+    if (!a || a === canonical) continue;
+    const other = data.buyers[a];
+    if (!other || other === canon) continue;
+    const sameTx = other.lastDepositTxid && other.lastDepositTxid === canon.lastDepositTxid;
+    if (!sameTx) {
+      canon.balance += Number(other.balance) || 0;
+      canon.totalDeposited += Number(other.totalDeposited) || 0;
+      canon.totalSpent += Number(other.totalSpent) || 0;
+      if (other.lastDepositTxid && !canon.lastDepositTxid) canon.lastDepositTxid = other.lastDepositTxid;
+    }
+    delete data.buyers[a];
+  }
+}
+
 function ensureBuyer(data, buyerVerusId) {
-  if (!data.buyers[buyerVerusId]) {
-    data.buyers[buyerVerusId] = {
+  const key = resolveBuyerKey(data, buyerVerusId);
+  if (!data.buyers[key]) {
+    data.buyers[key] = {
       balance: 0,
       totalDeposited: 0,
       totalSpent: 0,
@@ -120,7 +176,7 @@ function ensureBuyer(data, buyerVerusId) {
       usage: {},
     };
   }
-  return data.buyers[buyerVerusId];
+  return data.buyers[key];
 }
 
 /**
@@ -217,14 +273,21 @@ function refundReservation(agentId, buyerVerusId, reservedCost) {
 /**
  * Credit a deposit (buyer sends VRSC to seller).
  */
-function creditDeposit(agentId, buyerVerusId, amount, txid) {
+function creditDeposit(agentId, buyerVerusId, amount, txid, opts = {}) {
   // failClosed: a deposit adjudication can simply be retried, unlike a proxy
   // settle for a request the buyer has already been served. Without this the
   // most carefully-guarded paths in the system inherit the hot path's
   // fail-open policy purely because they share a lock wrapper.
   return withMeterLock(agentId, () => {
   const data = loadMeters(agentId);
-  const buyer = ensureBuyer(data, buyerVerusId);
+  const canonical = opts.canonical || buyerVerusId;
+  const aliases = opts.aliases || [];
+  applyBuyerAliases(data, canonical, aliases);
+  const buyer = ensureBuyer(data, canonical);
+  if (txid && buyer.lastDepositTxid === txid) {
+    saveMeters(agentId, data);
+    return { newBalance: buyer.balance };
+  }
   buyer.balance += amount;
   buyer.totalDeposited += amount;
   buyer.lastActivity = new Date().toISOString();
@@ -302,7 +365,8 @@ function checkAndFlagLow(agentId, buyerVerusId, balance, threshold) {
  */
 function getMeter(agentId, buyerVerusId) {
   const data = loadMeters(agentId);
-  return data.buyers[buyerVerusId];
+  const key = resolveBuyerKey(data, buyerVerusId);
+  return data.buyers[key];
 }
 
 /**
@@ -310,7 +374,8 @@ function getMeter(agentId, buyerVerusId) {
  */
 function getBalance(agentId, buyerVerusId) {
   const data = loadMeters(agentId);
-  const buyer = data.buyers[buyerVerusId];
+  const key = resolveBuyerKey(data, buyerVerusId);
+  const buyer = data.buyers[key];
   return buyer ? buyer.balance : 0;
 }
 
@@ -322,4 +387,8 @@ function getMetrics(agentId) {
   return data.buyers;
 }
 
-module.exports = { reserveCredit, adjustCredit, refundReservation, creditDeposit, reverseDeposit, getBalance, getMetrics, calculateCost, checkAndFlagLow, getMeter };
+module.exports = {
+  reserveCredit, adjustCredit, refundReservation, creditDeposit, reverseDeposit,
+  getBalance, getMetrics, calculateCost, checkAndFlagLow, getMeter,
+  resolveBuyerKey, applyBuyerAliases, linkBuyerAliases, linkBuyerAliasesForAgent,
+};

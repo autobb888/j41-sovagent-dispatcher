@@ -269,8 +269,15 @@ test('seller ACCESS_NOT_API_ENDPOINT is above verifyAccessRequest and checkNonce
   assert.ok(gate < v1, 'serviceType gate must be above v1 verifyAccessRequest');
   assert.ok(gate < v2, 'serviceType gate must be above v2 checkNonceAfterVerify');
   assert.match(src, /ACCESS_NOT_API_ENDPOINT/);
+  assert.match(src, /ACCESS_SELLER_NOT_FOUND/);
   assert.doesNotMatch(src.slice(src.indexOf('sellerAgent'), gate + 80), /_isApiEndpoint/,
     '_isApiEndpoint stamp is not sufficient for mint');
+});
+
+test('poll skips labour start for api-endpoint jobs', () => {
+  const src = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
+  assert.match(src, /skip labour start for api-endpoint/);
+  assert.match(src, /isApiEndpointJob/);
 });
 
 test('mint payload uses mintBuyerProxyBase(publicUrl) and never cfg.endpointUrl', () => {
@@ -843,9 +850,12 @@ test('NVIDIA grant + listing health fail does not call requestApiAccess and does
   }
 });
 
-test('discovery maps ACCESS_NOT_API_ENDPOINT to 400 and envelope codes to 503', async () => {
+test('discovery maps ACCESS_NOT_API_ENDPOINT/SELLER_NOT_FOUND to 400, keys to 502, envelope to 503', async () => {
   const cases = [
     ['ACCESS_NOT_API_ENDPOINT', 400],
+    ['ACCESS_SELLER_NOT_FOUND', 400],
+    ['KEYS_UNSIGNED', 502],
+    ['KEYS_BAD_SIGNATURE', 502],
     ['ENVELOPE_NO_PUBLIC_URL', 503],
     ['ENVELOPE_UPSTREAM_URL', 503],
     ['ENVELOPE_BAD_PUBLIC_URL', 503],

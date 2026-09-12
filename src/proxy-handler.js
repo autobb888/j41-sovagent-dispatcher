@@ -219,6 +219,34 @@ const SAFE_HEADERS = new Set([
   'x-ratelimit-reset', 'openai-model', 'openai-processing-ms',
 ]);
 
+/**
+ * Node 22 http.request lookup with `{ all: true }` expects
+ * cb(null, [{ address, family }]). A bare string → Invalid IP address: undefined → CF 502.
+ */
+function makePinnedLookup(pinnedIp) {
+  const family = String(pinnedIp).includes(':') ? 6 : 4;
+  return (hostname, opts, cb) => {
+    if (typeof opts === 'function') {
+      cb = opts;
+      opts = {};
+    }
+    if (opts && opts.all) {
+      cb(null, [{ address: pinnedIp, family }]);
+      return;
+    }
+    cb(null, pinnedIp, family);
+  };
+}
+
+function applyUpstreamModelAlias(parsedBody, config) {
+  if (!parsedBody || typeof parsedBody !== 'object') return;
+  const requested = parsedBody.model;
+  const aliases = config && config.upstreamModelAlias;
+  if (!requested || !aliases || typeof aliases !== 'object') return;
+  const mapped = aliases[requested];
+  if (typeof mapped === 'string' && mapped) parsedBody.model = mapped;
+}
+
 function filterHeaders(upstreamHeaders) {
   const filtered = {};
   for (const [key, value] of Object.entries(upstreamHeaders)) {
@@ -277,6 +305,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   // Reject unpriced models up front. calculateCost returns 0 for unknown models, which would
   // let requests through for free — the seller explicitly declared which models they serve by
   // pricing them, so anything not in that list is an unsupported model.
+  // Alias rewrite happens AFTER this check so old grants (Pro) stay priced; Flash is upstream-only.
   const priced = (config.modelPricing || []).map(p => p.model);
   if (!priced.includes(model)) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -415,13 +444,14 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   // completion is billed at 2000 output tokens. Force-inject include_usage for
   // every stream:true request before forwarding. forwardBody is what we send
   // upstream (the original `body` is left intact for callers/logging).
-  let forwardBody = body;
+  applyUpstreamModelAlias(parsedBody, config);
   if (isStreaming) {
     const so = (parsedBody.stream_options && typeof parsedBody.stream_options === 'object')
       ? { ...parsedBody.stream_options, include_usage: true }
       : { include_usage: true };
-    forwardBody = JSON.stringify({ ...parsedBody, stream_options: so });
+    parsedBody.stream_options = so;
   }
+  const forwardBody = JSON.stringify(parsedBody);
 
   // Forward request to seller's backend
   const isHttps = upstreamUrl.protocol === 'https:';
@@ -434,9 +464,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   // host was already a bare IP literal, resolvedIp may be null — fall back
   // to Node's default lookup in those cases only.
   const pinnedIp = safety.resolvedIp;
-  const pinnedLookup = pinnedIp
-    ? (hostname, opts, cb) => cb(null, pinnedIp, pinnedIp.includes(':') ? 6 : 4)
-    : undefined;
+  const pinnedLookup = pinnedIp ? makePinnedLookup(pinnedIp) : undefined;
 
   // Set once a streaming response is in flight, so the request-level error handler
   // below settles through the SAME policy instead of its own.
@@ -726,4 +754,4 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   proxyReq.end();
 }
 
-module.exports = { handleProxyRequest, maybeNotifyCreditLow, resolveCreditLowThreshold, isPrivateIp, checkUpstreamHostSafe };
+module.exports = { handleProxyRequest, maybeNotifyCreditLow, resolveCreditLowThreshold, isPrivateIp, checkUpstreamHostSafe, makePinnedLookup, applyUpstreamModelAlias };

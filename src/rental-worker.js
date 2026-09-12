@@ -12,6 +12,15 @@ function isGpuRentalJob(job, services = []) {
   return !!(svc && svc.serviceType === 'gpu-rental');
 }
 
+function isApiEndpointJob(job, services = []) {
+  if (job && (job.serviceType === 'api-endpoint' || job.kind === 'model')) return true;
+  if (!job || !job.serviceId) {
+    return (services || []).some((s) => s && s.serviceType === 'api-endpoint');
+  }
+  const svc = (services || []).find((s) => s && (s.id === job.serviceId || s.serviceId === job.serviceId));
+  return !!(svc && svc.serviceType === 'api-endpoint');
+}
+
 function servicesForAgent(state, agentInfo, loadAgentConfigFn) {
   const id = agentInfo && agentInfo.id;
   const cap = state && state.capabilities && typeof state.capabilities.get === 'function' && id
@@ -363,6 +372,7 @@ async function stopRentalJob(state, jobId, { skipReturnAgent = false } = {}) {
 
 module.exports = {
   isGpuRentalJob,
+  isApiEndpointJob,
   startRentalJob,
   stopRentalJob,
   shouldTeardownRental,

@@ -107,7 +107,7 @@ const { writeKeysFile, readKeysFile } = require('./keys-file.js');
 const keystore = require('./keystore.js');
 const { encryptAllKeys, decryptAllKeys, listPlaintextKeys } = require('./keys-migrate.js');
 const { preflightAllowsAccept } = require('./preflight-gate.js');
-const { isGpuRentalJob, startRentalJob, stopRentalJob, shouldTeardownRental, servicesForAgent, resolveRentalProvider, ensureComputeController, decideRentalExtension, applyRentalExtension, adoptLiveRentals } = require('./rental-worker.js');
+const { isGpuRentalJob, isApiEndpointJob, startRentalJob, stopRentalJob, shouldTeardownRental, servicesForAgent, resolveRentalProvider, ensureComputeController, decideRentalExtension, applyRentalExtension, adoptLiveRentals } = require('./rental-worker.js');
 const {
   assertRentalHostPublic,
   shouldRefuseLanGpuRental,
@@ -6278,7 +6278,7 @@ program
             const sellerAgent = state.agents.find(a =>
               a.iAddress === accessRequest.sellerVerusId || a.identity === accessRequest.sellerVerusId
             );
-            if (!sellerAgent) throw new Error('Seller not found on this dispatcher');
+            if (!sellerAgent) throw codedError('ACCESS_SELLER_NOT_FOUND', 'Seller not found on this dispatcher');
             const cap = state.capabilities.get(sellerAgent.id);
             const api = (cap && cap.services || []).some((s) => s && s.serviceType === 'api-endpoint');
             if (!api) throw codedError('ACCESS_NOT_API_ENDPOINT', 'Seller has no api-endpoint service');
@@ -6335,8 +6335,23 @@ program
               }
             }
 
-            // Mint API key
-            const keyRecord = mintApiKey(sellerAgent.id, accessRequest.buyerVerusId);
+            // Mint API key against the i-address when keys resolve (meter aliases).
+            // Keys 502: mint the claimed id, do not create an empty R bucket.
+            let mintBuyerId = accessRequest.buyerVerusId;
+            try {
+              const idKeys = await client.getIdentityKeys(accessRequest.buyerVerusId);
+              const iAddr = idKeys && (idKeys.iaddress || idKeys.iAddress);
+              if (iAddr) {
+                mintBuyerId = iAddr;
+                const { linkBuyerAliasesForAgent } = require('./credit-meter');
+                linkBuyerAliasesForAgent(sellerAgent.id, iAddr, [
+                  accessRequest.buyerVerusId,
+                  iAddr,
+                  ...((idKeys.primaryAddresses) || []),
+                ]);
+              }
+            } catch { /* keep claimed id */ }
+            const keyRecord = mintApiKey(sellerAgent.id, mintBuyerId);
 
             // Build encrypted envelope
             const payload = {
@@ -10255,6 +10270,12 @@ async function pollForJobs(state) {
 
         const _startSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
         if (shouldRefuseLanGpuRental(agentInfo.id, job, _startSvcs)) continue;
+        if (isApiEndpointJob(job, _startSvcs)) {
+          console.log(`[Poll] skip labour start for api-endpoint job ${job.id}`);
+          state.seen.set(job.id, Date.now());
+          saveSeenJobs(state.seen);
+          continue;
+        }
 
         // Mark seen BEFORE starting to prevent duplicate spawns from concurrent polls
         state.seen.set(job.id, Date.now());
@@ -12788,6 +12809,10 @@ async function startJobOrRental(state, job, agentInfo) {
   const services = servicesForAgent(state, agentInfo, loadAgentConfig);
   if (isGpuRentalJob(job, services) || (services || []).some((s) => s && s.serviceType === 'gpu-rental')) {
     await startRentalJobWired(state, job, agentInfo);
+    return;
+  }
+  if (isApiEndpointJob(job, services)) {
+    console.log(`[Start] skip labour container for api-endpoint job ${job && job.id}`);
     return;
   }
   await startJob(state, job, agentInfo);
