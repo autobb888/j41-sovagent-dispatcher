@@ -97,4 +97,15 @@ function checkNonceAfterVerify(verified, nonce, expiresAtMs) {
   return checkAndRecordNonce(nonce, expiresAtMs);
 }
 
-module.exports = { checkAndRecordNonce, checkNonceAfterVerify, _reset, _size, MAX_ENTRIES, SWEEP_INTERVAL_MS, DEFAULT_TTL_MS };
+/**
+ * Lookup-only: true if `nonce` is already recorded and unexpired.
+ * Does not record. Use for v1 verifyAccessRequest `isReplay` so a failed
+ * verify never burns a cache slot; record via checkNonceAfterVerify after.
+ */
+function hasSeenNonce(nonce) {
+  if (typeof nonce !== 'string' || nonce.length === 0) return false;
+  const exp = _seen.get(nonce);
+  return Number.isFinite(exp) && exp > Date.now();
+}
+
+module.exports = { checkAndRecordNonce, checkNonceAfterVerify, hasSeenNonce, _reset, _size, MAX_ENTRIES, SWEEP_INTERVAL_MS, DEFAULT_TTL_MS };

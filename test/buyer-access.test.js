@@ -253,7 +253,7 @@ test('seller ACCESS_NOT_API_ENDPOINT is above verifyAccessRequest and checkNonce
   const v2 = src.indexOf('checkNonceAfterVerify');
   assert.ok(gate > -1, 'seller must gate on serviceType === api-endpoint');
   assert.ok(v1 > -1 && v2 > -1, 'v1 verify and v2 nonce check must still exist');
-  assert.ok(gate < v1, 'serviceType gate must be above v1 verifyAccessRequest (isReplay records during verify)');
+  assert.ok(gate < v1, 'serviceType gate must be above v1 verifyAccessRequest');
   assert.ok(gate < v2, 'serviceType gate must be above v2 checkNonceAfterVerify');
   assert.match(src, /ACCESS_NOT_API_ENDPOINT/);
   assert.doesNotMatch(src.slice(src.indexOf('sellerAgent'), gate + 80), /_isApiEndpoint/,

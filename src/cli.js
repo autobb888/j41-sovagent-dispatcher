@@ -6284,14 +6284,21 @@ program
               }
             } else {
               // Enforce freshness + single-use nonce (replay protection) in
-              // addition to the signature. The nonce-cache check-and-records,
-              // so a captured request cannot be re-submitted to re-mint a key.
-              const { checkAndRecordNonce } = require('./nonce-cache');
+              // addition to the signature. isReplay is lookup-only — recording
+              // inside the hook burned nonces when verify later failed. Record
+              // only after verified === true (same gate as the v2 path).
+              const { checkNonceAfterVerify, hasSeenNonce } = require('./nonce-cache.js');
               const verified = await verifyAccessRequest(accessRequest, client, J41_NETWORK, {
-                isReplay: (nonce) => !checkAndRecordNonce(String(nonce), Date.now() + 10 * 60 * 1000).ok,
+                isReplay: (nonce) => hasSeenNonce(String(nonce)),
               });
               if (!verified) throw new Error('Buyer signature verification failed, stale, or replayed (v1)');
               console.log(`[Discovery] Buyer signature verified (v1): ${untrusted(accessRequest.buyerVerusId, 60)}`);
+
+              const expiresMs = Date.now() + 10 * 60 * 1000;
+              const replayCheck = checkNonceAfterVerify(true, String(accessRequest.nonce), expiresMs);
+              if (!replayCheck.ok) {
+                throw new Error(`v1 envelope rejected: ${replayCheck.reason} (nonce=${String(accessRequest.nonce).slice(0, 8)}…)`);
+              }
             }
 
             // Mint API key
