@@ -487,6 +487,11 @@ async function _reportVerifiedDeposit(agentId, client, report, payAddress, netwo
         if (resolved.matched) {
           senderAccepted = true;
         } else {
+          // Retry may fail amount/address — do not mislabel as SENDER_MISMATCH.
+          const retryReason = verification && verification.reason;
+          if (retryReason && retryReason !== 'sender_mismatch') {
+            return { credited: false, message: `Payment verification failed: ${retryReason}` };
+          }
           return { credited: false, code: 'SENDER_MISMATCH', message: `Payment verification failed: ${reason}` };
         }
       } else {
@@ -503,6 +508,10 @@ async function _reportVerifiedDeposit(agentId, client, report, payAddress, netwo
       if (resolved.matched) {
         senderAccepted = true;
       } else {
+        const retryReason = verification && verification.reason;
+        if (retryReason && retryReason !== 'sender_mismatch' && verification.verified === false) {
+          return { credited: false, message: `Payment verification failed: ${retryReason}` };
+        }
         return { credited: false, code: 'SENDER_MISMATCH', message: 'Funding transaction sender could not be confirmed to belong to the claiming buyer' };
       }
     }

@@ -191,3 +191,47 @@ test('amount failure is not rescued by primary R match', async () => {
   assert.match(res.message || '', /amount_too_low/);
   assert.equal(getBalance(agentId, buyerVerusId), 0);
 });
+
+test('no-vin retry amount_too_low is not SENDER_MISMATCH', async () => {
+  const kp = generateKeypair(NET);
+  const buyerVerusId = 'buyer-novin-amount@';
+  const agentId = 'agent-sender-novin-amount';
+  const txid = 'tx_' + crypto.randomBytes(8).toString('hex');
+  const amount = 5;
+  const expectedSenders = [];
+
+  const client = baseClient(kp, buyerVerusId, {
+    async verifyPayment(params) {
+      expectedSenders.push(params.expectedSender);
+      if (params.expectedSender === buyerVerusId) {
+        // First pass: sender_mismatch, no vin field → triggers primary-R retry.
+        return {
+          verified: false,
+          reason: 'sender_mismatch',
+          senderVerified: false,
+          confirmedAmount: 1,
+          actualAmount: 1,
+        };
+      }
+      // Retry with first primary R: amount fails — must surface that, not SENDER_MISMATCH.
+      assert.equal(params.expectedSender, kp.address);
+      return {
+        verified: false,
+        reason: 'amount_too_low',
+        confirmedAmount: 1,
+        actualAmount: 1,
+      };
+    },
+  });
+
+  const res = await reportDeposit(
+    agentId, client,
+    signedReport(kp, buyerVerusId, 'seller@', txid, amount),
+    PAY_ADDR, NET,
+  );
+  assert.equal(res.credited, false);
+  assert.notEqual(res.code, 'SENDER_MISMATCH', JSON.stringify(res));
+  assert.match(res.message || '', /amount_too_low/);
+  assert.deepEqual(expectedSenders, [buyerVerusId, kp.address]);
+  assert.equal(getBalance(agentId, buyerVerusId), 0);
+});
