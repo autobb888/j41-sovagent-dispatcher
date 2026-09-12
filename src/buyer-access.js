@@ -52,8 +52,13 @@ function listingPublicUrlHint(listing) {
 
 function errorCode(err) {
   if (!err) return 'ACCESS_FAILED';
-  if (typeof err.code === 'string' && err.code) return err.code;
-  if (err.error && typeof err.error.code === 'string') return err.error.code;
+  const code = (typeof err.code === 'string' && err.code)
+    || (err.error && typeof err.error.code === 'string' && err.error.code)
+    || '';
+  const msg = String(err.message || (err.error && err.error.message) || '');
+  // Platform may return bare "Nonce already used" without a structured code.
+  if (code === 'NONCE_REPLAY' || /Nonce already used/i.test(msg)) return 'NONCE_REPLAY';
+  if (code) return code;
   return 'ACCESS_FAILED';
 }
 
@@ -105,6 +110,48 @@ function redactApiKey(key) {
   const s = String(key || '');
   if (s.length <= 8) return '(redacted)';
   return `${s.slice(0, 6)}…${s.slice(-4)}`;
+}
+
+/**
+ * Rewrite a saved non-dispatcher grant (e.g. stale NVIDIA /v1) from listing
+ * website/endpoints after GET /j41/health service===dispatcher. Never mints a
+ * new ECDH grant — callers must not invoke requestApiAccess on this path.
+ * Failure: ACCESS_GRANT_UPSTREAM, grant file unchanged.
+ */
+async function refreshGrantFromListing({
+  grant,
+  listing,
+  publicUrlHint,
+  agentsDir,
+  buyerId,
+  seller,
+  fetchImpl,
+} = {}) {
+  if (!grant || !grant.apiKey || !grant.endpointUrl) {
+    return { ok: false, code: 'ACCESS_GRANT_MISSING', message: 'No decrypted access grant. Run access first.' };
+  }
+  if (isDispatcherProxyBase(grant.endpointUrl)) {
+    return { ok: true, grant, refreshed: false };
+  }
+  const hint = publicUrlHint || listingPublicUrlHint(listing);
+  if (!hint) {
+    return { ok: false, code: 'ACCESS_GRANT_UPSTREAM', message: GRANT_UPSTREAM_MESSAGE };
+  }
+  let minted;
+  try {
+    minted = await resolveListingDispatcherBase(hint, {
+      grant,
+      fetchImpl,
+      failCode: 'ACCESS_GRANT_UPSTREAM',
+    });
+  } catch {
+    return { ok: false, code: 'ACCESS_GRANT_UPSTREAM', message: GRANT_UPSTREAM_MESSAGE };
+  }
+  const working = { ...grant, endpointUrl: minted };
+  if (agentsDir && buyerId && seller) {
+    try { saveAccessGrant(agentsDir, buyerId, seller, working); } catch { /* proceed in memory */ }
+  }
+  return { ok: true, grant: working, refreshed: true };
 }
 
 async function requestAndOpenAccess({
@@ -221,24 +268,17 @@ async function chatCompletions({
 
   let working = grant;
   if (!isDispatcherProxyBase(working.endpointUrl)) {
-    const hint = publicUrlHint || listingPublicUrlHint(listing);
-    if (!hint) {
-      return { ok: false, code: 'ACCESS_GRANT_UPSTREAM', message: GRANT_UPSTREAM_MESSAGE };
-    }
-    let minted;
-    try {
-      minted = await resolveListingDispatcherBase(hint, {
-        grant: working,
-        fetchImpl,
-        failCode: 'ACCESS_GRANT_UPSTREAM',
-      });
-    } catch {
-      return { ok: false, code: 'ACCESS_GRANT_UPSTREAM', message: GRANT_UPSTREAM_MESSAGE };
-    }
-    working = { ...working, endpointUrl: minted };
-    if (agentsDir && buyerId && seller) {
-      try { saveAccessGrant(agentsDir, buyerId, seller, working); } catch { /* proceed in memory */ }
-    }
+    const rewritten = await refreshGrantFromListing({
+      grant: working,
+      listing,
+      publicUrlHint,
+      agentsDir,
+      buyerId,
+      seller,
+      fetchImpl,
+    });
+    if (!rewritten.ok) return rewritten;
+    working = rewritten.grant;
   } else {
     const hint = publicUrlHint || listingPublicUrlHint(listing);
     let nextUrl;
@@ -306,6 +346,7 @@ module.exports = {
   persistGrantSession,
   redactApiKey,
   listingPublicUrlHint,
+  refreshGrantFromListing,
   requestAndOpenAccess,
   chatCompletions,
 };

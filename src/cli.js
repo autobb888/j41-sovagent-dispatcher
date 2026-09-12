@@ -3621,8 +3621,9 @@ program
     const { assertAccessAllowed } = require('./hire.js');
     let services = [];
     let sellerKind = null;
+    let listing = null;
     try {
-      const listing = await agent.client.getAgent(seller);
+      listing = await agent.client.getAgent(seller);
       sellerKind = listing && (listing.kind || listing.listingKind);
       if (listing && Array.isArray(listing.services)) services = listing.services;
       if (typeof agent.client.getAgentServices === 'function') {
@@ -3636,8 +3637,41 @@ program
     const gate = assertAccessAllowed({ sellerKind, services });
     if (!gate.ok) fail(gate.code, gate.message);
     const {
-      requestAndOpenAccess, saveAccessGrant, redactApiKey,
+      requestAndOpenAccess, saveAccessGrant, loadAccessGrant, refreshGrantFromListing, redactApiKey,
     } = require('./buyer-access');
+    // Stale NVIDIA /v1 grants: rewrite from listing public URL after /j41/health
+    // service===dispatcher. Skip requestApiAccess when that refresh succeeds so
+    // `access` does not burn another nonce (NONCE_REPLAY) just to fix endpointUrl.
+    const existingGrant = loadAccessGrant(AGENTS_DIR, buyerAgentId, seller);
+    if (existingGrant) {
+      const refreshed = await refreshGrantFromListing({
+        grant: existingGrant,
+        listing,
+        agentsDir: AGENTS_DIR,
+        buyerId: buyerAgentId,
+        seller,
+      });
+      if (refreshed.ok && refreshed.refreshed) {
+        const grant = refreshed.grant;
+        say(`✅ Access grant refreshed for ${seller} (listing rewrite; no re-access)`);
+        say(`   endpoint ${grant.endpointUrl}`);
+        say(`   expires  ${grant.expiresAt || '—'}`);
+        say(`   apiKey   ${redactApiKey(grant.apiKey)}  (full key only in --json)`);
+        say(`   Chat: j41-dispatcher chat ${buyerAgentId} ${seller} --message "..."`);
+        if (options.json) {
+          console.log(JSON.stringify({
+            ok: true,
+            refreshed: true,
+            seller,
+            endpointUrl: grant.endpointUrl,
+            expiresAt: grant.expiresAt,
+            models: grant.models,
+            apiKey: grant.apiKey,
+          }, null, 2));
+        }
+        return;
+      }
+    }
     const sdk = require('@junction41/sovagent-sdk/dist/index.js');
     const cfgSigner = (cfg.platform && cfg.platform.signer) || process.env.J41_PLATFORM_SIGNER;
     const opened = await requestAndOpenAccess({

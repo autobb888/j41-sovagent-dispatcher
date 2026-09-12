@@ -12,6 +12,7 @@ const {
   loadAccessGrant,
   redactApiKey,
   listingPublicUrlHint,
+  refreshGrantFromListing,
 } = require('../src/buyer-access');
 const { assertAccessAllowed } = require('../src/hire');
 const { TESTNET_PLATFORM_SIGNER, FEE_TANK_NOT_SIGNER } = require('../src/platform-signer');
@@ -244,6 +245,18 @@ test('access CLI calls assertAccessAllowed before requestAndOpenAccess', () => {
   assert.ok(gate > -1, 'access command must call assertAccessAllowed');
   assert.ok(req > -1, 'access command must call requestAndOpenAccess');
   assert.ok(gate < req, 'ACCESS_NOT_API_ENDPOINT preflight must run before signing');
+});
+
+test('access CLI tries loadAccessGrant + refreshGrantFromListing before requestAndOpenAccess', () => {
+  const src = cliAccessBlock();
+  const load = src.indexOf('loadAccessGrant(');
+  const refresh = src.indexOf('refreshGrantFromListing(');
+  const req = src.indexOf('await requestAndOpenAccess(');
+  assert.ok(load > -1, 'access must load any saved grant');
+  assert.ok(refresh > -1, 'access must try listing rewrite before re-access');
+  assert.ok(req > -1, 'access still falls through to requestAndOpenAccess');
+  assert.ok(load < refresh, 'load saved grant before refresh');
+  assert.ok(refresh < req, 'listing rewrite must run before requestApiAccess path');
 });
 
 test('seller ACCESS_NOT_API_ENDPOINT is above verifyAccessRequest and checkNonceAfterVerify', () => {
@@ -703,6 +716,131 @@ test('listingPublicUrlHint reads typed endpoints[].url and skips non-http(s)', (
     'https://web.example',
   );
   assert.equal(listingPublicUrlHint({ endpoints: [] }), null);
+});
+
+test('requestAndOpenAccess maps Nonce already used to NONCE_REPLAY', async () => {
+  const prev = process.env.J41_PLATFORM_SIGNER;
+  try {
+    const err = new Error('Nonce already used');
+    const r = await requestAndOpenAccess({
+      apiUrl: 'https://api.junction41.io',
+      network: 'verustest',
+      signer: TESTNET_PLATFORM_SIGNER,
+      seller: 'moonkimi.agentplatform@',
+      keys: { wif: 'WIF' },
+      services: API_SERVICES,
+      agent: {
+        client: {
+          requestApiAccess: async () => { throw err; },
+        },
+      },
+      sdk: {
+        generateEphemeralKeypair: () => ({ privateKey: new Uint8Array(32), publicKey: new Uint8Array(33) }),
+        buildAccessRequest: () => ({ nonce: 'bb'.repeat(16) }),
+        openAccessEnvelope: async () => { throw new Error('should not decrypt'); },
+      },
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, 'NONCE_REPLAY');
+    assert.match(r.message, /Nonce already used/);
+
+    const coded = new Error('platform rejected');
+    coded.code = 'NONCE_REPLAY';
+    const r2 = await requestAndOpenAccess({
+      apiUrl: 'https://api.junction41.io',
+      network: 'verustest',
+      signer: TESTNET_PLATFORM_SIGNER,
+      seller: 'moonkimi.agentplatform@',
+      keys: { wif: 'WIF' },
+      services: API_SERVICES,
+      agent: {
+        client: {
+          requestApiAccess: async () => { throw coded; },
+        },
+      },
+      sdk: {
+        generateEphemeralKeypair: () => ({ privateKey: new Uint8Array(32), publicKey: new Uint8Array(33) }),
+        buildAccessRequest: () => ({ nonce: 'cc'.repeat(16) }),
+        openAccessEnvelope: async () => { throw new Error('should not decrypt'); },
+      },
+    });
+    assert.equal(r2.ok, false);
+    assert.equal(r2.code, 'NONCE_REPLAY');
+  } finally {
+    if (prev === undefined) delete process.env.J41_PLATFORM_SIGNER;
+    else process.env.J41_PLATFORM_SIGNER = prev;
+  }
+});
+
+test('NVIDIA saved grant + listing dispatcher health rewrites endpointUrl without requestApiAccess', async () => {
+  const dir = tmpDir();
+  const seller = 'moonkimi.agentplatform@';
+  try {
+    saveAccessGrant(dir, 'agent-1', seller, {
+      apiKey: 'sk-nvidia-secret',
+      endpointUrl: 'https://integrate.api.nvidia.com/v1',
+      expiresAt: '2099-01-01T00:00:00Z',
+      models: ['moonkimi'],
+    });
+    let requestApiAccessCalled = false;
+    const poisoned = async () => { requestApiAccessCalled = true; throw new Error('requestApiAccess must not run'); };
+    const r = await refreshGrantFromListing({
+      grant: loadAccessGrant(dir, 'agent-1', seller),
+      listing: { networkEndpoints: ['https://seller.example/'], website: 'https://ignored.example' },
+      agentsDir: dir,
+      buyerId: 'agent-1',
+      seller,
+      fetchImpl: async () => ({ ok: true, json: async () => ({ service: 'dispatcher', status: 'ok' }) }),
+      // If a future regression wires this through requestAndOpenAccess, poison the client:
+      agent: { client: { requestApiAccess: poisoned } },
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.refreshed, true);
+    assert.equal(r.grant.endpointUrl, 'https://seller.example/j41/proxy/v1');
+    assert.equal(r.grant.apiKey, 'sk-nvidia-secret');
+    assert.equal(requestApiAccessCalled, false);
+    const src = fs.readFileSync(path.join(__dirname, '../src/buyer-access.js'), 'utf8');
+    const fnStart = src.indexOf('async function refreshGrantFromListing');
+    const fnEnd = src.indexOf('\nasync function ', fnStart + 1);
+    const body = src.slice(fnStart, fnEnd > fnStart ? fnEnd : undefined);
+    assert.doesNotMatch(body, /requestApiAccess/, 'refreshGrantFromListing must never call requestApiAccess');
+    const rec = JSON.parse(fs.readFileSync(grantFile(dir, seller), 'utf8'));
+    assert.equal(rec.endpointUrl, 'https://seller.example/j41/proxy/v1');
+    assert.equal(fs.statSync(grantFile(dir, seller)).mode & 0o077, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('NVIDIA grant + listing health fail does not call requestApiAccess and does not overwrite file', async () => {
+  const dir = tmpDir();
+  const seller = 'moonkimi.agentplatform@';
+  try {
+    saveAccessGrant(dir, 'agent-1', seller, {
+      apiKey: 'sk-nvidia-secret',
+      endpointUrl: 'https://integrate.api.nvidia.com/v1',
+      expiresAt: '2099-01-01T00:00:00Z',
+      models: ['moonkimi'],
+    });
+    const before = fs.readFileSync(grantFile(dir, seller), 'utf8');
+    let requestApiAccessCalled = false;
+    const r = await refreshGrantFromListing({
+      grant: loadAccessGrant(dir, 'agent-1', seller),
+      listing: { website: 'https://marketing.example/' },
+      agentsDir: dir,
+      buyerId: 'agent-1',
+      seller,
+      fetchImpl: async () => ({ ok: true, json: async () => ({ service: 'pages' }) }),
+      agent: { client: { requestApiAccess: async () => { requestApiAccessCalled = true; } } },
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, 'ACCESS_GRANT_UPSTREAM');
+    assert.equal(requestApiAccessCalled, false);
+    assert.equal(fs.readFileSync(grantFile(dir, seller), 'utf8'), before);
+    assert.match(before, /integrate\.api\.nvidia\.com/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('discovery maps ACCESS_NOT_API_ENDPOINT to 400 and envelope codes to 503', async () => {
