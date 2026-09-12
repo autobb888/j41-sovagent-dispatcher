@@ -328,6 +328,84 @@ function saveDeposits(agentId, data) {
 }
 
 /**
+ * Vin / source address from a verifyPayment payload.
+ * Platform field is `senderAddress`; also accept `sender` / `fromAddress` / `from`.
+ */
+function extractVinAddress(verification) {
+  if (!verification || typeof verification !== 'object') return null;
+  const raw = verification.senderAddress || verification.sender || verification.fromAddress || verification.from;
+  return typeof raw === 'string' && raw.length > 0 ? raw : null;
+}
+
+/**
+ * True when the funding vin belongs to the claiming VerusID: primary R (exact)
+ * or that identity's i-address (trimmed).
+ */
+function senderMatchesBuyer({ vinAddress, buyerVerusId: _buyerVerusId, keys }) {
+  if (typeof vinAddress !== 'string' || !vinAddress) return false;
+  const primary = (keys && Array.isArray(keys.primaryAddresses)) ? keys.primaryAddresses : [];
+  if (primary.includes(vinAddress)) return true;
+  const iAddr = (keys && (keys.iaddress || keys.iAddress)) || null;
+  if (typeof iAddr === 'string' && iAddr.trim() === vinAddress.trim()) return true;
+  return false;
+}
+
+/**
+ * After platform sender_mismatch / senderVerified:false, accept vin if it is a
+ * primary R (or i-address) of buyerVerusId. Prefer local R-set check; if the
+ * payload has no vin, retry verifyPayment once with the first primary R.
+ *
+ * @returns {{ matched: boolean, verification: object }}
+ */
+async function resolveSenderViaPrimaryR(client, verification, buyerVerusId, verifyArgs) {
+  let keys;
+  try {
+    keys = await client.getIdentityKeys(buyerVerusId);
+  } catch {
+    return { matched: false, verification };
+  }
+
+  const vin = extractVinAddress(verification);
+  if (vin && senderMatchesBuyer({ vinAddress: vin, buyerVerusId, keys })) {
+    return { matched: true, verification };
+  }
+
+  if (vin) {
+    return { matched: false, verification };
+  }
+
+  // No vin in payload — retry once with first primary R as expectedSender.
+  const primary = ((keys && keys.primaryAddresses) || []).filter((a) => typeof a === 'string' && a);
+  if (primary.length === 0) {
+    return { matched: false, verification };
+  }
+  let retry;
+  try {
+    retry = await client.verifyPayment({ ...verifyArgs, expectedSender: primary[0] });
+  } catch {
+    return { matched: false, verification };
+  }
+  if (!retry || typeof retry !== 'object') {
+    return { matched: false, verification };
+  }
+  // Amount/address must still hold on the retry.
+  if (retry.verified === false && retry.reason && retry.reason !== 'sender_mismatch') {
+    return { matched: false, verification: retry };
+  }
+  if (retry.verified === true && retry.senderVerified === true) {
+    return { matched: true, verification: retry };
+  }
+  const retryVin = extractVinAddress(retry);
+  if (retryVin && senderMatchesBuyer({ vinAddress: retryVin, buyerVerusId, keys })) {
+    // Only accept when amount/address already passed (verified or sender-only fail).
+    if (retry.verified === true || retry.reason === 'sender_mismatch') {
+      return { matched: true, verification: retry };
+    }
+  }
+  return { matched: false, verification: retry };
+}
+
+/**
  * Report a deposit (buyer-initiated). Authenticates the signed report, verifies
  * on-chain, and credits the meter.
  *
@@ -379,8 +457,9 @@ async function _reportVerifiedDeposit(agentId, client, report, payAddress, netwo
   // claimTxid covers future attempts).
   let committed = false;
   try {
-    // Verify on-chain
-    const verification = await client.verifyPayment({
+    // Verify on-chain. First pass always uses the claiming VerusID as
+    // expectedSender (ruling: keep buyerVerusId; do not start with primary R).
+    const verifyArgs = {
       txid,
       expectedAddress: payAddress,
       expectedAmount,
@@ -389,23 +468,43 @@ async function _reportVerifiedDeposit(agentId, client, report, payAddress, netwo
       // platforms that support it this is the authoritative anti-misattribution
       // check; older platforms omit the sender fields (handled below).
       expectedSender: buyerVerusId,
-    });
+    };
+    let verification = await client.verifyPayment(verifyArgs);
+
+    // Buyer spends from primary R; claim is VerusID/i-address. Platform may
+    // treat that as sender_mismatch / senderVerified:false. Locally accept vin
+    // ∈ primaryAddresses ∪ {i-address} — never J41_DEPOSIT_ALLOW_AUTH_ONLY.
+    let senderAccepted = false;
 
     // Canonical field is `verified` (the platform has no `valid`). On a provable
     // sender mismatch the platform forces verified=false with reason
-    // "sender_mismatch", so this single check also blocks misattribution.
+    // "sender_mismatch". Amount/address failures must not be rescued.
     if (!verification.verified) {
       const reason = verification.reason || 'invalid';
-      const code = reason === 'sender_mismatch' ? 'SENDER_MISMATCH' : undefined;
-      return { credited: false, code, message: `Payment verification failed: ${reason}` };
+      if (reason === 'sender_mismatch') {
+        const resolved = await resolveSenderViaPrimaryR(client, verification, buyerVerusId, verifyArgs);
+        verification = resolved.verification;
+        if (resolved.matched) {
+          senderAccepted = true;
+        } else {
+          return { credited: false, code: 'SENDER_MISMATCH', message: `Payment verification failed: ${reason}` };
+        }
+      } else {
+        return { credited: false, message: `Payment verification failed: ${reason}` };
+      }
     }
 
     // Sender binding: if the platform verified the sender, enforce it matches
-    // the claiming buyer. If it could not be verified (false), refuse. If the
-    // field is absent, the platform doesn't verify sender yet — fall back to
-    // the signature-based authentication above (auth-only) and warn.
-    if (verification.senderVerified === false) {
-      return { credited: false, code: 'SENDER_MISMATCH', message: 'Funding transaction sender could not be confirmed to belong to the claiming buyer' };
+    // the claiming buyer. If it could not be verified (false), try primary-R
+    // ownership. If the field is absent, refuse (no auth-only credit).
+    if (!senderAccepted && verification.senderVerified === false) {
+      const resolved = await resolveSenderViaPrimaryR(client, verification, buyerVerusId, verifyArgs);
+      verification = resolved.verification;
+      if (resolved.matched) {
+        senderAccepted = true;
+      } else {
+        return { credited: false, code: 'SENDER_MISMATCH', message: 'Funding transaction sender could not be confirmed to belong to the claiming buyer' };
+      }
     }
     // Audit 2026-06-02 M-DISPATCHER-auth-2 (Family 3): literal-string compare
     // of two VerusID forms ('seller.agentplatform@' vs 'seller.agentplatform')
@@ -416,11 +515,11 @@ async function _reportVerifiedDeposit(agentId, client, report, payAddress, netwo
     // (`client.normalizeIdentity(form) → iAddress`). The simple normalizer
     // catches every Family-3 case seen in the 2026-05 backend audit.
     const normId = (s) => (typeof s === 'string' ? s.trim().toLowerCase().replace(/@+$/, '') : s);
-    if (verification.senderVerified === true && verification.senderVerusId &&
+    if (!senderAccepted && verification.senderVerified === true && verification.senderVerusId &&
         normId(verification.senderVerusId) !== normId(buyerVerusId)) {
       return { credited: false, code: 'SENDER_MISMATCH', message: 'Funding transaction sender does not match the claiming buyer' };
     }
-    if (verification.senderVerified === undefined) {
+    if (!senderAccepted && verification.senderVerified === undefined) {
       // Audit M-DISPATCHER-funds-1: without sender verification, anyone who
       // observes a public funding transaction can claim its credit. Signing the
       // report proves you control the buyer identity; it does NOT prove that
@@ -1955,4 +2054,4 @@ async function notifyJ41CreditLow(sellerWif, sellerVerusId, buyerVerusId, balanc
   }
 }
 
-module.exports = { networkCurrency, retryPendingNotifies, _pendingNotifies, NOTIFY_MAX_ATTEMPTS, STUCK_CREDITING_MS, reportDeposit, verifyDepositReport, pollPendingDeposits, reconcileUnconfirmedDeposits, listDepositAnomalies, listDepositAnomaliesForAgent, creditDepositAnomaly, dismissDepositAnomaly, reconcileMeterAgainstLedger, withDepositLock, _recheckReversals, _settleReversedForTxid, _classifyLookupFailure, _syncedView, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_MIN_ADVANCE_BLOCKS, REVERSAL_RECHECK_WINDOW_MS, REVERSAL_BUDGET_MAX_DEFAULT, PROCESSED_AUDIT_CAP, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS, loadDeposits };
+module.exports = { networkCurrency, retryPendingNotifies, _pendingNotifies, NOTIFY_MAX_ATTEMPTS, STUCK_CREDITING_MS, reportDeposit, verifyDepositReport, senderMatchesBuyer, pollPendingDeposits, reconcileUnconfirmedDeposits, listDepositAnomalies, listDepositAnomaliesForAgent, creditDepositAnomaly, dismissDepositAnomaly, reconcileMeterAgainstLedger, withDepositLock, _recheckReversals, _settleReversedForTxid, _classifyLookupFailure, _syncedView, RECONCILE_MIN_MISSES, RECONCILE_MISS_SPAN_MS, RECONCILE_MIN_ADVANCE_BLOCKS, REVERSAL_RECHECK_WINDOW_MS, REVERSAL_BUDGET_MAX_DEFAULT, PROCESSED_AUDIT_CAP, startDepositPoller, requiredConfirmations, notifyJ41DepositConfirmed, notifyJ41CreditLow, setNotifyContext, getNotifyContext, DEPOSIT_REPORT_MAX_AGE_MS, loadDeposits };
