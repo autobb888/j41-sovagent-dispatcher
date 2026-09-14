@@ -1,11 +1,12 @@
 'use strict';
 /**
- * Buyer API-session review (model grants). Job `review` stays on submitReview.
+ * Buyer API-session review (model grants). Job `review` is src/buyer-review.js.
  * Sign GET /v1/reviews/message?sessionId=…  J41-REVIEW-SESSION|… only.
  * Homemade J41-REVIEW|Session: is a 401 — never send it.
  * Until reviews.j41-review-v2, GET cannot return that line → REVIEW_SESSION_UNSUPPORTED.
  */
 const { loadAccessGrant, persistGrantSession } = require('./buyer-access');
+const { parseRating } = require('./buyer-review');
 
 function fail(code, message, extra = {}) {
   return { ok: false, code, message, ...extra };
@@ -26,12 +27,6 @@ function buyerVerusId(keys) {
     return keys.identity.endsWith('@') ? keys.identity : `${keys.identity}@`;
   }
   return (keys && keys.iAddress) || '';
-}
-
-function parseRating(raw) {
-  const rating = parseInt(String(raw), 10);
-  if (!Number.isInteger(rating) || rating < 1 || rating > 5) return null;
-  return rating;
 }
 
 function httpStatus(err) {
@@ -83,8 +78,11 @@ function resolveSessionId({ sessionId, grant, agentsDir, buyerId, seller }) {
   return '';
 }
 
-function canonicalNotBound(message, sessionId, rating) {
-  return !message.includes(String(sessionId)) || !message.includes(String(rating));
+function canonicalNotBound(message, sessionId, rating, seller) {
+  return !message.includes(String(sessionId))
+    || !message.includes(String(rating))
+    || !message.includes('Agent:')
+    || !message.includes(String(seller));
 }
 
 async function submitBuyerApiSessionReview({
@@ -158,7 +156,7 @@ async function submitBuyerApiSessionReview({
       { seller, sessionId: sid },
     );
   }
-  if (canonicalNotBound(platformBytes, sid, rating)) {
+  if (canonicalNotBound(platformBytes, sid, rating, seller)) {
     return fail(
       'REVIEW_NOT_CANONICAL',
       'Refusing to sign review bytes that do not bind our sessionId + rating.',

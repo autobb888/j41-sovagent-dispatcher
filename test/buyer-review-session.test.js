@@ -245,6 +245,21 @@ test('--rating must be an integer 1-5', async () => {
   assert.equal(called, 0);
 });
 
+test('--rating 1.5 is REVIEW_BAD_RATING', async () => {
+  let called = 0;
+  const r = await submitBuyerApiSessionReview({
+    client: { submitApiSessionReview: async () => { called += 1; } },
+    keys: BUYER,
+    seller: SELLER,
+    sessionId: SESSION_ID,
+    rating: 1.5,
+    signMessage: () => 'sig',
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'REVIEW_BAD_RATING');
+  assert.equal(called, 0);
+});
+
 test('persistGrantSession writes sessionId onto the access grant (0600)', () => {
   const dir = tmpDir();
   try {

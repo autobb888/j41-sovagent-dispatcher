@@ -3367,7 +3367,7 @@ program
 
 program
   .command('review <buyer-agent-id> <job-id>')
-  .description('Submit a review after completed. Fail-closed unless platform bytes start with J41-.')
+  .description('Submit a review after completed. Fail-closed unless platform bytes start with J41-REVIEW| (REVIEW_NOT_CANONICAL).')
   .requiredOption('--rating <n>', '1-5')
   .option('--message <text>', 'Review text')
   .option('--yes', 'Skip confirmation')
@@ -3376,37 +3376,32 @@ program
     const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
     const say = (line) => { if (!options.json) console.log(line); };
     if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
-    const rating = parseInt(String(options.rating), 10);
-    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
-      fail('REVIEW_BAD_RATING', '--rating must be an integer 1-5.');
-    }
+    const { submitBuyerJobReview } = require('./buyer-review');
     const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
-    const job = await agent.client.getJob(jobId);
-    if (!job || !job.id) fail('REVIEW_NOT_COMPLETED', `Job ${jobId} not found.`);
-    if (!buyerOwnsJob(keys, job)) fail('PAY_NOT_BUYER', 'This identity is not the buyer on that job.');
-    if (job.status !== 'completed') {
-      fail('REVIEW_NOT_COMPLETED', `Job status is ${job.status}, not completed.`, { jobId: job.id, status: job.status });
-    }
     if (!options.yes) {
-      const ok = await confirmHire({ amountText: `review ${job.id} rating ${rating}`, pay: false });
+      const ok = await confirmHire({ amountText: `review ${jobId} rating ${options.rating}`, pay: false });
       if (!ok) { console.log('Cancelled.'); process.exit(0); }
     }
-    try {
-      const result = await agent.submitReview({
-        agentVerusId: job.sellerVerusId || job.seller,
-        jobHash: job.jobHash,
-        rating,
-        message: options.message || '',
-      });
-      say(`✅ Review submitted (${result && (result.inboxId || result.id) || 'ok'})`);
-      if (options.json) console.log(JSON.stringify({ ok: true, jobId: job.id, rating, result }, null, 2));
-    } catch (e) {
-      const msg = String(e.message || e);
-      if (/do not start with J41-/i.test(msg) || /Junction41 Review/i.test(msg)) {
-        fail('REVIEW_NOT_CANONICAL',
-          'Platform review bytes are not J41-…; backend must emit J41-REVIEW|. Review on the website or retry after that fix. Dispatcher will not sign Junction41 Review.');
-      }
-      fail('REVIEW_FAILED', msg);
+    const result = await submitBuyerJobReview({
+      client: agent.client,
+      keys,
+      jobId,
+      rating: options.rating,
+      message: options.message || '',
+      network: J41_NETWORK,
+    });
+    if (!result.ok) fail(result.code, result.message, { jobId: result.jobId, status: result.status });
+    say(`✅ Review submitted (${result.result && (result.result.inboxId || result.result.id) || 'ok'})`);
+    if (result.inboxWarning) say(`   ${result.inboxWarning}`);
+    if (options.json) {
+      console.log(JSON.stringify({
+        ok: true,
+        jobId: result.jobId,
+        rating: result.rating,
+        result: result.result,
+        inboxCount: result.inboxCount,
+        ...(result.inboxWarning ? { inboxWarning: result.inboxWarning } : {}),
+      }, null, 2));
     }
   });
 
