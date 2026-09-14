@@ -25,7 +25,7 @@ function applyRentalAgentConfig(existing, { ackPostpayVastRisk } = {}) {
   return next;
 }
 
-function assertRentalSetupAllowed({ agentId, cfg, services, paymentTerms, ackPostpayVastRisk, host }) {
+function assertRentalSetupAllowed({ agentId, cfg, services, paymentTerms, ackPostpayVastRisk, host, outboundSshV1, version } = {}) {
   assertRentalEligibleAgent(services);
   if (!cfg || !cfg.compute || cfg.compute.enabled !== true) {
     throw new Error('RENTAL_COMPUTE_DISABLED: set [compute] enabled=true before rental-setup');
@@ -37,7 +37,10 @@ function assertRentalSetupAllowed({ agentId, cfg, services, paymentTerms, ackPos
   // Tunnel/resource checks before createProvider so HOME_GPU_NO_TUNNEL / HOME_GPU_NO_RAM win over a dockerode constructor error.
   if (pcfg.type === 'home-gpu') {
     assertTunnelHostname(pcfg.ssh_hostname);
-    require('./ssh-host').assertPublicSshHost(pcfg.ssh_hostname);
+    const { hasOutboundSshV1 } = require('./compute-edge');
+    const token = !!outboundSshV1 || hasOutboundSshV1(version);
+    // Edge token means attach 200 issues the public host; LAN ssh_hostname is leftover.
+    if (!token) require('./ssh-host').assertPublicSshHost(pcfg.ssh_hostname);
     assertTunnelPort(pcfg.ssh_tunnel_port);
     assertJailResources(pcfg);
     const { assertHomeGpuHostReady } = require('./docker-host');

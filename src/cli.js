@@ -1310,7 +1310,7 @@ function getActiveJobs() {
   });
 }
 
-function doctorLiveInputs() {
+async function doctorLiveInputs() {
   let llm = { configured: false, provider: '' };
   let computeEnabled = false;
   let cfg;
@@ -1331,7 +1331,12 @@ function doctorLiveInputs() {
     });
     nvidiaRuntime = /nvidia/i.test(out);
   } catch { /* no docker */ }
-  return { llm, computeEnabled, nvidiaRuntime, cfg };
+  let outboundSshV1 = false;
+  try {
+    const { fetchOutboundSshV1 } = require('./compute-edge');
+    outboundSshV1 = await fetchOutboundSshV1({ apiUrl: J41_API_URL });
+  } catch { outboundSshV1 = false; }
+  return { llm, computeEnabled, nvidiaRuntime, cfg, outboundSshV1 };
 }
 
 program
@@ -5087,6 +5092,12 @@ program
     let config = {};
     try { if (fs.existsSync(configPath)) config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch {}
 
+    let outboundSshV1 = false;
+    try {
+      const { fetchOutboundSshV1 } = require('./compute-edge');
+      outboundSshV1 = await fetchOutboundSshV1({ apiUrl: J41_API_URL });
+    } catch { outboundSshV1 = false; }
+
     let setup;
     try {
       setup = assertRentalSetupAllowed({
@@ -5095,6 +5106,7 @@ program
         services: slotServicesFromAgentConfig(config),
         paymentTerms,
         ackPostpayVastRisk: !!options.ackPostpayVastRisk,
+        outboundSshV1,
       });
     } catch (e) {
       console.error(`✗ ${e.message}`);
@@ -7537,7 +7549,7 @@ program
   .description('Diagnose this machine for dispatcher mass-use (Node, Docker, clock, identity)')
   .option('--json', 'Print DoctorReport JSON')
   .action(async (options) => {
-    const report = await runDoctor(doctorLiveInputs());
+    const report = await runDoctor(await doctorLiveInputs());
     if (options.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     else process.stdout.write(formatDoctorTable(report));
     process.exit(report.ok ? 0 : 1);

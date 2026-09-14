@@ -19,7 +19,7 @@ function assertTunnelHostname(host) {
   try {
     const { isLanSshHost } = require('../ssh-host');
     if (isLanSshHost(host)) {
-      console.warn(`HOME_GPU_LAN_HOST: ssh_hostname ${host.trim()} is RFC1918/LAN — gpu-rental jobs will not be accepted until a named TCP tunnel is set or J41_ALLOW_LAN_RENTAL=1`);
+      console.warn(`HOME_GPU_LAN_HOST: ssh_hostname ${host.trim()} is RFC1918/LAN — gpu-rental jobs will not be accepted without compute.outbound-ssh-v1`);
     }
   } catch { /* warn is best-effort */ }
   return host.trim();

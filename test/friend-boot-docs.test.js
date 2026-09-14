@@ -103,6 +103,14 @@ test('compute signup TUI routes to provider config then rental-setup, not straig
 
   const providerBody = dashScreenBody('computeProviderScreen');
   assert.match(providerBody, /config\.toml/);
+  assert.match(providerBody, /compute\.outbound-ssh-v1/);
+  assert.match(providerBody, /never 0\.0\.0\.0/i);
+  assert.match(providerBody, /127\.0\.0\.1:\$ssh_tunnel_port|127\.0\.0\.1:\$\{ssh_tunnel_port\}/);
+  assert.match(providerBody, /renter@sovcompute\.junction41\.io/);
+  assert.doesNotMatch(providerBody, /Point a named TCP tunnel/i);
+
+  const statusBody = dashScreenBody('statusScreen');
+  assert.match(statusBody, /compute\.outbound-ssh-v1/);
 
   const rentalBody = dashScreenBody('rentalSetupScreen');
   assert.match(rentalBody, /rental-setup/);
