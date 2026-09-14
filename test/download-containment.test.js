@@ -66,14 +66,43 @@ test('symlink-smuggled path outside filesDir is unlinked', withTmp(async (_t, ro
   assert.equal(fs.existsSync(planted), false, 'realpath must follow the planted link and unlink the target');
 }));
 
+test('missing filesDir fail-closes and unlinks the planted file', withTmp(async (_t, root) => {
+  const filesDir = path.join(root, 'workspace', 'files');
+  const planted = path.join(root, 'tmp', 'ipc-msg.jsonl');
+  fs.mkdirSync(path.dirname(planted), { recursive: true });
+  fs.writeFileSync(planted, '{"type":"shutdown"}');
+  assert.equal(fs.existsSync(filesDir), false);
+
+  const result = containDownload(planted, filesDir);
+
+  assert.equal(result.contained, false);
+  assert.equal(fs.existsSync(planted), false, 'unresolvable filesDir must unlink via the original path');
+}));
+
+test('missing dirname(localPath) fail-closes', withTmp(async (_t, root) => {
+  const filesDir = path.join(root, 'workspace', 'files');
+  fs.mkdirSync(filesDir, { recursive: true });
+  const localPath = path.join(root, 'does-not-exist', 'notes.txt');
+  assert.equal(fs.existsSync(path.dirname(localPath)), false);
+
+  const result = containDownload(localPath, filesDir);
+
+  assert.equal(result.contained, false);
+}));
+
 test('both downloadFileTo sites call containDownload', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'job-agent.js'), 'utf8');
   const code = src
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/^\s*\/\/.*$/gm, '');
-  const downloads = code.match(/downloadFileTo\(/g) || [];
-  assert.equal(downloads.length, 2, 'hire-time and downloadNewFiles are the two download sites');
+  const slices = code.split('downloadFileTo(');
+  assert.equal(slices.length - 1, 2, 'hire-time and downloadNewFiles are the two download sites');
+  for (let i = 1; i < slices.length; i++) {
+    assert.ok(
+      slices[i].includes('containDownload('),
+      `downloadFileTo site ${i} must call containDownload before the next statement`,
+    );
+  }
   const calls = code.match(/containDownload\(/g) || [];
-  // definition + two call sites
-  assert.ok(calls.length >= 3, `containDownload must wrap both downloads, found ${calls.length}`);
+  assert.equal(calls.length, 3, `definition + two call sites, found ${calls.length}`);
 });
