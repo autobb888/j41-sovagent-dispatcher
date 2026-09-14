@@ -6,10 +6,16 @@ set -e
 for f in /etc/resolv.conf /etc/hosts /etc/hostname; do
   [ -e "$f" ] || continue
   cp "$f" "/run/$(basename "$f")"
-  umount "$f" 2>/dev/null || umount -l "$f" 2>/dev/null || true
-  cp "/run/$(basename "$f")" "$f"
+  # Writing through a still-mounted Docker bind lands on host docker-xfs.
+  if umount "$f" 2>/dev/null || umount -l "$f" 2>/dev/null; then
+    cp "/run/$(basename "$f")" "$f"
+    if [ "$f" = /etc/resolv.conf ]; then
+      printf '%s\n' 'nameserver 1.1.1.1' 'nameserver 8.8.8.8' > /etc/resolv.conf
+    fi
+  else
+    echo "gpu-jail-init: umount $f failed — docker bind may remain on host xfs" >&2
+  fi
 done
-printf '%s\n' 'nameserver 1.1.1.1' 'nameserver 8.8.8.8' > /etc/resolv.conf
 command -v capsh >/dev/null || { echo 'gpu-jail-init: capsh missing' >&2; exit 1; }
 ssh-keygen -A
 # capsh `-- cmd` runs $SHELL cmd (sshd as a script → ENOEXEC). Use -c exec.

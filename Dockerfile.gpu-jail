@@ -28,7 +28,7 @@ RUN apt-get update \
       'PermitEmptyPasswords no' \
       'UsePAM no' \
       'StrictModes no' \
-      'LoginGraceTime 0' \
+      'LoginGraceTime 60' \
       'TCPKeepAlive yes' \
       'AuthorizedKeysFile .ssh/authorized_keys' \
       > /etc/ssh/sshd_config.d/j41-jail.conf
