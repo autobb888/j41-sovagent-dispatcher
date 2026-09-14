@@ -18,15 +18,26 @@ test('gpu-jail renter is not a locked shadow account (pubkey must work with UseP
   assert.match(df, /chown renter:renter \/workspace/);
   assert.match(df, /libcap2-bin/);
   assert.match(df, /gpu-jail-init/);
+  assert.match(df, /LoginGraceTime 60/);
+  assert.doesNotMatch(df, /LoginGraceTime 0/);
   assert.doesNotMatch(df, /bind-mounted from the host jail dir/);
 });
 
 test('gpu-jail-init umounts docker hosts/resolv binds and drops SYS_ADMIN before sshd', () => {
   const init = fs.readFileSync(path.join(__dirname, '../docker/gpu-jail-init.sh'), 'utf8');
   assert.match(init, /umount/);
+  assert.doesNotMatch(init, /\|\|\s*true\b/);
   assert.match(init, /capsh --drop=cap_sys_admin,cap_setpcap/);
   assert.match(init, /nameserver 1\.1\.1\.1/);
   assert.match(init, /\/usr\/sbin\/sshd/);
+  assert.match(init, /gpu-jail-init: umount \$f failed — docker bind may remain on host xfs/);
+  const loop = init.match(/for f in \/etc\/resolv\.conf \/etc\/hosts \/etc\/hostname; do\n[\s\S]*?\ndone/);
+  assert.ok(loop, 'hosts/resolv umount loop must exist');
+  const thenIdx = loop[0].search(/\bthen\b/);
+  const elseIdx = loop[0].search(/\belse\b/);
+  const printfIdx = loop[0].indexOf('nameserver 1.1.1.1');
+  assert.ok(thenIdx >= 0 && elseIdx > thenIdx, 'umount success/failure branches');
+  assert.ok(printfIdx > thenIdx && printfIdx < elseIdx, 'printf resolv is behind the umount success path');
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '../package.json'), 'utf8'));
   assert.ok(pkg.files.includes('docker/gpu-jail-init.sh'));
 });
