@@ -43,10 +43,9 @@ function isJobCanonical(message) {
 }
 
 function canonicalNotBound(message, jobHash, rating, seller) {
-  return !message.includes(String(jobHash))
-    || !message.includes(String(rating))
-    || !message.includes('Agent:')
-    || !message.includes(String(seller));
+  return !message.includes(`Job:${jobHash}`)
+    || !message.includes(`Rating:${rating}`)
+    || !message.includes(`Agent:${seller}`);
 }
 
 function inboxItems(raw) {
@@ -54,6 +53,19 @@ function inboxItems(raw) {
   if (Array.isArray(raw)) return raw;
   if (Array.isArray(raw.data)) return raw.data;
   return [];
+}
+
+async function readBuyerReviewInbox(client) {
+  let inboxCount = 0;
+  let inboxWarning;
+  try {
+    const inbox = await client.getInbox('pending', 20, ['review', 'attestation']);
+    inboxCount = inboxItems(inbox).length;
+    if (inboxCount === 0) inboxWarning = 'BUYER_INBOX_EMPTY';
+  } catch {
+    inboxWarning = 'BUYER_INBOX_READ_FAILED';
+  }
+  return { inboxCount, ...(inboxWarning ? { inboxWarning } : {}) };
 }
 
 async function getJobReviewMessage(client, params) {
@@ -144,7 +156,7 @@ async function submitBuyerJobReview({
     return fail('REVIEW_FAILED', e.message || String(e), { jobId: job.id });
   }
   const platformBytes = msgResult && msgResult.message;
-  if (!isJobCanonical(platformBytes) || /Junction41 Review/i.test(String(platformBytes || ''))) {
+  if (!isJobCanonical(platformBytes)) {
     return fail(
       'REVIEW_NOT_CANONICAL',
       'Platform review bytes are not J41-…; backend must emit J41-REVIEW|. Review on the website or retry after that fix. Dispatcher will not sign Junction41 Review.',
@@ -199,24 +211,15 @@ async function submitBuyerJobReview({
     return fail('REVIEW_FAILED', msg, { jobId: job.id });
   }
 
-  let inboxCount = 0;
-  let inboxWarning;
-  try {
-    const inbox = await client.getInbox('pending', 20, ['review', 'attestation']);
-    inboxCount = inboxItems(inbox).length;
-    if (inboxCount === 0) inboxWarning = 'BUYER_INBOX_EMPTY';
-  } catch {
-    inboxWarning = 'BUYER_INBOX_READ_FAILED';
-  }
+  const inbox = await readBuyerReviewInbox(client);
 
   return {
     ok: true,
     jobId: job.id,
     rating,
     result,
-    inboxCount,
     timestamp: signedTimestamp,
-    ...(inboxWarning ? { inboxWarning } : {}),
+    ...inbox,
   };
 }
 
@@ -224,4 +227,5 @@ module.exports = {
   submitBuyerJobReview,
   parseRating,
   getJobReviewMessage,
+  readBuyerReviewInbox,
 };

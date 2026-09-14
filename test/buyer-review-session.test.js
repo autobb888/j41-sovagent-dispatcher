@@ -19,8 +19,14 @@ const BUYER = {
 const SELLER = 'duskseek.agentplatform@';
 const SESSION_ID = '11111111-1111-1111-1111-111111111111';
 
-function sessionCanonical({ rating = 5, text = '', ts = 1700000000 } = {}) {
-  return `J41-REVIEW-SESSION|Agent:${SELLER}|Session:${SESSION_ID}|Rating:${rating}|Msg:${text}|Ts:${ts}|I submit this review for an API session.`;
+function sessionCanonical({
+  rating = 5,
+  text = '',
+  ts = 1700000000,
+  agent = SELLER,
+  sessionId = SESSION_ID,
+} = {}) {
+  return `J41-REVIEW-SESSION|Agent:${agent}|Session:${sessionId}|Rating:${rating}|Msg:${text}|Ts:${ts}|I submit this review for an API session.`;
 }
 
 function stringifyNoWif(value) {
@@ -47,6 +53,8 @@ test('review-session source GETs J41-REVIEW-SESSION| and never homemade J41-REVI
   assert.doesNotMatch(src, /toSign = `J41-REVIEW\|Session:/);
   assert.doesNotMatch(src, /J41-REVIEW\|Session:\$\{/);
   assert.doesNotMatch(src, /reviews shipped/i);
+  assert.doesNotMatch(src, /getAttestations/);
+  assert.match(src, /readBuyerReviewInbox/);
 });
 
 test('submitBuyerApiSessionReview signs GET J41-REVIEW-SESSION| and POSTs sessionId', async () => {
@@ -54,11 +62,16 @@ test('submitBuyerApiSessionReview signs GET J41-REVIEW-SESSION| and POSTs sessio
   const sent = [];
   const got = [];
   const canonical = sessionCanonical({ rating: 5, text: 'good model', ts: 1_700_000_222 });
+  const inboxArgs = [];
   const r = await submitBuyerApiSessionReview({
     client: {
       submitApiSessionReview: async (payload) => {
         sent.push(payload);
         return { id: 'review-1' };
+      },
+      getInbox: async (status, limit, types) => {
+        inboxArgs.push({ status, limit, types });
+        return { data: [{ type: 'review' }] };
       },
     },
     keys: BUYER,
@@ -91,6 +104,10 @@ test('submitBuyerApiSessionReview signs GET J41-REVIEW-SESSION| and POSTs sessio
   assert.equal(sent[0].signature, 'sig-from-buyer-wif');
   assert.equal(sent[0].agentVerusId, SELLER);
   assert.equal(sent[0].buyerVerusId, BUYER.identity);
+  assert.equal(r.inboxCount, 1);
+  assert.equal(r.inboxWarning, undefined);
+  assert.equal(inboxArgs[0].status, 'pending');
+  assert.deepEqual(inboxArgs[0].types, ['review', 'attestation']);
   assert.equal(stringifyNoWif(r).includes(BUYER.wif), false);
   assert.equal(stringifyNoWif(sent).includes(BUYER.wif), false);
 });
@@ -104,6 +121,7 @@ test('grant sessionId after chat is enough — no extra --session-id required', 
         sent.push(payload);
         return { id: 'review-grant' };
       },
+      getInbox: async () => ({ data: [{ type: 'review' }] }),
     },
     keys: BUYER,
     seller: SELLER,
@@ -213,6 +231,7 @@ test('platform J41-REVIEW-SESSION| bytes that bind sessionId+rating are signed a
         sent.push(payload);
         return { id: 'review-canonical' };
       },
+      getInbox: async () => ({ data: [{ type: 'attestation' }] }),
     },
     keys: BUYER,
     seller: SELLER,
@@ -243,6 +262,74 @@ test('--rating must be an integer 1-5', async () => {
   assert.equal(r.ok, false);
   assert.equal(r.code, 'REVIEW_BAD_RATING');
   assert.equal(called, 0);
+});
+
+test('session Rating:5 does not bind rating 1 via timestamp substring', async () => {
+  let signed = 0;
+  let submitted = 0;
+  const message = sessionCanonical({ rating: 5, ts: 1700000001 });
+  const r = await submitBuyerApiSessionReview({
+    client: {
+      submitApiSessionReview: async () => { submitted += 1; return { id: 'nope' }; },
+    },
+    keys: BUYER,
+    seller: SELLER,
+    sessionId: SESSION_ID,
+    rating: 1,
+    getReviewMessage: async () => ({ message, timestamp: 1700000001 }),
+    signMessage: () => { signed += 1; return 'sig'; },
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'REVIEW_NOT_CANONICAL');
+  assert.equal(signed, 0);
+  assert.equal(submitted, 0);
+});
+
+test('missing Agent:/wrong seller is REVIEW_NOT_CANONICAL and never signs or POSTs', async () => {
+  const cases = [
+    `J41-REVIEW-SESSION|Session:${SESSION_ID}|Rating:5|Msg:|Ts:1700000000|I submit this review for an API session.`,
+    sessionCanonical({ agent: 'eve.agentplatform@', rating: 5 }),
+  ];
+  for (const message of cases) {
+    let signed = 0;
+    let submitted = 0;
+    const r = await submitBuyerApiSessionReview({
+      client: {
+        submitApiSessionReview: async () => { submitted += 1; return { id: 'nope' }; },
+      },
+      keys: BUYER,
+      seller: SELLER,
+      sessionId: SESSION_ID,
+      rating: 5,
+      getReviewMessage: async () => ({ message, timestamp: 1700000000 }),
+      signMessage: () => { signed += 1; return 'sig'; },
+    });
+    assert.equal(r.ok, false, message);
+    assert.equal(r.code, 'REVIEW_NOT_CANONICAL', message);
+    assert.equal(signed, 0, message);
+    assert.equal(submitted, 0, message);
+  }
+});
+
+test('2xx session POST + throwing getInbox still { ok: true, inboxWarning }', async () => {
+  const r = await submitBuyerApiSessionReview({
+    client: {
+      submitApiSessionReview: async () => ({ id: 'review-ok' }),
+      getInbox: async () => { throw new Error('inbox down'); },
+    },
+    keys: BUYER,
+    seller: SELLER,
+    sessionId: SESSION_ID,
+    rating: 5,
+    getReviewMessage: async () => ({
+      message: sessionCanonical({ rating: 5, ts: 1700000666 }),
+      timestamp: 1700000666,
+    }),
+    signMessage: () => 'sig',
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.inboxWarning, 'BUYER_INBOX_READ_FAILED');
+  assert.equal(r.result.id, 'review-ok');
 });
 
 test('--rating 1.5 is REVIEW_BAD_RATING', async () => {
@@ -290,6 +377,11 @@ test('CLI review-session is a thin rind over buyer-review-session', () => {
   assert.match(rind, /submitBuyerApiSessionReview/);
   assert.match(rind, /REVIEW_SESSION_UNSUPPORTED/);
   assert.match(rind, /\.requiredOption\('--rating/);
+  assert.match(rind, /inboxWarning/);
+  assert.match(rind, /inboxCount/);
+  const parseAt = rind.indexOf('parseRating(');
+  const confirmAt = rind.indexOf('confirmHire(');
+  assert.ok(parseAt > -1 && parseAt < confirmAt, 'parseRating must run before confirmHire');
   assert.doesNotMatch(rind, /client\.submitApiSessionReview\(/);
   assert.doesNotMatch(rind, /console\.(log|error|info).*wif/i);
   assert.doesNotMatch(rind, /reviews shipped/i);

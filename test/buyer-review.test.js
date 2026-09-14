@@ -174,6 +174,45 @@ test('J41-COMPLETE|Job:<hash>| containing rating is REVIEW_NOT_CANONICAL', async
   assert.equal(posted, 0);
 });
 
+test('Rating:5 does not bind rating 1 via timestamp substring', async () => {
+  let signed = 0;
+  let posted = 0;
+  const message = jobCanonical({ rating: 5, ts: 1700000001 });
+  const r = await submitBuyerJobReview({
+    client: baseClient({
+      submitReview: async () => { posted += 1; return { id: 'nope' }; },
+    }),
+    keys: BUYER,
+    jobId: JOB.id,
+    rating: 1,
+    getReviewMessage: async () => ({ message, timestamp: 1700000001 }),
+    signMessage: () => { signed += 1; return 'sig'; },
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'REVIEW_NOT_CANONICAL');
+  assert.equal(signed, 0);
+  assert.equal(posted, 0);
+});
+
+test('canonical J41-REVIEW| with Junction41 Review in Msg: is still signed', async () => {
+  const canonical = jobCanonical({ rating: 5, text: 'mentions Junction41 Review', ts: 1700000888 });
+  const signed = [];
+  const r = await submitBuyerJobReview({
+    client: baseClient({
+      submitReview: async () => ({ id: 'review-msg' }),
+      getInbox: async () => ({ data: [{ type: 'review' }] }),
+    }),
+    keys: BUYER,
+    jobId: JOB.id,
+    rating: 5,
+    message: 'mentions Junction41 Review',
+    getReviewMessage: async () => ({ message: canonical, timestamp: 1700000888 }),
+    signMessage: (_wif, message) => { signed.push(message); return 'sig'; },
+  });
+  assert.equal(r.ok, true);
+  assert.equal(signed[0], canonical);
+});
+
 test('unbound hash/rating/missing Agent:/wrong seller is REVIEW_NOT_CANONICAL', async () => {
   const cases = [
     jobCanonical({ hash: 'zzz-not-our-hash', rating: 5 }),
@@ -291,6 +330,11 @@ test('CLI review is a thin rind over buyer-review', () => {
   assert.match(rind, /submitBuyerJobReview/);
   assert.match(rind, /REVIEW_NOT_CANONICAL/);
   assert.match(rind, /\.requiredOption\('--rating/);
+  const parseAt = rind.indexOf('parseRating(');
+  const confirmAt = rind.indexOf('confirmHire(');
+  const getJobAt = rind.indexOf('getJob(');
+  assert.ok(parseAt > -1 && parseAt < confirmAt, 'parseRating must run before confirmHire');
+  assert.ok(getJobAt > -1 && getJobAt < confirmAt, 'job gates must run before confirmHire');
   assert.doesNotMatch(rind, /agent\.submitReview\(/);
   assert.doesNotMatch(rind, /`J41-REVIEW\|/);
   assert.doesNotMatch(rind, /toSign = `J41-REVIEW\|/);

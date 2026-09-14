@@ -6,7 +6,7 @@
  * Until reviews.j41-review-v2, GET cannot return that line → REVIEW_SESSION_UNSUPPORTED.
  */
 const { loadAccessGrant, persistGrantSession } = require('./buyer-access');
-const { parseRating } = require('./buyer-review');
+const { parseRating, readBuyerReviewInbox } = require('./buyer-review');
 
 function fail(code, message, extra = {}) {
   return { ok: false, code, message, ...extra };
@@ -79,10 +79,9 @@ function resolveSessionId({ sessionId, grant, agentsDir, buyerId, seller }) {
 }
 
 function canonicalNotBound(message, sessionId, rating, seller) {
-  return !message.includes(String(sessionId))
-    || !message.includes(String(rating))
-    || !message.includes('Agent:')
-    || !message.includes(String(seller));
+  return !message.includes(`Session:${sessionId}`)
+    || !message.includes(`Rating:${rating}`)
+    || !message.includes(`Agent:${seller}`);
 }
 
 async function submitBuyerApiSessionReview({
@@ -147,9 +146,7 @@ async function submitBuyerApiSessionReview({
     return fail('REVIEW_FAILED', e.message || String(e), { seller, sessionId: sid });
   }
   const platformBytes = msgResult && msgResult.message;
-  if (!isSessionCanonical(platformBytes)
-      || /Junction41 Review/i.test(String(platformBytes || ''))
-      || /Junction41 API Session Review/i.test(String(platformBytes || ''))) {
+  if (!isSessionCanonical(platformBytes)) {
     return fail(
       'REVIEW_SESSION_UNSUPPORTED',
       'Platform session-review bytes are not J41-REVIEW-SESSION|. Homemade J41-REVIEW|Session: will 401. Gate on reviews.j41-review-v2.',
@@ -211,6 +208,8 @@ async function submitBuyerApiSessionReview({
     return fail('REVIEW_FAILED', msg, { seller, sessionId: sid });
   }
 
+  const inbox = await readBuyerReviewInbox(client);
+
   return {
     ok: true,
     seller,
@@ -218,6 +217,7 @@ async function submitBuyerApiSessionReview({
     rating,
     result,
     timestamp: signedTimestamp,
+    ...inbox,
   };
 }
 

@@ -3376,17 +3376,30 @@ program
     const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
     const say = (line) => { if (!options.json) console.log(line); };
     if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
-    const { submitBuyerJobReview } = require('./buyer-review');
+    const { submitBuyerJobReview, parseRating } = require('./buyer-review');
     const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    const rating = parseRating(options.rating);
+    if (rating == null) fail('REVIEW_BAD_RATING', '--rating must be an integer 1-5.');
+    let job;
+    try {
+      job = await agent.client.getJob(jobId);
+    } catch (e) {
+      fail('REVIEW_NOT_COMPLETED', e.message || String(e));
+    }
+    if (!job || !job.id) fail('REVIEW_NOT_COMPLETED', `Job ${jobId} not found.`);
+    if (!buyerOwnsJob(keys, job)) fail('PAY_NOT_BUYER', 'This identity is not the buyer on that job.', { jobId: job.id });
+    if (job.status !== 'completed') {
+      fail('REVIEW_NOT_COMPLETED', `Job status is ${job.status}, not completed.`, { jobId: job.id, status: job.status });
+    }
     if (!options.yes) {
-      const ok = await confirmHire({ amountText: `review ${jobId} rating ${options.rating}`, pay: false });
+      const ok = await confirmHire({ amountText: `review ${job.id} rating ${rating}`, pay: false });
       if (!ok) { console.log('Cancelled.'); process.exit(0); }
     }
     const result = await submitBuyerJobReview({
       client: agent.client,
       keys,
       jobId,
-      rating: options.rating,
+      rating,
       message: options.message || '',
       network: J41_NETWORK,
     });
@@ -3416,17 +3429,19 @@ program
     const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
     const say = (line) => { if (!options.json) console.log(line); };
     if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
-    const { submitBuyerApiSessionReview } = require('./buyer-review-session');
+    const { submitBuyerApiSessionReview, parseRating } = require('./buyer-review-session');
     const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    const rating = parseRating(options.rating);
+    if (rating == null) fail('REVIEW_BAD_RATING', '--rating must be an integer 1-5.');
     if (!options.yes) {
-      const ok = await confirmHire({ amountText: `review-session ${seller} rating ${options.rating}`, pay: false });
+      const ok = await confirmHire({ amountText: `review-session ${seller} rating ${rating}`, pay: false });
       if (!ok) { console.log('Cancelled.'); process.exit(0); }
     }
     const result = await submitBuyerApiSessionReview({
       client: agent.client,
       keys,
       seller,
-      rating: options.rating,
+      rating,
       message: options.message || '',
       agentsDir: AGENTS_DIR,
       buyerId: buyerAgentId,
@@ -3434,6 +3449,7 @@ program
     });
     if (!result.ok) fail(result.code, result.message, { seller: result.seller, sessionId: result.sessionId });
     say(`✅ Session review submitted (${result.result && (result.result.inboxId || result.result.id) || 'ok'})`);
+    if (result.inboxWarning) say(`   ${result.inboxWarning}`);
     if (options.json) {
       console.log(JSON.stringify({
         ok: true,
@@ -3441,6 +3457,8 @@ program
         sessionId: result.sessionId,
         rating: result.rating,
         result: result.result,
+        inboxCount: result.inboxCount,
+        ...(result.inboxWarning ? { inboxWarning: result.inboxWarning } : {}),
       }, null, 2));
     }
   });
