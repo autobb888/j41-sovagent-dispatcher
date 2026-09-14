@@ -10758,13 +10758,23 @@ async function handleWebhookEvent(state, agentId, payload) {
 
     case 'job.cancelled': {
       if (!jobId) return;
-      if (state.active.has(jobId)) {
+      // T3 — bind lives here, not as a handleWebhookEvent preamble: job.requested
+      // / job.started have no local job yet. A captured secret for agent-2 must
+      // not yank agent-1's GPU rental or queued labour.
+      const cancelActive = state.active.get(jobId);
+      const queuedJob = Array.isArray(state.queue) ? state.queue.find(j => j.id === jobId) : null;
+      const ownsActive = !!(cancelActive && (cancelActive.agentInfo?.id === agentInfo.id || cancelActive.agentId === agentInfo.id));
+      const ownsQueued = !!(queuedJob && queuedJob.assignedAgent?.id === agentInfo.id);
+      if (!ownsActive && !ownsQueued) {
+        console.error(`[Webhook] ${agentInfo.id} sent job.cancelled for ${jobId.substring(0, 8)} not owned by this agent — refusing`);
+        return;
+      }
+      if (ownsActive) {
         console.log(`[Webhook] Job ${jobId.substring(0, 8)} cancelled — cleaning up`);
         // Mark cancelled as an abnormal exit so its log is archived under the
         // default 'errors' retention (deterministic + symmetric with local).
-        const cancelActive = state.active.get(jobId);
-        if (cancelActive) cancelActive._killed = true;
-        if (cancelActive && cancelActive.kind === 'gpu-rental') {
+        cancelActive._killed = true;
+        if (cancelActive.kind === 'gpu-rental') {
           await stopRentalJob(state, jobId);
           removeActiveJobFromAllowlist(jobId);
         } else if (RUNTIME === 'docker') {

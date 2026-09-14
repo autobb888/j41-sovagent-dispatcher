@@ -72,14 +72,18 @@ const evt = (id) => JSON.stringify({ id, type: 'job.created', jobId: 'j-1', data
 
 // ---------------------------------------------------------------------------
 
-test('a correctly signed event is accepted and delivered exactly once', async () => {
+test('legacy body-only HMAC is refused (timestamped signature required)', async () => {
+  // T7 — an on-path attacker who strips X-Webhook-Signature-Timestamped must
+  // not be able to replay the body-only HMAC outside the freshness window.
+  // Do not set J41_ALLOW_LEGACY_WEBHOOK in this suite; that is a production
+  // escape hatch, not a test default.
+  assert.notEqual(process.env.J41_ALLOW_LEGACY_WEBHOOK, '1');
   const s = await serve();
   try {
     const body = evt('e1');
     const r = await post(s.port, '/webhook/agent-a', body, { 'x-webhook-signature': sign(body, SECRET_A) });
-    assert.equal(r.status, 200, `expected 200, got ${r.status}: ${r.body}`);
-    assert.equal(s.events.length, 1, 'a valid event must be delivered');
-    assert.equal(s.events[0].agentId, 'agent-a');
+    assert.equal(r.status, 401, `expected 401, got ${r.status}: ${r.body}`);
+    assert.equal(s.events.length, 0, 'a rejected event must never reach the handler');
   } finally { await s.close(); }
 });
 
@@ -157,12 +161,17 @@ test('agent ids that try to traverse or inject are refused', async () => {
 });
 
 test('a replayed event id is accepted at most once', async () => {
-  // The signature stays valid forever, so replay protection has to come from
-  // the nonce. Without it, a captured event can be re-driven indefinitely.
+  // The timestamped signature is fresh for 5 minutes, so replay protection
+  // inside that window has to come from the nonce. Without it, a captured
+  // event can be re-driven until the timestamp expires.
   const s = await serve();
   try {
     const body = evt('replay-me');
-    const sig = { 'x-webhook-signature': sign(body, SECRET_A) };
+    const now = Math.floor(Date.now() / 1000);
+    const sig = {
+      'x-webhook-signature-timestamped': signTs(body, SECRET_A, now),
+      'x-webhook-timestamp': String(now),
+    };
     await post(s.port, '/webhook/agent-a', body, sig);
     await post(s.port, '/webhook/agent-a', body, sig);
     await post(s.port, '/webhook/agent-a', body, sig);
@@ -195,6 +204,26 @@ test('a fresh timestamped signature IS accepted', async () => {
     });
     assert.equal(r.status, 200, `fresh timestamped signature rejected: ${r.body}`);
     assert.equal(s.events.length, 1);
+    assert.equal(s.events[0].agentId, 'agent-a');
+  } finally { await s.close(); }
+});
+
+test('stripping the timestamped header cannot downgrade to the legacy HMAC', async () => {
+  const s = await serve();
+  try {
+    const body = evt('e-downgrade');
+    const now = Math.floor(Date.now() / 1000);
+    const first = await post(s.port, '/webhook/agent-a', body, {
+      'x-webhook-signature-timestamped': signTs(body, SECRET_A, now),
+      'x-webhook-timestamp': String(now),
+      'x-webhook-signature': sign(body, SECRET_A),
+    });
+    assert.equal(first.status, 200, `dual-signed event rejected: ${first.body}`);
+    const replay = await post(s.port, '/webhook/agent-a', body, {
+      'x-webhook-signature': sign(body, SECRET_A),
+    });
+    assert.equal(replay.status, 401, 'legacy replay after stripping timestamp must be refused');
+    assert.equal(s.events.length, 1, 'the downgrade replay must never reach the handler');
   } finally { await s.close(); }
 });
 

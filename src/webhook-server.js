@@ -338,9 +338,13 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
       return;
     }
 
-    // O(1) lookup — verify against this agent's secret only
+    // O(1) lookup — verify against this agent's secret only.
+    // requireTimestamped refuses the legacy body-only HMAC so an on-path
+    // attacker can't strip the timestamped header to force a replayable
+    // downgrade. J41_ALLOW_LEGACY_WEBHOOK=1 is the dual-sign rollout escape.
     const config = agentWebhooks.get(agentId);
-    if (!verifyInboundWebhook(rawBody, req.headers, config.secret)) {
+    const requireTimestamped = process.env.J41_ALLOW_LEGACY_WEBHOOK !== '1';
+    if (!verifyInboundWebhook(rawBody, req.headers, config.secret, { requireTimestamped })) {
       res.writeHead(401);
       res.end('Invalid or stale signature');
       return;
