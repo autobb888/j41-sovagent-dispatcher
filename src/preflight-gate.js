@@ -57,6 +57,7 @@ async function preflightAllowsAccept(state, agentInfo, agentCfg, dispatcherCfg, 
   if (health.ok) {
     state.llmHealth.set(agentInfo.id, { ok: true, at: Date.now() });
   } else {
+    console.error(`[PREFLIGHT] ${agentInfo.id} LLM probe failed: status=${health.status} error=${health.error} model=${llmCfg && llmCfg.model} base=${llmCfg && llmCfg.baseUrl} key=${llmCfg && llmCfg.apiKey ? 'set' : 'missing'}`);
     state.emitEvent?.('agent.llm_down', {
       agentId: agentInfo.id,
       status: health.status,

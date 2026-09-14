@@ -203,9 +203,10 @@ async function checkUpstreamHostSafe(hostname, cfg, allowPrivate = false) {
         return { safe: false, reason: `hostname ${hostname} resolves to private address ${a.address}` };
       }
     }
-    // Use the first resolved address for the DNS pin so http.request skips
-    // its own re-resolution (DNS-rebind TOCTOU).
-    const pinnedIp = addrs.length > 0 ? addrs[0].address : null;
+    // Prefer IPv4: this host's IPv6 path to NVIDIA hangs (60s proxy timeout,
+    // meter refund). dns.lookup({all:true}) often returns AAAA first.
+    const v4 = addrs.find(a => a.family === 4);
+    const pinnedIp = (v4 || addrs[0])?.address || null;
     return { safe: true, resolvedIp: pinnedIp };
   } catch (e) {
     return { safe: false, reason: `DNS lookup failed for ${hostname}: ${e.message}` };
@@ -244,7 +245,10 @@ function applyUpstreamModelAlias(parsedBody, config) {
   const aliases = config && config.upstreamModelAlias;
   if (!requested || !aliases || typeof aliases !== 'object') return;
   const mapped = aliases[requested];
-  if (typeof mapped === 'string' && mapped) parsedBody.model = mapped;
+  if (typeof mapped === 'string' && mapped) {
+    parsedBody.model = mapped;
+    console.log(`[PROXY] alias ${requested} -> ${mapped}`);
+  }
 }
 
 function filterHeaders(upstreamHeaders) {
@@ -492,6 +496,8 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
       ...(config.upstreamAuth ? { 'Authorization': config.upstreamAuth } : {}),
     },
     timeout: cfg.proxy.upstream_timeout_ms,
+    // NVIDIA chat hangs on HTTP/2 from this host; Node https may ALPN to h2.
+    ...(isHttps ? { ALPNProtocols: ['http/1.1'] } : {}),
     ...(pinnedLookup ? { lookup: pinnedLookup } : {}),
   }, (proxyRes) => {
     const j41Headers = {
@@ -742,6 +748,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   });
 
   proxyReq.on('timeout', () => {
+    console.error(`[PROXY] Upstream timeout after ${cfg.proxy.upstream_timeout_ms}ms agent=${agentId} model=${model}`);
     proxyReq.destroy();
     if (res.headersSent || res.writableEnded) { releaseOnce(); return; }
     refundOnce();

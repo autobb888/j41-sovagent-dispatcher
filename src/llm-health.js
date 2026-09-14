@@ -6,7 +6,7 @@
  */
 async function probeLLM(llmConfig, opts = {}) {
   const { baseUrl, model, apiKey, customHeaders } = llmConfig || {};
-  const timeoutMs = opts.timeoutMs ?? 5000;
+  const timeoutMs = opts.timeoutMs ?? 15000;
   const fetchImpl = opts.fetchImpl || globalThis.fetch;
   if (!baseUrl || !model) return { ok: false, latencyMs: 0, status: null, error: 'missing baseUrl/model' };
   const headers = { 'Content-Type': 'application/json', 'User-Agent': 'j41-agent/1.0' };

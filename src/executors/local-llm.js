@@ -378,117 +378,133 @@ function buildHeaders() {
   return h;
 }
 
-async function callLLM(systemPrompt, messages) {
-  try {
+// NVIDIA integrate hangs Node's default fetch (HTTP/2) from this host and from
+// the job jail; Python urllib and undici with allowH2:false return 200.
+let _http1Agent;
+function http1Fetch() {
+  const undici = require('undici');
+  if (!_http1Agent) _http1Agent = new undici.Agent({ allowH2: false });
+  return { fetch: undici.fetch, dispatcher: _http1Agent };
+}
+
+async function fetchChatCompletions(payload) {
+  const body = JSON.stringify(payload);
+  const { fetch: doFetch, dispatcher } = http1Fetch();
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 60000);
-
-    const apiMessages = [
-      { role: 'system', content: systemPrompt },
-      ...messages.map(m => ({ role: m.role, content: m.content })),
-    ];
-
-    const res = await fetch(`${LLM_CONFIG.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: buildHeaders(),
-      signal: controller.signal,
-      body: JSON.stringify({
-        model: LLM_CONFIG.model,
-        messages: apiMessages,
-        temperature: 0.6,
-        max_tokens: 8192,
-      }),
-    });
-
-    clearTimeout(timer);
-
-    if (!res.ok) {
-      const err = await res.text();
-      log.error('LLM API error', { status: res.status, error: err.substring(0, 200) });
-      log.error('[LLM-OUTAGE] shipping canned fallback', { model: LLM_CONFIG.model, base: LLM_CONFIG.baseUrl, error: `${res.status}: ${err.substring(0, 200)}` });
-      return { content: 'I encountered an issue generating a response. Let me try to help directly — could you rephrase your question?', usage: null };
+    const timer = setTimeout(() => controller.abort(), 20000);
+    try {
+      const res = await doFetch(`${LLM_CONFIG.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: buildHeaders(),
+        signal: controller.signal,
+        dispatcher,
+        body,
+      });
+      clearTimeout(timer);
+      if (!res.ok) {
+        const err = await res.text();
+        lastErr = `${res.status}: ${err.substring(0, 200)}`;
+        log.error('LLM API error', { status: res.status, attempt, error: err.substring(0, 200) });
+        if (res.status === 429 || res.status >= 500 || res.status === 408) continue;
+        return { ok: false, error: lastErr };
+      }
+      return { ok: true, data: await res.json() };
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e.message;
+      log.error('LLM call failed', { error: e.message, attempt });
     }
-
-    const data = await res.json();
-    const msg = data.choices?.[0]?.message;
-    return {
-      content: msg?.content || msg?.reasoning_content || msg?.reasoning || 'I could not generate a response.',
-      usage: data.usage || null,
-    };
-  } catch (e) {
-    log.error('LLM call failed', { error: e.message });
-    log.error('[LLM-OUTAGE] shipping canned fallback', { model: LLM_CONFIG.model, base: LLM_CONFIG.baseUrl, error: e.message });
-    return { content: 'I experienced a temporary issue. Please try sending your message again.', usage: null };
   }
+  return { ok: false, error: lastErr };
+}
+
+async function callLLM(systemPrompt, messages) {
+  const apiMessages = [
+    { role: 'system', content: systemPrompt },
+    ...messages.map(m => ({ role: m.role, content: m.content })),
+  ];
+
+  const fetched = await fetchChatCompletions({
+    model: LLM_CONFIG.model,
+    messages: apiMessages,
+    temperature: 0.6,
+    max_tokens: 256,
+  });
+
+  if (!fetched.ok) {
+    log.error('[LLM-OUTAGE] shipping canned fallback', { model: LLM_CONFIG.model, base: LLM_CONFIG.baseUrl, error: fetched.error });
+    const aborted = /abort/i.test(fetched.error || '');
+    return {
+      content: aborted
+        ? 'I experienced a temporary issue. Please try sending your message again.'
+        : 'I encountered an issue generating a response. Let me try to help directly — could you rephrase your question?',
+      usage: null,
+    };
+  }
+
+  const msg = fetched.data.choices?.[0]?.message;
+  return {
+    content: msg?.content || msg?.reasoning_content || msg?.reasoning || 'I could not generate a response.',
+    usage: fetched.data.usage || null,
+  };
 }
 
 async function callLLMWithTools(systemPrompt, messages, tools) {
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 60000);
-
-    const apiMessages = [
-      { role: 'system', content: systemPrompt },
-      ...messages.map(m => {
-        if (m.role === 'tool') {
-          return { role: 'tool', tool_call_id: m.tool_call_id, content: m.content };
-        }
-        if (m.tool_calls) {
-          return { role: 'assistant', content: m.content || null, tool_calls: m.tool_calls };
-        }
-        return { role: m.role, content: m.content };
-      }),
-    ];
-
-    const body = {
-      model: LLM_CONFIG.model,
-      messages: apiMessages,
-      temperature: 0.6,
-      max_tokens: 8192,
-    };
-    if (tools.length > 0) {
-      body.tools = tools;
-    }
-
-    const res = await fetch(`${LLM_CONFIG.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: buildHeaders(),
-      signal: controller.signal,
-      body: JSON.stringify(body),
-    });
-
-    clearTimeout(timer);
-
-    if (!res.ok) {
-      const err = await res.text();
-      log.error('LLM API error', { status: res.status, error: err.substring(0, 200) });
-      log.error('[LLM-OUTAGE] shipping canned fallback', { model: LLM_CONFIG.model, base: LLM_CONFIG.baseUrl, error: `${res.status}: ${err.substring(0, 200)}` });
-      return { content: 'I encountered an issue processing your request. Please try again.' };
-    }
-
-    const data = await res.json();
-    const msg = data.choices?.[0]?.message || { content: 'No response generated.' };
-    // Kimi K2.5 via NVIDIA returns content=null with text in reasoning field
-    if (!msg.content && (msg.reasoning_content || msg.reasoning)) {
-      msg.content = msg.reasoning_content || msg.reasoning;
-    }
-    // Kimi K2.5 emits tool calls as raw markup in content instead of tool_calls array
-    // Parse <|tool_calls_section_begin|> ... <|tool_calls_section_end|> into proper tool_calls
-    if (msg.content && msg.content.includes('<|tool_calls_section_begin|>') && (!msg.tool_calls || msg.tool_calls.length === 0)) {
-      const parsed = parseInlineToolCalls(msg.content);
-      if (parsed.length > 0) {
-        msg.tool_calls = parsed;
-        // Strip tool call markup from content, keep any text before it
-        msg.content = msg.content.replace(/<\|tool_calls_section_begin\|>[\s\S]*?<\|tool_calls_section_end\|>/, '').trim() || null;
+  const apiMessages = [
+    { role: 'system', content: systemPrompt },
+    ...messages.map(m => {
+      if (m.role === 'tool') {
+        return { role: 'tool', tool_call_id: m.tool_call_id, content: m.content };
       }
-    }
-    msg._usage = data.usage || null;
-    return msg;
-  } catch (e) {
-    log.error('LLM call failed', { error: e.message });
-    log.error('[LLM-OUTAGE] shipping canned fallback', { model: LLM_CONFIG.model, base: LLM_CONFIG.baseUrl, error: e.message });
-    return { content: 'I experienced a temporary issue. Please try again.', _usage: null };
+      if (m.tool_calls) {
+        return { role: 'assistant', content: m.content || null, tool_calls: m.tool_calls };
+      }
+      return { role: m.role, content: m.content };
+    }),
+  ];
+
+  const body = {
+    model: LLM_CONFIG.model,
+    messages: apiMessages,
+    temperature: 0.6,
+    max_tokens: 256,
+  };
+  if (tools.length > 0) {
+    body.tools = tools;
   }
+
+  const fetched = await fetchChatCompletions(body);
+  if (!fetched.ok) {
+    log.error('[LLM-OUTAGE] shipping canned fallback', { model: LLM_CONFIG.model, base: LLM_CONFIG.baseUrl, error: fetched.error });
+    const aborted = /abort/i.test(fetched.error || '');
+    return {
+      content: aborted
+        ? 'I experienced a temporary issue. Please try again.'
+        : 'I encountered an issue processing your request. Please try again.',
+      _usage: null,
+    };
+  }
+
+  const data = fetched.data;
+  const msg = data.choices?.[0]?.message || { content: 'No response generated.' };
+  // Kimi K2.5 via NVIDIA returns content=null with text in reasoning field
+  if (!msg.content && (msg.reasoning_content || msg.reasoning)) {
+    msg.content = msg.reasoning_content || msg.reasoning;
+  }
+  // Kimi K2.5 emits tool calls as raw markup in content instead of tool_calls array
+  // Parse <|tool_calls_section_begin|> ... <|tool_calls_section_end|> into proper tool_calls
+  if (msg.content && msg.content.includes('<|tool_calls_section_begin|>') && (!msg.tool_calls || msg.tool_calls.length === 0)) {
+    const parsed = parseInlineToolCalls(msg.content);
+    if (parsed.length > 0) {
+      msg.tool_calls = parsed;
+      // Strip tool call markup from content, keep any text before it
+      msg.content = msg.content.replace(/<\|tool_calls_section_begin\|>[\s\S]*?<\|tool_calls_section_end\|>/, '').trim() || null;
+    }
+  }
+  msg._usage = data.usage || null;
+  return msg;
 }
 
 /**
