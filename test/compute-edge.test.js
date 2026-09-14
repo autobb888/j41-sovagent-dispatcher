@@ -5,6 +5,7 @@ const {
   COMPUTE_OUTBOUND_SSH_V1,
   KEEP_ALIVE_MS,
   hasOutboundSshV1,
+  fetchOutboundSshV1,
   buildAttachMessage,
   parseAttachBody,
   challengeAndAttach,
@@ -17,6 +18,26 @@ test('hasOutboundSshV1 is only the live token', () => {
   assert.equal(hasOutboundSshV1({ features: ['rental.public-host-v1'] }), false);
   assert.equal(hasOutboundSshV1({}), false);
   assert.equal(hasOutboundSshV1(null), false);
+});
+
+test('fetchOutboundSshV1 is GET /v1/version, fail-closed', async () => {
+  const calls = [];
+  assert.equal(await fetchOutboundSshV1({
+    client: {
+      async request(method, p) {
+        calls.push({ method, p });
+        return { features: [COMPUTE_OUTBOUND_SSH_V1] };
+      },
+    },
+  }), true);
+  assert.deepEqual(calls, [{ method: 'GET', p: '/v1/version' }]);
+  assert.equal(await fetchOutboundSshV1({
+    client: { async request() { return { features: ['rental.public-host-v1'] }; } },
+  }), false);
+  assert.equal(await fetchOutboundSshV1({
+    client: { async request() { throw new Error('network'); } },
+  }), false);
+  assert.equal(await fetchOutboundSshV1({}), false);
 });
 
 test('buildAttachMessage matches backend A–C', () => {

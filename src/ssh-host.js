@@ -50,7 +50,7 @@ function assertPublicSshHost(host) {
     const err = new Error(
       'RENTAL_LAN_HOST: ssh host is RFC1918/loopback/LAN'
       + (trimmed ? ` (${trimmed})` : '')
-      + '; point ssh_hostname at a named TCP tunnel or set J41_ALLOW_LAN_RENTAL=1',
+      + '; need compute.outbound-ssh-v1 on GET /v1/version (retry) or a public ssh_hostname',
     );
     err.code = 'RENTAL_LAN_HOST';
     throw err;

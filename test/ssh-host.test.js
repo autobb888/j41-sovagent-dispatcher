@@ -20,7 +20,17 @@ function restoreLanEnv(prev) {
 }
 
 test('assertPublicSshHost throws RENTAL_LAN_HOST on 192.168.1.69', () => {
-  assert.throws(() => assertPublicSshHost('192.168.1.69'), /RENTAL_LAN_HOST/);
+  assert.throws(
+    () => assertPublicSshHost('192.168.1.69'),
+    (e) => {
+      assert.match(e.message, /RENTAL_LAN_HOST/);
+      assert.match(e.message, /compute\.outbound-ssh-v1/);
+      assert.match(e.message, /GET \/v1\/version/);
+      assert.doesNotMatch(e.message, /named TCP/i);
+      assert.doesNotMatch(e.message, /J41_ALLOW_LAN_RENTAL/);
+      return true;
+    },
+  );
 });
 
 test('assertPublicSshHost throws on 10.x RFC1918', () => {

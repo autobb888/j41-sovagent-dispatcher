@@ -19,7 +19,7 @@ function assertTunnelHostname(host) {
   try {
     const { isLanSshHost } = require('../ssh-host');
     if (isLanSshHost(host)) {
-      console.warn(`HOME_GPU_LAN_HOST: ssh_hostname ${host.trim()} is RFC1918/LAN — gpu-rental jobs will not be accepted until a named TCP tunnel is set or J41_ALLOW_LAN_RENTAL=1`);
+      console.warn(`HOME_GPU_LAN_HOST: ssh_hostname ${host.trim()} is RFC1918/LAN — gpu-rental jobs will not be accepted without compute.outbound-ssh-v1`);
     }
   } catch { /* warn is best-effort */ }
   return host.trim();
@@ -154,15 +154,25 @@ const JAIL_RESOLV_CONF = 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n';
 
 const JAIL_NETWORK = 'j41-gpu-jail';
 const JAIL_APPARMOR = 'j41-gpu-jail';
+const JAIL_APPARMOR_PROFILE = path.join(__dirname, '..', '..', 'docker', 'apparmor-gpu-jail');
+const JAIL_APPARMOR_DENIED_WARN = 'AppArmor j41-gpu-jail not loaded (policy admin denied). mountinfo glob deny inactive.';
+
+function homeGpuNoNet(detail) {
+  const err = new Error(`HOME_GPU_NO_NET: ${detail}`);
+  err.code = 'HOME_GPU_NO_NET';
+  return err;
+}
 
 async function ensureJailNetwork(docker) {
-  if (!docker || typeof docker.createNetwork !== 'function') return 'bridge';
-  try {
-    if (typeof docker.getNetwork === 'function') {
+  if (!docker || typeof docker.createNetwork !== 'function') {
+    throw homeGpuNoNet('docker.createNetwork required for j41-gpu-jail (no docker0 fallback)');
+  }
+  if (typeof docker.getNetwork === 'function') {
+    try {
       await docker.getNetwork(JAIL_NETWORK).inspect();
       return JAIL_NETWORK;
-    }
-  } catch { /* create */ }
+    } catch { /* create */ }
+  }
   try {
     await docker.createNetwork({
       Name: JAIL_NETWORK,
@@ -175,23 +185,38 @@ async function ensureJailNetwork(docker) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     if (/already exists/i.test(msg)) return JAIL_NETWORK;
-    console.warn(`[home-gpu] jail network ${JAIL_NETWORK}: ${msg} — using default bridge`);
-    return 'bridge';
+    throw homeGpuNoNet(msg);
   }
 }
 
-function loadJailApparmor() {
-  const profilePath = path.join(__dirname, '..', 'docker', 'apparmor-gpu-jail');
-  if (!fs.existsSync(profilePath)) return false;
-  const run = require('child_process').execFileSync;
+let _jailApparmorDeniedWarned = false;
+
+function resetJailApparmorWarned() {
+  _jailApparmorDeniedWarned = false;
+}
+
+function warnApparmorDeniedOnce() {
+  if (_jailApparmorDeniedWarned) return;
+  _jailApparmorDeniedWarned = true;
+  console.warn(JAIL_APPARMOR_DENIED_WARN);
+}
+
+function loadJailApparmor(execFileSync) {
+  if (!fs.existsSync(JAIL_APPARMOR_PROFILE)) {
+    warnApparmorDeniedOnce();
+    return false;
+  }
+  const run = execFileSync || require('child_process').execFileSync;
   try {
-    run('apparmor_parser', ['-r', '--skip-cache', profilePath], { stdio: 'pipe' });
+    run('apparmor_parser', ['-r', '--skip-cache', JAIL_APPARMOR_PROFILE], { stdio: 'pipe' });
     return true;
   } catch {
     try {
-      run('apparmor_parser', ['-r', profilePath], { stdio: 'pipe' });
+      run('apparmor_parser', ['-r', JAIL_APPARMOR_PROFILE], { stdio: 'pipe' });
       return true;
     } catch {
+      // Policy admin denied: hire still proceeds, glob deny on mountinfo is off.
+      warnApparmorDeniedOnce();
       return false;
     }
   }
@@ -450,7 +475,7 @@ class HomeGpuProvider extends ComputeProvider {
       fs.writeFileSync(path.join(sshDir, 'authorized_keys'), `${pair.publicKey}\n`, { mode: 0o600 });
 
       const networkMode = await ensureJailNetwork(this.docker);
-      const apparmor = loadJailApparmor();
+      const apparmor = loadJailApparmor(this.cfg.__apparmorParser);
       const securityOpt = ['no-new-privileges:true'];
       if (apparmor) securityOpt.push(`apparmor=${JAIL_APPARMOR}`);
       const nvidiaFiles = Object.prototype.hasOwnProperty.call(this.cfg, '__nvidiaFiles')
@@ -593,4 +618,5 @@ module.exports = {
   JAIL_MASKED_PATHS, JAIL_READONLY_PATHS, JAIL_CAP_ADD, tarAuthorizedKeys, injectRenterAuthorizedKeys,
   ensureJailNetwork, JAIL_NETWORK, collectNvidiaUserspace, nvidiaDeviceSpecs,
   tarHostFiles, injectNvidiaUserspace, injectResolvConf, JAIL_RESOLV_CONF,
+  loadJailApparmor, JAIL_APPARMOR_PROFILE, JAIL_APPARMOR_DENIED_WARN, resetJailApparmorWarned,
 };

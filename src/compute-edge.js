@@ -17,6 +17,27 @@ function hasOutboundSshV1(version) {
   return featuresFromVersion(version).includes(COMPUTE_OUTBOUND_SSH_V1);
 }
 
+// GET /v1/version; any miss is false. Callers must not treat a throw as "token on".
+async function fetchOutboundSshV1(opts = {}) {
+  try {
+    const client = opts.client && typeof opts.client.request === 'function'
+      ? opts.client
+      : null;
+    let version;
+    if (client) {
+      version = await client.request('GET', '/v1/version');
+    } else {
+      const apiUrl = opts.apiUrl;
+      if (!apiUrl) return false;
+      const { J41Client } = require('@junction41/sovagent-sdk/dist/index.js');
+      version = await new J41Client({ apiUrl }).request('GET', '/v1/version');
+    }
+    return hasOutboundSshV1(version);
+  } catch {
+    return false;
+  }
+}
+
 function buildAttachMessage(jobId, timestamp) {
   return `J41-COMPUTE-ATTACH|Job:${jobId}|Ts:${timestamp}`;
 }
@@ -313,6 +334,7 @@ module.exports = {
   KEEP_ALIVE_MS,
   featuresFromVersion,
   hasOutboundSshV1,
+  fetchOutboundSshV1,
   buildAttachMessage,
   parseAttachBody,
   parseDial,

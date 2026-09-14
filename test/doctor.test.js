@@ -574,6 +574,36 @@ test('compute agent RFC1918 ssh_hostname: rental.ssh_public fail', async () => {
   }
 });
 
+test('compute agent RFC1918 ssh_hostname + outboundSshV1: rental.ssh_public pass', async () => {
+  const prev = process.env.J41_ALLOW_LAN_RENTAL;
+  delete process.env.J41_ALLOW_LAN_RENTAL;
+  try {
+    const home = tmpHome();
+    writeKeys(home, 'gpu-1', { identity: 'g.sovcompute@', iAddress: 'iABC', kind: 'compute' });
+    const report = await runDoctor(baseOpts({
+      homedir: home,
+      computeEnabled: true,
+      nvidiaRuntime: true,
+      supportsStorageOpt: () => true,
+      outboundSshV1: true,
+      execSync: dockerExec({ images: { 'job-agent': true, 'gpu-jail': true } }),
+      cfg: {
+        compute: {
+          enabled: true,
+          providers: {
+            card0: { type: 'home-gpu', agent_id: 'gpu-1', ssh_hostname: '192.168.1.69', ssh_tunnel_port: 2222 },
+          },
+        },
+      },
+    }));
+    assert.equal(check(report, 'rental.ssh_public').status, 'pass');
+    assert.match(check(report, 'rental.ssh_public').detail, /compute\.outbound-ssh-v1/);
+  } finally {
+    if (prev === undefined) delete process.env.J41_ALLOW_LAN_RENTAL;
+    else process.env.J41_ALLOW_LAN_RENTAL = prev;
+  }
+});
+
 test('compute agent public ssh_hostname: rental.ssh_public pass', async () => {
   const home = tmpHome();
   writeKeys(home, 'gpu-1', { identity: 'g.sovcompute@', iAddress: 'iABC', kind: 'compute' });
@@ -731,4 +761,29 @@ test('listingAdvertiseRefusal skips labour; refuses LAN compute and model withou
     if (prev === undefined) delete process.env.J41_ALLOW_LAN_RENTAL;
     else process.env.J41_ALLOW_LAN_RENTAL = prev;
   }
+});
+
+test('CLI doctorLiveInputs and TUI doctor/status fetch outboundSshV1 before runDoctor', () => {
+  const cli = fs.readFileSync(path.join(__dirname, '..', 'src', 'cli.js'), 'utf8');
+  const dash = fs.readFileSync(path.join(__dirname, '..', 'src', 'dashboard.js'), 'utf8');
+  const liveStart = cli.indexOf('async function doctorLiveInputs');
+  assert.ok(liveStart > 0, 'doctorLiveInputs must be async');
+  const live = cli.slice(liveStart, cli.indexOf('\nprogram', liveStart));
+  assert.match(live, /fetchOutboundSshV1/);
+  assert.match(live, /outboundSshV1/);
+  assert.match(cli, /await runDoctor\(await doctorLiveInputs\(\)\)/);
+
+  function screen(name) {
+    const start = dash.indexOf(`async function ${name}(`);
+    assert.ok(start > 0, `${name} must exist`);
+    const next = dash.indexOf('\nasync function ', start + 10);
+    return dash.slice(start, next === -1 ? start + 4000 : next);
+  }
+  const doctor = screen('doctorScreen');
+  assert.ok(doctor.indexOf('fetchOutboundSshV1') < doctor.indexOf('runDoctor'), 'doctorScreen fetches before runDoctor');
+  assert.match(doctor, /outboundSshV1/);
+  const status = screen('statusScreen');
+  assert.ok(status.indexOf('fetchOutboundSshV1') < status.indexOf('runDoctor'), 'statusScreen fetches before runDoctor');
+  assert.match(status, /outboundSshV1/);
+  assert.match(status, /compute\.outbound-ssh-v1/);
 });

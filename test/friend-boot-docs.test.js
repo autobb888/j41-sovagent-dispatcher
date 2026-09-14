@@ -10,6 +10,7 @@ const CLAUDE = fs.readFileSync(path.join(ROOT, 'CLAUDE.md'), 'utf8');
 const EXAMPLE = fs.readFileSync(path.join(ROOT, 'docs/config.toml.example'), 'utf8');
 const CLI = fs.readFileSync(path.join(ROOT, 'src/cli.js'), 'utf8');
 const DASH = fs.readFileSync(path.join(ROOT, 'src/dashboard.js'), 'utf8');
+const CHANGELOG = fs.readFileSync(path.join(ROOT, 'CHANGELOG.md'), 'utf8');
 
 test('README command table: build-image builds job-agent and gpu-jail; rental-setup exists', () => {
   assert.match(README, /build-image[\s\S]{0,200}gpu-jail/);
@@ -17,20 +18,36 @@ test('README command table: build-image builds job-agent and gpu-jail; rental-se
   assert.match(README, /home-gpu/);
 });
 
-test('README Cat-1 section: named TCP tunnel, not HTTP webhook, never 0.0.0.0', () => {
-  assert.match(README, /named TCP/i);
+test('README Cat-1 section: compute.outbound-ssh-v1, loopback jail, never 0.0.0.0, buyer SSH at compute edge', () => {
+  assert.match(README, /compute\.outbound-ssh-v1/);
   assert.match(README, /127\.0\.0\.1:\$ssh_tunnel_port|127\.0\.0\.1:\$\{?ssh_tunnel_port\}?/);
+  assert.match(README, /never `?0\.0\.0\.0`?/);
+  assert.match(README, /renter@sovcompute\.junction41\.io/);
   assert.match(README, /not (the )?HTTP webhook/i);
-  assert.match(README, /0\.0\.0\.0/);
   assert.match(README, /rental-setup <agent-id>|rental-setup <id>/);
   assert.match(README, /RENTAL_SECRETS_KEY/);
   assert.match(README, /not a dispatcher/i);
+  assert.match(README, /LAN `ssh_hostname` is allowed at `rental-setup`/);
+  assert.doesNotMatch(README, /LAN `ssh_hostname` still fails `rental-setup`/);
+  assert.doesNotMatch(README, /Point a (Cloudflare )?named TCP tunnel/i);
+  assert.doesNotMatch(README, /Wave 2/);
 });
 
 test('CLAUDE.md quick reference names gpu-jail and rental-setup', () => {
   assert.match(CLAUDE, /gpu-jail/);
   assert.match(CLAUDE, /rental-setup/);
   assert.match(CLAUDE, /home-gpu/);
+  assert.match(CLAUDE, /compute\.outbound-ssh-v1/);
+  assert.match(CLAUDE, /127\.0\.0\.1:\$ssh_tunnel_port/);
+  assert.match(CLAUDE, /renter@sovcompute\.junction41\.io/);
+  assert.match(CLAUDE, /never `0\.0\.0\.0`/);
+  assert.match(CLAUDE, /j41-dispatcher access /);
+  assert.match(CLAUDE, /j41-dispatcher chat /);
+  assert.match(CLAUDE, /j41-dispatcher deposit /);
+  assert.match(CLAUDE, /j41-dispatcher browse /);
+  assert.match(CLAUDE, /j41-dispatcher job-chat /);
+  assert.match(CLAUDE, /name\.agentplatform@/);
+  assert.doesNotMatch(CLAUDE, /Point a (Cloudflare )?named TCP tunnel/i);
 });
 
 test('config.toml.example keeps compute off by default and ships a paste-ready home-gpu recipe', () => {
@@ -39,9 +56,17 @@ test('config.toml.example keeps compute off by default and ships a paste-ready h
   assert.match(EXAMPLE, /type\s*=\s*"home-gpu"/);
   assert.match(EXAMPLE, /ssh_hostname/);
   assert.match(EXAMPLE, /ssh_tunnel_port/);
+  assert.match(EXAMPLE, /127\.0\.0\.1:\$ssh_tunnel_port/);
+  assert.match(EXAMPLE, /compute\.outbound-ssh-v1/);
+  assert.match(EXAMPLE, /renter@sovcompute\.junction41\.io/);
+  assert.match(EXAMPLE, /never 0\.0\.0\.0/);
   assert.match(EXAMPLE, /memory_mb/);
   assert.match(EXAMPLE, /disk_gb/);
   assert.match(EXAMPLE, /default_provider\s*=\s*"home-gpu"/);
+  const pasteStart = EXAMPLE.indexOf('PASTE RECIPE');
+  assert.ok(pasteStart >= 0);
+  const pasteRecipe = EXAMPLE.slice(pasteStart, EXAMPLE.indexOf('[compute.providers.card0]', pasteStart));
+  assert.doesNotMatch(pasteRecipe, /Point a (Cloudflare )?named TCP tunnel/i);
 });
 
 test('build-image description names gpu-jail', () => {
@@ -78,7 +103,14 @@ test('compute signup TUI routes to provider config then rental-setup, not straig
 
   const providerBody = dashScreenBody('computeProviderScreen');
   assert.match(providerBody, /config\.toml/);
-  assert.match(providerBody, /TCP tunnel/);
+  assert.match(providerBody, /compute\.outbound-ssh-v1/);
+  assert.match(providerBody, /never 0\.0\.0\.0/i);
+  assert.match(providerBody, /127\.0\.0\.1:\$ssh_tunnel_port|127\.0\.0\.1:\$\{ssh_tunnel_port\}/);
+  assert.match(providerBody, /renter@sovcompute\.junction41\.io/);
+  assert.doesNotMatch(providerBody, /Point a named TCP tunnel/i);
+
+  const statusBody = dashScreenBody('statusScreen');
+  assert.match(statusBody, /compute\.outbound-ssh-v1/);
 
   const rentalBody = dashScreenBody('rentalSetupScreen');
   assert.match(rentalBody, /rental-setup/);
@@ -106,6 +138,31 @@ test('API Endpoint Setup and Configure Services refuse compute listings', () => 
   // worth checking is that a compute listing gets routed to the actual
   // rental-setup screen, which it does.
   assert.match(svcBody, /rentalSetupScreen\(inquirer, agentId\)/);
+});
+
+test('README CLI table lists buyer verbs that cli.js already registers', () => {
+  const verbs = [
+    ['access', 'access <buyer'],
+    ['chat', 'chat <buyer'],
+    ['deposit', 'deposit <buyer'],
+    ['browse', 'browse <seller'],
+    ['job-chat', 'job-chat <buyer'],
+  ];
+  for (const [cmd, tableCell] of verbs) {
+    assert.match(CLI, new RegExp(String.raw`\.command\('` + cmd + String.raw` `));
+    assert.match(README, new RegExp('\\| `' + tableCell.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  }
+});
+
+test('CHANGELOG Unreleased: sovmodel first-class mint; no coming-soon; no reviews shipped', () => {
+  const start = CHANGELOG.indexOf('## Unreleased');
+  assert.ok(start >= 0, 'CHANGELOG must have an Unreleased section');
+  const next = CHANGELOG.indexOf('\n## ', start + 1);
+  const unreleased = CHANGELOG.slice(start, next === -1 ? undefined : next);
+  assert.match(unreleased, /name\.agentplatform@/);
+  assert.match(unreleased, /sovmodel[\s\S]{0,400}first-class/i);
+  assert.doesNotMatch(unreleased, /sovmodel[\s\S]{0,200}coming soon|coming soon[\s\S]{0,200}sovmodel/i);
+  assert.doesNotMatch(unreleased, /reviews shipped/i);
 });
 
 /** Slice a named async function's body out of dashboard.js (up to the next top-level async function). */

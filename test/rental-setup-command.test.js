@@ -51,6 +51,50 @@ test('rental-setup fails closed on RFC1918 ssh_hostname unless J41_ALLOW_LAN_REN
   }
 });
 
+test('rental-setup with injected outboundSshV1 skips public-host; without token still RENTAL_LAN_HOST', () => {
+  const cfg = { compute: { enabled: true, providers: { card0: { type: 'home-gpu', agent_id: 'gpu-1', ssh_hostname: '192.168.1.69', ssh_tunnel_port: 2222, memory_mb: 8192, disk_gb: 40 } } } };
+  const prevLan = process.env.J41_ALLOW_LAN_RENTAL;
+  const prevEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'test';
+  delete process.env.J41_ALLOW_LAN_RENTAL;
+  try {
+    assert.throws(
+      () => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay' }),
+      (e) => {
+        assert.match(e.message, /RENTAL_LAN_HOST/);
+        assert.match(e.message, /compute\.outbound-ssh-v1/);
+        assert.match(e.message, /GET \/v1\/version/);
+        assert.doesNotMatch(e.message, /named TCP/i);
+        assert.doesNotMatch(e.message, /J41_ALLOW_LAN_RENTAL/);
+        return true;
+      },
+    );
+    assert.throws(
+      () => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay', outboundSshV1: false }),
+      /RENTAL_LAN_HOST/,
+    );
+    assert.throws(
+      () => assertRentalSetupAllowed({
+        agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay',
+        version: { features: [] },
+      }),
+      /RENTAL_LAN_HOST/,
+    );
+    assert.doesNotThrow(() => assertRentalSetupAllowed({
+      agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay', outboundSshV1: true,
+    }));
+    assert.doesNotThrow(() => assertRentalSetupAllowed({
+      agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay',
+      version: { features: ['compute.outbound-ssh-v1'] },
+    }));
+  } finally {
+    if (prevLan === undefined) delete process.env.J41_ALLOW_LAN_RENTAL;
+    else process.env.J41_ALLOW_LAN_RENTAL = prevLan;
+    if (prevEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prevEnv;
+  }
+});
+
 test('rental-setup refuses local provider (canSsh false)', () => {
   const cfg = { compute: { enabled: true, providers: { w: { type: 'local', agent_id: 'gpu-1', base_url: 'http://127.0.0.1:8000/v1' } } } };
   assert.throws(() => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay' }), /RENTAL_NO_SSH/);
@@ -116,6 +160,11 @@ test('cli.js registers rental-setup and wires the reverse api-setup guard', () =
   assert.match(cli, /\.command\('rental-setup <agent-id>'\)/);
   assert.match(cli, /serviceType:\s*'gpu-rental'/);
   assert.match(cli, /--ack-postpay-vast-risk/);
+  const rentalStart = cli.indexOf(".command('rental-setup <agent-id>')");
+  const rentalEnd = cli.indexOf('\n  .command(', rentalStart + 1);
+  const rentalBlock = cli.slice(rentalStart, rentalEnd === -1 ? rentalStart + 4000 : rentalEnd);
+  assert.match(rentalBlock, /fetchOutboundSshV1/);
+  assert.match(rentalBlock, /outboundSshV1/);
   assert.match(setupSrc, /rentalAckPostpayVastRisk/);
   const apiStart = cli.indexOf(".command('api-setup <agent-id>')");
   const apiEnd = cli.indexOf('\n  .command(', apiStart + 1);

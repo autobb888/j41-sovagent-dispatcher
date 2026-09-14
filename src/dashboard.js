@@ -922,7 +922,13 @@ async function doctorScreen(inquirer) {
     });
     nvidiaRuntime = /nvidia/i.test(out);
   } catch {}
-  const report = await runDoctor({ llm, computeEnabled, nvidiaRuntime });
+  let outboundSshV1 = false;
+  try {
+    const { fetchOutboundSshV1 } = require('./compute-edge');
+    const apiUrl = loadCfg().platform && loadCfg().platform.api_url;
+    outboundSshV1 = await fetchOutboundSshV1({ apiUrl });
+  } catch { outboundSshV1 = false; }
+  const report = await runDoctor({ llm, computeEnabled, nvidiaRuntime, outboundSshV1 });
   console.log(formatDoctorTable(report));
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
@@ -957,7 +963,12 @@ async function statusScreen(inquirer) {
         || Object.values(keys).some((v) => v && String(v).trim());
       llm.configured = hasKey;
     } catch {}
-    const report = await runDoctor({ llm, computeEnabled: !!(cfg.compute && cfg.compute.enabled) });
+    let outboundSshV1 = false;
+    try {
+      const { fetchOutboundSshV1 } = require('./compute-edge');
+      outboundSshV1 = await fetchOutboundSshV1({ apiUrl });
+    } catch { outboundSshV1 = false; }
+    const report = await runDoctor({ llm, computeEnabled: !!(cfg.compute && cfg.compute.enabled), outboundSshV1 });
     console.log(formatDoctorTable(report));
   } catch (e) {
     console.log(`  doctor failed: ${e.message}\n`);
@@ -1011,6 +1022,7 @@ async function statusScreen(inquirer) {
       'platform.config-v1',
       'buyer.inbox-attestation-v1',
       'rental.public-host-v1',
+      'compute.outbound-ssh-v1',
       'listings.data-service-v1',
       'discovery.dispatcher-url-v1',
     ];
@@ -2184,8 +2196,10 @@ async function computeProviderScreen(inquirer, agentId) {
   console.clear();
   console.log(`\n  ═══ GPU provider: ${agentId} ═══\n`);
   console.log('  Writes [compute] enabled=true and [compute.providers.*] into');
-  console.log('  ~/.j41/dispatcher/config.toml. Does not create the TCP tunnel.');
-  console.log('  Never 0.0.0.0. Never host SSH. Vast or home-gpu only.\n');
+  console.log('  ~/.j41/dispatcher/config.toml.');
+  console.log('  Jail SSH 22/tcp publishes on 127.0.0.1:$ssh_tunnel_port (never 0.0.0.0).');
+  console.log('  Public SSH is J41 compute edge (compute.outbound-ssh-v1).');
+  console.log('  Buyer SSH: renter@sovcompute.junction41.io from attach. Never host SSH.\n');
 
   const cfg = loadDispatcherConfig();
   const bound = providerBoundToAgent(cfg.compute && cfg.compute.providers, agentId);
@@ -2229,11 +2243,11 @@ async function computeProviderScreen(inquirer, agentId) {
     const { device_index } = await promptWithEsc(inquirer, [{ type: 'input', name: 'device_index', message: 'NVIDIA device_index:', default: '0' }]);
     const { ssh_hostname } = await promptWithEsc(inquirer, [{
       type: 'input', name: 'ssh_hostname',
-      message: 'TCP tunnel hostname (not 127.0.0.1, not 0.0.0.0, not https://):',
+      message: 'ssh_hostname leftover (not the buyer host; not 0.0.0.0, not https://):',
     }]);
     const { ssh_tunnel_port } = await promptWithEsc(inquirer, [{
       type: 'input', name: 'ssh_tunnel_port',
-      message: 'Jail SSH loopback port (tunnel target 127.0.0.1:this):',
+      message: 'Jail SSH loopback port (22/tcp on 127.0.0.1:this, never 0.0.0.0):',
       default: '2222',
     }]);
     const { tableName, partial } = homeGpuProviderPartial(agentId, {
@@ -2241,8 +2255,8 @@ async function computeProviderScreen(inquirer, agentId) {
     }, cfg.compute && cfg.compute.providers);
     saveDispatcherConfig(partial);
     console.log(`\n  ✅ Wrote [compute.providers.${tableName}] type=home-gpu`);
-    console.log(`  Point a named TCP tunnel at 127.0.0.1:${ssh_tunnel_port} before rental-setup.`);
-    console.log('  The TUI does not create the tunnel. Never bind 0.0.0.0.\n');
+    console.log(`  Jail SSH publishes on 127.0.0.1:${ssh_tunnel_port} — never 0.0.0.0.`);
+    console.log('  Public reachability is compute.outbound-ssh-v1; buyer SSHs renter@sovcompute.junction41.io from attach.\n');
   } catch (e) {
     console.log(`\n  ❌ ${e.message}\n`);
   }
