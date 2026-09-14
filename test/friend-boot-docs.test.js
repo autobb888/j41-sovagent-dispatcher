@@ -27,6 +27,10 @@ test('README Cat-1 section: compute.outbound-ssh-v1, loopback jail, never 0.0.0.
   assert.match(README, /rental-setup <agent-id>|rental-setup <id>/);
   assert.match(README, /RENTAL_SECRETS_KEY/);
   assert.match(README, /not a dispatcher/i);
+  assert.match(README, /LAN `ssh_hostname` still fails `rental-setup`/);
+  assert.doesNotMatch(README, /Point a (Cloudflare )?named TCP tunnel/i);
+  assert.doesNotMatch(README, /Wave 2/);
+  assert.doesNotMatch(README, /rental-setup will skip the public-host check/i);
 });
 
 test('CLAUDE.md quick reference names gpu-jail and rental-setup', () => {
@@ -43,6 +47,7 @@ test('CLAUDE.md quick reference names gpu-jail and rental-setup', () => {
   assert.match(CLAUDE, /j41-dispatcher browse /);
   assert.match(CLAUDE, /j41-dispatcher job-chat /);
   assert.match(CLAUDE, /name\.agentplatform@/);
+  assert.doesNotMatch(CLAUDE, /Point a (Cloudflare )?named TCP tunnel/i);
 });
 
 test('config.toml.example keeps compute off by default and ships a paste-ready home-gpu recipe', () => {
@@ -58,6 +63,10 @@ test('config.toml.example keeps compute off by default and ships a paste-ready h
   assert.match(EXAMPLE, /memory_mb/);
   assert.match(EXAMPLE, /disk_gb/);
   assert.match(EXAMPLE, /default_provider\s*=\s*"home-gpu"/);
+  const pasteStart = EXAMPLE.indexOf('PASTE RECIPE');
+  assert.ok(pasteStart >= 0);
+  const pasteRecipe = EXAMPLE.slice(pasteStart, EXAMPLE.indexOf('[compute.providers.card0]', pasteStart));
+  assert.doesNotMatch(pasteRecipe, /Point a (Cloudflare )?named TCP tunnel/i);
 });
 
 test('build-image description names gpu-jail', () => {

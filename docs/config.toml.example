@@ -185,6 +185,7 @@ max_usd_per_hour = 0.0        # fleet spend ceiling for paid provisioning (S6/Va
 #    Public reachability is J41 compute edge (compute.outbound-ssh-v1).
 #    Buyer SSH: ssh -i <jobkey> -p <port> renter@sovcompute.junction41.io
 #    ssh_hostname is leftover / LAN-override, not the buyer host.
+#    LAN ssh_hostname still fails rental-setup (assertPublicSshHost).
 #    Named TCP tunnels are not the product. tunnel-setup is for HTTP model publicUrl.
 # 5. j41-dispatcher rental-setup <agent-id>
 # Dispatcher MUST run on the GPU machine with docker.sock. Jail SSH binds 127.0.0.1 only.
