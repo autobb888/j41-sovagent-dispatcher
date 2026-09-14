@@ -64,10 +64,16 @@ function parseDataSetupUrls({ website, networkEndpoints } = {}) {
   return { website: site, networkEndpoints: endpoints };
 }
 
-function applyDataAgentConfig(existing, { website, networkEndpoints } = {}) {
+function applyDataAgentConfig(existing, { website, networkEndpoints, onChain } = {}) {
   const next = Object.assign({}, existing && typeof existing === 'object' ? existing : {});
   if (website) next.website = website;
   if (networkEndpoints && networkEndpoints.length) next.networkEndpoints = networkEndpoints;
+  if (onChain === true) {
+    delete next.dataEndpointLocalOnly;
+  } else if (website || (networkEndpoints && networkEndpoints.length)) {
+    // Buyer browse reads GET /v1/agents/:seller, not this file.
+    next.dataEndpointLocalOnly = true;
+  }
   return next;
 }
 
@@ -109,6 +115,12 @@ function dataEndpointRefusal(agentConfig) {
       message: 'data.endpoint: website/networkEndpoints is ephemeral (trycloudflare/ngrok/localhost/RFC1918) — run data-setup --website https://...',
     };
   }
+  if (agentConfig.dataEndpointLocalOnly) {
+    return {
+      code: 'data.endpoint',
+      message: 'data.endpoint: website is local-only — browse will not see it until data-setup writes VDXF (drop --no-register)',
+    };
+  }
   return null;
 }
 
@@ -122,7 +134,14 @@ function assertDataSetupDescription({ kind, identity, description } = {}) {
   if (err) throw err;
 }
 
-function dataSetupNextLines(identity) {
+function dataSetupNextLines(identity, { localOnly, agentId } = {}) {
+  if (localOnly) {
+    const id = agentId || '<agent-id>';
+    return [
+      `Next: j41-dispatcher data-setup ${id} --website https://...`,
+      '      browse will not see this URL until the on-chain VDXF write (drop --no-register)',
+    ];
+  }
   const seller = identity || '<seller>';
   return [
     `Next: j41-dispatcher listings --kind data`,

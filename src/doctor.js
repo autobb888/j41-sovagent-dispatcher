@@ -342,11 +342,23 @@ function identityNext(identities) {
   };
 }
 
-function pickNext(checks) {
+function dataOnlyOnChainNext(identities) {
+  const onChain = (identities || []).filter((r) => r.onChain);
+  if (!onChain.length || !onChain.every((r) => r.kind === 'data')) return null;
+  const seller = onChain[0].identity || '<seller>';
+  return {
+    nextCommand: 'j41-dispatcher listings --kind data',
+    copyPasteBlock: `j41-dispatcher listings --kind data\nj41-dispatcher browse ${seller}`,
+  };
+}
+
+function pickNext(checks, identities) {
   const fails = checks.filter((c) => c.status === 'fail');
   const warns = checks.filter((c) => c.status === 'warn');
   const hit = fails[0] || warns.find((c) => ['llm', 'identity', 'image.job-agent', 'fee-tank', 'data.endpoint', 'model.webhook', 'model.public_url'].includes(c.id)) || warns[0];
-  if (!hit) return { nextCommand: 'j41-dispatcher start', copyPasteBlock: null };
+  if (!hit) {
+    return dataOnlyOnChainNext(identities) || { nextCommand: 'j41-dispatcher start', copyPasteBlock: null };
+  }
   let nextCommand = hit.nextCommand || firstPasteCommand(hit.copyPasteBlock) || 'j41-dispatcher doctor';
   const dockerFail = fails.some((c) => String(c.id).startsWith('docker.'));
   if (dockerFail && /j41-dispatcher start/.test(String(nextCommand))) {
@@ -909,7 +921,7 @@ async function runDoctor(opts = {}) {
     checks.push(mkCheck('image.canonicalize', 'Canonicalize pin', 'warn', pin.detail || 'cannot confirm job-agent image'));
   }
 
-  const { nextCommand, copyPasteBlock } = pickNext(checks);
+  const { nextCommand, copyPasteBlock } = pickNext(checks, identities);
   const ok = checks.every((c) => c.status !== 'fail');
   const generatedAt = new Date(typeof deps.now === 'function' ? deps.now() : Date.now()).toISOString();
 

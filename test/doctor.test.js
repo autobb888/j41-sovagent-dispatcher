@@ -632,6 +632,17 @@ test('on-chain data listing with HTTP(S) website: data.endpoint pass', async () 
   assert.equal(check(report, 'data.endpoint').status, 'pass');
 });
 
+test('on-chain data listing with local-only URL: data.endpoint fail', async () => {
+  const home = tmpHome();
+  writeKeys(home, 'data-1', { identity: 'corpus.agentplatform@', iAddress: 'iDATA', kind: 'data' });
+  writeAgentConfig(home, 'data-1', { website: 'https://data.example/apples.json', dataEndpointLocalOnly: true });
+  const report = await runDoctor(baseOpts({ homedir: home }));
+  assert.equal(check(report, 'data.endpoint').status, 'fail');
+  assert.match(check(report, 'data.endpoint').detail, /local-only|browse will not see/);
+  assert.match(check(report, 'data.endpoint').nextCommand, /data-setup data-1 --website/);
+  assert.equal(report.ok, false);
+});
+
 test('listingAdvertiseRefusal data without endpoint', () => {
   const home = tmpHome();
   writeKeys(home, 'data-1', { identity: 'corpus.agentplatform@', kind: 'data' });
@@ -649,6 +660,14 @@ test('listingAdvertiseRefusal data without endpoint', () => {
     agentsDir: path.join(home, '.j41', 'dispatcher', 'agents'),
   });
   assert.equal(ok, null);
+
+  writeAgentConfig(home, 'data-1', { website: 'https://data.example/apples.json', dataEndpointLocalOnly: true });
+  const localOnly = listingAdvertiseRefusal({
+    agentId: 'data-1',
+    keys: { identity: 'corpus.agentplatform@', kind: 'data' },
+    agentsDir: path.join(home, '.j41', 'dispatcher', 'agents'),
+  });
+  assert.equal(localOnly.code, 'data.endpoint');
 });
 
 test('pickNext includes data.endpoint, model.webhook, model.public_url', () => {
@@ -659,6 +678,31 @@ test('pickNext includes data.endpoint, model.webhook, model.public_url', () => {
     { id: 'data.endpoint', status: 'fail', nextCommand: 'j41-dispatcher data-setup data-1 --website https://...' },
   ]);
   assert.match(hit.nextCommand, /data-setup data-1/);
+});
+
+test('pickNext all-green data-only is listings --kind data, not start', () => {
+  const data = pickNext(
+    [{ id: 'os', status: 'pass' }, { id: 'data.endpoint', status: 'pass' }],
+    [{ id: 'data-1', kind: 'data', onChain: true, identity: 'corpus.agentplatform@' }],
+  );
+  assert.equal(data.nextCommand, 'j41-dispatcher listings --kind data');
+  assert.match(data.copyPasteBlock, /browse corpus\.agentplatform@/);
+  assert.doesNotMatch(data.nextCommand, /start/);
+
+  const labour = pickNext(
+    [{ id: 'os', status: 'pass' }],
+    [{ id: 'agent-1', kind: 'agent', onChain: true, identity: 'alice.agentplatform@' }],
+  );
+  assert.equal(labour.nextCommand, 'j41-dispatcher start');
+
+  const mixed = pickNext(
+    [{ id: 'os', status: 'pass' }],
+    [
+      { id: 'data-1', kind: 'data', onChain: true, identity: 'corpus.agentplatform@' },
+      { id: 'agent-1', kind: 'agent', onChain: true, identity: 'alice.agentplatform@' },
+    ],
+  );
+  assert.equal(mixed.nextCommand, 'j41-dispatcher start');
 });
 
 test('identityNext: 0 identities keep labour default; data-1 is not agent-1', () => {

@@ -5085,6 +5085,7 @@ program
     const {
       planDataSetup,
       dataSetupNextLines,
+      applyDataAgentConfig,
     } = require('./data-setup');
 
     const configPath = path.join(agentDir, 'agent-config.json');
@@ -5118,7 +5119,8 @@ program
 
     if (!options.register) {
       console.log('Config saved. Skipping on-chain VDXF (--no-register).');
-      for (const line of dataSetupNextLines(keys.identity)) console.log(line);
+      console.log('browse will not see this URL until the on-chain VDXF write.');
+      for (const line of dataSetupNextLines(keys.identity, { localOnly: true, agentId })) console.log(line);
       return;
     }
 
@@ -5140,11 +5142,15 @@ program
         wif: keys.wif,
         onProgress: (msg) => console.log(`  ${msg}`),
       });
+      const onChainCfg = applyDataAgentConfig(plan.agentConfig, { onChain: true });
+      fs.writeFileSync(configPath, JSON.stringify(onChainCfg, null, 2) + '\n');
+      try { fs.chmodSync(configPath, 0o600); } catch {}
       console.log(`✓ VDXF website/networkEndpoints written (${result.writeTxid || 'ok'})`);
       for (const line of plan.nextLines) console.log(line);
     } catch (e) {
       console.error(`✗ On-chain VDXF write failed: ${e.message}`);
-      console.error('  Config was still written — rerun with --no-register to skip this step, or fix auth and retry.');
+      console.error('  Config was still written locally — browse will not see this URL until the on-chain VDXF write.');
+      console.error('  Fix auth and rerun data-setup (drop --no-register), or rerun with --no-register to skip the chain write.');
       process.exit(1);
     } finally {
       try { agent.stop?.(); } catch {}

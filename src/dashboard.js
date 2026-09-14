@@ -2349,8 +2349,8 @@ async function hireScreen(inquirer) {
     if (result.browseOnly) {
       console.log('\n  Data listings (browse only — hire is refused):\n');
       for (const r of result.rows) {
-        const seller = r.qualifiedName || r.seller;
-        console.log(`    ${seller}`);
+        const seller = r.seller || r.qualifiedName;
+        console.log(`    ${r.qualifiedName || r.seller}`);
         console.log(`    Browse: j41-dispatcher browse ${seller}`);
       }
       console.log('');
@@ -2432,7 +2432,7 @@ async function hireScreen(inquirer) {
   console.log(`\n  Seller kind: ${kind}  ${sellerName}`);
   if (kind === 'data') {
     console.log('  Data listings are browse-only — POST /v1/jobs is refused.');
-    console.log(`  Browse: j41-dispatcher browse ${sellerName}\n`);
+    console.log(`  Browse: j41-dispatcher browse ${sellerId}\n`);
     await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
     return;
   }

@@ -74,6 +74,10 @@ test('applyDataAgentConfig persists website + networkEndpoints without a labour 
   assert.deepEqual(next.networkEndpoints, ['https://ep.example']);
   assert.equal(next.foo, 1);
   assert.equal(next.serviceType, undefined);
+  assert.equal(next.dataEndpointLocalOnly, true);
+  const written = applyDataAgentConfig(next, { onChain: true });
+  assert.equal(written.dataEndpointLocalOnly, undefined);
+  assert.equal(written.website, 'https://data.example');
 });
 
 test('buildDataVdxfFields maps website → profileWebsite and JSON-stringifies endpoints', () => {
@@ -102,12 +106,24 @@ test('dataSetupNextLines is listings --kind data + browse, never start', () => {
   assert.doesNotMatch(lines, /\bstart\b/);
 });
 
+test('--no-register Next says browse will not see the URL until on-chain write', () => {
+  const lines = dataSetupNextLines('pippin.agentplatform@', { localOnly: true, agentId: 'data-1' }).join('\n');
+  assert.match(lines, /data-setup data-1 --website/);
+  assert.match(lines, /browse will not see this URL until/);
+  assert.match(lines, /drop --no-register/);
+  assert.doesNotMatch(lines, /listings --kind data/);
+  assert.doesNotMatch(lines, /\bstart\b/);
+});
+
 test('firstDataEndpoint / dataEndpointRefusal fail closed on missing or ephemeral URLs', () => {
   assert.equal(firstDataEndpoint({}), null);
   assert.equal(dataEndpointRefusal({}).code, 'data.endpoint');
   assert.equal(firstDataEndpoint({ website: 'https://data.example' }), 'https://data.example');
   assert.equal(dataEndpointRefusal({ website: 'https://data.example' }), null);
   assert.equal(dataEndpointRefusal({ website: 'https://x.trycloudflare.com' }).code, 'data.endpoint');
+  const localOnly = dataEndpointRefusal({ website: 'https://data.example', dataEndpointLocalOnly: true });
+  assert.equal(localOnly.code, 'data.endpoint');
+  assert.match(localOnly.message, /local-only|browse will not see/);
 });
 
 test('cli.js registers data-setup next to api-setup as a VDXF rind, not registerService', () => {
@@ -118,6 +134,9 @@ test('cli.js registers data-setup next to api-setup as a VDXF rind, not register
   assert.match(block, /removeAndRewriteVdxfFields/);
   assert.match(block, /is not registered on-chain/);
   assert.match(block, /listings --kind data|dataSetupNextLines/);
+  assert.match(block, /browse will not see this URL until/);
+  assert.match(block, /localOnly:\s*true/);
+  assert.match(block, /onChain:\s*true/);
   assert.doesNotMatch(block, /registerService/);
   assert.doesNotMatch(block, /j41-dispatcher start/);
   const apiStart = CLI.indexOf(".command('api-setup <agent-id>')");
@@ -187,8 +206,10 @@ test('TUI [5] diverts kind=data to data-setup and kind=model away from labour ad
 test('TUI Hire prints filled browse for data and access/chat/deposit for model (no ECDH)', () => {
   const hireAt = DASH.indexOf('async function hireScreen');
   const hire = DASH.slice(hireAt, DASH.indexOf('\nasync function ', hireAt + 10));
+  assert.match(hire, /const seller = r\.seller \|\| r\.qualifiedName/);
   assert.match(hire, /Browse: j41-dispatcher browse \$\{seller\}/);
-  assert.match(hire, /Browse: j41-dispatcher browse \$\{sellerName\}/);
+  assert.match(hire, /Browse: j41-dispatcher browse \$\{sellerId\}/);
+  assert.doesNotMatch(hire, /Browse: j41-dispatcher browse \$\{sellerName\}/);
   assert.match(hire, /access \$\{buyerId\} \$\{seller\}/);
   assert.match(hire, /deposit \$\{buyerId\} \$\{seller\} --amount/);
   assert.match(hire, /Print-argv only — no ECDH in TUI/);
