@@ -8,7 +8,7 @@ os.homedir = () => TEST_HOME;
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { HomeGpuProvider, assertTunnelHostname, assertTunnelPort, assertJailResources, jailImageRef, generateRenterKeypair, reclaimStaleHomeGpuLocks, collectNvidiaUserspace, nvidiaDeviceSpecs, JAIL_MASKED_PATHS, JAIL_NETWORK, ensureJailNetwork } = require('../src/providers/home-gpu');
+const { HomeGpuProvider, assertTunnelHostname, assertTunnelPort, assertJailResources, jailImageRef, generateRenterKeypair, reclaimStaleHomeGpuLocks, collectNvidiaUserspace, nvidiaDeviceSpecs, JAIL_MASKED_PATHS, JAIL_NETWORK, ensureJailNetwork, loadJailApparmor, JAIL_APPARMOR_PROFILE, JAIL_APPARMOR_DENIED_WARN, resetJailApparmorWarned } = require('../src/providers/home-gpu');
 const { listProviderTypes } = require('../src/providers');
 
 test('generateRenterKeypair public line is ssh-keygen -y of the sealed private file', () => {
@@ -153,6 +153,7 @@ function homeCfg(extra = {}) {
     __probeSsh: async () => true,
     __nvidiaFiles: [],
     __nvidiaDevices: [{ PathOnHost: '/dev/nvidia0', PathInContainer: '/dev/nvidia0', CgroupPermissions: 'rwm' }],
+    __apparmorParser: () => {},
     ...extra,
   };
 }
@@ -197,6 +198,7 @@ test('waitReady publishes 22/tcp on 127.0.0.1:ssh_tunnel_port, never 0.0.0.0, ne
     __generateKeypair: () => pair,
     __nvidiaFiles: [],
     __nvidiaDevices: [{ PathOnHost: '/dev/nvidia0', PathInContainer: '/dev/nvidia0', CgroupPermissions: 'rwm' }],
+    __apparmorParser: () => {},
   });
   const cand = (await p.discover())[0];
   let lease = await p.acquire(cand);
@@ -396,6 +398,48 @@ test('createNetwork permission denied or IPAM collision is HOME_GPU_NO_NET; wait
     assert.equal((await p.discover()).length, 1);
     assert.equal(fs.existsSync(lockPath(0)), false);
     assert.equal(docker.created.length, 0);
+  }
+});
+
+test('JAIL_APPARMOR_PROFILE is repo-root docker/apparmor-gpu-jail', () => {
+  assert.equal(
+    path.resolve(JAIL_APPARMOR_PROFILE),
+    path.resolve(__dirname, '..', 'docker', 'apparmor-gpu-jail'),
+  );
+  assert.equal(fs.existsSync(JAIL_APPARMOR_PROFILE), true);
+});
+
+test('loadJailApparmor parser deny warns once; waitReady stays no-new-privileges; no sudo', async () => {
+  resetJailApparmorWarned();
+  const calls = [];
+  const deny = (cmd, args) => {
+    calls.push({ cmd, args: args ? [...args] : [] });
+    throw new Error('Access denied');
+  };
+  const warns = [];
+  const orig = console.warn;
+  console.warn = (...a) => warns.push(a.join(' '));
+  try {
+    assert.equal(loadJailApparmor(deny), false);
+    assert.equal(loadJailApparmor(deny), false);
+    const docker = stubDocker();
+    const p = new HomeGpuProvider(homeCfg({ docker, __apparmorParser: deny }));
+    const lease = await p.acquire((await p.discover())[0]);
+    const ready = await p.waitReady(lease, { timeoutMs: 1000 });
+    assert.equal(ready.state, 'ready');
+    assert.deepEqual(docker.created[0].HostConfig.SecurityOpt, ['no-new-privileges:true']);
+    assert.equal(docker.created[0].HostConfig.SecurityOpt.some((s) => String(s).startsWith('apparmor=')), false);
+    await p.release(ready);
+  } finally {
+    console.warn = orig;
+  }
+  assert.deepEqual(warns, [JAIL_APPARMOR_DENIED_WARN]);
+  assert.equal(warns[0], 'AppArmor j41-gpu-jail not loaded (policy admin denied). mountinfo glob deny inactive.');
+  assert.ok(calls.length >= 2);
+  for (const c of calls) {
+    assert.equal(c.cmd, 'apparmor_parser');
+    assert.notEqual(c.cmd, 'sudo');
+    assert.equal(c.args.includes('sudo'), false);
   }
 });
 
