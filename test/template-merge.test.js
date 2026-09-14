@@ -46,12 +46,40 @@ test('template session.duration is seconds with no * 60', () => {
   assert.equal(profile.session.duration, 7200);
 });
 
+test('template session tokenLimit and messageLimit merge into options', () => {
+  const options = mergeTemplateIntoOptions({
+    profile: { session: { duration: 7200, tokenLimit: 200000, messageLimit: 100 } },
+  }, {});
+  assert.equal(options.sessionTokenLimit, 200000);
+  assert.equal(options.sessionMessageLimit, 100);
+  const profile = buildFullProfile(options, {});
+  assert.equal(profile.session.tokenLimit, 200000);
+  assert.equal(profile.session.messageLimit, 100);
+});
+
 test('CLI flags win over template markup and session duration', () => {
-  const options = mergeTemplateIntoOptions(CODE_REVIEW, { markup: 10, sessionDuration: 60 });
+  const options = mergeTemplateIntoOptions(CODE_REVIEW, {
+    markup: 10,
+    sessionDuration: 3600,
+    sessionTokenLimit: 1,
+    sessionMessageLimit: 2,
+  });
   assert.equal(options.markup, 10);
-  assert.equal(options.sessionDuration, 60);
+  assert.equal(options.sessionDuration, 3600);
+  assert.equal(options.sessionTokenLimit, 1);
+  assert.equal(options.sessionMessageLimit, 2);
   const profile = buildFullProfile(options, {});
   assert.equal(profile.markup, 10);
+});
+
+test('CLI --session-duration minutes coerce * 60 to seconds', () => {
+  const cli = fs.readFileSync(path.join(__dirname, '..', 'src', 'cli.js'), 'utf8');
+  assert.match(cli, /function parseSessionMinutes\(/);
+  assert.match(cli, /parseInt\(v, 10\);/);
+  assert.match(cli, /n \* 60/);
+  assert.equal((cli.match(/parseSessionMinutes/g) || []).length >= 4, true, 'helper + three --session-duration flags');
+  const setup = cli.slice(cli.indexOf(".command('setup <agent-id>"), cli.indexOf(".command('start')", cli.indexOf(".command('setup <agent-id>")));
+  assert.match(setup, /--session-duration <min>.*parseSessionMinutes/);
 });
 
 test('workspace-reviewer profile.workspace maps to options.workspace, not workspaceCapability', () => {
@@ -72,6 +100,7 @@ test('interactive onboarding still converts minutes to seconds', () => {
   const io = cli.slice(cli.indexOf('async function interactiveOnboarding('), cli.indexOf('function saveProfile('));
   assert.match(io, /Max session duration \(minutes\)/);
   assert.match(io, /parseInt\(sessionDuration\) \* 60/);
-  const merge = cli.slice(cli.indexOf('function mergeTemplateIntoOptions('), cli.indexOf('// ── Interactive profile setup'));
-  assert.doesNotMatch(merge, /\* 60/);
+  const merge = cli.slice(cli.indexOf('function mergeTemplateIntoOptions('), cli.indexOf('function parseSessionMinutes('));
+  assert.match(merge, /options\.sessionDuration = sess\.duration/);
+  assert.doesNotMatch(merge, /sess\.duration \* 60/);
 });

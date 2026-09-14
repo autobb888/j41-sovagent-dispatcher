@@ -34,13 +34,13 @@ test('init -n default remains 9', () => {
   const start = CLI.indexOf(".command('init')");
   const body = CLI.slice(start, CLI.indexOf(".command('register", start));
   assert.match(body, /--agents <number>.*'9'/);
-  assert.match(body, /parseInt\(options\.agents, 10\)/);
+  assert.match(body, /\/\^\\d\+\$\//);
   assert.match(body, /Number\.isInteger\(count\) \|\| count < 1 \|\| count > 100/);
   assert.match(body, /process\.exit\(1\)/);
 });
 
-test('init -n non-numeric / 0 / 101 exit 1 and write no agents', () => {
-  for (const n of ['abc', '0', '101', 'NaN', '-1']) {
+test('init -n non-numeric / 0 / 101 / 1.5 / 1abc exit 1 and write no agents', () => {
+  for (const n of ['abc', '0', '101', 'NaN', '-1', '1.5', '1abc', '1e2']) {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-init-'));
     try {
       const r = runInit(home, ['-n', n]);

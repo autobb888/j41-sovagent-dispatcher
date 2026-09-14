@@ -374,7 +374,7 @@ async function probeClock(deps, apiUrl) {
       if (typeof fetchFn !== 'function') {
         return { status: 'warn', detail: 'no fetch — skipped clock check', skewMs: null };
       }
-      const res = await fetchFn(apiUrl, { method: 'HEAD' });
+      const res = await fetchFn(apiUrl, { method: 'HEAD', signal: AbortSignal.timeout(8000) });
       header = res.headers && res.headers.get && res.headers.get('date');
     } catch (e) {
       return { status: 'warn', detail: `API unreachable (${redact(e.message)})`, skewMs: null };

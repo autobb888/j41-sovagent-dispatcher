@@ -753,8 +753,12 @@ function mergeTemplateIntoOptions(tpl, options) {
     }
 
     const sess = tpl.profile.session;
-    if (sess && options.sessionDuration == null && sess.duration != null) {
-      options.sessionDuration = sess.duration;
+    if (sess) {
+      // Templates store duration in seconds. Do not * 60 here — interactive
+      // and --session-duration <min> are the minutes paths.
+      if (options.sessionDuration == null && sess.duration != null) options.sessionDuration = sess.duration;
+      if (options.sessionTokenLimit == null && sess.tokenLimit != null) options.sessionTokenLimit = sess.tokenLimit;
+      if (options.sessionMessageLimit == null && sess.messageLimit != null) options.sessionMessageLimit = sess.messageLimit;
     }
   }
   if (tpl.service) {
@@ -767,6 +771,12 @@ function mergeTemplateIntoOptions(tpl, options) {
     if (!options.servicePaymentTerms) options.servicePaymentTerms = tpl.service.paymentTerms;
   }
   return options;
+}
+
+/** CLI --session-duration is minutes (help text); profile.session.duration is seconds. */
+function parseSessionMinutes(v) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n * 60 : n;
 }
 
 // ── Interactive profile setup ──────────────────────────────────────
@@ -1657,7 +1667,8 @@ program
   .option('-n, --agents <number>', 'Number of agents to create', '9')
   .option('--soul <file>', 'SOUL.md template to use for all agents')
   .action(async (options) => {
-    const count = parseInt(options.agents, 10);
+    const raw = String(options.agents ?? '').trim();
+    const count = /^\d+$/.test(raw) ? Number(raw) : NaN;
     if (!Number.isInteger(count) || count < 1 || count > 100) {
       console.error('❌ --agents must be an integer from 1 to 100');
       process.exit(1);
@@ -1751,7 +1762,7 @@ program
   .option('--profile-avatar <url>', 'Agent avatar URL')
   .option('--models <models>', 'Comma-separated LLM model names (e.g. "kimi-k2.5,claude-sonnet-4.6")')
   .option('--profile-category <cat>', 'Agent category')
-  .option('--session-duration <min>', 'Max session duration in minutes', parseInt)
+  .option('--session-duration <min>', 'Max session duration in minutes', parseSessionMinutes)
   .option('--session-token-limit <n>', 'Max tokens per session', parseInt)
   .option('--session-image-limit <n>', 'Max images per session', parseInt)
   .option('--session-message-limit <n>', 'Max messages per session', parseInt)
@@ -1962,7 +1973,7 @@ program
   .option('--service-payment-terms <terms>', 'Payment terms (prepay|postpay)', 'prepay')
   .option('--service-private-mode', 'Enable private mode for this service')
   .option('--service-sovguard', 'Require SovGuard protection (default: true)')
-  .option('--session-duration <min>', 'Max session duration in minutes', parseInt)
+  .option('--session-duration <min>', 'Max session duration in minutes', parseSessionMinutes)
   .option('--session-token-limit <n>', 'Max tokens per session', parseInt)
   .option('--session-image-limit <n>', 'Max images per session', parseInt)
   .option('--session-message-limit <n>', 'Max messages per session', parseInt)
@@ -4656,7 +4667,7 @@ program
   .option('--service-payment-terms <terms>', 'Payment terms (prepay|postpay)', 'prepay')
   .option('--service-private-mode', 'Enable private mode for this service')
   .option('--service-sovguard', 'Require SovGuard protection (default: true)')
-  .option('--session-duration <min>', 'Max session duration in minutes', parseInt)
+  .option('--session-duration <min>', 'Max session duration in minutes', parseSessionMinutes)
   .option('--session-token-limit <n>', 'Max tokens per session', parseInt)
   .option('--session-message-limit <n>', 'Max messages per session', parseInt)
   .option('--data-policy <policy>', 'Data handling policy (ephemeral|retained|encrypted)')

@@ -290,6 +290,26 @@ test('probeClock unreachable API is warn, not fail', async () => {
   assert.equal(warnFlag.status, 'warn');
 });
 
+test('probeClock live HEAD uses AbortSignal.timeout(8000); abort is warn', async () => {
+  let seen;
+  const abortErr = new Error('The operation was aborted');
+  abortErr.name = 'TimeoutError';
+  const warn = await probeClock({
+    now: () => Date.now(),
+    fetch: async (_url, opts) => {
+      seen = opts;
+      throw abortErr;
+    },
+  }, 'https://api.example');
+  assert.ok(seen && seen.signal, 'HEAD must pass an AbortSignal');
+  assert.equal(typeof seen.signal.aborted, 'boolean');
+  assert.equal(warn.status, 'warn');
+  assert.equal(warn.skewMs, null);
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'doctor.js'), 'utf8');
+  const fn = src.slice(src.indexOf('async function probeClock('), src.indexOf('function loadFeeTankRows('));
+  assert.match(fn, /AbortSignal\.timeout\(8000\)/);
+});
+
 test('ntpBlock is OS-specific copy-paste', () => {
   assert.match(ntpBlock({ platform: 'linux' }), /timedatectl set-ntp true/);
   assert.match(ntpBlock({ platform: 'linux', wsl: true }), /hwclock/);
