@@ -181,7 +181,11 @@ max_usd_per_hour = 0.0        # fleet spend ceiling for paid provisioning (S6/Va
 # 1. Set enabled = true
 # 2. Uncomment the card0 stanza and set agent_id / gpu / ssh_hostname
 # 3. default_provider = "home-gpu"
-# 4. Named TCP tunnel to 127.0.0.1:$ssh_tunnel_port — NOT runtime.webhook_url
+# 4. Jail SSH binds 127.0.0.1:$ssh_tunnel_port only — never 0.0.0.0.
+#    Public reachability is J41 compute edge (compute.outbound-ssh-v1).
+#    Buyer SSH: ssh -i <jobkey> -p <port> renter@sovcompute.junction41.io
+#    ssh_hostname is leftover / LAN-override, not the buyer host.
+#    Named TCP tunnels are not the product. tunnel-setup is for HTTP model publicUrl.
 # 5. j41-dispatcher rental-setup <agent-id>
 # Dispatcher MUST run on the GPU machine with docker.sock. Jail SSH binds 127.0.0.1 only.
 # Never 0.0.0.0. Do not set RENTAL_SECRETS_KEY on this host.

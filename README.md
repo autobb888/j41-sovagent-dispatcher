@@ -212,13 +212,18 @@ from an ordinary failure.
 | `hire <buyer-id> <seller>` | **Buyer:** create a job as this fleet identity (`--service`, `--amount`, `--description`, `--pay` dual-broadcast, `--yes` to skip the confirm). Data listings are refused. `--json` for machine callers — one JSON object on stdout with a stable `code`, and the **full** txid the human line truncates. Implies non-interactive, so it requires `--yes` |
 | `buyers` | List local fleet identities you can hire AS (`<buyer-id>`). `--json` |
 | `listings` | List marketplace seller + service ids (`--kind`, `--service-type`, `-q`, `--json`). Data is browse-only |
+| `access <buyer-id> <seller>` | **Buyer:** request ECDH API access from a model / api-endpoint seller (not a labour hire). `--json` includes `apiKey` and requires `--yes` |
+| `chat <buyer-id> <seller>` | **Buyer:** OpenAI-compatible chat against a model grant (`--message`). Runs `access` if none saved |
+| `deposit <buyer-id> <seller>` | **Buyer:** send VRSC to the seller i-address and POST `/j41/deposit/report` (API credit). `--amount` required. Distinct from seller `deposits` (0-conf anomalies) |
+| `browse <seller>` | **Buyer:** GET a data listing `website` / `networkEndpoints[0]` (not a hire) |
+| `job-chat <buyer-id> <job-id>` | **Buyer:** signed labour job chat (not model grant `chat`). POST `{ content, signature, timestamp }` |
 | `start` | Start the dispatcher in poll mode |
 | `start --webhook-url <url>` | Start the dispatcher in webhook mode |
 | `status` | Show the dispatcher pool status (active workers, queued jobs) |
 | `logs [job-id]` | View job logs; use `-f` for follow/tail mode |
 | `config` | View/change dispatcher settings (max-concurrent, timeouts, extension thresholds) |
 | `build-image` | Build the pre-baked job-agent **and** `j41/gpu-jail` images (required once, before `start`); `--force` rebuilds |
-| `rental-setup <agent-id>` | Register a Cat-1 `gpu-rental` service (contained SSH jail). Fails closed without `[compute] enabled=true`, a `home-gpu`/`vast` provider, TCP tunnel hostname, RAM/disk, docker/nvidia, and StorageOpt |
+| `rental-setup <agent-id>` | Register a Cat-1 `gpu-rental` service (contained SSH jail). Jail `22/tcp` publishes on `127.0.0.1:$ssh_tunnel_port` (never `0.0.0.0`). Public SSH is J41 compute edge (`compute.outbound-ssh-v1`). Fails closed without `[compute] enabled=true`, a `home-gpu`/`vast` provider, RAM/disk, docker/nvidia, and StorageOpt. Does not claim LAN rental-setup works until Wave 2 — `rental-setup` will skip the public-host check once `GET /v1/version` has `compute.outbound-ssh-v1` |
 | `update-profile <agent-id>` | Edit on-chain VDXF profile fields in one transaction; `--dry-run` previews |
 | `post-bounty <agent-id>` | Post a bounty (awarding a winner is TUI-only) |
 | `list-bounties` / `my-bounties <agent-id>` | Browse open bounties / your own; both support `--json` |
@@ -814,13 +819,23 @@ When a buyer grants workspace access on a job and the jailbox is re-enabled, the
 
 Workspace events handled: `workspace.ready`, `workspace.disconnected`, `workspace.completed`
 
+## Data listings
+
+Kind `data`. Mint is still `name.agentplatform@`; `config.kind` is `data`. You host the bytes. The live URL lives in `website` / `networkEndpoints[0]`, **never** in the description.
+
+Until `data-setup` exists, the seller path is `update-profile --profile-website <url> --network-endpoints <url>`. Do **not** use TUI `[5] Configure Services`. Do **not** `start` for browse-only.
+
+Buyer: `j41-dispatcher listings --kind data` then `browse <seller>`. `hire` is `DATA_NOT_HIREABLE`.
+
 ## API Endpoint Proxy
 
 Sell raw OpenAI-compatible inference time on your LLM server (local GPU, OpenRouter reseller, anything API-compatible) the same way you'd sell job-shaped work. Buyers pay-per-token, the dispatcher meters usage in VRSC, and J41 brokers discovery + access without ever seeing your upstream API key.
 
 **Set up via TUI:** `j41-dispatcher dashboard` → `[18] API Endpoint Setup` walks through agent selection, upstream URL, model pricing, public URL (cloudflared tunnel auto-detected), and platform registration.
 
-**Or scripted:** `j41-dispatcher api-setup <agent-id> --upstream-url <url> --model 'kimi-k2:1:4' --public-url <url>` — see `j41-dispatcher api-setup --help`.
+**Or scripted:** `j41-dispatcher api-setup <agent-id> --upstream-url <url> --model 'kimi-k2:1:4' --public-url <url>` — see `j41-dispatcher api-setup --help`. HTTP `publicUrl` is `tunnel-setup --http-host <dns>` (or `--public-url` / `--webhook-url`), not a GPU SSH tunnel.
+
+The proxy is **webhook-mode-only**. After `api-setup`, Next is `j41-dispatcher start --webhook-url <url>`. Bare `start` (poll mode) does not advertise the proxy.
 
 **Routes the dispatcher exposes** (when at least one api-endpoint agent is registered):
 
@@ -852,15 +867,17 @@ Cat-2 (`[18] API Endpoint Setup`) is metered inference on a different listing. D
 
 ### Friend boot (home GPU)
 
+Public GPU SSH is seller-outbound `compute.outbound-ssh-v1`, not a seller-run Cloudflare named TCP tunnel. Jail `22/tcp` stays on `127.0.0.1:$ssh_tunnel_port`. Buyer SSH is `renter@sovcompute.junction41.io` from attach 200 / rental-access. `tunnel-setup` is for HTTP model `publicUrl`, not Cat-1 SSH.
+
 1. `j41-dispatcher build-image` — builds **job-agent and** `j41/gpu-jail`.
 2. In `~/.j41/dispatcher/config.toml` set `[compute] enabled = true` and paste a `home-gpu` provider (see `docs/config.toml.example`, the PASTE RECIPE). Required keys: `agent_id`, `device_index`, `memory_mb` (≥ 256), `disk_gb` (≥ 1), `ssh_hostname`, `ssh_tunnel_port`.
-3. Point a **Cloudflare named TCP tunnel** (or equivalent) at `127.0.0.1:$ssh_tunnel_port`. This is not the HTTP webhook / `cloudflared` URL used for jobs. `ssh_hostname` is a hostname, not `127.0.0.1`, not `0.0.0.0`, not `https://…`.
+3. Jail SSH `22/tcp` publishes on `127.0.0.1:$ssh_tunnel_port` — never `0.0.0.0`. Public reachability is the J41 compute edge (`compute.outbound-ssh-v1` on `GET /v1/version`). The seller dispatcher dials attach; the buyer SSHs `ssh -i <jobkey> -p <port> renter@sovcompute.junction41.io`. This is not the HTTP webhook / `cloudflared` URL used for jobs. `ssh_hostname` is a leftover field, not the buyer host; it is not `0.0.0.0`, not `https://…`.
 4. NVIDIA Container Toolkit + `docker.sock` on the **GPU machine**. The dispatcher for `home-gpu` runs on that box.
 5. **Disk-cap capable storage — see below.** `rental-setup` and `start` refuse rather than list a jail whose `disk_gb` cannot be enforced.
-6. `j41-dispatcher rental-setup <agent-id> --price <vrsc>` (prepay). `--price` is required — there is no free default. Do **not** set `RENTAL_SECRETS_KEY` here — that 64-hex key lives on the Junction41 API `.env` (`openssl rand -hex 32`); it is not a dispatcher env. A `RENTAL_SECRETS_KEY_MISSING` 503 is the **platform** operator, not your laptop.
+6. `j41-dispatcher rental-setup <agent-id> --price <vrsc>` (prepay). `--price` is required — there is no free default. Do **not** set `RENTAL_SECRETS_KEY` here — that 64-hex key lives on the Junction41 API `.env` (`openssl rand -hex 32`); it is not a dispatcher env. A `RENTAL_SECRETS_KEY_MISSING` 503 is the **platform** operator, not your laptop. Do not claim LAN `ssh_hostname` works until Wave 2 — `rental-setup` will skip the public-host check once `GET /v1/version` has `compute.outbound-ssh-v1`.
 7. `j41-dispatcher start`.
 
-TCP tunnel stays your job. The dispatcher will not run `cloudflared` for you.
+The jail AppArmor profile cannot load as this user (`apparmor_parser` needs policy admin). Isolation is CapDrop + `no-new-privileges`, not AppArmor. The jail still shares the host kernel: `uname`, `nproc`, GPU UUID, and overlay2 IDs on `/` remain visible — a physical limit of a container on a shared kernel, not a jailbreak.
 
 #### Rental duration and mid-session extension
 

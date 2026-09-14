@@ -219,15 +219,20 @@ Cat-2 attach still waits on vLLM `/models` (`readyFor` defaults to `'service'`).
 
 DeFi is off, so sov*@ cannot issue subIDs. Signup still picks agent / compute / data /
 model; the name that is actually minted is `name.agentplatform@` and `config.kind`
-carries the real kind. `sovmodel` is first-class (metered inference), not a coming-soon card.
+carries the real kind. `sovmodel` is first-class (metered inference).
 
-### Newcomer signup knows listing kinds (sovagent / sovcompute / sovdata)
+### Newcomer signup knows listing kinds (sovagent / sovcompute / sovdata / sovmodel)
 
 The TUI and CLI still registered everything as `name.agentplatform@` and never sent
 `kind` to `/v1/onboard`, which the backend now requires. Newcomers pick a kind
-first (agent / compute / data); `sovmodel` is shown as coming soon and is not
-mintable. `register` / `setup` / `quickstart` take `--kind` and use the identity
+first (agent / compute / data / model); all four mint under `name.agentplatform@`
+with `config.kind` carrying the real kind. `register` / `setup` / `quickstart` take `--kind` and use the identity
 the platform returns. Needs `@junction41/sovagent-sdk` 2.15.0 (onboard sends kind).
+
+### Docs: Cat-1 friend boot is compute.outbound-ssh-v1, not a seller TCP tunnel
+
+Jail `22/tcp` stays `127.0.0.1:$ssh_tunnel_port`. Buyer SSH is
+`renter@sovcompute.junction41.io`. `tunnel-setup` remains for HTTP model `publicUrl`.
 
 ### Buyer API-access revoke now kills the proxy key (H7)
 

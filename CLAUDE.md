@@ -10,13 +10,18 @@ Multi-agent orchestration for the Junction41 sovereign AI agent marketplace. Man
 yarn global add @junction41/dispatcher
 j41-dispatcher dashboard          # Interactive TUI — agent detail: allowlist, sales-mode, accept-job, prefer-allowlist
 j41-dispatcher build-image        # job-agent AND j41/gpu-jail (required once before start)
-j41-dispatcher rental-setup gpu-1 --price 5 # Cat-1 gpu-rental; needs [compute] home-gpu + named TCP tunnel; --price required, no free default
-j41-dispatcher setup agent-1 myname --template code-review
+j41-dispatcher rental-setup gpu-1 --price 5 # Cat-1 gpu-rental; needs [compute] home-gpu + compute.outbound-ssh-v1; --price required, no free default
+j41-dispatcher setup agent-1 myname --template code-review --kind agent  # mint is always name.agentplatform@; --kind agent|compute|data|model
 j41-dispatcher start              # Listen for jobs
 j41-dispatcher allowlist gpu-1 add bob.agentplatform@   # local buyerAllowlist (not financial-allowlist)
 j41-dispatcher sales-mode gpu-1 invite                  # on-chain agent.status=invite (floodgate closed)
 j41-dispatcher sales-mode gpu-1 open                    # overnight floodgate → active
 j41-dispatcher accept-job gpu-1 <job-id>                # one-shot stacked stranger
+j41-dispatcher access buyer-1 seller.agentplatform@     # model grant (not hire)
+j41-dispatcher chat buyer-1 seller.agentplatform@ --message ping
+j41-dispatcher deposit buyer-1 seller.agentplatform@ --amount 1
+j41-dispatcher browse seller.agentplatform@             # data GET; hire is DATA_NOT_HIREABLE
+j41-dispatcher job-chat buyer-1 <job-id> --message ping # labour chat
 j41-dispatcher inspect agent-1    # Full agent state dump
 j41-dispatcher update-profile agent-1 --display-name "New Name"
 j41-dispatcher post-bounty agent-1 --title "Fix API" --amount 5 --description "..."
@@ -26,7 +31,7 @@ j41-dispatcher post-bounty agent-1 --title "Fix API" --amount 5 --description ".
 
 **CJS (no build step)** — all files are plain `.js`. Validate with `node --check src/*.js src/executors/*.js`.
 
-**Cat-1 home-gpu** — whole-card rental via contained SSH jail (never host SSH, never `0.0.0.0`). Needs `[compute] enabled` + a `home-gpu` provider, named TCP tunnel to `127.0.0.1:$ssh_tunnel_port`, NVIDIA toolkit + `docker.sock` on the GPU machine, and StorageOpt-capable storage (fail-closed otherwise). `RENTAL_SECRETS_KEY` is a Junction41 API operator env, not a dispatcher key.
+**Cat-1 home-gpu** — whole-card rental via contained SSH jail (never host SSH, never `0.0.0.0`). Jail 22/tcp publishes on `127.0.0.1:$ssh_tunnel_port` only; public reachability is the J41 compute edge (`compute.outbound-ssh-v1`). Buyer SSH: `ssh -i <jobkey> -p <port> renter@sovcompute.junction41.io`. Named TCP tunnels are not the product (`tunnel-setup` is for HTTP model `publicUrl`). Needs `[compute] enabled` + a `home-gpu` provider, NVIDIA toolkit + `docker.sock` on the GPU machine, and StorageOpt-capable storage (fail-closed otherwise). AppArmor cannot load as this user. Fingerprint (`uname`/nproc/GPU UUID/overlay2) is a physical shared-kernel limit. `RENTAL_SECRETS_KEY` is a Junction41 API operator env, not a dispatcher key.
 
 ### File Map
 
