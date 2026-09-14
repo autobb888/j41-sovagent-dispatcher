@@ -27,10 +27,10 @@ test('README Cat-1 section: compute.outbound-ssh-v1, loopback jail, never 0.0.0.
   assert.match(README, /rental-setup <agent-id>|rental-setup <id>/);
   assert.match(README, /RENTAL_SECRETS_KEY/);
   assert.match(README, /not a dispatcher/i);
-  assert.match(README, /LAN `ssh_hostname` still fails `rental-setup`/);
+  assert.match(README, /LAN `ssh_hostname` is allowed at `rental-setup`/);
+  assert.doesNotMatch(README, /LAN `ssh_hostname` still fails `rental-setup`/);
   assert.doesNotMatch(README, /Point a (Cloudflare )?named TCP tunnel/i);
   assert.doesNotMatch(README, /Wave 2/);
-  assert.doesNotMatch(README, /rental-setup will skip the public-host check/i);
 });
 
 test('CLAUDE.md quick reference names gpu-jail and rental-setup', () => {

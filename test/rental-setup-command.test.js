@@ -60,7 +60,14 @@ test('rental-setup with injected outboundSshV1 skips public-host; without token 
   try {
     assert.throws(
       () => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay' }),
-      /RENTAL_LAN_HOST/,
+      (e) => {
+        assert.match(e.message, /RENTAL_LAN_HOST/);
+        assert.match(e.message, /compute\.outbound-ssh-v1/);
+        assert.match(e.message, /GET \/v1\/version/);
+        assert.doesNotMatch(e.message, /named TCP/i);
+        assert.doesNotMatch(e.message, /J41_ALLOW_LAN_RENTAL/);
+        return true;
+      },
     );
     assert.throws(
       () => assertRentalSetupAllowed({ agentId: 'gpu-1', cfg, services: [], paymentTerms: 'prepay', outboundSshV1: false }),
