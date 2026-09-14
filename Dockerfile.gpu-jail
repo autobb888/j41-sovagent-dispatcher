@@ -4,20 +4,37 @@
 
 FROM debian:bookworm-slim
 
+COPY docker/gpu-jail-init.sh /usr/local/sbin/gpu-jail-init
+
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       openssh-server \
+      libcap2-bin \
  && rm -rf /var/lib/apt/lists/* \
+ && chmod 755 /usr/local/sbin/gpu-jail-init \
  && useradd --create-home --shell /bin/bash renter \
+ && usermod -p '*' renter \
  && mkdir -p /run/sshd \
+ && mkdir -p /home/renter/.ssh \
+ && chown renter:renter /home/renter/.ssh \
+ && chmod 700 /home/renter/.ssh \
+ && mkdir -p /workspace \
+ && chown renter:renter /workspace \
+ && chmod 700 /workspace \
  && printf '%s\n' \
-      'PasswordAuthentication yes' \
+      'PasswordAuthentication no' \
+      'PubkeyAuthentication yes' \
       'PermitRootLogin no' \
       'PermitEmptyPasswords no' \
       'UsePAM no' \
+      'StrictModes no' \
+      'LoginGraceTime 0' \
+      'TCPKeepAlive yes' \
+      'AuthorizedKeysFile .ssh/authorized_keys' \
       > /etc/ssh/sshd_config.d/j41-jail.conf
 
 EXPOSE 22
 
-# Password is written at container start from J41_RENTER_PASSWORD.
-CMD ["sh", "-c", "ssh-keygen -A && echo \"renter:${J41_RENTER_PASSWORD}\" | chpasswd && exec /usr/sbin/sshd -D -e"]
+# authorized_keys is injected onto the overlay via putArchive (no host bind).
+# Init umounts Docker's hosts/hostname/resolv binds, then drops SYS_ADMIN.
+CMD ["/usr/local/sbin/gpu-jail-init"]

@@ -1,0 +1,38 @@
+#include <tunables/global>
+
+profile j41-gpu-jail flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  network,
+  capability,
+  file,
+  umount,
+
+  deny @{PROC}/* w,
+  deny @{PROC}/[0-9]*/** wklx,
+  deny @{PROC}/sys/[^k]** wklx,
+  deny @{PROC}/kcore rwklx,
+  deny mount,
+  deny /sys/firmware/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+  deny /sys/block/** r,
+  deny /sys/class/block/** r,
+  deny /sys/class/nvme/** r,
+  deny /sys/dev/block/** r,
+
+  deny @{PROC}/modules r,
+  deny @{PROC}/config.gz r,
+  deny @{PROC}/kallsyms r,
+  deny @{PROC}/uptime r,
+  deny @{PROC}/loadavg r,
+  deny @{PROC}/stat r,
+  deny @{PROC}/interrupts r,
+  deny @{PROC}/[0-9]*/mounts r,
+  deny @{PROC}/[0-9]*/mountinfo r,
+  deny @{PROC}/[0-9]*/mountstats r,
+  deny @{PROC}/sys/kernel/random/boot_id r,
+  deny @{PROC}/sys/kernel/osrelease r,
+  deny @{PROC}/net/arp r,
+  deny @{PROC}/net/route r,
+  deny @{PROC}/net/fib_trie r,
+}

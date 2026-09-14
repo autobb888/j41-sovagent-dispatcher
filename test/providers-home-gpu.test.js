@@ -8,8 +8,23 @@ os.homedir = () => TEST_HOME;
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { HomeGpuProvider, assertTunnelHostname, assertTunnelPort, assertJailResources, jailImageRef } = require('../src/providers/home-gpu');
+const { HomeGpuProvider, assertTunnelHostname, assertTunnelPort, assertJailResources, jailImageRef, generateRenterKeypair, reclaimStaleHomeGpuLocks, collectNvidiaUserspace, nvidiaDeviceSpecs, JAIL_MASKED_PATHS, JAIL_NETWORK } = require('../src/providers/home-gpu');
 const { listProviderTypes } = require('../src/providers');
+
+test('generateRenterKeypair public line is ssh-keygen -y of the sealed private file', () => {
+  const { execFileSync } = require('child_process');
+  const pair = generateRenterKeypair(execFileSync);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-y-'));
+  const f = path.join(dir, 'id');
+  try {
+    fs.writeFileSync(f, pair.privateKey, { mode: 0o600 });
+    const derived = execFileSync('ssh-keygen', ['-y', '-f', f], { encoding: 'utf8' }).trim();
+    assert.equal(pair.publicKey, derived);
+    assert.match(pair.privateKey, /BEGIN OPENSSH PRIVATE KEY/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('jailImageRef prefers cfg.jail_image over env default', () => {
   assert.equal(jailImageRef({ jail_image: 'j41/gpu-jail:custom' }), 'j41/gpu-jail:custom');
@@ -83,9 +98,9 @@ test('assertJailResources requires memory_mb >= 256 and disk_gb >= 1', () => {
 });
 
 function stubDocker({ publishedPort, startError, createError } = {}) {
-  const created = []; const removed = [];
+  const created = []; const removed = []; const archives = [];
   return {
-    created, removed,
+    created, removed, archives,
     async createContainer(spec) {
       if (createError) throw createError;
       created.push(spec);
@@ -96,6 +111,7 @@ function stubDocker({ publishedPort, startError, createError } = {}) {
       const hip = (bind && bind.HostIp) || '127.0.0.1';
       return {
         id,
+        async putArchive(stream, opts) { archives.push({ id, opts, stream }); },
         async start() { if (startError) throw startError; },
         async inspect() {
           return { NetworkSettings: { Ports: { '22/tcp': [{ HostIp: hip, HostPort: hp }] } } };
@@ -117,6 +133,8 @@ function homeCfg(extra = {}) {
     disk_gb: 40,
     docker: stubDocker(),
     __probeSsh: async () => true,
+    __nvidiaFiles: [],
+    __nvidiaDevices: [{ PathOnHost: '/dev/nvidia0', PathInContainer: '/dev/nvidia0', CgroupPermissions: 'rwm' }],
     ...extra,
   };
 }
@@ -147,13 +165,20 @@ test('registry lists home-gpu alongside local and vast only', () => {
   assert.ok(types.includes('vast'));
 });
 
-test('waitReady publishes 22/tcp on 127.0.0.1:ssh_tunnel_port, never 0.0.0.0, never host net, and ssh has password', async () => {
+test('waitReady publishes 22/tcp on 127.0.0.1:ssh_tunnel_port, never 0.0.0.0, never host net, and ssh has a key', async () => {
   const probed = [];
   const docker = stubDocker();
+  const pair = {
+    privateKey: '-----BEGIN OPENSSH PRIVATE KEY-----\nTEST\n-----END OPENSSH PRIVATE KEY-----\n',
+    publicKey: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest j41-renter',
+  };
   const p = new HomeGpuProvider({
     id: 'card0', device_index: 0, memory_mb: 8192, disk_gb: 40, gpu: 'RTX 5090', vram_gb: 32,
     ssh_hostname: 'gpu.example.com', ssh_tunnel_port: 2222, jail_image: 'j41/gpu-jail:test',
     docker, __probeSsh: async (port) => { probed.push(port); return true; },
+    __generateKeypair: () => pair,
+    __nvidiaFiles: [],
+    __nvidiaDevices: [{ PathOnHost: '/dev/nvidia0', PathInContainer: '/dev/nvidia0', CgroupPermissions: 'rwm' }],
   });
   const cand = (await p.discover())[0];
   let lease = await p.acquire(cand);
@@ -162,8 +187,8 @@ test('waitReady publishes 22/tcp on 127.0.0.1:ssh_tunnel_port, never 0.0.0.0, ne
   assert.equal(lease.ssh.host, 'gpu.example.com');
   assert.equal(lease.ssh.port, 2222);
   assert.equal(lease.ssh.user, 'renter');
-  assert.ok(lease.ssh.password);
-  assert.equal(lease.ssh.password, lease.meta.password);
+  assert.equal(lease.ssh.privateKey, pair.privateKey);
+  assert.equal(lease.ssh.password, undefined);
   const spec = docker.created[0];
   assert.equal(spec.HostConfig.NetworkMode, 'bridge');
   assert.notEqual(spec.HostConfig.NetworkMode, 'host');
@@ -171,18 +196,43 @@ test('waitReady publishes 22/tcp on 127.0.0.1:ssh_tunnel_port, never 0.0.0.0, ne
   assert.notEqual(spec.HostConfig.PortBindings['22/tcp'][0].HostIp, '0.0.0.0');
   assert.equal(spec.HostConfig.Memory, 8192 * 1024 * 1024);
   assert.ok(spec.HostConfig.Memory > 0);
-  assert.ok(spec.HostConfig.Binds.some((b) => b.endsWith(':/workspace')));
+  assert.equal(spec.Hostname, 'gpu-jail');
   const jailDir = path.join(TEST_HOME, '.j41', 'dispatcher', 'jails', lease.id);
-  assert.ok(spec.HostConfig.Binds.includes(`${jailDir}:/workspace`));
+  const sshDir = path.join(jailDir, 'ssh');
+  assert.equal(spec.HostConfig.Binds.some((b) => b.includes(':/workspace')), false);
+  assert.deepEqual(spec.HostConfig.Binds, []);
+  assert.equal(docker.archives.length, 2);
+  assert.equal(docker.archives[0].opts.path, '/home/renter/.ssh');
+  assert.equal(docker.archives[1].opts.path, '/etc');
+  assert.ok(spec.HostConfig.MaskedPaths.includes('/proc/cpuinfo'));
+  assert.ok(spec.HostConfig.MaskedPaths.includes('/proc/meminfo'));
+  assert.ok(spec.HostConfig.MaskedPaths.includes('/proc/mounts'));
+  assert.ok(spec.HostConfig.MaskedPaths.includes('/proc/self/mountinfo'));
+  assert.ok(spec.HostConfig.MaskedPaths.includes('/proc/modules'));
+  assert.ok(spec.HostConfig.MaskedPaths.includes('/sys/class/dmi'));
+  assert.ok(spec.HostConfig.MaskedPaths.includes('/proc/uptime'));
+  assert.ok(spec.HostConfig.MaskedPaths.includes('/proc/sys/kernel/random/boot_id'));
+  assert.ok(spec.HostConfig.MaskedPaths.includes('/proc/net/arp'));
+  assert.deepEqual(spec.HostConfig.Dns, ['1.1.1.1', '8.8.8.8']);
+  assert.deepEqual(spec.HostConfig.DnsSearch, []);
   assert.equal(fs.statSync(jailDir).mode & 0o777, 0o700);
+  assert.equal(fs.readFileSync(path.join(sshDir, 'authorized_keys'), 'utf8').trim(), pair.publicKey);
   assert.equal(spec.HostConfig.StorageOpt.size, '40G');
-  assert.deepEqual(spec.HostConfig.DeviceRequests[0].DeviceIDs, ['0']);
+  assert.equal(spec.HostConfig.DeviceRequests, undefined);
+  assert.deepEqual(spec.HostConfig.Devices, [
+    { PathOnHost: '/dev/nvidia0', PathInContainer: '/dev/nvidia0', CgroupPermissions: 'rwm' },
+  ]);
+  assert.equal(spec.HostConfig.Sysctls['net.ipv6.conf.all.disable_ipv6'], '1');
   assert.ok(spec.HostConfig.CapDrop.includes('ALL'));
   assert.ok(spec.HostConfig.CapAdd.includes('SETUID'));
   assert.ok(spec.HostConfig.CapAdd.includes('SETGID'));
   assert.ok(spec.HostConfig.CapAdd.includes('NET_BIND_SERVICE'));
+  assert.ok(spec.HostConfig.CapAdd.includes('SYS_ADMIN'));
+  assert.ok(spec.HostConfig.CapAdd.includes('SETPCAP'));
+  assert.ok(spec.HostConfig.MaskedPaths.includes('/sys/block'));
+  assert.ok(spec.HostConfig.MaskedPaths.includes('/sys/class/nvme'));
   assert.deepEqual(probed, [2222]);
-  assert.ok(spec.Env.includes(`J41_RENTER_PASSWORD=${lease.ssh.password}`));
+  assert.equal((spec.Env || []).some((e) => String(e).startsWith('J41_RENTER_PASSWORD=')), false);
   await p.release(lease);
 });
 
@@ -236,18 +286,87 @@ test('waitReady requires memory_mb and disk_gb and never Memory 0', async () => 
   assert.equal(docker.created.length, 0);
 });
 
-test('waitReady HostConfig has Memory, workspace bind, StorageOpt size', async () => {
+test('waitReady HostConfig has Memory, key-only bind, StorageOpt size', async () => {
   const docker = stubDocker();
-  const p = new HomeGpuProvider({
-    ssh_hostname: 'gpu.example.com', ssh_tunnel_port: 2222,
-    memory_mb: 8192, disk_gb: 40, device_index: 0,
-    docker, __probeSsh: async () => true,
-  });
+  const p = new HomeGpuProvider(homeCfg({ docker }));
   await p.waitReady(await p.acquire((await p.discover())[0]), { timeoutMs: 1000 });
   const spec = docker.created[0];
   assert.equal(spec.HostConfig.Memory, 8192 * 1024 * 1024);
-  assert.ok(spec.HostConfig.Binds.some((b) => b.endsWith(':/workspace')));
+  assert.deepEqual(spec.HostConfig.Binds, []);
   assert.equal(spec.HostConfig.StorageOpt.size, '40G');
+});
+
+test('waitReady fails closed without nvidia devices and unlocks', async () => {
+  const p = new HomeGpuProvider(homeCfg({ docker: stubDocker(), __nvidiaDevices: [] }));
+  const lease = await p.acquire((await p.discover())[0]);
+  await assert.rejects(() => p.waitReady(lease, { timeoutMs: 100 }), /HOME_GPU_NO_NVIDIA/);
+  assert.equal((await p.discover()).length, 1);
+  assert.equal(fs.existsSync(lockPath(0)), false);
+});
+
+test('waitReady copies nvidia userspace onto the overlay and does not ask the nvidia toolkit', async () => {
+  const docker = stubDocker();
+  const fake = path.join(TEST_HOME, 'nvidia-smi');
+  fs.writeFileSync(fake, 'smi');
+  const p = new HomeGpuProvider(homeCfg({ docker, __nvidiaFiles: [fake] }));
+  await p.waitReady(await p.acquire((await p.discover())[0]), { timeoutMs: 1000 });
+  const spec = docker.created[0];
+  assert.equal(spec.HostConfig.DeviceRequests, undefined);
+  assert.ok(spec.HostConfig.Devices.length >= 1);
+  assert.equal(docker.archives.length, 3);
+  assert.equal(docker.archives[0].opts.path, '/home/renter/.ssh');
+  assert.equal(docker.archives[1].opts.path, '/');
+  assert.equal(docker.archives[2].opts.path, '/etc');
+});
+
+test('waitReady uses j41-gpu-jail when docker can create the network', async () => {
+  const docker = stubDocker();
+  docker.networks = new Set();
+  docker.getNetwork = (name) => ({
+    async inspect() {
+      if (!docker.networks.has(name)) throw new Error('no such network');
+      return { Name: name };
+    },
+  });
+  docker.createNetwork = async (spec) => {
+    docker.createdNetworks = docker.createdNetworks || [];
+    docker.createdNetworks.push(spec);
+    docker.networks.add(spec.Name);
+    return { id: spec.Name };
+  };
+  const p = new HomeGpuProvider(homeCfg({ docker }));
+  await p.waitReady(await p.acquire((await p.discover())[0]), { timeoutMs: 1000 });
+  assert.equal(docker.created[0].HostConfig.NetworkMode, JAIL_NETWORK);
+  assert.equal(docker.createdNetworks[0].IPAM.Config[0].Subnet, '10.255.255.0/24');
+});
+
+test('collectNvidiaUserspace only takes the smi binary and compute libs', () => {
+  const files = collectNvidiaUserspace();
+  for (const f of files) {
+    assert.equal(f.includes('..'), false);
+    assert.match(f, /^\/usr\/(bin\/nvidia-smi|lib\/x86_64-linux-gnu\/)/);
+    assert.doesNotMatch(f, /i386|persistenced|debugdump|firmware|libnvidia-container/);
+  }
+  if (fs.existsSync('/usr/bin/nvidia-smi')) {
+    assert.ok(files.includes('/usr/bin/nvidia-smi'));
+  }
+});
+
+test('nvidiaDeviceSpecs lists host device nodes for the card index', () => {
+  const specs = nvidiaDeviceSpecs(0);
+  for (const s of specs) {
+    assert.equal(s.PathOnHost, s.PathInContainer);
+    assert.equal(s.CgroupPermissions, 'rwm');
+    assert.match(s.PathOnHost, /^\/dev\/nvidia/);
+  }
+});
+
+test('JAIL_MASKED_PATHS keeps OCI defaults and host-fingerprint files', () => {
+  assert.ok(JAIL_MASKED_PATHS.includes('/proc/kcore'));
+  assert.ok(JAIL_MASKED_PATHS.includes('/proc/modules'));
+  assert.ok(JAIL_MASKED_PATHS.includes('/proc/uptime'));
+  assert.ok(JAIL_MASKED_PATHS.includes('/proc/sys/kernel/random/boot_id'));
+  assert.ok(JAIL_MASKED_PATHS.includes('/sys/block'));
 });
 
 test('waitReady wraps storage-opt quota errors as HOME_GPU_NO_DISK_QUOTA and unlocks', async () => {
@@ -320,4 +439,19 @@ test('reconstructed provider release unlinks the device lock so the next acquire
   const again = await p3.acquire((await p3.discover())[0]);
   assert.equal(again.state, 'pending');
   await p3.release(again);
+});
+
+test('reclaimStaleHomeGpuLocks unlinks a lock with no live lease, keeps one that still has a lease', () => {
+  const dir = path.join(TEST_HOME, '.j41', 'dispatcher', 'locks');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(lockPath(0), '');
+  fs.writeFileSync(lockPath(1), '');
+  const n = reclaimStaleHomeGpuLocks([
+    { provider: 'home-gpu', state: 'ready', meta: { device_index: 1 } },
+    { provider: 'home-gpu', state: 'released', meta: { device_index: 0 } },
+  ]);
+  assert.equal(n >= 1, true);
+  assert.equal(fs.existsSync(lockPath(0)), false);
+  assert.equal(fs.existsSync(lockPath(1)), true);
+  fs.unlinkSync(lockPath(1));
 });

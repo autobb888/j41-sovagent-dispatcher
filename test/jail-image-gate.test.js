@@ -10,6 +10,27 @@ test('package.json files includes Dockerfile.gpu-jail', () => {
   assert.ok(pkg.files.includes('Dockerfile.gpu-jail'));
 });
 
+test('gpu-jail renter is not a locked shadow account (pubkey must work with UsePAM no)', () => {
+  const df = fs.readFileSync(path.join(__dirname, '../Dockerfile.gpu-jail'), 'utf8');
+  assert.match(df, /useradd --create-home --shell \/bin\/bash renter/);
+  assert.match(df, /usermod -p '\*' renter/, 'Debian useradd locks with !; sshd then refuses pubkey as Permission denied (publickey)');
+  assert.match(df, /mkdir -p \/workspace/);
+  assert.match(df, /chown renter:renter \/workspace/);
+  assert.match(df, /libcap2-bin/);
+  assert.match(df, /gpu-jail-init/);
+  assert.doesNotMatch(df, /bind-mounted from the host jail dir/);
+});
+
+test('gpu-jail-init umounts docker hosts/resolv binds and drops SYS_ADMIN before sshd', () => {
+  const init = fs.readFileSync(path.join(__dirname, '../docker/gpu-jail-init.sh'), 'utf8');
+  assert.match(init, /umount/);
+  assert.match(init, /capsh --drop=cap_sys_admin,cap_setpcap/);
+  assert.match(init, /nameserver 1\.1\.1\.1/);
+  assert.match(init, /\/usr\/sbin\/sshd/);
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '../package.json'), 'utf8'));
+  assert.ok(pkg.files.includes('docker/gpu-jail-init.sh'));
+});
+
 test('homeGpuConfigured is true only when compute is on and a home-gpu provider exists', () => {
   assert.equal(homeGpuConfigured({ compute: { enabled: false, providers: { c: { type: 'home-gpu' } } } }), false);
   assert.equal(homeGpuConfigured({ compute: { enabled: true, providers: { c: { type: 'vast' } } } }), false);

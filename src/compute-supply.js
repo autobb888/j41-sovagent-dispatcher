@@ -328,6 +328,10 @@ async function maybeStartComputeSupply({ cfg, agentConfigs }) {
   if (!cfg || !cfg.compute || cfg.compute.enabled !== true) { current = null; return null; }
   const ctrl = createSupplyController({ cfg, agentConfigs });
   try { await ctrl.releaseOrphansOnBoot(); } catch { /* boot best-effort */ }
+  try {
+    const { reclaimStaleHomeGpuLocks } = require('./providers/home-gpu');
+    reclaimStaleHomeGpuLocks(ctrl.getLeases());
+  } catch { /* lock reclaim is best-effort */ }
   await ctrl.attachLocalLeases();
   await ctrl.attachVastLeases();
   const ms = Number(cfg.compute.reconcile_ms) || 60000;

@@ -12,6 +12,8 @@
     "scripts",
     "Dockerfile.job-agent",
     "Dockerfile.gpu-jail",
+    "docker/apparmor-gpu-jail",
+    "docker/gpu-jail-init.sh",
     "package.docker.json",
     "README.md",
     "CHANGELOG.md",

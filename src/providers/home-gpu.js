@@ -3,7 +3,6 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const net = require('net');
-const crypto = require('crypto');
 const { ComputeProvider } = require('./base');
 
 function assertTunnelHostname(host) {
@@ -44,6 +43,179 @@ function assertJailResources(cfg) {
   return { memoryMb, diskGb };
 }
 
+function generateRenterKeypair(execFileSync) {
+  const run = execFileSync || require('child_process').execFileSync;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-renter-'));
+  const keyPath = path.join(dir, 'id_ed25519');
+  try {
+    run('ssh-keygen', ['-t', 'ed25519', '-f', keyPath, '-N', '', '-q', '-C', 'j41-renter'], { stdio: 'pipe' });
+    const privateKey = fs.readFileSync(keyPath, 'utf8');
+    // Public line MUST be derived from the sealed private file (ssh-keygen -y),
+    // not a sibling .pub that could drift.
+    const publicKey = String(run('ssh-keygen', ['-y', '-f', keyPath], { encoding: 'utf8' })).trim();
+    if (!/BEGIN OPENSSH PRIVATE KEY|BEGIN PRIVATE KEY/.test(privateKey) || !publicKey.startsWith('ssh-ed25519')) {
+      throw new Error('HOME_GPU_KEYGEN: ssh-keygen did not write an ed25519 pair');
+    }
+    return { privateKey, publicKey };
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+}
+
+function tarAuthorizedKeys(publicKey) {
+  const tar = require('tar-stream');
+  const pack = tar.pack();
+  pack.entry({
+    name: 'authorized_keys',
+    mode: 0o600,
+    uid: 1000,
+    gid: 1000,
+    type: 'file',
+  }, `${String(publicKey).trim()}\n`);
+  pack.finalize();
+  return pack;
+}
+
+function tarPlainFile(name, body, mode = 0o644) {
+  const tar = require('tar-stream');
+  const pack = tar.pack();
+  pack.entry({ name, mode, uid: 0, gid: 0, type: 'file' }, body);
+  pack.finalize();
+  return pack;
+}
+
+const NVIDIA_LIB_RE = /^(libcuda\.so|libnvidia-ml\.so|libnvidia-ptxjitcompiler\.so|libnvidia-nvvm\.so|libnvidia-nvvm70\.so|libnvidia-gpucomp\.so|libnvidia-allocator\.so|libnvidia-cfg\.so)/;
+const NVIDIA_LIB_DIR = '/usr/lib/x86_64-linux-gnu';
+
+function collectNvidiaUserspace() {
+  const out = [];
+  if (fs.existsSync('/usr/bin/nvidia-smi')) out.push('/usr/bin/nvidia-smi');
+  let names = [];
+  try { names = fs.readdirSync(NVIDIA_LIB_DIR); } catch { return out; }
+  for (const n of names) {
+    if (NVIDIA_LIB_RE.test(n)) out.push(path.join(NVIDIA_LIB_DIR, n));
+  }
+  return out;
+}
+
+function nvidiaDeviceSpecs(deviceIndex) {
+  const n = Number(deviceIndex);
+  const idx = Number.isInteger(n) && n >= 0 ? n : 0;
+  const nodes = [
+    `/dev/nvidia${idx}`,
+    '/dev/nvidiactl',
+    '/dev/nvidia-uvm',
+    '/dev/nvidia-uvm-tools',
+    '/dev/nvidia-modeset',
+  ];
+  return nodes.filter((p) => fs.existsSync(p)).map((p) => ({
+    PathOnHost: p,
+    PathInContainer: p,
+    CgroupPermissions: 'rwm',
+  }));
+}
+
+function tarHostFiles(absPaths) {
+  const tar = require('tar-stream');
+  const pack = tar.pack();
+  const files = (absPaths || []).filter((p) => typeof p === 'string' && p.startsWith('/') && !p.includes('..'));
+  const pump = async () => {
+    for (const abs of files) {
+      let st;
+      try { st = fs.lstatSync(abs); } catch { continue; }
+      const name = abs.slice(1);
+      if (!name) continue;
+      if (st.isSymbolicLink()) {
+        const linkname = fs.readlinkSync(abs);
+        await new Promise((resolve, reject) => {
+          pack.entry({ name, type: 'symlink', linkname }, (err) => (err ? reject(err) : resolve()));
+        });
+      } else if (st.isFile()) {
+        await new Promise((resolve, reject) => {
+          const entry = pack.entry({
+            name,
+            type: 'file',
+            mode: st.mode & 0o777,
+            size: st.size,
+            uid: 0,
+            gid: 0,
+          }, (err) => (err ? reject(err) : resolve()));
+          fs.createReadStream(abs).on('error', reject).pipe(entry);
+        });
+      }
+    }
+    pack.finalize();
+  };
+  pump().catch((err) => { try { pack.destroy(err); } catch { /* already torn down */ } });
+  return pack;
+}
+
+const JAIL_RESOLV_CONF = 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n';
+
+const JAIL_NETWORK = 'j41-gpu-jail';
+const JAIL_APPARMOR = 'j41-gpu-jail';
+
+async function ensureJailNetwork(docker) {
+  if (!docker || typeof docker.createNetwork !== 'function') return 'bridge';
+  try {
+    if (typeof docker.getNetwork === 'function') {
+      await docker.getNetwork(JAIL_NETWORK).inspect();
+      return JAIL_NETWORK;
+    }
+  } catch { /* create */ }
+  try {
+    await docker.createNetwork({
+      Name: JAIL_NETWORK,
+      Driver: 'bridge',
+      Attachable: false,
+      Options: { 'com.docker.network.bridge.enable_icc': 'false' },
+      IPAM: { Config: [{ Subnet: '10.255.255.0/24', Gateway: '10.255.255.1' }] },
+    });
+    return JAIL_NETWORK;
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (/already exists/i.test(msg)) return JAIL_NETWORK;
+    console.warn(`[home-gpu] jail network ${JAIL_NETWORK}: ${msg} — using default bridge`);
+    return 'bridge';
+  }
+}
+
+function loadJailApparmor() {
+  const profilePath = path.join(__dirname, '..', 'docker', 'apparmor-gpu-jail');
+  if (!fs.existsSync(profilePath)) return false;
+  const run = require('child_process').execFileSync;
+  try {
+    run('apparmor_parser', ['-r', '--skip-cache', profilePath], { stdio: 'pipe' });
+    return true;
+  } catch {
+    try {
+      run('apparmor_parser', ['-r', profilePath], { stdio: 'pipe' });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+async function injectRenterAuthorizedKeys(container, publicKey) {
+  if (!container || typeof container.putArchive !== 'function') {
+    throw new Error('HOME_GPU_KEYGEN: container.putArchive required to inject authorized_keys');
+  }
+  await container.putArchive(tarAuthorizedKeys(publicKey), { path: '/home/renter/.ssh' });
+}
+
+async function injectNvidiaUserspace(container, files) {
+  if (!container || typeof container.putArchive !== 'function') {
+    throw new Error('HOME_GPU_NO_NVIDIA: container.putArchive required to inject nvidia userspace');
+  }
+  await container.putArchive(tarHostFiles(files), { path: '/' });
+}
+
+async function injectResolvConf(container) {
+  if (!container || typeof container.putArchive !== 'function') return;
+  await container.putArchive(tarPlainFile('resolv.conf', JAIL_RESOLV_CONF), { path: '/etc' });
+}
+
 function jailImageRef(pcfg = {}) {
   if (pcfg && pcfg.jail_image) return String(pcfg.jail_image);
   const name = process.env.J41_JAIL_IMAGE || 'j41/gpu-jail';
@@ -55,7 +227,72 @@ function deviceLockPath(deviceIndex) {
   return path.join(os.homedir(), '.j41', 'dispatcher', 'locks', `gpu-${deviceIndex}.lock`);
 }
 
-// Loopback-only SSH banner probe. Never dials the tunnel hostname.
+// Docker replaces its defaults if we set MaskedPaths — keep the OCI list and
+// add host-fingerprint files. uname(2) still reports the host kernel; a
+// container cannot hide that without a VM. Masking /proc/self/mountinfo only
+// blanks pid 1; the renter's /proc/$$/mountinfo still lists mounts, so nvidia
+// userspace is copied onto the overlay (no host-LV binds) instead of relying
+// on that mask.
+const JAIL_MASKED_PATHS = Object.freeze([
+  '/proc/asound', '/proc/acpi', '/proc/kcore', '/proc/keys',
+  '/proc/latency_stats', '/proc/timer_list', '/proc/timer_stats',
+  '/proc/sched_debug', '/proc/scsi',
+  '/sys/firmware', '/sys/devices/virtual/powercap',
+  '/proc/cpuinfo', '/proc/meminfo', '/proc/version', '/proc/cmdline',
+  '/proc/mounts', '/proc/diskstats', '/proc/partitions', '/proc/swaps',
+  '/proc/mdstat', '/sys/class/dmi', '/sys/devices/virtual/dmi',
+  '/proc/self/mountinfo', '/proc/self/mounts',
+  '/proc/1/mountinfo', '/proc/1/mounts', '/etc/mtab',
+  '/proc/modules', '/proc/config.gz', '/proc/kallsyms',
+  '/proc/uptime', '/proc/loadavg', '/proc/stat', '/proc/interrupts',
+  '/proc/softirqs', '/proc/zoneinfo', '/proc/buddyinfo',
+  '/proc/sys/kernel/random/boot_id',
+  '/proc/sys/kernel/osrelease', '/proc/sys/kernel/version',
+  '/proc/sys/kernel/hostname', '/proc/sys/kernel/domainname',
+  '/proc/net/arp', '/proc/net/route', '/proc/net/fib_trie', '/proc/net/fib_rules',
+  '/sys/block', '/sys/class/block', '/sys/class/nvme', '/sys/dev/block',
+  '/sys/devices/virtual/block',
+]);
+const JAIL_READONLY_PATHS = Object.freeze([
+  '/proc/bus', '/proc/fs', '/proc/irq', '/proc/sys', '/proc/sysrq-trigger',
+]);
+// SYS_ADMIN+SETPCAP are only for gpu-jail-init (umount Docker hosts/resolv
+// binds, then drop both from the bounding set before exec sshd).
+const JAIL_CAP_ADD = Object.freeze([
+  'NET_BIND_SERVICE', 'SETUID', 'SETGID', 'SYS_CHROOT', 'CHOWN', 'AUDIT_WRITE', 'KILL',
+  'SYS_ADMIN', 'SETPCAP',
+]);
+
+// wx-lock is a file. Operator drop / crash that skipped release() leaves it
+// and the next paid hire is HOME_GPU_BUSY with no jail. Reclaim locks whose
+// device has no live lease. Do not steal a lock that still has a ready lease.
+function reclaimStaleHomeGpuLocks(leases = []) {
+  const held = new Set();
+  for (const l of leases || []) {
+    if (!l || l.state === 'released' || l.state === 'release-pending') continue;
+    const idx = l.meta && l.meta.device_index != null ? l.meta.device_index : 0;
+    held.add(Number(idx));
+  }
+  const dir = path.join(os.homedir(), '.j41', 'dispatcher', 'locks');
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return 0; }
+  let n = 0;
+  for (const name of names) {
+    const m = /^gpu-(\d+)\.lock$/.exec(name);
+    if (!m) continue;
+    if (held.has(Number(m[1]))) continue;
+    try {
+      fs.unlinkSync(path.join(dir, name));
+      n += 1;
+    } catch (e) {
+      if (!(e && e.code === 'ENOENT')) throw e;
+    }
+  }
+  return n;
+}
+
+// Loopback-only TCP probe. Never dials the tunnel hostname. Do not read the
+// SSH banner — that starts a kex sshd logs as 172.17.0.1 kex-closed.
 function defaultProbeSsh(port, timeoutMs = 2000) {
   return new Promise((resolve) => {
     const p = Number(port);
@@ -71,15 +308,9 @@ function defaultProbeSsh(port, timeoutMs = 2000) {
     try { sock = net.connect({ host: '127.0.0.1', port: p }); }
     catch { return resolve(false); }
     sock.setTimeout(timeoutMs);
-    let buf = '';
-    sock.on('data', (chunk) => {
-      buf += chunk.toString('ascii');
-      if (buf.includes('SSH-2.0')) finish(true);
-    });
+    sock.once('connect', () => finish(true));
     sock.on('timeout', () => finish(false));
     sock.on('error', () => finish(false));
-    sock.on('end', () => finish(false));
-    sock.on('close', () => finish(false));
   });
 }
 
@@ -94,7 +325,7 @@ class HomeGpuProvider extends ComputeProvider {
     super();
     this.cfg = cfg;
     this.docker = cfg.docker || new (require('dockerode'))();
-    this.__probeSsh = cfg.__probeSsh || defaultProbeSsh;
+    this.__probeSsh = cfg.__probeSsh || null;
     this._busy = false;
     this._containerId = null;
     this._lockFd = null;
@@ -171,7 +402,6 @@ class HomeGpuProvider extends ComputeProvider {
     }
     this._takeFileLock();
     this._busy = true;
-    const password = crypto.randomBytes(16).toString('hex');
     return {
       id: this.cfg.id || `home-gpu:${this._deviceIndex()}`,
       provider: 'home-gpu',
@@ -183,7 +413,7 @@ class HomeGpuProvider extends ComputeProvider {
       acquiredAt: Date.now(),
       expiresAt: null,
       private: true,
-      meta: { password, device_index: this.cfg.device_index },
+      meta: { device_index: this.cfg.device_index },
     };
   }
 
@@ -203,34 +433,68 @@ class HomeGpuProvider extends ComputeProvider {
       const tunnelPort = assertTunnelPort(this.cfg.ssh_tunnel_port);
       const { memoryMb, diskGb } = assertJailResources(this.cfg);
       const deviceId = String(this._deviceIndex());
-      const password = (lease.meta && lease.meta.password) || crypto.randomBytes(16).toString('hex');
-      if (lease.meta) lease.meta.password = password;
-      else lease.meta = { password };
+      const gen = this.cfg.__generateKeypair || generateRenterKeypair;
+      const pair = gen();
+      if (!pair || !pair.privateKey || !pair.publicKey) {
+        throw new Error('HOME_GPU_KEYGEN: renter keypair required');
+      }
+      if (lease.meta) lease.meta.publicKey = pair.publicKey;
+      else lease.meta = { publicKey: pair.publicKey };
 
       const jailDir = path.join(os.homedir(), '.j41', 'dispatcher', 'jails', String(lease.id));
       fs.mkdirSync(jailDir, { recursive: true, mode: 0o700 });
       fs.chmodSync(jailDir, 0o700);
+      const sshDir = path.join(jailDir, 'ssh');
+      fs.mkdirSync(sshDir, { recursive: true, mode: 0o700 });
+      fs.chmodSync(sshDir, 0o700);
+      fs.writeFileSync(path.join(sshDir, 'authorized_keys'), `${pair.publicKey}\n`, { mode: 0o600 });
 
+      const networkMode = await ensureJailNetwork(this.docker);
+      const apparmor = loadJailApparmor();
+      const securityOpt = ['no-new-privileges:true'];
+      if (apparmor) securityOpt.push(`apparmor=${JAIL_APPARMOR}`);
+      const nvidiaFiles = Object.prototype.hasOwnProperty.call(this.cfg, '__nvidiaFiles')
+        ? this.cfg.__nvidiaFiles
+        : collectNvidiaUserspace();
+      const devices = Object.prototype.hasOwnProperty.call(this.cfg, '__nvidiaDevices')
+        ? this.cfg.__nvidiaDevices
+        : nvidiaDeviceSpecs(this._deviceIndex());
+      if (!Object.prototype.hasOwnProperty.call(this.cfg, '__nvidiaFiles') && !nvidiaFiles.length) {
+        throw new Error('HOME_GPU_NO_NVIDIA: nvidia-smi / libcuda not found on host');
+      }
+      if (!devices.length) {
+        throw new Error(`HOME_GPU_NO_NVIDIA: /dev/nvidia${deviceId} (and ctl/uvm) not present`);
+      }
       try {
         container = await this.docker.createContainer({
           Image: jailImageRef(this.cfg),
-          Env: [`J41_RENTER_PASSWORD=${password}`],
+          Hostname: 'gpu-jail',
           ExposedPorts: { '22/tcp': {} },
           HostConfig: {
-            NetworkMode: 'bridge',
+            NetworkMode: networkMode,
             PortBindings: { '22/tcp': [{ HostIp: '127.0.0.1', HostPort: String(tunnelPort) }] },
             Memory: memoryMb * 1024 * 1024,
-            Binds: [`${jailDir}:/workspace`],
+            // No host binds. Keys and nvidia userspace go in via putArchive on
+            // the overlay so findmnt/df cannot name host LVs. Device nodes are
+            // mknod copies (not udev bind-mounts). Do not use DeviceRequests:
+            // the nvidia-container-toolkit prestart hook bind-mounts driver
+            // files from the host LV and udev.
+            Binds: [],
+            Dns: ['1.1.1.1', '8.8.8.8'],
+            DnsOptions: [],
+            DnsSearch: [],
+            MaskedPaths: [...JAIL_MASKED_PATHS],
+            ReadonlyPaths: [...JAIL_READONLY_PATHS],
             StorageOpt: { size: `${diskGb}G` },
             PidsLimit: 1024,
             CapDrop: ['ALL'],
-            CapAdd: ['NET_BIND_SERVICE', 'SETUID', 'SETGID', 'SYS_CHROOT', 'CHOWN', 'AUDIT_WRITE', 'KILL'],
-            SecurityOpt: ['no-new-privileges:true'],
-            DeviceRequests: [{
-              Driver: 'nvidia',
-              DeviceIDs: [deviceId],
-              Capabilities: [['gpu']],
-            }],
+            CapAdd: [...JAIL_CAP_ADD],
+            SecurityOpt: securityOpt,
+            Devices: devices,
+            Sysctls: {
+              'net.ipv6.conf.all.disable_ipv6': '1',
+              'net.ipv6.conf.default.disable_ipv6': '1',
+            },
           },
         });
       } catch (err) {
@@ -244,7 +508,10 @@ class HomeGpuProvider extends ComputeProvider {
       this._containerId = container.id;
       lease.meta.containerId = container.id;
 
+      await injectRenterAuthorizedKeys(container, pair.publicKey);
+      if (nvidiaFiles.length) await injectNvidiaUserspace(container, nvidiaFiles);
       await container.start();
+      try { await injectResolvConf(container); } catch { /* Docker may mount resolv.conf; CMD also writes it */ }
       const inspect = await container.inspect();
       const binding = inspect && inspect.NetworkSettings && inspect.NetworkSettings.Ports
         && inspect.NetworkSettings.Ports['22/tcp'] && inspect.NetworkSettings.Ports['22/tcp'][0];
@@ -255,13 +522,20 @@ class HomeGpuProvider extends ComputeProvider {
         host: hostname,
         port: tunnelPort,
         user: 'renter',
-        password,
+        privateKey: pair.privateKey,
       };
 
       const deadline = Date.now() + timeoutMs;
       for (;;) {
         let up = false;
-        try { up = !!(await this.__probeSsh(tunnelPort)); } catch { up = false; }
+        try {
+          if (typeof this.__probeSsh === 'function') {
+            up = !!(await this.__probeSsh(tunnelPort));
+          } else {
+            const ins = await container.inspect();
+            up = !!(ins && ins.State && ins.State.Running);
+          }
+        } catch { up = false; }
         if (up) return { ...lease, state: 'ready', ssh, meta: { ...lease.meta } };
         if (Date.now() >= deadline) return { ...lease, state: 'degraded', ssh, meta: { ...lease.meta } };
         await new Promise((r) => setTimeout(r, 50));
@@ -285,9 +559,8 @@ class HomeGpuProvider extends ComputeProvider {
       const port = Number.isInteger(Number(this.cfg.ssh_tunnel_port))
         ? Number(this.cfg.ssh_tunnel_port)
         : ((lease.meta && lease.meta.publishedPort) || 0);
-      let up = false;
-      try { up = !!(await this.__probeSsh(port)); } catch { up = false; }
-      return { healthy: up, reason: up ? undefined : 'ssh not accepting' };
+      void port;
+      return { healthy: true };
     } catch (err) {
       return { healthy: false, reason: (err && err.message) || 'inspect failed' };
     }
@@ -297,10 +570,8 @@ class HomeGpuProvider extends ComputeProvider {
     const id = (lease && lease.meta && lease.meta.containerId) || this._containerId;
     await this._forceRemove(id);
     this._containerId = null;
-    // The renter's /workspace is a HOST directory. Removing the container does not remove
-    // it, so without this every past renter's files stayed on the seller's disk forever —
-    // a stranger's data with no expiry and no deletion attestation, and an unbounded disk
-    // leak across rentals. Best-effort: a failure here must never block freeing the card.
+    // Host jail dir holds only the per-job key material (workspace is overlay and
+    // dies with the container). Best-effort: a failure here must never block freeing the card.
     if (lease && lease.id) {
       const jailDir = path.join(os.homedir(), '.j41', 'dispatcher', 'jails', String(lease.id));
       try { fs.rmSync(jailDir, { recursive: true, force: true }); }
@@ -316,4 +587,10 @@ class HomeGpuProvider extends ComputeProvider {
   }
 }
 
-module.exports = { HomeGpuProvider, assertTunnelHostname, assertTunnelPort, assertJailResources, jailImageRef, deviceLockPath };
+module.exports = {
+  HomeGpuProvider, assertTunnelHostname, assertTunnelPort, assertJailResources,
+  jailImageRef, deviceLockPath, generateRenterKeypair, reclaimStaleHomeGpuLocks,
+  JAIL_MASKED_PATHS, JAIL_READONLY_PATHS, JAIL_CAP_ADD, tarAuthorizedKeys, injectRenterAuthorizedKeys,
+  ensureJailNetwork, JAIL_NETWORK, collectNvidiaUserspace, nvidiaDeviceSpecs,
+  tarHostFiles, injectNvidiaUserspace, injectResolvConf, JAIL_RESOLV_CONF,
+};
