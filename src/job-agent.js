@@ -364,6 +364,42 @@ function sanitizeInput(input) {
     .substring(0, 10000); // Limit length to prevent DoS
 }
 
+/**
+ * I1 — after SDK downloadFileTo, prove the bytes landed inside filesDir.
+ * Content-Disposition filenames are unsanitised (`filename="([^"]+)"`), so a
+ * traversing name can write outside the workspace — `/app/sign/req/` (host
+ * broker watch dir) or `/tmp/ipc-msg.jsonl`. We cannot sanitise before the SDK
+ * writes, so verify after and unlink anything that escaped.
+ *
+ * realpath, not resolve. `path.resolve` normalises `..` LEXICALLY and does not
+ * follow symlinks, so it catches `../../../tmp/ipc-msg.jsonl` but not the
+ * sibling vector: this process can write into filesDir, so it can plant
+ * `filesDir/link -> /app/sign/req` and then a Content-Disposition of
+ * `link/abcd1234.json` resolves lexically INSIDE filesDir while the bytes land
+ * in the broker's watch dir. Resolving the real parent closes that. An
+ * unresolvable path is an escape — we cannot prove containment.
+ *
+ * @returns {{ contained: boolean, resolved: string }}
+ */
+function containDownload(localPath, filesDir) {
+  let resolved;
+  let root;
+  try {
+    root = fs.realpathSync(filesDir) + path.sep;
+    // realpath the PARENT: the file itself may be a dangling link or already
+    // removed, and realpathSync on a missing path throws.
+    resolved = path.join(fs.realpathSync(path.dirname(localPath)), path.basename(localPath));
+  } catch {
+    resolved = String(localPath);
+    root = '\u0000never-matches';
+  }
+  if (!resolved.startsWith(root)) {
+    try { fs.unlinkSync(resolved); } catch {}
+    return { contained: false, resolved };
+  }
+  return { contained: true, resolved };
+}
+
 // Retry helper with exponential backoff for transient API failures
 async function withRetry(fn, label, { maxAttempts = 3, baseDelayMs = 1000 } = {}) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -1067,6 +1103,12 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
       for (const f of jobFiles) {
         try {
           const localPath = await agent.downloadFileTo(job.id, f.id, filesDir);
+          const { contained, resolved } = containDownload(localPath, filesDir);
+          if (!contained) {
+            console.error(`  ⛔ SECURITY: download for ${f.filename} escaped the job files dir ` +
+              `(${resolved}) — removed. Filename came from an untrusted Content-Disposition header.`);
+            continue;
+          }
           console.log(`  ✓ Downloaded: ${localPath}`);
         } catch (dlErr) {
           console.error(`  ⚠️  Failed to download ${f.filename}: ${dlErr.message}`);
@@ -1257,42 +1299,10 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
         knownFileIds.add(f.id);
         try {
           const localPath = await agent.downloadFileTo(job.id, f.id, filesDir);
-          // I1 — the SDK derives the on-disk name from the `Content-Disposition`
-          // header (`filename="([^"]+)"`, unsanitised), so a traversing filename can
-          // land the payload OUTSIDE filesDir — including `/app/sign/req/`, the host
-          // broker's watch dir, whose own filter `^[a-f0-9-]{8,80}\.json$` such a name
-          // satisfies. A forged `executeOnChain` there broadcasts an identity tx and
-          // drains the fee tank; a forged `budget_increased` lifts the token ceiling.
-          // No code execution or prompt injection required.
-          //
-          // We cannot sanitise before the SDK writes, so verify after and remove
-          // anything that escaped. NOTE: this closes the window, it does not eliminate
-          // it — the file exists briefly at the escaped path. The durable fix is
-          // broker-side (only act on request files the host itself created); tracked
-          // as I1-residual.
-          // realpath, not resolve. `path.resolve` normalises `..` LEXICALLY and does
-          // not follow symlinks, so it catches `../../../app/sign/req/x.json` but not
-          // the sibling vector: this process can write into filesDir, so it can plant
-          // `filesDir/link -> /app/sign/req` and then a Content-Disposition of
-          // `link/abcd1234.json` resolves lexically INSIDE filesDir while the bytes
-          // land in the broker's watch dir. Resolving the real parent closes that.
-          let _resolved;
-          let _root;
-          try {
-            _root = fs.realpathSync(filesDir) + path.sep;
-            // realpath the PARENT: the file itself may be a dangling link or already
-            // removed, and realpathSync on a missing path throws.
-            _resolved = path.join(fs.realpathSync(path.dirname(localPath)), path.basename(localPath));
-          } catch {
-            // If either side cannot be resolved, treat it as an escape — we cannot
-            // prove containment, and this path is security-critical.
-            _resolved = String(localPath);
-            _root = '\u0000never-matches';
-          }
-          if (!_resolved.startsWith(_root)) {
-            try { fs.unlinkSync(_resolved); } catch {}
+          const { contained, resolved } = containDownload(localPath, filesDir);
+          if (!contained) {
             console.error(`[FILES] ⛔ SECURITY: download for ${f.id} escaped the job files dir ` +
-              `(${_resolved}) — removed. Filename came from an untrusted Content-Disposition header.`);
+              `(${resolved}) — removed. Filename came from an untrusted Content-Disposition header.`);
             continue;
           }
           console.log(`[FILES] ✓ ${f.filename} (${(f.sizeBytes / 1024).toFixed(1)}KB)`);
@@ -2406,5 +2416,5 @@ if (require.main === module) {
 // Export testable helpers when running under NODE_ENV=test.
 // Avoids shipping a test seam in production while keeping coverage honest.
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach, isTerminalAttachError, ATTACH_CONFIRM_BACKOFF_MS, resumeJob, ensureChatConnected };
+  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach, isTerminalAttachError, ATTACH_CONFIRM_BACKOFF_MS, resumeJob, ensureChatConnected, containDownload };
 }
