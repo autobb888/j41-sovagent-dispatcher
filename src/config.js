@@ -38,8 +38,26 @@ function saveConfig(obj) {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(obj, null, 2), { mode: 0o600 });
 }
 
+/**
+ * Read-path runtime. Only the exact string "local" (any case) is local;
+ * everything else — missing, unknown, "Docker" — is docker.
+ */
+function resolveRuntime(value) {
+  return String(value == null ? '' : value).toLowerCase() === 'local' ? 'local' : 'docker';
+}
+
+/**
+ * Write-path runtime. Persist only docker|local (case-insensitive, canonical
+ * lowercase). Anything else is rejected so we never store a value getRuntime
+ * would silently reinterpret.
+ */
+function persistableRuntime(value) {
+  const r = String(value == null ? '' : value).toLowerCase();
+  return r === 'docker' || r === 'local' ? r : null;
+}
+
 function getRuntime() {
-  return loadConfig().runtime || 'docker';
+  return resolveRuntime(loadConfig().runtime);
 }
 
 function persistActiveJobs(activeMap) {
@@ -160,6 +178,8 @@ module.exports = {
   loadConfig,
   saveConfig,
   getRuntime,
+  resolveRuntime,
+  persistableRuntime,
   persistActiveJobs,
   loadActiveJobs,
   persistReactivationQueue,

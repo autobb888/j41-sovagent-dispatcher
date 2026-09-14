@@ -947,4 +947,6 @@ module.exports = {
   listingAdvertiseRefusal,
   webhookBindActive,
   inspectJobAgentCanonicalize,
+  probeClock,
+  ntpBlock,
 };

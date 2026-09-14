@@ -92,3 +92,19 @@ test('dashboard hides compute kind on darwin/win32', () => {
 test('cli.js uses dockerAdviceFromError or classifyDockerError for Docker errors', () => {
   assert.match(CLI, /dockerAdviceFromError|classifyDockerError/);
 });
+
+test('start clock probe is after image/jail preflights and before authenticate', () => {
+  const startAt = CLI.indexOf(".command('start')\n  .description('Start the dispatcher");
+  const body = CLI.slice(startAt, CLI.indexOf(".command('encrypt-keys')", startAt));
+  const jailAt = body.indexOf('homeGpuConfigured');
+  const clockAt = body.indexOf('// MO6 — clock skew');
+  const authAt = body.indexOf('authenticate()');
+  assert.ok(jailAt > -1 && clockAt > jailAt, 'probeClock must follow the jail preflight');
+  assert.ok(authAt > clockAt, 'probeClock must run before signed login');
+  const clockBlock = body.slice(clockAt, body.indexOf('// Local mode warning timer', clockAt));
+  assert.match(clockBlock, /status === 'fail'/);
+  assert.match(clockBlock, /process\.exit\(1\)/);
+  assert.match(clockBlock, /NODE_ENV !== 'test'/);
+  assert.doesNotMatch(clockBlock, /_devUnsafe/, '--dev-unsafe must not bypass a clock fail');
+  assert.match(clockBlock, /J41_API_URL/);
+});

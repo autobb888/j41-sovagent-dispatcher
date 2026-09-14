@@ -11,6 +11,7 @@ const os = require('os');
 
 const {
   CHECK_IDS,
+  CLOCK_SKEW_MS,
   nodeMajor,
   runDoctor,
   formatDoctorTable,
@@ -20,6 +21,8 @@ const {
   dockerAdviceFromError,
   firstPasteCommand,
   listingAdvertiseRefusal,
+  probeClock,
+  ntpBlock,
 } = require('../src/doctor');
 
 function tmpHome() {
@@ -257,6 +260,41 @@ test('clock skew 65 min: clock fail, NTP copy-paste', async () => {
   }));
   assert.equal(check(report, 'clock').status, 'fail');
   assert.match(check(report, 'clock').copyPasteBlock, /timedatectl set-ntp true/);
+});
+
+test('probeClock fail threshold is 30s (same as doctor CLOCK_SKEW_MS)', async () => {
+  assert.equal(CLOCK_SKEW_MS, 30 * 1000);
+  const now = Date.parse('2026-09-04T12:00:00Z');
+  // Date headers are second-resolution; 31s is the first whole second over the limit.
+  const fail = await probeClock({
+    now: () => now,
+    fetchDateHeader: new Date(now + 31 * 1000).toUTCString(),
+  }, 'https://api.example');
+  assert.equal(fail.status, 'fail');
+  assert.match(fail.detail, /limit 30s/);
+  const pass = await probeClock({
+    now: () => now,
+    fetchDateHeader: new Date(now + 30 * 1000).toUTCString(),
+  }, 'https://api.example');
+  assert.equal(pass.status, 'pass');
+});
+
+test('probeClock unreachable API is warn, not fail', async () => {
+  const warnFetch = await probeClock({
+    now: () => Date.now(),
+    fetch: async () => { throw new Error('ECONNREFUSED'); },
+  }, 'https://api.example');
+  assert.equal(warnFetch.status, 'warn');
+  assert.equal(warnFetch.skewMs, null);
+  const warnFlag = await probeClock({ now: () => Date.now(), fetchOk: false }, 'https://api.example');
+  assert.equal(warnFlag.status, 'warn');
+});
+
+test('ntpBlock is OS-specific copy-paste', () => {
+  assert.match(ntpBlock({ platform: 'linux' }), /timedatectl set-ntp true/);
+  assert.match(ntpBlock({ platform: 'linux', wsl: true }), /hwclock/);
+  assert.match(ntpBlock({ platform: 'darwin' }), /Date & Time/);
+  assert.match(ntpBlock({ platform: 'win32' }), /Set time automatically/);
 });
 
 test('omitted feeTankRows loads fee-tank-status.json from homedir (32 writes is low)', async () => {

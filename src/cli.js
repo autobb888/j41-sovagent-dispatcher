@@ -24,7 +24,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
-const { getRuntime, persistActiveJobs, loadActiveJobs, saveConfig, loadConfig, persistReactivationQueue, loadReactivationQueue } = require('./config');
+const { getRuntime, persistActiveJobs, loadActiveJobs, saveConfig, loadConfig, persistReactivationQueue, loadReactivationQueue, persistableRuntime } = require('./config');
 const {
   runDoctor,
   formatDoctorTable,
@@ -32,6 +32,8 @@ const {
   classifyIdentities,
   dockerAdviceFromError,
   listingAdvertiseRefusal,
+  probeClock,
+  ntpBlock,
 } = require('./doctor');
 const { isIndexerLagError, retryRegisterWithJ41, INDEXER_LAG_HINT, planOnboardingAfterProfile } = require('./indexer-lag');
 const { jobPaymentReady } = require('./job-payment');
@@ -715,6 +717,56 @@ function buildFullProfile(options, keys) {
   }
 
   return profile;
+}
+
+/**
+ * Merge a setup template into commander options. CLI flags already set on
+ * `options` win. Session duration is copied as seconds (templates store
+ * seconds; interactive onboarding is the path that converts minutes).
+ * workspaceCapability becomes options.workspace + modes/tools — there is no
+ * workspaceCapability option.
+ */
+function mergeTemplateIntoOptions(tpl, options) {
+  if (!tpl || !options) return options;
+  if (tpl.profile) {
+    if (!options.profileName) options.profileName = tpl.profile.name;
+    if (!options.profileType) options.profileType = tpl.profile.type;
+    if (!options.profileDescription) options.profileDescription = tpl.profile.description;
+    if (!options.profileCategory && tpl.profile.profile?.category) options.profileCategory = tpl.profile.profile.category;
+    if (!options.profileTags && tpl.profile.profile?.tags) options.profileTags = tpl.profile.profile.tags;
+    if (!options.profileProtocols && tpl.profile.network?.protocols) options.profileProtocols = tpl.profile.network.protocols;
+    if (!options.models && tpl.profile.models) options.models = tpl.profile.models;
+    if (options.markup == null && tpl.profile.markup != null) options.markup = tpl.profile.markup;
+
+    const ws = tpl.profile.workspaceCapability || tpl.profile.workspace;
+    if (!options.workspace && ws && typeof ws === 'object') {
+      const enabled = ws.workspace !== false && ws.enabled !== false;
+      if (enabled) {
+        options.workspace = true;
+        if (!options.workspaceModes && ws.modes) {
+          options.workspaceModes = Array.isArray(ws.modes) ? ws.modes.join(',') : String(ws.modes);
+        }
+        if (!options.workspaceTools && ws.tools) {
+          options.workspaceTools = Array.isArray(ws.tools) ? ws.tools.join(',') : String(ws.tools);
+        }
+      }
+    }
+
+    const sess = tpl.profile.session;
+    if (sess && options.sessionDuration == null && sess.duration != null) {
+      options.sessionDuration = sess.duration;
+    }
+  }
+  if (tpl.service) {
+    if (!options.serviceName) options.serviceName = tpl.service.name;
+    if (!options.serviceDescription) options.serviceDescription = tpl.service.description;
+    if (!options.servicePrice) options.servicePrice = tpl.service.price;
+    if (!options.serviceCurrency) options.serviceCurrency = tpl.service.currency;
+    if (!options.serviceCategory) options.serviceCategory = tpl.service.category;
+    if (!options.serviceTurnaround) options.serviceTurnaround = tpl.service.turnaround;
+    if (!options.servicePaymentTerms) options.servicePaymentTerms = tpl.service.paymentTerms;
+  }
+  return options;
 }
 
 // ── Interactive profile setup ──────────────────────────────────────
@@ -1545,7 +1597,12 @@ program
       console.log('Junction41 never stores the dataset bytes.');
     }
 
-    const runtime = await ask('Runtime mode (docker or local)', 'docker');
+    const runtime = persistableRuntime(await ask('Runtime mode (docker or local)', 'docker'));
+    if (!runtime) {
+      console.error('❌ Runtime must be docker or local');
+      rl.close();
+      process.exit(1);
+    }
 
     rl.close();
 
@@ -1600,6 +1657,11 @@ program
   .option('-n, --agents <number>', 'Number of agents to create', '9')
   .option('--soul <file>', 'SOUL.md template to use for all agents')
   .action(async (options) => {
+    const count = parseInt(options.agents, 10);
+    if (!Number.isInteger(count) || count < 1 || count > 100) {
+      console.error('❌ --agents must be an integer from 1 to 100');
+      process.exit(1);
+    }
     // K2 — `init` writes a WIF per agent, so it must respect an encrypted key pool.
     // Without this it wrote every new agent's key in PLAINTEXT onto a pool the
     // operator had deliberately encrypted, silently downgrading custody. This is a
@@ -1608,7 +1670,6 @@ program
     // guard immediately before the identical write.
     await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
-    const count = parseInt(options.agents);
     
     console.log('╔══════════════════════════════════════════╗');
     console.log('║     J41 Dispatcher Init                  ║');
@@ -4620,24 +4681,7 @@ program
       console.log(`📋 Using template: ${options.template}\n`);
 
       // Merge template into options (CLI flags override template)
-      if (tpl.profile) {
-        if (!options.profileName) options.profileName = tpl.profile.name;
-        if (!options.profileType) options.profileType = tpl.profile.type;
-        if (!options.profileDescription) options.profileDescription = tpl.profile.description;
-        if (!options.profileCategory && tpl.profile.profile?.category) options.profileCategory = tpl.profile.profile.category;
-        if (!options.profileTags && tpl.profile.profile?.tags) options.profileTags = tpl.profile.profile.tags;
-        if (!options.profileProtocols && tpl.profile.network?.protocols) options.profileProtocols = tpl.profile.network.protocols;
-        if (!options.models && tpl.profile.models) options.models = tpl.profile.models;
-      }
-      if (tpl.service) {
-        if (!options.serviceName) options.serviceName = tpl.service.name;
-        if (!options.serviceDescription) options.serviceDescription = tpl.service.description;
-        if (!options.servicePrice) options.servicePrice = tpl.service.price;
-        if (!options.serviceCurrency) options.serviceCurrency = tpl.service.currency;
-        if (!options.serviceCategory) options.serviceCategory = tpl.service.category;
-        if (!options.serviceTurnaround) options.serviceTurnaround = tpl.service.turnaround;
-        if (!options.servicePaymentTerms) options.servicePaymentTerms = tpl.service.paymentTerms;
-      }
+      mergeTemplateIntoOptions(tpl, options);
       // Copy SOUL.md if template has one and agent doesn't yet
       options._templateSoulPath = path.join(tplDir, 'SOUL.md');
     }
@@ -5568,6 +5612,28 @@ program
           console.error('');
           process.exit(1);
         }
+      }
+    }
+
+    // MO6 — clock skew vs the API Date header, before any signed login.
+    // Unreachable API is a warning (do not block start on a down platform).
+    // --dev-unsafe does not bypass a fail: the challenge would expire anyway.
+    // NODE_ENV=test skips the live HEAD like the image/jail preflights above.
+    if (process.env.NODE_ENV !== 'test') {
+      const clock = await probeClock({}, J41_API_URL);
+      if (clock.status === 'fail') {
+        console.error(`\n❌ Refusing to start: ${clock.detail}`);
+        console.error('   Signed platform login will fail with "challenge expired".');
+        console.error('   Nothing was accepted and no buyer can pay into this fleet.');
+        console.error('');
+        console.error(ntpBlock({
+          platform: process.platform,
+          wsl: !!(process.env.WSL_DISTRO_NAME),
+        }));
+        process.exit(1);
+      }
+      if (clock.status === 'warn') {
+        console.warn(`  ⚠️  Clock: ${clock.detail}`);
       }
     }
 
@@ -15384,6 +15450,7 @@ program
 if (process.env.NODE_ENV === 'test') {
   module.exports = { buildContainerEnv, loadAgentConfig, moveJobToReactivationQueue, respawnReadyResumes, sweepExpiredQueue, hasMemoryHeadroom, loadAgentCapabilities, loadAgentDisputePolicy, drainPendingRefunds, attemptPendingRefund, refundAbandonedJob, refundsList, refundsReject, refundsApprove, refundsApproveAll, preflightAllowsAccept, sweepDisputesForRefund, OUTAGE_APOLOGY, acquireSendLock, releaseSendLock, dispatchInboxAccept, processInboxForAgent, checkPendingInbox, queueDisputedJobForRespawn, reconcileOrphanedDisputes, readShutdownDeactivatedAt, readShutdownDeactivatedTxids, readReworkCycles, reworkCyclesFor, bumpReworkCycle, REWORK_CYCLES_PATH, shouldReconcileJob, MAX_RECONCILE_RESPAWNS_PER_SWEEP, MAX_RECONCILE_ATTEMPTS_PER_JOB, readShutdownDeactivated, writeShutdownDeactivated, clearShutdownDeactivated, SHUTDOWN_DEACTIVATED_FILE, effectiveAgentStatus, decidePlatformStatusSupport, backendSupportsPlatformStatus, PLATFORM_STATUS_FEATURE, setFinancialSuspended, isFinanciallySuspended, loadSendHistory, SEND_HISTORY_PATH, FINANCIAL_SUSPENDED_PATH, chainAgentStatus, platformAgentStatus, planAgentActivation, shouldWriteChainActiveOnActivate, checkDispatcherRateLimit, recordDispatcherSend, _resetDispatcherRateLimit, reportSpawnAttachFailed, walletList, walletShow, walletSweep, walletSend, buildWalletState, loadWalletPending, saveWalletPending, walletPendingPath, resolveWalletPending, waitWalletPendingUnlink, checkFeeTanks, markRefundInflight, clearRefundInflight, readRefundInflight, noteRefundInflightFailure, refundInflightPath, loadSeenJobs, saveSeenJobs, loadFinalizeState, untrusted, untrustedField, requireInteractiveConfirm, printFundingInstructions, handleWebhookEvent, stopJobContainer, stopJobLocal, _cleanupCompletedJobs, jobImageExists, JOB_IMAGE, jailImageExists, JAIL_IMAGE, NATIVE_COIN,
     saveProfile, loadSavedProfile, createFinalizeHooks, jobPaymentReady, isIndexerLagError, retryRegisterWithJ41, planHirePayment,
+    mergeTemplateIntoOptions, buildFullProfile,
     // Execution-harness seam: `program` so a test can drive the REAL `start`
     // action through commander, and `__getState` so it can then assert on what
     // that action actually did. See test/helpers/dispatcher-harness.js.

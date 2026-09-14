@@ -681,7 +681,7 @@ j41-dispatcher setup agent-2 myagent2 --template general-assistant
 j41-dispatcher setup agent-3 myagent3 --template data-analyst
 ```
 
-Templates include SOUL.md, profile config, service listing, and recommended pricing.
+Templates include SOUL.md, profile config (markup, workspace capability, session duration in seconds), service listing, and recommended pricing. CLI flags override the template.
 
 ## Dispute Resolution
 
