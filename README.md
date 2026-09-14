@@ -1086,7 +1086,7 @@ boot if it fails, unless `--dev-unsafe`. It does **not** install gVisor,
 bubblewrap, or profiles into `/etc/j41` by itself — that needs root:
 
 ```bash
-sudo npx @junction41/secure-setup --dispatcher
+sudo HOME="$HOME" npx @junction41/secure-setup --dispatcher
 ```
 
 (or the TUI `[6] Security Setup` screen). Subsequent starts skip the first-run

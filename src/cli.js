@@ -6002,6 +6002,8 @@ program
       console.log('');
       const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
       const canRunInline = !!(secureSetup && isRoot && process.stdin.isTTY);
+      // HOME="$HOME" so sudo writes the marker under the operator home, not /root.
+      const sudoSecureSetup = 'sudo HOME="$HOME" npx @junction41/secure-setup --dispatcher';
       if (canRunInline) {
         try {
           const setupResult = await secureSetup.setup('dispatcher');
@@ -6016,11 +6018,11 @@ program
           }
         } catch (e) {
           console.error(`  Security setup: ${e.message}`);
-          console.error('  Run manually with sudo: sudo npx @junction41/secure-setup --dispatcher');
+          console.error('  Run manually with sudo: ' + sudoSecureSetup);
         }
       } else {
         console.error('  First start checks isolation; installing to /etc/j41 needs root:');
-        console.error('    sudo npx @junction41/secure-setup --dispatcher');
+        console.error('    ' + sudoSecureSetup);
         console.error('  Or use the TUI Security screen ([6] Security Setup).');
         if (!secureSetup) {
           console.warn('  @junction41/secure-setup is not installed (optionalDependency).');
@@ -6031,16 +6033,31 @@ program
 
     // ── Task 19: Startup security quick-check ──────────────────
     // Timeout ≡ fail. A hung quickCheck used to warn "unavailable" and continue.
+    // Do not leave a rejecting timer armed after a passing check — that leftover
+    // reject is unhandled. Resolve + clearTimeout; swallow a late checkP.
     if (secureSetup) {
       let checkResult = null;
       let checkError = null;
+      let timedOut = false;
+      let timeoutTimer;
       try {
-        checkResult = await Promise.race([
-          secureSetup.quickCheck('dispatcher'),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 10000)),
-        ]);
+        const checkP = Promise.resolve(secureSetup.quickCheck('dispatcher'));
+        checkP.catch(() => {});
+        checkResult = await new Promise((resolve, reject) => {
+          timeoutTimer = setTimeout(() => {
+            timedOut = true;
+            resolve(null);
+          }, 10000);
+          checkP.then(
+            (value) => { if (!timedOut) resolve(value); },
+            (err) => { if (!timedOut) reject(err); },
+          );
+        });
+        if (timedOut) checkError = new Error('timeout');
       } catch (e) {
-        checkError = e;
+        checkError = timedOut ? new Error('timeout') : e;
+      } finally {
+        if (timeoutTimer) clearTimeout(timeoutTimer);
       }
       const checkFailed = !!(checkError || !checkResult || !checkResult.passed);
       if (checkFailed) {
@@ -6055,7 +6072,7 @@ program
           console.error(`  - ${issue.name}: ${issue.detail}`);
         }
         console.error('');
-        console.error('  Fix: yarn dlx @junction41/secure-setup --dispatcher --fix');
+        console.error('  Fix: sudo HOME="$HOME" npx @junction41/secure-setup --dispatcher --fix');
         console.error('');
         if (!state._devUnsafe) {
           process.exit(1);

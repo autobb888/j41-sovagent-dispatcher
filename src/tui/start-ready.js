@@ -75,13 +75,13 @@ async function waitForDispatcherReady(opts) {
   let exited = false;
   let exitCode;
   const onExit = (code) => { exited = true; exitCode = code; };
-  if (child) {
-    if (typeof child.exitCode === 'number') {
-      exited = true;
-      exitCode = child.exitCode;
-    } else if (typeof child.once === 'function') {
-      child.once('exit', onExit);
-    }
+  // Attach before reading exitCode so a death between the two is not missed.
+  if (child && typeof child.once === 'function') {
+    child.once('exit', onExit);
+  }
+  if (child && typeof child.exitCode === 'number') {
+    exited = true;
+    exitCode = child.exitCode;
   }
 
   const deadline = now() + timeoutMs;
@@ -106,7 +106,10 @@ async function waitForDispatcherReady(opts) {
       }
       if (healthUrl) {
         const res = await httpGet(healthUrl);
-        if (res && res.statusCode === 200) return { ok: true, url: healthUrl };
+        if (res && res.statusCode === 200) {
+          if (exited) return { ok: false, reason: 'exit', code: exitCode };
+          return { ok: true, url: healthUrl };
+        }
       }
       await sleep(pollMs);
     }

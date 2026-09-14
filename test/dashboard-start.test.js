@@ -43,8 +43,8 @@ test('dashboard Start seeks the log before spawn and waits for [Health], not 2.5
   assert.doesNotMatch(block, /dispatcher\.pid/);
 });
 
-test('README first start checks; installing to /etc/j41 needs sudo npx secure-setup', () => {
-  assert.match(README, /sudo npx @junction41\/secure-setup --dispatcher/);
+test('README first start checks; installing to /etc/j41 needs sudo HOME=$HOME npx secure-setup', () => {
+  assert.match(README, /sudo HOME="\$HOME" npx @junction41\/secure-setup --dispatcher/);
   assert.doesNotMatch(README, /On first start, the dispatcher automatically:/);
   assert.doesNotMatch(README, /Installs gVisor \(if KVM\)/);
 });
@@ -167,6 +167,31 @@ test('child exit is failure even if leftover [Health] and GET would 200', async 
       timeoutMs: 150,
       pollMs: 20,
       httpGet: async () => ({ statusCode: 200 }),
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'exit');
+    assert.equal(r.code, 1);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('GET 200 after child exit during GET is not success', async () => {
+  const { dir, logPath } = tmpLog();
+  try {
+    const startOffset = seekLogEnd(logPath);
+    fs.appendFileSync(logPath, '[Health] http://127.0.0.1:19999/health\n');
+    const child = new EventEmitter();
+    const r = await waitForDispatcherReady({
+      logPath,
+      startOffset,
+      child,
+      timeoutMs: 400,
+      pollMs: 20,
+      httpGet: async () => {
+        child.emit('exit', 1);
+        return { statusCode: 200 };
+      },
     });
     assert.equal(r.ok, false);
     assert.equal(r.reason, 'exit');

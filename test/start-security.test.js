@@ -33,7 +33,7 @@ test('cli.js first-run block never Promise.races setup() and never prints a fake
   assert.doesNotMatch(block, /✓ Security setup complete/);
   assert.match(block, /process\.getuid\(\) === 0/);
   assert.match(block, /stdin\.isTTY/);
-  assert.match(block, /sudo npx @junction41\/secure-setup --dispatcher/);
+  assert.match(block, /sudo HOME="\$HOME" npx @junction41\/secure-setup --dispatcher/);
   assert.match(block, /Security Setup/);
 });
 
@@ -44,6 +44,11 @@ test('cli.js quickCheck timeout is fail-closed (not "unavailable" + continue)', 
   const block = CLI.slice(start, end);
   assert.match(block, /checkFailed|checkError/);
   assert.doesNotMatch(block, /quick-check unavailable/);
+  assert.doesNotMatch(block, /Promise\.race/);
+  assert.match(block, /timedOut/);
+  assert.match(block, /clearTimeout\(timeoutTimer\)/);
+  assert.match(block, /sudo HOME="\$HOME" npx @junction41\/secure-setup --dispatcher --fix/);
+  assert.doesNotMatch(block, /yarn dlx/);
   assert.match(block, /process\.exit\(1\)/);
   assert.match(block, /_devUnsafe/);
 });
@@ -66,7 +71,7 @@ test('marker absent, not root: does not call setup(), prints sudo, no ✓', asyn
   });
   t.after(() => r.teardown());
   assert.equal(setupCalls(r).length, 0, 'non-root first start must not call setup()');
-  assert.ok(r.logged('sudo npx @junction41/secure-setup --dispatcher'));
+  assert.ok(r.logged('sudo HOME="$HOME" npx @junction41/secure-setup --dispatcher'));
   assert.ok(r.logged('Security Setup'));
   assert.equal(r.logged('✓ Security setup complete'), false);
   assert.equal(r.logged('✅ Setup complete'), false);
