@@ -155,14 +155,22 @@ const JAIL_RESOLV_CONF = 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n';
 const JAIL_NETWORK = 'j41-gpu-jail';
 const JAIL_APPARMOR = 'j41-gpu-jail';
 
+function homeGpuNoNet(detail) {
+  const err = new Error(`HOME_GPU_NO_NET: ${detail}`);
+  err.code = 'HOME_GPU_NO_NET';
+  return err;
+}
+
 async function ensureJailNetwork(docker) {
-  if (!docker || typeof docker.createNetwork !== 'function') return 'bridge';
-  try {
-    if (typeof docker.getNetwork === 'function') {
+  if (!docker || typeof docker.createNetwork !== 'function') {
+    throw homeGpuNoNet('docker.createNetwork required for j41-gpu-jail (no docker0 fallback)');
+  }
+  if (typeof docker.getNetwork === 'function') {
+    try {
       await docker.getNetwork(JAIL_NETWORK).inspect();
       return JAIL_NETWORK;
-    }
-  } catch { /* create */ }
+    } catch { /* create */ }
+  }
   try {
     await docker.createNetwork({
       Name: JAIL_NETWORK,
@@ -175,10 +183,11 @@ async function ensureJailNetwork(docker) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     if (/already exists/i.test(msg)) return JAIL_NETWORK;
-    console.warn(`[home-gpu] jail network ${JAIL_NETWORK}: ${msg} — using default bridge`);
-    return 'bridge';
+    throw homeGpuNoNet(msg);
   }
 }
+
+let _jailApparmorDeniedWarned = false;
 
 function loadJailApparmor() {
   const profilePath = path.join(__dirname, '..', 'docker', 'apparmor-gpu-jail');
@@ -192,6 +201,11 @@ function loadJailApparmor() {
       run('apparmor_parser', ['-r', profilePath], { stdio: 'pipe' });
       return true;
     } catch {
+      // Policy admin denied: hire still proceeds, glob deny on mountinfo is off.
+      if (!_jailApparmorDeniedWarned) {
+        _jailApparmorDeniedWarned = true;
+        console.warn('AppArmor j41-gpu-jail not loaded (policy admin denied). mountinfo glob deny inactive.');
+      }
       return false;
     }
   }

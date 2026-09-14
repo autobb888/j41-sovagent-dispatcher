@@ -8,7 +8,7 @@ os.homedir = () => TEST_HOME;
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { HomeGpuProvider, assertTunnelHostname, assertTunnelPort, assertJailResources, jailImageRef, generateRenterKeypair, reclaimStaleHomeGpuLocks, collectNvidiaUserspace, nvidiaDeviceSpecs, JAIL_MASKED_PATHS, JAIL_NETWORK } = require('../src/providers/home-gpu');
+const { HomeGpuProvider, assertTunnelHostname, assertTunnelPort, assertJailResources, jailImageRef, generateRenterKeypair, reclaimStaleHomeGpuLocks, collectNvidiaUserspace, nvidiaDeviceSpecs, JAIL_MASKED_PATHS, JAIL_NETWORK, ensureJailNetwork } = require('../src/providers/home-gpu');
 const { listProviderTypes } = require('../src/providers');
 
 test('generateRenterKeypair public line is ssh-keygen -y of the sealed private file', () => {
@@ -54,6 +54,8 @@ test('waitReady creates jailImageRef(cfg), not a hardcoded latest that ignores e
   const lease = await provider.acquire();
   await provider.waitReady(lease);
   assert.equal(docker.created[0].Image, 'j41/gpu-jail:from-toml');
+  assert.equal(docker.created[0].HostConfig.NetworkMode, 'j41-gpu-jail');
+  assert.notEqual(docker.created[0].HostConfig.NetworkMode, 'host');
   await provider.release(lease);
 });
 
@@ -97,10 +99,12 @@ test('assertJailResources requires memory_mb >= 256 and disk_gb >= 1', () => {
   assert.deepEqual(assertJailResources({ memory_mb: '8192', disk_gb: '40' }), { memoryMb: 8192, diskGb: 40 });
 });
 
-function stubDocker({ publishedPort, startError, createError } = {}) {
+function stubDocker({ publishedPort, startError, createError, createNetworkError } = {}) {
   const created = []; const removed = []; const archives = [];
+  const networks = new Set();
+  const createdNetworks = [];
   return {
-    created, removed, archives,
+    created, removed, archives, networks, createdNetworks,
     async createContainer(spec) {
       if (createError) throw createError;
       created.push(spec);
@@ -120,6 +124,20 @@ function stubDocker({ publishedPort, startError, createError } = {}) {
     },
     getContainer(id) {
       return { id, async inspect() { return { State: { Running: true } }; }, async remove(opts) { removed.push({ id, opts }); } };
+    },
+    getNetwork(name) {
+      return {
+        async inspect() {
+          if (!networks.has(name)) throw new Error(`network ${name} not found`);
+          return { Name: name };
+        },
+      };
+    },
+    async createNetwork(spec) {
+      if (createNetworkError) throw createNetworkError;
+      createdNetworks.push(spec);
+      networks.add(spec.Name);
+      return { id: spec.Name };
     },
   };
 }
@@ -190,8 +208,9 @@ test('waitReady publishes 22/tcp on 127.0.0.1:ssh_tunnel_port, never 0.0.0.0, ne
   assert.equal(lease.ssh.privateKey, pair.privateKey);
   assert.equal(lease.ssh.password, undefined);
   const spec = docker.created[0];
-  assert.equal(spec.HostConfig.NetworkMode, 'bridge');
+  assert.equal(spec.HostConfig.NetworkMode, 'j41-gpu-jail');
   assert.notEqual(spec.HostConfig.NetworkMode, 'host');
+  assert.notEqual(spec.HostConfig.NetworkMode, 'bridge');
   assert.deepEqual(spec.HostConfig.PortBindings['22/tcp'][0], { HostIp: '127.0.0.1', HostPort: '2222' });
   assert.notEqual(spec.HostConfig.PortBindings['22/tcp'][0].HostIp, '0.0.0.0');
   assert.equal(spec.HostConfig.Memory, 8192 * 1024 * 1024);
@@ -291,6 +310,8 @@ test('waitReady HostConfig has Memory, key-only bind, StorageOpt size', async ()
   const p = new HomeGpuProvider(homeCfg({ docker }));
   await p.waitReady(await p.acquire((await p.discover())[0]), { timeoutMs: 1000 });
   const spec = docker.created[0];
+  assert.equal(spec.HostConfig.NetworkMode, 'j41-gpu-jail');
+  assert.notEqual(spec.HostConfig.NetworkMode, 'host');
   assert.equal(spec.HostConfig.Memory, 8192 * 1024 * 1024);
   assert.deepEqual(spec.HostConfig.Binds, []);
   assert.equal(spec.HostConfig.StorageOpt.size, '40G');
@@ -311,6 +332,8 @@ test('waitReady copies nvidia userspace onto the overlay and does not ask the nv
   const p = new HomeGpuProvider(homeCfg({ docker, __nvidiaFiles: [fake] }));
   await p.waitReady(await p.acquire((await p.discover())[0]), { timeoutMs: 1000 });
   const spec = docker.created[0];
+  assert.equal(spec.HostConfig.NetworkMode, 'j41-gpu-jail');
+  assert.notEqual(spec.HostConfig.NetworkMode, 'host');
   assert.equal(spec.HostConfig.DeviceRequests, undefined);
   assert.ok(spec.HostConfig.Devices.length >= 1);
   assert.equal(docker.archives.length, 3);
@@ -321,23 +344,59 @@ test('waitReady copies nvidia userspace onto the overlay and does not ask the nv
 
 test('waitReady uses j41-gpu-jail when docker can create the network', async () => {
   const docker = stubDocker();
-  docker.networks = new Set();
-  docker.getNetwork = (name) => ({
-    async inspect() {
-      if (!docker.networks.has(name)) throw new Error('no such network');
-      return { Name: name };
-    },
-  });
-  docker.createNetwork = async (spec) => {
-    docker.createdNetworks = docker.createdNetworks || [];
-    docker.createdNetworks.push(spec);
-    docker.networks.add(spec.Name);
-    return { id: spec.Name };
-  };
   const p = new HomeGpuProvider(homeCfg({ docker }));
   await p.waitReady(await p.acquire((await p.discover())[0]), { timeoutMs: 1000 });
   assert.equal(docker.created[0].HostConfig.NetworkMode, JAIL_NETWORK);
+  assert.notEqual(docker.created[0].HostConfig.NetworkMode, 'host');
+  assert.equal(docker.createdNetworks[0].Name, JAIL_NETWORK);
+  assert.equal(docker.createdNetworks[0].Driver, 'bridge');
+  assert.equal(docker.createdNetworks[0].Attachable, false);
+  assert.equal(docker.createdNetworks[0].Options['com.docker.network.bridge.enable_icc'], 'false');
   assert.equal(docker.createdNetworks[0].IPAM.Config[0].Subnet, '10.255.255.0/24');
+  assert.equal(docker.createdNetworks[0].IPAM.Config[0].Gateway, '10.255.255.1');
+});
+
+test('ensureJailNetwork missing createNetwork is HOME_GPU_NO_NET', async () => {
+  await assert.rejects(() => ensureJailNetwork(undefined), (err) => {
+    assert.match(err.message, /HOME_GPU_NO_NET: docker\.createNetwork required for j41-gpu-jail \(no docker0 fallback\)/);
+    assert.equal(err.code, 'HOME_GPU_NO_NET');
+    return true;
+  });
+  await assert.rejects(() => ensureJailNetwork({}), (err) => {
+    assert.match(err.message, /HOME_GPU_NO_NET/);
+    assert.equal(err.code, 'HOME_GPU_NO_NET');
+    return true;
+  });
+});
+
+test('ensureJailNetwork never returns bridge', async () => {
+  const docker = stubDocker();
+  const name = await ensureJailNetwork(docker);
+  assert.equal(name, JAIL_NETWORK);
+  assert.notEqual(name, 'bridge');
+});
+
+test('ensureJailNetwork returns j41-gpu-jail when createNetwork throws already exists', async () => {
+  const docker = stubDocker({ createNetworkError: new Error('network with name j41-gpu-jail already exists') });
+  assert.equal(await ensureJailNetwork(docker), JAIL_NETWORK);
+  assert.notEqual(await ensureJailNetwork(docker), 'bridge');
+});
+
+test('createNetwork permission denied or IPAM collision is HOME_GPU_NO_NET; waitReady unlocks', async () => {
+  for (const msg of ['permission denied', 'IPAM collision']) {
+    const docker = stubDocker({ createNetworkError: new Error(msg) });
+    const p = new HomeGpuProvider(homeCfg({ docker }));
+    const lease = await p.acquire((await p.discover())[0]);
+    await assert.rejects(() => p.waitReady(lease, { timeoutMs: 1000 }), (err) => {
+      assert.match(err.message, /HOME_GPU_NO_NET/);
+      assert.equal(err.message.includes(msg), true);
+      assert.equal(err.code, 'HOME_GPU_NO_NET');
+      return true;
+    });
+    assert.equal((await p.discover()).length, 1);
+    assert.equal(fs.existsSync(lockPath(0)), false);
+    assert.equal(docker.created.length, 0);
+  }
 });
 
 test('collectNvidiaUserspace only takes the smi binary and compute libs', () => {
