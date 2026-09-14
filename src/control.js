@@ -648,6 +648,14 @@ async function handleCommand(cmd, state, handlers, startedAt) {
       return { redriven, itemId: cmd.itemId || null };
     }
 
+    case 'stop-rental': {
+      const jobId = cmd.jobId || cmd.job;
+      if (!jobId) return { error: 'jobId required' };
+      if (typeof handlers.stopRentalJob !== 'function') return { error: 'No stopRentalJob handler' };
+      const ok = await handlers.stopRentalJob(jobId);
+      return { ok: !!ok, jobId };
+    }
+
     case 'shutdown': {
       if (handlers.onShutdown) {
         // Respond before shutting down
@@ -783,7 +791,7 @@ async function handleCommand(cmd, state, handlers, startedAt) {
     default:
       return {
         error: `Unknown command: ${action}`,
-        available: ['status', 'jobs', 'agents', 'resources', 'earnings', 'history', 'providers', 'inbox', 'deposits', 'shutdown', 'canary'],
+        available: ['status', 'jobs', 'agents', 'resources', 'earnings', 'history', 'providers', 'inbox', 'deposits', 'stop-rental', 'shutdown', 'canary'],
       };
   }
 }

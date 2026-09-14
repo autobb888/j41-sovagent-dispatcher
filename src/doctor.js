@@ -267,6 +267,7 @@ function listingAdvertiseRefusal({
   webhookUrl,
   fs: fss,
   canonicalizeStatus,
+  outboundSshV1,
 } = {}) {
   const { parseListingKind, kindFromIdentityName } = require('./listing-kind');
   const row = {
@@ -277,7 +278,7 @@ function listingAdvertiseRefusal({
   const compute = isComputeAgent(row, agentId, cfg);
   const model = isApiEndpointAgent(row, agentCfg);
 
-  if (compute) {
+  if (compute && !outboundSshV1) {
     try {
       require('./ssh-host').assertRentalHostPublic(agentId, cfg);
     } catch (e) {
@@ -452,6 +453,7 @@ async function runDoctor(opts = {}) {
     cfg: opts.cfg,
     jobAgentPackageJson: opts.jobAgentPackageJson,
     webhookUrl: opts.webhookUrl,
+    outboundSshV1: !!opts.outboundSshV1,
   };
 
   const osInfo = detectOs(deps);
@@ -790,13 +792,16 @@ async function runDoctor(opts = {}) {
         }
       }
     }
-    if (lan.length) {
+    if (deps.outboundSshV1) {
+      checks.push(mkCheck('rental.ssh_public', 'Rental SSH', 'pass',
+        'compute.outbound-ssh-v1 — edge will issue public host:port on attach 200'));
+    } else if (lan.length) {
       const { sshHostnameForAgent } = require('./ssh-host');
       const host = sshHostnameForAgent(lan[0], cfg) || '';
       checks.push(mkCheck('rental.ssh_public', 'Rental SSH', 'fail',
-        `RENTAL_LAN_HOST: ${lan[0]} ssh_hostname ${host} is RFC1918/LAN — named TCP tunnel required`,
-        `j41-dispatcher tunnel-setup ${lan[0]} --http-host <dns> --ssh-host <dns>`,
-        `j41-dispatcher tunnel-setup ${lan[0]} --http-host <dns> --ssh-host <dns>\n# or set J41_ALLOW_LAN_RENTAL=1 (dev only)`));
+        `RENTAL_LAN_HOST: ${lan[0]} ssh_hostname ${host} is RFC1918/LAN — need compute.outbound-ssh-v1 or a public ssh_hostname`,
+        `wait for compute.outbound-ssh-v1 on GET /v1/version`,
+        `wait for compute.outbound-ssh-v1 (J41 compute edge) — do not seal RFC1918`));
     } else {
       checks.push(mkCheck('rental.ssh_public', 'Rental SSH', 'pass', 'ssh_hostname is public'));
     }

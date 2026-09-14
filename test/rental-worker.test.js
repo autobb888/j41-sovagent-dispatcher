@@ -76,6 +76,135 @@ test('startRentalJob confirms worker-attached and records leaseId, never a docke
   assert.equal(state.available.length, 0);
 });
 
+test('startRentalJob with outboundSshV1 seals attach host:port not the jail LAN host', async () => {
+  const posted = [];
+  const state = { active: new Map(), emitEvent() {} };
+  const provider = {
+    get capabilities() { return { canSsh: true, canProvision: true, canScaleToZero: true, isElastic: false }; },
+    async discover() { return [{ provider: 'home-gpu', usdPerHour: 0, meta: {} }]; },
+    async acquire() { return { id: 'home:1', provider: 'home-gpu', state: 'pending', usdPerHour: 0, ssh: null, meta: {} }; },
+    async waitReady(l) {
+      return { ...l, state: 'ready', ssh: { host: '192.168.1.69', port: 2222, user: 'renter', privateKey: 'KEY' } };
+    },
+    async release(l) { return { ...l, state: 'released' }; },
+  };
+  const { createSupplyController } = require('../src/compute-supply');
+  const controller = createSupplyController({ cfg: { compute: { enabled: true, max_usd_per_hour: 0, providers: {} } }, agentConfigs: new Map(), now: () => 1000 });
+  const client = {
+    async postRentalSecret(jobId, body) { posted.push(body.ssh); },
+    async deliverJob() { return {}; },
+    async confirmWorkerAttached() {},
+  };
+  await startRentalJob({
+    state,
+    job: { id: 'job-1', jobHash: 'h', serviceType: 'gpu-rental', payment: { verified: true } },
+    agentInfo: { id: 'gpu-1' },
+    controller,
+    provider,
+    client,
+    signDeliver: ({ hash }) => ({ signature: 's', timestamp: 1, hash }),
+    outboundSshV1: true,
+    attachEdge: async () => ({ host: 'gpu.junction41.io', port: 40123 }),
+    now: 1000,
+  });
+  assert.equal(posted[0].host, 'gpu.junction41.io');
+  assert.equal(posted[0].port, 40123);
+  assert.equal(posted[0].privateKey, 'KEY');
+  assert.equal(posted[0].host !== '192.168.1.69', true);
+});
+
+test('startRentalJob re-seals rental-secret when outbound TCP dies before first SSH', async () => {
+  const posted = [];
+  const handlers = {};
+  const remote = {
+    pipe() { return remote; },
+    unpipe() {},
+    setKeepAlive() {},
+    setNoDelay() {},
+    on(ev, fn) { (handlers[ev] = handlers[ev] || []).push(fn); return remote; },
+    once(ev, fn) { (handlers[ev] = handlers[ev] || []).push(fn); return remote; },
+    emit(ev) { for (const fn of handlers[ev] || []) fn(); },
+    destroy() {},
+  };
+  let attachCount = 0;
+  const state = { active: new Map(), emitEvent() {} };
+  const provider = {
+    get capabilities() { return { canSsh: true, canProvision: true, canScaleToZero: true, isElastic: false }; },
+    async discover() { return [{ provider: 'home-gpu', usdPerHour: 0, meta: {} }]; },
+    async acquire() { return { id: 'home:1', provider: 'home-gpu', state: 'pending', usdPerHour: 0, ssh: null, meta: {} }; },
+    async waitReady(l) {
+      return { ...l, state: 'ready', ssh: { host: '192.168.1.69', port: 2222, user: 'renter', privateKey: 'KEY' } };
+    },
+    async release(l) { return { ...l, state: 'released' }; },
+  };
+  const { createSupplyController } = require('../src/compute-supply');
+  const controller = createSupplyController({ cfg: { compute: { enabled: true, max_usd_per_hour: 0, providers: {} } }, agentConfigs: new Map(), now: () => 1000 });
+  const client = {
+    async postRentalSecret(jobId, body) { posted.push({ jobId, port: body.ssh.port }); },
+    async deliverJob() { return {}; },
+    async confirmWorkerAttached() {},
+  };
+  await startRentalJob({
+    state,
+    job: { id: 'job-1', jobHash: 'h', serviceType: 'gpu-rental', payment: { verified: true } },
+    agentInfo: { id: 'gpu-1' },
+    controller,
+    provider,
+    client,
+    signDeliver: ({ hash }) => ({ signature: 's', timestamp: 1, hash }),
+    outboundSshV1: true,
+    attachEdge: async () => {
+      attachCount += 1;
+      if (attachCount === 1) {
+        return { host: 'sovcompute.junction41.io', port: 40002, remote, stopHold() {} };
+      }
+      return { host: 'sovcompute.junction41.io', port: 40003, remote: { destroy() {} }, stopHold() {} };
+    },
+    now: 1000,
+  });
+  assert.equal(posted[0].port, 40002);
+  remote.emit('close');
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(attachCount, 2);
+  assert.equal(posted[posted.length - 1].port, 40003);
+});
+
+test('startRentalJob releases the jail if attach returns 402', async () => {
+  const released = [];
+  const state = { active: new Map(), emitEvent() {} };
+  const provider = {
+    get capabilities() { return { canSsh: true, canProvision: true, canScaleToZero: true, isElastic: false }; },
+    async discover() { return [{ provider: 'home-gpu', usdPerHour: 0, meta: {} }]; },
+    async acquire() { return { id: 'home:1', provider: 'home-gpu', state: 'pending', usdPerHour: 0, ssh: null, meta: {} }; },
+    async waitReady(l) {
+      return { ...l, state: 'ready', ssh: { host: '192.168.1.69', port: 2222, user: 'renter', privateKey: 'KEY' } };
+    },
+    async release(l) { released.push(l.id); return { ...l, state: 'released' }; },
+  };
+  const { createSupplyController } = require('../src/compute-supply');
+  const controller = createSupplyController({ cfg: { compute: { enabled: true, max_usd_per_hour: 0, providers: {} } }, agentConfigs: new Map(), now: () => 1000 });
+  const client = { async postRentalSecret() {}, async deliverJob() { return {}; }, async confirmWorkerAttached() {} };
+  await assert.rejects(() => startRentalJob({
+    state,
+    job: { id: 'job-1', jobHash: 'h', serviceType: 'gpu-rental', payment: { verified: true } },
+    agentInfo: { id: 'gpu-1' },
+    controller,
+    provider,
+    client,
+    signDeliver: ({ hash }) => ({ signature: 's', timestamp: 1, hash }),
+    outboundSshV1: true,
+    attachEdge: async () => {
+      const e = new Error('COMPUTE_EDGE_UNPAID');
+      e.code = 'COMPUTE_EDGE_UNPAID';
+      e.statusCode = 402;
+      throw e;
+    },
+    now: 1000,
+  }), /COMPUTE_EDGE_UNPAID/);
+  assert.ok(released.length >= 1);
+  assert.equal(state.active.size, 0);
+});
+
 test('cli.js skips LLM preflight for gpu-rental and routes start to startRentalJob', () => {
   const CLI = fs.readFileSync(require.resolve('../src/cli.js'), 'utf8');
   const requested = CLI.slice(CLI.indexOf("case 'job.requested'"), CLI.indexOf("case 'job.started'"));
@@ -89,6 +218,7 @@ test('cli.js skips LLM preflight for gpu-rental and routes start to startRentalJ
   assert.match(bounty, /skip(?:ping)? startJob|LLM-only/i);
   const pollPart = CLI.slice(0, CLI.indexOf('async function handleWebhookEvent'));
   assert.match(pollPart, /isGpuRentalJob/, 'poll accept must skip LLM preflight for gpu-rental');
+  assert.match(pollPart, /seen\.delete/, 'failed start must unsee so poll retries a paid gpu-rental');
   const cancelled = CLI.slice(CLI.indexOf("case 'job.cancelled'"), CLI.indexOf("case 'job.delivery_rejected'"));
   assert.match(cancelled, /kind === 'gpu-rental'/, 'job.cancelled must branch on gpu-rental');
   assert.match(cancelled, /stopRentalJob/, 'job.cancelled must release via stopRentalJob, not container.stop');

@@ -165,6 +165,7 @@ test('shouldRefuseLanGpuRental is true for gpu-rental on LAN and does not throw'
   };
   assert.equal(shouldRefuseLanGpuRental('gpu-1', { id: 'job-1', serviceType: 'gpu-rental' }, [], cfg), true);
   assert.equal(shouldRefuseLanGpuRental('gpu-1', { id: 'job-1', serviceType: 'agent' }, [], cfg), false);
+  assert.equal(shouldRefuseLanGpuRental('gpu-1', { id: 'job-1', serviceType: 'gpu-rental' }, [], cfg, { outboundSshV1: true }), false);
 });
 
 test('isLanSshHost ignores J41_ALLOW_LAN_RENTAL (buyer complete stays honest)', () => {

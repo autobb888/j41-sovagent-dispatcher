@@ -110,6 +110,18 @@ test('ctl inbox-redrive clears quarantine and reports the count', async () => {
   assert.strictEqual(isDeadLettered(state._inboxFailures, 'r1'), false);
 });
 
+test('ctl stop-rental calls stopRentalJob with the job id', async () => {
+  const stopped = [];
+  const out = await handleCommand(
+    { action: 'stop-rental', jobId: '36369141-ab75-454e-bfad-5ccfb98d0717' },
+    {},
+    { stopRentalJob: async (id) => { stopped.push(id); return true; } },
+    Date.now(),
+  );
+  assert.deepEqual(stopped, ['36369141-ab75-454e-bfad-5ccfb98d0717']);
+  assert.equal(out.ok, true);
+});
+
 test('ctl inbox-redrive with an item id touches only that item', async () => {
   const state = makeState();
   for (let i = 0; i < 5; i++) recordInboxFailure(state._inboxFailures, 'r1', 'boom');

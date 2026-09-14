@@ -635,6 +635,16 @@ test('listingAdvertiseRefusal skips labour; refuses LAN compute and model withou
     });
     assert.equal(lan.code, 'rental.ssh_public');
 
+    const edge = listingAdvertiseRefusal({
+      agentId: 'gpu-1',
+      keys: { identity: 'g.sovcompute@', kind: 'compute' },
+      cfg: {
+        compute: { providers: { card0: { type: 'home-gpu', agent_id: 'gpu-1', ssh_hostname: '192.168.1.69' } } },
+      },
+      outboundSshV1: true,
+    });
+    assert.equal(edge, null);
+
     const home = tmpHome();
     writeAgentConfig(home, 'model-1', { serviceType: 'api-endpoint' });
     const missing = listingAdvertiseRefusal({

@@ -108,7 +108,7 @@ async function startRentalJob(opts) {
   // The period price for mid-session extensions: the job amount at hire, BEFORE any paid
   // extension increments it on the platform side.
   const periodAmount = Number(job.amount) > 0 ? Number(job.amount) : null;
-  const { lease, deliverable } = await acquireRentalLease({
+  let { lease, deliverable } = await acquireRentalLease({
     controller,
     provider,
     spec,
@@ -128,11 +128,61 @@ async function startRentalJob(opts) {
     console.warn(`[Rental] confirmWorkerAttached failed for ${job.id}: ${e && e.message}`);
   }
 
+  let edge = null;
+  if (opts.outboundSshV1) {
+    const { attachAndDial, keepOutboundUntilBuyer } = require('./compute-edge');
+    const attach = typeof opts.attachEdge === 'function' ? opts.attachEdge : attachAndDial;
+    const localPort = deliverable && deliverable.ssh && deliverable.ssh.port;
+    const attachOpts = {
+      client,
+      jobId: job.id,
+      signMessage: opts.signMessage,
+      localHost: '127.0.0.1',
+      localPort,
+      connect: opts.connect,
+    };
+    try {
+      edge = await attach(attachOpts);
+      deliverable = {
+        ...deliverable,
+        ssh: {
+          ...deliverable.ssh,
+          host: edge.host,
+          port: edge.port,
+        },
+      };
+      if (edge && edge.remote) {
+        keepOutboundUntilBuyer(edge, {
+          attach,
+          attachOpts,
+          onReattached: async ({ host, port }) => {
+            // Upsert after deliver is allowed; buyer re-GETs rental-access for the live port.
+            console.warn(`[Rental] outbound TCP died — re-sealed ${host}:${port} for ${job.id}`);
+            deliverable = {
+              ...deliverable,
+              ssh: { ...deliverable.ssh, host, port },
+            };
+            const { postRentalSecret } = require('./rental-delivery');
+            await postRentalSecret(client, job.id, deliverable);
+          },
+        });
+      }
+    } catch (e) {
+      try { await controller.releaseLease(lease); } catch (relErr) {
+        console.error(`[Rental] release after edge attach failure: ${relErr && relErr.message}`);
+      }
+      throw e;
+    }
+  }
+
   try {
     await deliverSealed({ client, signDeliver, signer, job, deliverable });
   } catch (e) {
     try { await controller.releaseLease(lease); } catch (relErr) {
       console.error(`[Rental] release after deliver failure: ${relErr && relErr.message}`);
+    }
+    if (edge) {
+      try { require('./compute-edge').dropEdgeSockets(edge); } catch { /* ignore */ }
     }
     throw e;
   }
@@ -149,6 +199,7 @@ async function startRentalJob(opts) {
     jobAmount: job.amount || null,
     buyerPayAddress: job.buyerPayAddress || (job.buyer && job.buyer.payAddress) || null,
     currency: job.currency || null,
+    edge,
   };
   state.active.set(job.id, rec);
   if (Array.isArray(state.available)) {
@@ -344,6 +395,8 @@ async function stopRentalJob(state, jobId, { skipReturnAgent = false } = {}) {
 
   const ctrl = resolveComputeController(state);
   const lease = findRentalLease(ctrl, active, jobId);
+  try { require('./compute-edge').dropEdgeSockets(active.edge); } catch { /* ignore */ }
+
   if (ctrl && typeof ctrl.releaseLease === 'function' && lease && lease.state !== 'released') {
     try {
       await ctrl.releaseLease(lease);

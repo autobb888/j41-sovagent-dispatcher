@@ -80,7 +80,8 @@ function assertRentalHostPublic(agentId, cfg) {
   return assertPublicSshHost(host);
 }
 
-function shouldRefuseLanGpuRental(agentId, job, services, cfg) {
+function shouldRefuseLanGpuRental(agentId, job, services, cfg, opts = {}) {
+  if (opts && opts.outboundSshV1) return false;
   const { isGpuRentalJob } = require('./rental-worker');
   const rental = isGpuRentalJob(job, services)
     || (services || []).some((s) => s && s.serviceType === 'gpu-rental');
@@ -91,7 +92,7 @@ function shouldRefuseLanGpuRental(agentId, job, services, cfg) {
   } catch (e) {
     if (e && (e.code === 'RENTAL_LAN_HOST' || /RENTAL_LAN_HOST/.test(String(e.message || e)))) {
       const id = job && job.id != null ? job.id : '';
-      console.error(`[Rental] RENTAL_LAN_HOST — not accepting job ${id}; point ssh_hostname at a named TCP tunnel or set J41_ALLOW_LAN_RENTAL=1`);
+      console.error(`[Rental] RENTAL_LAN_HOST — not accepting job ${id}; need compute.outbound-ssh-v1 or a public ssh_hostname`);
       return true;
     }
     throw e;

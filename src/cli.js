@@ -5615,6 +5615,15 @@ program
         canonicalizeStatus = pin.ok ? 'pass' : (pin.inspectable && !pin.ok ? 'fail' : 'warn');
       } catch { canonicalizeStatus = 'warn'; }
     }
+    let _outboundSshV1 = false;
+    try {
+      const { hasOutboundSshV1 } = require('./compute-edge');
+      const { J41Client } = require('@junction41/sovagent-sdk/dist/index.js');
+      _outboundSshV1 = hasOutboundSshV1(await new J41Client({ apiUrl: J41_API_URL }).request('GET', '/v1/version'));
+    } catch { _outboundSshV1 = false; }
+    if (_outboundSshV1) {
+      console.log('  compute.outbound-ssh-v1 present — GPU listings may advertise; seal ssh.host/port from attach 200');
+    }
     const readyAgents = [];
     // Agents our own last shutdown turned off, and which this start restores.
     const _shutdownDeactivated = readShutdownDeactivated();
@@ -5667,6 +5676,7 @@ program
           agentsDir: AGENTS_DIR,
           webhookUrl: options.webhookUrl || (startCfg.runtime && startCfg.runtime.webhook_url) || '',
           canonicalizeStatus,
+          outboundSshV1: _outboundSshV1,
         });
         if (refuse) {
           console.error(`[${refuse.code}] ${agentId}: ${refuse.message} — not advertising`);
@@ -5864,6 +5874,7 @@ program
     console.log('→ Starting job listener...\n');
 
     const state = {
+      outboundSshV1: _outboundSshV1,
       agents: [...readyAgents], // all registered agents (never modified)
       active: new Map(), // jobId -> { agentId, container, startedAt, retries }
       reactivationQueue: loadReactivationQueue(), // paused jobs waiting to respawn (persisted)
@@ -6210,6 +6221,9 @@ program
               iAddress: a.iAddress,
               payAddress: a.iAddress || a.address,
               upstreamAuth,
+              // Operator-only (not git): rewrite a priced grant model before
+              // forward so a hung NIM id (e.g. DeepSeek Pro) can map to Flash.
+              upstreamModelAlias: localCfg.upstreamModelAlias || {},
             });
             let egressHost = apiSvc.endpointUrl || '';
             try { egressHost = new URL(apiSvc.endpointUrl).hostname; } catch {}
@@ -6772,6 +6786,7 @@ program
     const controlServer = startControlServer(state, {
       onShutdown: (source) => requestShutdown(`control-plane (${source})`),
       getAgentSession,
+      stopRentalJob: (jobId) => stopRentalJob(state, jobId),
     });
     // Keep the handles reachable. They were locals, so nothing but the graceful
     // shutdown path could close them — which is also why a harnessed run left a
@@ -6797,9 +6812,17 @@ program
     }
 
     // ── Start egress proxy (sole outbound path for sandboxed job containers) ──
+    // Bind 0.0.0.0 so a container on docker0 or j41-isolated can reach the
+    // proxy. Listen-on-gateway-only (172.18.0.1) is black-holed when
+    // j41-isolated has enable_icc=false and host INPUT drops the bridge.
     state.gatewayIp = isolatedGatewayIp();
+    try {
+      require('child_process').execSync('docker network inspect j41-isolated', { stdio: 'ignore', timeout: 5000 });
+    } catch {
+      state.gatewayIp = '172.17.0.1';
+    }
     state.egressProxy = new EgressProxyHost({
-      host: state.gatewayIp,
+      host: '0.0.0.0',
       port: EGRESS_PROXY_PORT,
       log: (m) => console.log(`[egress] ${m}`),
       allowLocalUpstream: !!cfg.runtime.allow_local_upstream,
@@ -10162,7 +10185,7 @@ async function pollForJobs(state) {
             const fullJob = await agent.client.getJob(job.id);
             if (fullJob?.jobHash && fullJob?.buyerVerusId) {
               const _rentalSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
-              if (shouldRefuseLanGpuRental(agentInfo.id, fullJob, _rentalSvcs)) continue;
+              if (shouldRefuseLanGpuRental(agentInfo.id, fullJob, _rentalSvcs, undefined, { outboundSshV1: !!state.outboundSshV1 })) continue;
               if (!isGpuRentalJob(fullJob, _rentalSvcs) && !(_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
                 if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
                   console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${job.id.substring(0, 8)}, buyer not charged`);
@@ -10269,7 +10292,7 @@ async function pollForJobs(state) {
         console.log(`📥 New job: ${job.id} (${job.amount} ${job.currency})`);
 
         const _startSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
-        if (shouldRefuseLanGpuRental(agentInfo.id, job, _startSvcs)) continue;
+        if (shouldRefuseLanGpuRental(agentInfo.id, job, _startSvcs, undefined, { outboundSshV1: !!state.outboundSshV1 })) continue;
         if (isApiEndpointJob(job, _startSvcs)) {
           console.log(`[Poll] skip labour start for api-endpoint job ${job.id}`);
           state.seen.set(job.id, Date.now());
@@ -10277,7 +10300,9 @@ async function pollForJobs(state) {
           continue;
         }
 
-        // Mark seen BEFORE starting to prevent duplicate spawns from concurrent polls
+        // Mark seen BEFORE starting to prevent duplicate spawns from concurrent polls.
+        // If start throws (stale GPU lock, attach 402, …) unsee so the next poll retries
+        // a paid job instead of leaving it stranded in seen with no jail.
         state.seen.set(job.id, Date.now());
         saveSeenJobs(state.seen);
 
@@ -10286,7 +10311,13 @@ async function pollForJobs(state) {
           queueInsertByPriority(state.queue, { ...job, assignedAgent: agentInfo });
         } else {
           console.log(`   → Starting job with ${agentInfo.id} (${RUNTIME})`);
-          await startJobOrRental(state, job, agentInfo);
+          try {
+            await startJobOrRental(state, job, agentInfo);
+          } catch (startErr) {
+            state.seen.delete(job.id);
+            try { saveSeenJobs(state.seen); } catch { /* retry path still live in memory */ }
+            throw startErr;
+          }
         }
       }
     } catch (e) {
@@ -10568,7 +10599,7 @@ async function handleWebhookEvent(state, agentId, payload) {
         const fullJob = await agent.client.getJob(jobId);
         if (fullJob?.jobHash && fullJob?.buyerVerusId) {
           const _rentalSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
-          if (shouldRefuseLanGpuRental(agentInfo.id, fullJob, _rentalSvcs)) return;
+          if (shouldRefuseLanGpuRental(agentInfo.id, fullJob, _rentalSvcs, undefined, { outboundSshV1: !!state.outboundSshV1 })) return;
           if (!isGpuRentalJob(fullJob, _rentalSvcs) && !(_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
             if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
               console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${jobId.substring(0, 8)}, buyer not charged`);
@@ -10661,7 +10692,7 @@ async function handleWebhookEvent(state, agentId, payload) {
           return;
         }
         const _startSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
-        if (shouldRefuseLanGpuRental(agentInfo.id, job, _startSvcs)) return;
+        if (shouldRefuseLanGpuRental(agentInfo.id, job, _startSvcs, undefined, { outboundSshV1: !!state.outboundSshV1 })) return;
         if (state.active.size >= MAX_AGENTS) {
           queueInsertByPriority(state.queue, { ...job, assignedAgent: agentInfo });
           console.log(`[Webhook] Job ${jobId.substring(0, 8)} queued (priority, ${job.amount || '?'} ${job.currency || NATIVE_COIN})`);
@@ -12078,12 +12109,9 @@ async function startJobContainer(state, job, agentInfo) {
       Tmpfs: { '/tmp': 'rw,noexec,nosuid,size=64m' },
       PidsLimit: 64,
       CapDrop: ['ALL'],
-      // The sandbox performs NO DNS — all name resolution happens at the host egress
-      // proxy, which receives the hostname via HTTP CONNECT. Setting an unusable resolver
-      // (0.0.0.0) prevents the container from falling back to Docker's embedded
-      // 127.0.0.11 resolver, which the bridge firewall cannot block (dockerd forwards
-      // those lookups from the host netns, not via the bridge).
-      Dns: ['0.0.0.0'],
+      // Isolated net: no DNS, host CONNECT proxy resolves. Bridge fallback: Docker
+      // 127.0.0.11 + NAT (j41-isolated was not egress-capable on this host).
+      ...(getDispatcherNetworkMode() === 'bridge' ? {} : { Dns: ['0.0.0.0'] }),
       // --- Security hardening (Plan B) ---
       SecurityOpt: buildDispatcherSecurityOpt(),
       NetworkMode: getDispatcherNetworkMode(),
@@ -12137,10 +12165,16 @@ async function startJobContainer(state, job, agentInfo) {
             .map(([k, v]) => `${k}=${v}`)
             .concat(getExecutorEnvVars(agentInfo).filter(s => !s.startsWith('J41_LLM_')))
             .concat(brokerEnv)
-            .concat([
-              `J41_EGRESS_PROXY=http://${state.gatewayIp}:${EGRESS_PROXY_PORT}`,
-              `J41_EGRESS_TOKEN=${egressToken}`,
-            ]),
+            .concat(
+              // Default docker bridge already NATs 443. Forcing undici through
+              // the host CONNECT proxy hangs NVIDIA chat (60s abort → canned
+              // "temporary issue") even though J41 login via the same proxy
+              // works. Skip the proxy on bridge; isolated nets still use it.
+              getDispatcherNetworkMode() === 'bridge' ? [] : [
+                `J41_EGRESS_PROXY=http://${state.gatewayIp}:${EGRESS_PROXY_PORT}`,
+                `J41_EGRESS_TOKEN=${egressToken}`,
+              ],
+            ),
       HostConfig: hostConfig,
       Labels: {
         'j41.job.id': job.id,
@@ -12767,7 +12801,7 @@ async function startJob(state, job, agentInfo) {
 }
 
 async function startRentalJobWired(state, job, agentInfo) {
-  if (shouldRefuseLanGpuRental(agentInfo && agentInfo.id, job, [{ serviceType: 'gpu-rental' }])) {
+  if (shouldRefuseLanGpuRental(agentInfo && agentInfo.id, job, [{ serviceType: 'gpu-rental' }], undefined, { outboundSshV1: !!(state && state.outboundSshV1) })) {
     return;
   }
   const allowUnpriced = process.env.J41_ALLOW_UNPRICED_JOBS === '1';
@@ -12791,6 +12825,8 @@ async function startRentalJobWired(state, job, agentInfo) {
     providerName,
     client: agent.client,
     signDeliver: ({ hash }) => signer.signDeliver({ jobHash: job.jobHash, deliveryHash: hash }),
+    signMessage: (message) => signer.signMessage(message),
+    outboundSshV1: !!(state && state.outboundSshV1),
     ackPostpayVastRisk: !!(agentCfg && agentCfg.rentalAckPostpayVastRisk),
     // The advertised period. `rental-setup` writes this same value into the service
     // description ("Runs up to N minutes"), so anything else here sells one duration and
@@ -13167,9 +13203,10 @@ program
 // ── Control Plane Client ──
 program
   .command('ctl <command>')
-  .description('Send command to running dispatcher: status, jobs, agents, resources, earnings, history, providers, inbox, inbox-redrive, deposits, leases, shutdown, canary')
+  .description('Send command to running dispatcher: status, jobs, agents, resources, earnings, history, providers, inbox, inbox-redrive, deposits, leases, stop-rental, shutdown, canary')
   .option('--agent <id>', 'Agent ID (for canary command)')
   .option('--item <id>', 'Inbox item ID (for inbox-redrive)')
+  .option('--job <id>', 'Job ID (for stop-rental)')
   .option('--all', 'inbox-redrive: redrive EVERY dead letter (destructive — hands fresh budgets to poisoned items)')
   .option('--json', 'Raw JSON output')
   .action(async (command, options) => {
@@ -13178,6 +13215,7 @@ program
     try {
       const cmd = { action: command };
       if (options.agent) cmd.agentId = options.agent;
+      if (options.job) cmd.jobId = options.job;
       // Without this, `ctl inbox-redrive <id>` silently drops the id (commander
       // allows excess args) and redrives EVERY dead letter — an operator would
       // hand fresh budgets to genuinely poisoned items believing they targeted one.
@@ -13187,6 +13225,11 @@ program
       // a bare `ctl inbox-redrive` redrove every dead letter, handing fresh
       // budgets to genuinely poisoned items, and probing `ctl` verbs to see
       // what they print would fire it.
+      if (command === 'stop-rental' && !options.job) {
+        console.error('❌ `ctl stop-rental` needs --job <id>.');
+        console.error('   Drops a live gpu-rental (jail + edge TCP). Does not complete or cancel on-chain.');
+        process.exit(1);
+      }
       if (command === 'inbox-redrive' && !options.item && !options.all) {
         console.error('❌ `ctl inbox-redrive` needs a target.');
         console.error('   One item:      j41-dispatcher ctl inbox-redrive --item <id>');
@@ -13215,6 +13258,12 @@ program
           console.log(`  Queue:      ${result.queue} pending`);
           console.log(`  Seen:       ${result.seen} (lifetime)`);
           console.log('');
+          break;
+
+        case 'stop-rental':
+          if (result.error) console.error(`❌ ${result.error}`);
+          else if (result.ok) console.log(`✅ Stopped rental ${result.jobId}`);
+          else console.log(`⚠️  No live gpu-rental ${result.jobId}`);
           break;
 
         case 'jobs':
