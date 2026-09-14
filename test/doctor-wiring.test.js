@@ -16,6 +16,34 @@ test('cli.js registers doctor command', () => {
   assert.match(CLI, /\.command\('doctor'\)/);
 });
 
+test('cli.js refuses Node <20 immediately after umask, before secure-setup', () => {
+  const umaskAt = CLI.indexOf('process.umask(0o077)');
+  const gateAt = CLI.indexOf('nodeMajor(process.version)');
+  const secureAt = CLI.indexOf("require('@junction41/secure-setup')");
+  assert.ok(umaskAt > -1, 'umask must still be at process entry');
+  assert.ok(gateAt > umaskAt, 'Node gate must follow umask');
+  assert.ok(secureAt > gateAt, 'Node gate must run before requiring secure-setup');
+  assert.match(CLI, /need Node 20\+ \(22 recommended\)/);
+  assert.match(CLI, /Ubuntu apt nodejs is 18/);
+});
+
+test('cli.js splits secure-setup MODULE_NOT_FOUND from ESM require failure', () => {
+  const start = CLI.indexOf("require('@junction41/secure-setup')");
+  assert.ok(start > -1);
+  const block = CLI.slice(start, start + 900);
+  assert.match(block, /MODULE_NOT_FOUND/);
+  assert.match(block, /ERR_REQUIRE_ESM/);
+  assert.match(block, /ERR_REQUIRE_ASYNC_MODULE/);
+  assert.match(block, /20\.19\+/);
+  assert.match(block, /process\.exit\(1\)/);
+});
+
+test('dashboard.js refuses Node <20 at entry (launched without cli.js)', () => {
+  const gateAt = DASH.indexOf('nodeMajor(process.version)');
+  assert.ok(gateAt > -1, 'dashboard must gate Node itself — it does not require cli.js');
+  assert.match(DASH, /need Node 20\+ \(22 recommended\)/);
+});
+
 test('getActiveJobs does not recommend config --runtime local', () => {
   assert.equal((CLI.match(/config --runtime local/g) || []).length, 0,
     'cli.js still tells operators to switch to local mode');

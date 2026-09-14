@@ -11,6 +11,7 @@ const os = require('os');
 
 const {
   CHECK_IDS,
+  nodeMajor,
   runDoctor,
   formatDoctorTable,
   formatIdentitySummary,
@@ -101,6 +102,20 @@ function baseOpts(over = {}) {
     homedir: home,
   };
 }
+
+test('nodeMajor parses v-prefixed, bare, and garbage versions', () => {
+  assert.equal(nodeMajor('v18.19.1'), 18);
+  assert.equal(nodeMajor('v20.0.0'), 20);
+  assert.equal(nodeMajor('v20.18.0'), 20);
+  assert.equal(nodeMajor('v22.19.0'), 22);
+  assert.equal(nodeMajor('18.19.1'), 18);
+  assert.equal(nodeMajor('20.19.0'), 20);
+  assert.equal(nodeMajor(''), 0);
+  assert.equal(nodeMajor(undefined), 0);
+  assert.equal(nodeMajor('nope'), 0);
+  assert.ok(nodeMajor('v18.19.1') < 20);
+  assert.equal(nodeMajor('v20.0.0') < 20, false);
+});
 
 test('Ubuntu 24.04, node 18.19.1: node fail, ok false', async () => {
   const report = await runDoctor(baseOpts({ nodeVersion: 'v18.19.1' }));

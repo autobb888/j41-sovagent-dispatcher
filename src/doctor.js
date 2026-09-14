@@ -934,6 +934,7 @@ module.exports = {
   CHECK_IDS,
   CLOCK_SKEW_MS,
   CANONICALIZE_PIN,
+  nodeMajor,
   runDoctor,
   formatDoctorTable,
   formatIdentitySummary,

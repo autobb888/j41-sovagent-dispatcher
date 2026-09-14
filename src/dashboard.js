@@ -4,6 +4,12 @@
  * Arrow-key TUI for managing agents, viewing VDXF data, configuring LLM, etc.
  */
 
+const { nodeMajor } = require('./doctor');
+if (nodeMajor(process.version) < 20) {
+  console.error(`${process.version} — need Node 20+ (22 recommended). Ubuntu apt nodejs is 18.`);
+  process.exit(1);
+}
+
 const fs = require('fs');
 const path = require('path');
 const os = require('os');

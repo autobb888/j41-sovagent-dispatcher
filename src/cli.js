@@ -13,6 +13,12 @@
 // inherit world-readable agent identity files.
 process.umask(0o077);
 
+const { nodeMajor } = require('./doctor');
+if (nodeMajor(process.version) < 20) {
+  console.error(`${process.version} — need Node 20+ (22 recommended). Ubuntu apt nodejs is 18.`);
+  process.exit(1);
+}
+
 const { Command } = require('commander');
 const fs = require('fs');
 const path = require('path');
@@ -152,7 +158,16 @@ if (RUNTIME === 'docker') {
 let secureSetup;
 try {
   secureSetup = require('@junction41/secure-setup');
-} catch {
+} catch (e) {
+  const code = e && e.code;
+  if (code === 'ERR_REQUIRE_ESM' || code === 'ERR_REQUIRE_ASYNC_MODULE') {
+    console.error(`Node 20.19+ required for @junction41/secure-setup (got ${process.version}).`);
+    process.exit(1);
+  }
+  if (code !== 'MODULE_NOT_FOUND') {
+    console.error(`Failed to load @junction41/secure-setup: ${e && e.message ? e.message : e}`);
+    process.exit(1);
+  }
   // @junction41/secure-setup not installed — security features will be skipped
 }
 
