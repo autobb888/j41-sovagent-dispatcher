@@ -162,7 +162,7 @@ class LocalLLMExecutor extends Executor {
    * @param {string} agentId  Agent's iAddress (identifies 'assistant' turns).
    * @param {string} [agentName] Agent's identityName (secondary match).
    */
-  seedConversationLog(messages, agentId, agentName) {
+  async seedConversationLog(messages, agentId, agentName) {
     // Defensive oldest-first sort by createdAt (guarantees correct order
     // regardless of backend sort, for conversations up to the fetch limit).
     const ordered = (messages || []).slice()
@@ -175,7 +175,15 @@ class LocalLLMExecutor extends Executor {
       const isAgent =
         (agentId && m.senderVerusId === agentId) ||
         (agentName && m.senderVerusId === agentName);
-      this.conversationLog.push({ role: isAgent ? 'assistant' : 'user', content: m.content });
+      // Respawn reloads the platform store, which still has the unstripped
+      // original. Match handleMessage: scan non-agent rows (default-on) so a
+      // pause-and-resume cannot reintroduce an injection that live chat already
+      // stripped. Agent-authored rows are our own prior output — leave them.
+      let content = m.content;
+      if (!isAgent && process.env.J41_SCAN_BUYER_CHAT !== '0') {
+        content = await scanUntrusted(m.content, 'other_agent');
+      }
+      this.conversationLog.push({ role: isAgent ? 'assistant' : 'user', content });
       seeded++;
     }
     return seeded;
@@ -189,7 +197,7 @@ class LocalLLMExecutor extends Executor {
     try {
       const histRes = await agent.client.getChatMessages(jobId, { limit: 100 });
       const msgs = histRes.data || [];
-      const seeded = this.seedConversationLog(msgs, agent.iAddress, agent.identityName);
+      const seeded = await this.seedConversationLog(msgs, agent.iAddress, agent.identityName);
       console.log(`[CHAT] Seeded ${seeded} prior message(s) into conversation context`);
     } catch (e) {
       console.warn(`[CHAT] Could not fetch message history (${e.message}) — continuing with empty context`);
