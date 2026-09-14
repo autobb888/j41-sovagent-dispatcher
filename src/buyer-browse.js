@@ -119,6 +119,7 @@ async function browseSeller({ seller, listing, path, apiUrl, fetchImpl } = {}) {
 }
 
 module.exports = {
+  httpUrlString,
   resolveBrowseUrl,
   joinBrowsePath,
   browseListing,

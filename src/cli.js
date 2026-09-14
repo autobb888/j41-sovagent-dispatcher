@@ -1573,8 +1573,22 @@ program
       ? `j41-dispatcher setup ${localId} ${name} --kind ${kind} --template ${template}`
       : `j41-dispatcher setup ${localId} ${name} --kind ${kind}`;
     console.log(`     ${setupCmd}`);
-    console.log(`\n  2. Start the dispatcher:`);
-    console.log(`     j41-dispatcher start`);
+    if (kind === 'compute') {
+      console.log(`\n  2. Attach the GPU:`);
+      console.log(`     j41-dispatcher rental-setup ${localId} --price <vrsc>`);
+    } else if (kind === 'model') {
+      console.log(`\n  2. Attach the inference endpoint:`);
+      console.log(`     j41-dispatcher api-setup ${localId} --upstream-url <url> --model '<name>:<in>:<out>' --public-url https://<dns>`);
+      console.log(`\n  3. Start in webhook mode:`);
+      console.log(`     j41-dispatcher start --webhook-url https://<dns>`);
+      console.log('     Poll mode (bare start) will not bind the proxy.');
+    } else if (kind === 'data') {
+      console.log(`\n  2. Attach the dataset URL:`);
+      console.log(`     j41-dispatcher data-setup ${localId} --website https://...`);
+    } else {
+      console.log(`\n  2. Start the dispatcher:`);
+      console.log(`     j41-dispatcher start`);
+    }
     console.log('');
   });
 
@@ -3191,6 +3205,7 @@ program
       }
       if (hasData) {
         console.log('  Data identities are browse-only (DATA_NOT_HIREABLE) even with 0 services.');
+        console.log('  Browse: j41-dispatcher browse <seller>');
       }
       if (hasHire) console.log('  Buyer ids: j41-dispatcher buyers\n');
       else console.log('');
@@ -4845,7 +4860,18 @@ program
     if (services.length) {
       console.log(`  Service:  ${services[0].name} — ${services[0].price} ${services[0].currency}`);
     }
-    console.log(`\n  Next: j41-dispatcher start`);
+    const doneKind = parseListingKind(keys.kind) || parseListingKind(options.kind) || 'agent';
+    if (doneKind === 'compute') {
+      console.log(`\n  Next: j41-dispatcher rental-setup ${agentId} --price <vrsc>`);
+    } else if (doneKind === 'model') {
+      console.log(`\n  Next: j41-dispatcher api-setup ${agentId} --upstream-url <url> --model '<name>:<in>:<out>' --public-url https://<dns>`);
+      console.log(`        then: j41-dispatcher start --webhook-url https://<dns>`);
+      console.log('        Poll mode (bare start) will not bind the proxy.');
+    } else if (doneKind === 'data') {
+      console.log(`\n  Next: j41-dispatcher data-setup ${agentId} --website https://...`);
+    } else {
+      console.log(`\n  Next: j41-dispatcher start`);
+    }
     console.log(`  Verify: j41-dispatcher inspect ${agentId}`);
   });
 
@@ -5025,9 +5051,99 @@ program
         rateLimits,
       });
       console.log(`✓ Service registered on platform (id: ${svc?.id || svc?.data?.id || '?'})`);
-      console.log('Next: start the dispatcher (j41-dispatcher start) — your service is now discoverable.');
+      console.log(`Next: j41-dispatcher start --webhook-url ${publicUrl}`);
+      console.log('Poll mode (bare start) will not bind the proxy.');
     } catch (e) {
       console.error(`✗ Platform registration failed: ${e.message}`);
+      console.error('  Config was still written — rerun with --no-register to skip this step, or fix auth and retry.');
+      process.exit(1);
+    } finally {
+      try { agent.stop?.(); } catch {}
+    }
+  });
+
+// Data setup — VDXF rind (website / networkEndpoints). Not a labour registrar.
+program
+  .command('data-setup <agent-id>')
+  .description('Attach HTTP(S) website / networkEndpoints for a data listing (VDXF rind, not a labour service)')
+  .option('--website <url>', 'HTTP(S) website URL')
+  .option('--network-endpoints <csv>', 'HTTP(S) endpoint URLs (comma-separated)')
+  .option('--description <desc>', 'Optional listing description (no tunnel/LAN URLs)')
+  .option('--no-register', 'Write local agent-config only (skip on-chain VDXF)')
+  .action(async (agentId, options) => {
+    await ensureKeystoreUnlockedIfEncrypted();
+    const agentDir = path.join(AGENTS_DIR, agentId);
+    if (!fs.existsSync(agentDir)) {
+      console.error(`✗ Agent directory not found: ${agentDir}`);
+      process.exit(1);
+    }
+
+    const keysPath = path.join(agentDir, 'keys.json');
+    if (!fs.existsSync(keysPath)) { console.error(`✗ keys.json not found for ${agentId}`); process.exit(1); }
+    const keys = readKeysFile(keysPath);
+
+    const {
+      planDataSetup,
+      dataSetupNextLines,
+    } = require('./data-setup');
+
+    const configPath = path.join(agentDir, 'agent-config.json');
+    let config = {};
+    try { if (fs.existsSync(configPath)) config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch {}
+
+    let plan;
+    try {
+      plan = planDataSetup({
+        keys,
+        agentConfig: config,
+        website: options.website,
+        networkEndpoints: options.networkEndpoints,
+        description: options.description,
+      });
+    } catch (e) {
+      console.error(`✗ ${e.message}`);
+      process.exit(1);
+    }
+
+    if (options.register) {
+      if (!keys.identity || !keys.iAddress) {
+        console.error(`❌ Agent ${agentId} is not registered on-chain. Register first.`);
+        process.exit(1);
+      }
+    }
+
+    fs.writeFileSync(configPath, JSON.stringify(plan.agentConfig, null, 2) + '\n');
+    try { fs.chmodSync(configPath, 0o600); } catch {}
+    console.log(`✓ Wrote ${configPath}`);
+
+    if (!options.register) {
+      console.log('Config saved. Skipping on-chain VDXF (--no-register).');
+      for (const line of dataSetupNextLines(keys.identity)) console.log(line);
+      return;
+    }
+
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+    const { removeAndRewriteVdxfFields } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+    const agent = new J41Agent({
+      apiUrl: J41_API_URL,
+      wif: keys.wif,
+      identityName: keys.identity,
+      iAddress: keys.iAddress,
+    });
+    try {
+      await agent.authenticate();
+      const result = await removeAndRewriteVdxfFields({
+        agent,
+        identityName: keys.identity,
+        fieldsToUpdate: plan.fieldsToUpdate,
+        chain: J41_NETWORK,
+        wif: keys.wif,
+        onProgress: (msg) => console.log(`  ${msg}`),
+      });
+      console.log(`✓ VDXF website/networkEndpoints written (${result.writeTxid || 'ok'})`);
+      for (const line of plan.nextLines) console.log(line);
+    } catch (e) {
+      console.error(`✗ On-chain VDXF write failed: ${e.message}`);
       console.error('  Config was still written — rerun with --no-register to skip this step, or fix auth and retry.');
       process.exit(1);
     } finally {

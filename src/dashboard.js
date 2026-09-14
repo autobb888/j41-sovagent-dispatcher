@@ -1400,8 +1400,8 @@ async function addAgentScreen(inquirer) {
   console.log(`  Identity: ${preview}`);
   if (template) console.log(`  Template: ${template}`);
   if (kind === 'compute') console.log(`  Next:      write [compute.providers.*] then rental-setup`);
-  if (kind === 'model') console.log(`  Next:      attach the inference endpoint for this model`);
-  if (kind === 'data') console.log(`  Next:      attach a data policy; you keep hosting the bytes`);
+  if (kind === 'model') console.log(`  Next:      [18] API Endpoint Setup, then start --webhook-url`);
+  if (kind === 'data') console.log(`  Next:      data-setup --website (not [5] Configure Services)`);
   console.log('');
 
   const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Proceed with setup?', default: false }]);
@@ -1428,10 +1428,24 @@ async function addAgentScreen(inquirer) {
           await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
           return;
         }
-        const next = kind === 'data'
-          ? '  Use [5] Configure Services to attach the data policy and endpoint you host.\n'
-          : '  Use [5] Configure Services / API endpoint so buyers can talk to this model.\n';
-        console.log(next);
+        if (kind === 'data') {
+          console.log('  Data listings are browse-only. Next is data-setup, not [5] Configure Services.\n');
+          console.log(`  j41-dispatcher data-setup ${agentId} --website https://...\n`);
+          await dataSetupScreen(inquirer, agentId);
+          return;
+        }
+        if (kind === 'model') {
+          console.log('  Next: [18] API Endpoint Setup, then j41-dispatcher start --webhook-url <publicUrl>');
+          console.log('  Poll mode will not bind the proxy. Do not use [5] Configure Services.\n');
+          const { goApi } = await promptWithEsc(inquirer, [{
+            type: 'confirm', name: 'goApi',
+            message: 'Open [18] API Endpoint Setup now?',
+            default: false,
+          }]);
+          if (goApi) await apiEndpointSetupScreen(inquirer);
+          await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+          return;
+        }
         await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
         return;
       }
@@ -1496,6 +1510,29 @@ async function configureServicesScreen(inquirer) {
     console.log('  This is a compute listing. Do not attach labour or api-endpoint here.\n');
     await computeProviderScreen(inquirer, agentId);
     await rentalSetupScreen(inquirer, agentId);
+    return;
+  }
+
+  if (listingKindOf(keys) === 'data') {
+    console.log('  This is a data listing. Labour services and API endpoints are refused.');
+    console.log('  Browse-only: attach website / networkEndpoints via data-setup, not Add agent service.\n');
+    await dataSetupScreen(inquirer, agentId);
+    return;
+  }
+
+  if (listingKindOf(keys) === 'model') {
+    console.log('  This is a model listing. Labour "Add agent service" is refused.');
+    console.log('  Use [18] API Endpoint Setup, then start --webhook-url (poll mode will not bind the proxy).\n');
+    const { goApi } = await promptWithEsc(inquirer, [{
+      type: 'confirm', name: 'goApi',
+      message: 'Open [18] API Endpoint Setup now?',
+      default: false,
+    }]);
+    if (goApi) await apiEndpointSetupScreen(inquirer);
+    else {
+      console.log(`\n  Next: j41-dispatcher api-setup ${agentId} --upstream-url <url> --model '<name>:<in>:<out>' --public-url https://...\n`);
+      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    }
     return;
   }
 
@@ -2311,17 +2348,24 @@ async function hireScreen(inquirer) {
     }
     if (result.browseOnly) {
       console.log('\n  Data listings (browse only — hire is refused):\n');
-      for (const r of result.rows) console.log(`    ${r.qualifiedName || r.seller}`);
+      for (const r of result.rows) {
+        const seller = r.qualifiedName || r.seller;
+        console.log(`    ${seller}`);
+        console.log(`    Browse: j41-dispatcher browse ${seller}`);
+      }
       console.log('');
       await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
       return;
     }
     if (kindPick === 'model' || result.rows.every((r) => r.next === 'access')) {
       console.log('\n  Models are metered inference — hire is refused (MODEL_NOT_A_LABOUR_JOB).');
-      console.log(`  Access: j41-dispatcher access ${buyerId} <seller>`);
-      console.log(`  Chat:   j41-dispatcher chat ${buyerId} <seller> --message "..."\n`);
+      console.log('  Print-argv only — no ECDH in TUI.\n');
       for (const r of result.rows) {
-        console.log(`    ${r.qualifiedName || r.seller}  ${r.serviceId || ''}`);
+        const seller = r.qualifiedName || r.seller;
+        console.log(`    ${seller}  ${r.serviceId || ''}`);
+        console.log(`    Access:  j41-dispatcher access ${buyerId} ${seller}`);
+        console.log(`    Chat:    j41-dispatcher chat ${buyerId} ${seller} --message "..."`);
+        console.log(`    Deposit: j41-dispatcher deposit ${buyerId} ${seller} --amount <n>`);
       }
       console.log('');
       await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
@@ -2384,16 +2428,20 @@ async function hireScreen(inquirer) {
   }
 
   const kind = listing.kind || listing.listingKind || 'agent';
-  console.log(`\n  Seller kind: ${kind}  ${listing.qualifiedName || listing.name || sellerId}`);
+  const sellerName = listing.qualifiedName || listing.name || sellerId;
+  console.log(`\n  Seller kind: ${kind}  ${sellerName}`);
   if (kind === 'data') {
-    console.log('  Data listings are browse-only — POST /v1/jobs is refused.\n');
+    console.log('  Data listings are browse-only — POST /v1/jobs is refused.');
+    console.log(`  Browse: j41-dispatcher browse ${sellerName}\n`);
     await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
     return;
   }
   if (kind === 'model') {
     console.log('  Models are metered inference — hire is refused (MODEL_NOT_A_LABOUR_JOB).');
-    console.log(`  Access: j41-dispatcher access ${buyerId} ${sellerId}`);
-    console.log(`  Chat:   j41-dispatcher chat ${buyerId} ${sellerId} --message "..."\n`);
+    console.log('  Print-argv only — no ECDH in TUI.');
+    console.log(`  Access:  j41-dispatcher access ${buyerId} ${sellerId}`);
+    console.log(`  Chat:    j41-dispatcher chat ${buyerId} ${sellerId} --message "..."`);
+    console.log(`  Deposit: j41-dispatcher deposit ${buyerId} ${sellerId} --amount <n>\n`);
     await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
     return;
   }
@@ -2488,6 +2536,39 @@ async function rentalSetupScreen(inquirer, agentId) {
   if (!confirm) return;
   console.log('');
   await runDispatcherCli(['rental-setup', agentId, '--price', String(price)]);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
+async function dataSetupScreen(inquirer, agentId) {
+  console.clear();
+  console.log(`\n  ═══ data-setup: ${agentId} ═══\n`);
+  console.log('  Data listings are browse-only. HTTP(S) website / networkEndpoints.');
+  console.log('  Do not register a labour service. Do not start the dispatcher for browse-only.\n');
+  const { website } = await promptWithEsc(inquirer, [{
+    type: 'input', name: 'website',
+    message: 'Website URL (https://...):',
+  }]);
+  const { endpoints } = await promptWithEsc(inquirer, [{
+    type: 'input', name: 'endpoints',
+    message: 'Network endpoints (comma-separated, optional):',
+  }]);
+  const args = ['data-setup', agentId];
+  if (website) args.push('--website', String(website).trim());
+  if (endpoints) args.push('--network-endpoints', String(endpoints).trim());
+  console.log(`\n  j41-dispatcher ${args.join(' ')}\n`);
+  if (!website && !endpoints) {
+    console.log('  Need --website and/or --network-endpoints.\n');
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+    return;
+  }
+  const { confirm } = await promptWithEsc(inquirer, [{
+    type: 'confirm', name: 'confirm',
+    message: 'Run data-setup now?',
+    default: false,
+  }]);
+  if (!confirm) return;
+  console.log('');
+  await runDispatcherCli(args);
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 

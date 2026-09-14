@@ -19,6 +19,8 @@ const {
   dockerAdviceFromError,
   firstPasteCommand,
   listingAdvertiseRefusal,
+  identityNext,
+  pickNext,
 } = require('../src/doctor');
 
 function tmpHome() {
@@ -465,8 +467,8 @@ function writeAgentConfig(home, id, config) {
   fs.writeFileSync(path.join(dir, 'agent-config.json'), JSON.stringify(config), { mode: 0o600 });
 }
 
-test('CHECK_IDS includes rental.ssh_public, model.public_url, model.webhook, image.canonicalize', () => {
-  for (const id of ['rental.ssh_public', 'model.public_url', 'model.webhook', 'image.canonicalize']) {
+test('CHECK_IDS includes rental.ssh_public, model.public_url, model.webhook, data.endpoint, image.canonicalize', () => {
+  for (const id of ['rental.ssh_public', 'model.public_url', 'model.webhook', 'data.endpoint', 'image.canonicalize']) {
     assert.ok(CHECK_IDS.includes(id), id);
   }
 });
@@ -581,6 +583,90 @@ test('no compute/model listings: rental.ssh_public and model checks skip', async
   assert.equal(check(report, 'rental.ssh_public').status, 'skip');
   assert.equal(check(report, 'model.public_url').status, 'skip');
   assert.equal(check(report, 'model.webhook').status, 'skip');
+  assert.equal(check(report, 'data.endpoint').status, 'skip');
+});
+
+test('0 identities: identity Next is labour setup agent-1; llm skip', async () => {
+  const report = await runDoctor(baseOpts({ llm: { configured: false } }));
+  assert.equal(check(report, 'llm').status, 'skip');
+  assert.equal(check(report, 'identity').status, 'warn');
+  assert.match(check(report, 'identity').nextCommand, /setup agent-1 .* --template code-review/);
+  assert.doesNotMatch(check(report, 'identity').nextCommand, /data-1/);
+});
+
+test('existing data-1 folder must not invent agent-1', async () => {
+  const home = tmpHome();
+  writeKeys(home, 'data-1', { kind: 'data' });
+  const report = await runDoctor(baseOpts({ homedir: home, llm: { configured: false } }));
+  assert.equal(check(report, 'llm').status, 'skip');
+  assert.equal(check(report, 'identity').status, 'warn');
+  assert.match(check(report, 'identity').nextCommand, /setup data-1 /);
+  assert.match(check(report, 'identity').nextCommand, /--kind data/);
+  assert.doesNotMatch(check(report, 'identity').nextCommand, /agent-1/);
+  assert.equal(check(report, 'data.endpoint').status, 'skip');
+});
+
+test('on-chain data listing without HTTP(S) endpoint: data.endpoint fail', async () => {
+  const home = tmpHome();
+  writeKeys(home, 'data-1', { identity: 'corpus.agentplatform@', iAddress: 'iDATA', kind: 'data' });
+  const report = await runDoctor(baseOpts({ homedir: home }));
+  assert.equal(check(report, 'data.endpoint').status, 'fail');
+  assert.match(check(report, 'data.endpoint').nextCommand, /data-setup data-1 --website https:\/\//);
+  assert.equal(report.ok, false);
+});
+
+test('on-chain data listing with ephemeral URL: data.endpoint fail', async () => {
+  const home = tmpHome();
+  writeKeys(home, 'data-1', { identity: 'corpus.agentplatform@', iAddress: 'iDATA', kind: 'data' });
+  writeAgentConfig(home, 'data-1', { website: 'https://dead.trycloudflare.com/apples.json' });
+  const report = await runDoctor(baseOpts({ homedir: home }));
+  assert.equal(check(report, 'data.endpoint').status, 'fail');
+  assert.match(check(report, 'data.endpoint').detail, /ephemeral|trycloudflare/);
+});
+
+test('on-chain data listing with HTTP(S) website: data.endpoint pass', async () => {
+  const home = tmpHome();
+  writeKeys(home, 'data-1', { identity: 'corpus.agentplatform@', iAddress: 'iDATA', kind: 'data' });
+  writeAgentConfig(home, 'data-1', { website: 'https://data.example/apples.json' });
+  const report = await runDoctor(baseOpts({ homedir: home }));
+  assert.equal(check(report, 'data.endpoint').status, 'pass');
+});
+
+test('listingAdvertiseRefusal data without endpoint', () => {
+  const home = tmpHome();
+  writeKeys(home, 'data-1', { identity: 'corpus.agentplatform@', kind: 'data' });
+  const missing = listingAdvertiseRefusal({
+    agentId: 'data-1',
+    keys: { identity: 'corpus.agentplatform@', kind: 'data' },
+    agentsDir: path.join(home, '.j41', 'dispatcher', 'agents'),
+  });
+  assert.equal(missing.code, 'data.endpoint');
+
+  writeAgentConfig(home, 'data-1', { website: 'https://data.example/apples.json' });
+  const ok = listingAdvertiseRefusal({
+    agentId: 'data-1',
+    keys: { identity: 'corpus.agentplatform@', kind: 'data' },
+    agentsDir: path.join(home, '.j41', 'dispatcher', 'agents'),
+  });
+  assert.equal(ok, null);
+});
+
+test('pickNext includes data.endpoint, model.webhook, model.public_url', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'doctor.js'), 'utf8');
+  assert.match(src, /data\.endpoint.*model\.webhook.*model\.public_url/);
+  const hit = pickNext([
+    { id: 'os', status: 'pass' },
+    { id: 'data.endpoint', status: 'fail', nextCommand: 'j41-dispatcher data-setup data-1 --website https://...' },
+  ]);
+  assert.match(hit.nextCommand, /data-setup data-1/);
+});
+
+test('identityNext: 0 identities keep labour default; data-1 is not agent-1', () => {
+  const none = identityNext([]);
+  assert.match(none.nextCommand, /setup agent-1 <name> --template code-review/);
+  const data = identityNext([{ id: 'data-1', kind: 'data' }]);
+  assert.match(data.nextCommand, /setup data-1 <name> --kind data/);
+  assert.doesNotMatch(data.nextCommand, /agent-1/);
 });
 
 test('image.canonicalize warns when docker is missing', async () => {
