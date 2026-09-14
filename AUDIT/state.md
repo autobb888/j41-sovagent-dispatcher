@@ -1057,3 +1057,31 @@ Follow-up same day: **O2-1 and O2-2 fixed in tree** (postinstall + TUI + empty-d
 - `inspect` “No services registered”.
 - Pre-existing `test/sign-channel-precreate.test.js` “replaced host slot” failure (untouched this pass; fails in isolation on this host).
 - Re-litigating 2.37 Wave 0–2 (alias, installer rewrite, doctor existence).
+
+---
+
+## gpu-jail — 2026-09-14 — DONE
+
+Artifacts: `AUDIT/gpu-jail.md`, `AUDIT/gpu-jail-claims.md`.
+
+**Counts by severity:** crit 0 · high 0 · med 3 · low 3 · total 6
+
+| Sev | Finding |
+|---|---|
+| med | G1 — README/CLAUDE still prescribe a seller named TCP tunnel; live gate is `compute.outbound-ssh-v1` |
+| med | G2 — jail network create failure falls back to docker0 |
+| med | G3 — init umount of Docker hosts/resolv binds is `\|\| true` |
+| low | G4 — AppArmor load failure is silent |
+| low | G5 — `LoginGraceTime 0` (no auth timeout) |
+| low | G6 — `assertNvidiaRuntime` still required after DeviceRequests removed |
+
+**Claims:** 22 VERIFIED · 3 DRIFT (A9, A25, A26) · 1 MISSING (A30 kernel/GPU UUID/overlay `/`) · 3 UNVERIFIED (backend A12–A14).
+
+**Files read:** `src/providers/home-gpu.js`, `src/compute-edge.js`, `src/rental-worker.js` (start/yank/adopt), `src/rental-delivery.js`, `src/ssh-host.js`, `src/docker-host.js`, `src/doctor.js` (rental.ssh_public), `src/cli.js` (start jail gate, complete honesty), `Dockerfile.gpu-jail`, `docker/gpu-jail-init.sh`, `docker/apparmor-gpu-jail`, README Cat-1 friend boot, CLAUDE.md Cat-1.
+
+### Deliberately NOT covered, and why
+
+- **Backend attach/rental-access HTTP contract** (A12–A14). Dispatcher is the outbound client; 200/400/extra-RST live on `api.junction41.io`.
+- **Unrelated dirty files** in the same worktree: `src/executors/local-llm.js`, `src/proxy-handler.js`, `src/preflight-gate.js`, `src/llm-health.js`. Orchard-walk, not jail.
+- **Running tests / docker / live API.** Read-only pass.
+- **Commits / push.** Operator asked audit first.
