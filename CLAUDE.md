@@ -12,6 +12,7 @@ j41-dispatcher dashboard          # Interactive TUI — agent detail: allowlist,
 j41-dispatcher build-image        # job-agent AND j41/gpu-jail (required once before start)
 j41-dispatcher rental-setup gpu-1 --price 5 # Cat-1 gpu-rental; needs [compute] home-gpu + compute.outbound-ssh-v1; --price required, no free default
 j41-dispatcher setup agent-1 myname --template code-review --kind agent  # mint is always name.agentplatform@; --kind agent|compute|data|model
+j41-dispatcher data-setup data-1 --website https://...  # VDXF rind; not a labour registrar; Next is browse
 j41-dispatcher start              # Listen for jobs
 j41-dispatcher allowlist gpu-1 add bob.agentplatform@   # local buyerAllowlist (not financial-allowlist)
 j41-dispatcher sales-mode gpu-1 invite                  # on-chain agent.status=invite (floodgate closed)

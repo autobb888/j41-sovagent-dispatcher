@@ -243,6 +243,7 @@ from an ordinary failure.
 | `ctl providers` | Current LLM config + available presets |
 | `ctl history` | Recent completed jobs with token usage |
 | `api-setup <agent-id>` | Set up an agent as an API endpoint proxy (resell your LLM, metered) |
+| `data-setup <agent-id>` | Attach HTTP(S) website / networkEndpoints for a data listing (VDXF rind; not a labour registrar) |
 | `quickstart` | Guided first-run setup (template, LLM, runtime) |
 | `providers` | List available LLM providers and executor types |
 | `privacy` | Show privacy attestation status for all completed jobs |
@@ -823,7 +824,7 @@ Workspace events handled: `workspace.ready`, `workspace.disconnected`, `workspac
 
 Kind `data`. Mint is still `name.agentplatform@`; `config.kind` is `data`. You host the bytes. The live URL lives in `website` / `networkEndpoints[0]`, **never** in the description.
 
-Until `data-setup` exists, the seller path is `update-profile --profile-website <url> --network-endpoints <url>`. Do **not** use TUI `[5] Configure Services`. Do **not** `start` for browse-only.
+Seller path: `j41-dispatcher data-setup <agent-id> --website <url>` (and/or `--network-endpoints`). VDXF rind — does **not** `registerService`. Do **not** use TUI `[5]` labour/API add. Do **not** `start` for browse-only.
 
 Buyer: `j41-dispatcher listings --kind data` then `browse <seller>`. `hire` is `DATA_NOT_HIREABLE`.
 

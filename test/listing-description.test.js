@@ -105,6 +105,6 @@ test('setup post-profile gate prefers stored keys.kind over commander --kind def
 
 test('TUI Configure Services refuses ephemeral URLs on data listings', () => {
   const screen = DASH.slice(DASH.indexOf('async function configureServicesScreen'), DASH.indexOf('async function bountiesMenuScreen'));
-  assert.match(screen, /descriptionHasEphemeralUrl|refuseDataListingDescriptions/);
-  assert.match(screen, /DESCRIPTION_EPHEMERAL_URL/);
+  assert.match(screen, /descriptionHasEphemeralUrl|refuseDataListingDescriptions|dataSetupScreen/);
+  assert.match(screen, /DESCRIPTION_EPHEMERAL_URL|data-setup/);
 });

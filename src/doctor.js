@@ -19,7 +19,7 @@ const CHECK_IDS = Object.freeze([
   'image.job-agent', 'image.gpu-jail',
   'clock', 'runtime', 'llm', 'identity', 'fee-tank',
   'gpu.nvidia', 'gpu.storage',
-  'rental.ssh_public', 'model.public_url', 'model.webhook', 'image.canonicalize',
+  'rental.ssh_public', 'model.public_url', 'model.webhook', 'data.endpoint', 'image.canonicalize',
 ]);
 
 const CANONICALIZE_PIN = '2.0.0';
@@ -296,17 +296,69 @@ function listingAdvertiseRefusal({
       return { code: 'model.webhook', message: 'model.webhook: api-endpoint listed but webhook bind is not active — set runtime.webhook_url or start --webhook-url' };
     }
   }
+  const data = row.kind === 'data' || require('./listing-description').isDataListing(row.kind, keys && keys.identity);
+  if (data) {
+    const { dataEndpointRefusal } = require('./data-setup');
+    const refuse = dataEndpointRefusal(agentCfg);
+    if (refuse) return refuse;
+  }
   if ((compute || model) && canonicalizeStatus === 'fail') {
     return { code: 'image.canonicalize', message: 'image.canonicalize: job-agent image is missing json-canonicalize@2.0.0 — run j41-dispatcher build-image' };
   }
   return null;
 }
 
-function pickNext(checks) {
+function identityNext(identities) {
+  if (!identities || identities.length === 0) {
+    return {
+      nextCommand: 'j41-dispatcher setup agent-1 <name> --template code-review',
+      copyPasteBlock: 'j41-dispatcher setup agent-1 myagent --template code-review',
+    };
+  }
+  const row = identities[0];
+  const id = row.id;
+  const kind = row.kind || 'agent';
+  if (kind === 'data') {
+    return {
+      nextCommand: `j41-dispatcher setup ${id} <name> --kind data`,
+      copyPasteBlock: `j41-dispatcher setup ${id} mydata --kind data`,
+    };
+  }
+  if (kind === 'compute') {
+    return {
+      nextCommand: `j41-dispatcher setup ${id} <name> --kind compute`,
+      copyPasteBlock: `j41-dispatcher setup ${id} mygpu --kind compute`,
+    };
+  }
+  if (kind === 'model') {
+    return {
+      nextCommand: `j41-dispatcher setup ${id} <name> --kind model`,
+      copyPasteBlock: `j41-dispatcher setup ${id} mymodel --kind model`,
+    };
+  }
+  return {
+    nextCommand: `j41-dispatcher setup ${id} <name> --template code-review`,
+    copyPasteBlock: `j41-dispatcher setup ${id} myagent --template code-review`,
+  };
+}
+
+function dataOnlyOnChainNext(identities) {
+  const onChain = (identities || []).filter((r) => r.onChain);
+  if (!onChain.length || !onChain.every((r) => r.kind === 'data')) return null;
+  const seller = onChain[0].identity || '<seller>';
+  return {
+    nextCommand: 'j41-dispatcher listings --kind data',
+    copyPasteBlock: `j41-dispatcher listings --kind data\nj41-dispatcher browse ${seller}`,
+  };
+}
+
+function pickNext(checks, identities) {
   const fails = checks.filter((c) => c.status === 'fail');
   const warns = checks.filter((c) => c.status === 'warn');
-  const hit = fails[0] || warns.find((c) => ['llm', 'identity', 'image.job-agent', 'fee-tank'].includes(c.id)) || warns[0];
-  if (!hit) return { nextCommand: 'j41-dispatcher start', copyPasteBlock: null };
+  const hit = fails[0] || warns.find((c) => ['llm', 'identity', 'image.job-agent', 'fee-tank', 'data.endpoint', 'model.webhook', 'model.public_url'].includes(c.id)) || warns[0];
+  if (!hit) {
+    return dataOnlyOnChainNext(identities) || { nextCommand: 'j41-dispatcher start', copyPasteBlock: null };
+  }
   let nextCommand = hit.nextCommand || firstPasteCommand(hit.copyPasteBlock) || 'j41-dispatcher doctor';
   const dockerFail = fails.some((c) => String(c.id).startsWith('docker.'));
   if (dockerFail && /j41-dispatcher start/.test(String(nextCommand))) {
@@ -676,10 +728,13 @@ async function runDoctor(opts = {}) {
     checks.push(mkCheck('runtime', 'Runtime', 'pass', runtime || 'docker'));
   }
 
-  // llm
+  // llm — labour jobs only. Skip (do not warn) when this fleet has no kind=agent.
   const llm = deps.llm || {};
   const llmConfigured = llm.configured === true || !!(llm.provider && llm.provider !== '');
-  if (!llmConfigured) {
+  const hasLabour = identities.some((r) => r.kind === 'agent');
+  if (!hasLabour) {
+    checks.push(mkCheck('llm', 'LLM', 'skip', 'no labour identity'));
+  } else if (!llmConfigured) {
     checks.push(mkCheck('llm', 'LLM', 'warn',
       'not configured — labour jobs will be refused at accept',
       'j41-dispatcher dashboard',
@@ -691,14 +746,14 @@ async function runDoctor(opts = {}) {
 
   // identity
   if (identities.length === 0) {
+    const nxt = identityNext(identities);
     checks.push(mkCheck('identity', 'Identities', 'warn', 'no local agents',
-      'j41-dispatcher setup agent-1 <name> --template code-review',
-      'j41-dispatcher setup agent-1 myagent --template code-review'));
+      nxt.nextCommand, nxt.copyPasteBlock));
   } else if (identities.every((r) => r.stage === 'local-only' || r.stage === 'pending')) {
+    const nxt = identityNext(identities);
     checks.push(mkCheck('identity', 'Identities', 'warn',
       formatIdentitySummary(identities) + ' — none on-chain',
-      'j41-dispatcher setup agent-1 <name> --template code-review',
-      'j41-dispatcher register agent-1 <name>\n# or: j41-dispatcher setup agent-1 <name> --template code-review'));
+      nxt.nextCommand, nxt.copyPasteBlock));
   } else {
     checks.push(mkCheck('identity', 'Identities', 'pass', formatIdentitySummary(identities)));
   }
@@ -831,6 +886,28 @@ async function runDoctor(opts = {}) {
     }
   }
 
+  const dataRows = identities.filter((r) => r.kind === 'data' && r.onChain);
+  if (dataRows.length === 0) {
+    const anyData = identities.some((r) => r.kind === 'data');
+    checks.push(mkCheck('data.endpoint', 'Data endpoint', 'skip',
+      anyData ? 'data listing not on-chain yet' : 'no kind=data identity'));
+  } else {
+    const { dataEndpointRefusal } = require('./data-setup');
+    const missing = [];
+    for (const row of dataRows) {
+      const refuse = dataEndpointRefusal(loadLocalAgentConfig(agentsDir, row.id, deps.fs));
+      if (refuse) missing.push({ id: row.id, refuse });
+    }
+    if (missing.length) {
+      checks.push(mkCheck('data.endpoint', 'Data endpoint', 'fail',
+        `${missing[0].id} ${missing[0].refuse.message}`,
+        `j41-dispatcher data-setup ${missing[0].id} --website https://...`,
+        `j41-dispatcher data-setup ${missing[0].id} --website https://...`));
+    } else {
+      checks.push(mkCheck('data.endpoint', 'Data endpoint', 'pass', 'HTTP(S) website/networkEndpoints'));
+    }
+  }
+
   const pin = inspectJobAgentCanonicalize(deps, dockerUsable);
   const labourOrCompute = identities.some((r) => r.kind === 'agent' || r.kind === 'compute' || r.kind === 'model');
   if (pin.ok) {
@@ -844,7 +921,7 @@ async function runDoctor(opts = {}) {
     checks.push(mkCheck('image.canonicalize', 'Canonicalize pin', 'warn', pin.detail || 'cannot confirm job-agent image'));
   }
 
-  const { nextCommand, copyPasteBlock } = pickNext(checks);
+  const { nextCommand, copyPasteBlock } = pickNext(checks, identities);
   const ok = checks.every((c) => c.status !== 'fail');
   const generatedAt = new Date(typeof deps.now === 'function' ? deps.now() : Date.now()).toISOString();
 
@@ -949,4 +1026,6 @@ module.exports = {
   inspectJobAgentCanonicalize,
   probeClock,
   ntpBlock,
+  identityNext,
+  pickNext,
 };

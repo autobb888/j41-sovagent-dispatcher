@@ -215,6 +215,13 @@ Cat-2 attach still waits on vLLM `/models` (`readyFor` defaults to `'service'`).
 
 ## Unreleased
 
+### data-setup VDXF rind and kind-aware Next
+
+`j41-dispatcher data-setup <id> --website` writes website / networkEndpoints
+(on-chain VDXF + local 0600 mirror). It does not `registerService`. Setup /
+quickstart / api-setup / doctor / TUI [2] [5] Hire Next strings are kind-aware
+(data → data-setup / browse, model → api-setup then start --webhook-url).
+
 ### sovmodel is a live listing kind; all four mint under agentplatform@ on VRSCTEST
 
 DeFi is off, so sov*@ cannot issue subIDs. Signup still picks agent / compute / data /
