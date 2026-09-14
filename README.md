@@ -1081,17 +1081,16 @@ by the gate above — they are usable on testnet and nowhere else.
 
 ### First-Run Security Setup
 
-On first start, the dispatcher automatically:
+On first start the dispatcher **checks** isolation (quick-check) and refuses to
+boot if it fails, unless `--dev-unsafe`. It does **not** install gVisor,
+bubblewrap, or profiles into `/etc/j41` by itself — that needs root:
 
-1. Detects platform (Linux/macOS, KVM availability)
-2. Installs gVisor (if KVM) or bubblewrap (fallback)
-3. Deploys seccomp + AppArmor profiles
-4. Creates `j41-isolated` Docker network (internal, ICC disabled)
-5. Creates `~/.j41/financial-allowlist.json` (deny-all)
-6. Pins the egress allowlist (platform + LLM API endpoints) for the CONNECT proxy
-7. Runs self-test
+```bash
+sudo npx @junction41/secure-setup --dispatcher
+```
 
-Subsequent starts skip setup and run a quick-check instead.
+(or the TUI `[6] Security Setup` screen). Subsequent starts skip the first-run
+notice and run the same quick-check. A hung or timed-out check is a failure.
 
 ### Container Hardening
 

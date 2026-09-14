@@ -94,6 +94,7 @@ function makeDockerStub(audit) {
  * @param {object} opts.ports
  * @param {object} [opts.configOverrides]  extra [runtime]/[platform] toml values
  * @param {object|null} [opts.shutdownMarker]  contents of shutdown-deactivated.json
+ * @param {boolean} [opts.skipSecurityMarker]  omit ~/.j41/dispatcher-security-initialized
  */
 function writeFixture(home, opts) {
   const dispatcherDir = path.join(home, '.j41', 'dispatcher');
@@ -127,9 +128,12 @@ function writeFixture(home, opts) {
   ].join('\n');
   fs.writeFileSync(path.join(dispatcherDir, 'config.toml'), cfg, { mode: 0o600 });
 
-  // Skip the first-run security wizard — it is not what any of these scenarios
-  // are about, and it shells out to sudo.
-  fs.writeFileSync(path.join(home, '.j41', 'dispatcher-security-initialized'), 'harness');
+  // Skip the first-run security wizard unless the scenario is about it.
+  // setup() needs root + a TTY; without the marker a non-root start only prints
+  // the sudo instruction (it does not call setup()).
+  if (!opts.skipSecurityMarker) {
+    fs.writeFileSync(path.join(home, '.j41', 'dispatcher-security-initialized'), 'harness');
+  }
 
   if (opts.shutdownMarker) {
     fs.writeFileSync(
@@ -160,6 +164,10 @@ class ExitCalled extends Error {
  * @param {object}        [scenario.sdk]            passed through to createSdkStub
  * @param {number}        [scenario.timeoutMs=20000] REAL-time budget for startup
  * @param {boolean}       [scenario.quiet=true]     swallow the dispatcher's stdout
+ * @param {boolean}       [scenario.skipSecurityMarker] omit the first-run marker
+ * @param {boolean}       [scenario.asRoot]         stub process.getuid() === 0
+ * @param {boolean}       [scenario.tty]            stub process.stdin.isTTY
+ * @param {object}        [scenario.secureSetup]    { setup, quickCheck } overrides
  * @returns {Promise<object>} result — see the returned object's fields
  */
 async function runStart(scenario = {}) {
@@ -180,6 +188,7 @@ async function runStart(scenario = {}) {
       ports,
       configLines: scenario.configLines,
       shutdownMarker: scenario.shutdownMarker,
+      skipSecurityMarker: scenario.skipSecurityMarker,
     });
   }
 
@@ -189,6 +198,8 @@ async function runStart(scenario = {}) {
   const realHomedir = os.homedir;
   const realExit = process.exit;
   const realLoad = Module._load;
+  const realGetuid = process.getuid;
+  const origIsTTY = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');
   const realEnv = { ...process.env };
   const sigListeners = {
     SIGINT: process.listeners('SIGINT').slice(),
@@ -220,6 +231,9 @@ async function runStart(scenario = {}) {
     Module._load = realLoad;
     os.homedir = realHomedir;
     process.exit = realExit;
+    if (typeof realGetuid === 'function') process.getuid = realGetuid;
+    else delete process.getuid;
+    if (origIsTTY) Object.defineProperty(process.stdin, 'isTTY', origIsTTY);
     restoreConsole();
     for (const sig of ['SIGINT', 'SIGTERM']) {
       for (const fn of process.listeners(sig)) {
@@ -232,6 +246,11 @@ async function runStart(scenario = {}) {
 
   try {
     os.homedir = () => home;
+    if (scenario.asRoot === true) process.getuid = () => 0;
+    else if (scenario.asRoot === false) process.getuid = () => 1000;
+    if (scenario.tty === true || scenario.tty === false) {
+      Object.defineProperty(process.stdin, 'isTTY', { value: scenario.tty, configurable: true });
+    }
     process.env.NODE_ENV = 'test';
     process.env.J41_EGRESS_PROXY_PORT = String(ports.egress);
     // Nothing in these scenarios should reach a real chat socket or a real node.
@@ -308,9 +327,18 @@ async function runStart(scenario = {}) {
         return { ...realSdkIndex, ...sdk.modules };
       }
       if (request === '@junction41/secure-setup') {
+        const custom = scenario.secureSetup || {};
         return {
-          setup: async () => ({ ok: true }),
-          quickCheck: async () => ({ passed: true, score: 10, mode: 'harness', checks: [] }),
+          setup: async (...args) => {
+            sideEffects.push({ call: 'secureSetup.setup', args });
+            if (typeof custom.setup === 'function') return custom.setup(...args);
+            return { success: true, score: 10, mode: 'harness', log: [] };
+          },
+          quickCheck: async (...args) => {
+            sideEffects.push({ call: 'secureSetup.quickCheck', args });
+            if (typeof custom.quickCheck === 'function') return custom.quickCheck(...args);
+            return { passed: true, score: 10, mode: 'harness', checks: [] };
+          },
         };
       }
       if (request === '@junction41/sovagent-sdk/dist/chat/client.js') {

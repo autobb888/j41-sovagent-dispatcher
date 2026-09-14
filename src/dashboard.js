@@ -48,6 +48,7 @@ const {
 const { sendCommand } = require('./control.js');
 const { renderActiveJobs, runLiveScreen } = require('./tui/live-screen.js');
 const { formatUpstreamHealthTag } = require('./tui/health-tag.js');
+const { seekLogEnd, waitForDispatcherReady } = require('./tui/start-ready.js');
 const {
   classifyIdentities,
   formatIdentitySummary,
@@ -4032,29 +4033,30 @@ async function main() {
         } else {
           const { spawn } = require('child_process');
           fs.mkdirSync(DISPATCHER_DIR, { recursive: true, mode: 0o700 });
+          // Seek BEFORE spawn. A leftover [Health] line or a predecessor still
+          // holding :9842 must not count as this child becoming ready. The
+          // identity-summary banner is printed before security gates — ignore it.
+          // PID file / 2.5s aliveness are not success.
+          const startOffset = seekLogEnd(DISPATCHER_LOG);
           const logFd = fs.openSync(DISPATCHER_LOG, 'a');
           const child = spawn(process.execPath, [process.argv[1], 'start'], {
             detached: true,
             stdio: ['ignore', logFd, logFd],
           });
+          try { fs.closeSync(logFd); } catch { /* child holds the fd */ }
           child.unref();
 
-          // B3: this used to claim success unconditionally. The child is spawned with
-          // stdio 'ignore', so it has no TTY — and with an encrypted key pool and no
-          // passphrase in the environment it exits within a second. The operator who
-          // followed our own `encrypt-keys` hardening advice therefore got a Start
-          // button that ALWAYS reported success and never started anything.
-          // Wait briefly and report what actually happened.
-          const _alive = await new Promise(resolve => {
-            let settled = false;
-            child.on('exit', (code) => { if (!settled) { settled = true; resolve({ ok: false, code }); } });
-            setTimeout(() => { if (!settled) { settled = true; resolve({ ok: true }); } }, 2500);
+          const _ready = await waitForDispatcherReady({
+            logPath: DISPATCHER_LOG,
+            startOffset,
+            child,
+            timeoutMs: 60_000,
           });
 
-          if (_alive.ok) {
+          if (_ready.ok) {
             console.log(`\n  ✅ Dispatcher started (PID ${child.pid})\n  Logs: tail -f ${DISPATCHER_LOG}\n`);
-          } else {
-            console.log(`\n  ❌ Dispatcher exited immediately (code ${_alive.code}).`);
+          } else if (_ready.reason === 'exit') {
+            console.log(`\n  ❌ Dispatcher exited immediately (code ${_ready.code}).`);
             // F7 follow-up — local runtime now refuses to START (2.21.0), and this
             // screen has no way to pass --dev-unsafe, so the button is permanently
             // dead in that configuration. Diagnosing it as "encrypted keys" sends the
@@ -4074,6 +4076,10 @@ async function main() {
             console.log('     J41_KEYS_PASSPHRASE in the environment, or start it from a terminal:');
             console.log('       j41-dispatcher start');
             console.log(`     Full reason: tail -20 ${DISPATCHER_LOG}\n`);
+          } else {
+            console.log('\n  ⏳ Dispatcher still starting…');
+            console.log('     It has not published /health yet. Watch the log; do not assume it is up:');
+            console.log(`       tail -f ${DISPATCHER_LOG}\n`);
           }
         }
         await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);

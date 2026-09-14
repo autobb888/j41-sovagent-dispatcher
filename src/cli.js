@@ -5989,6 +5989,10 @@ program
     } catch {}
 
     // ── Task 18: First-run security setup ──────────────────────
+    // Marker present → skip (today's skip). Marker absent: do NOT call setup()
+    // unless we are root on a TTY — installing to /etc/j41 needs sudo. A timed
+    // setup used to print ✓ while the abandoned work kept mutating the host.
+    // Never race setup(); never print ✓ we did not earn.
     const initMarker = path.join(os.homedir(), '.j41', 'dispatcher-security-initialized');
     if (!fs.existsSync(initMarker)) {
       console.log('');
@@ -5996,55 +6000,69 @@ program
       console.log('  ║  J41 Dispatcher Security Setup (first run)      ║');
       console.log('  ╚══════════════════════════════════════════════════╝');
       console.log('');
-      if (secureSetup) {
+      const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+      const canRunInline = !!(secureSetup && isRoot && process.stdin.isTTY);
+      if (canRunInline) {
         try {
-          // Timeout security setup — don't block startup if sudo hangs
-          await Promise.race([
-            secureSetup.setup('dispatcher'),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout (sudo may be required — run manually)')), 10000)),
-          ]);
-          console.log('  ✓ Security setup complete');
+          const setupResult = await secureSetup.setup('dispatcher');
+          if (setupResult && setupResult.success) {
+            console.log('  ✅ Setup complete. Score: ' + setupResult.score + '/10 (' + setupResult.mode + ')');
+          } else {
+            console.log('  ❌ Setup had issues. Score: ' + ((setupResult && setupResult.score) != null ? setupResult.score : 0) + '/10');
+          }
+          if (setupResult && setupResult.log && setupResult.log.length > 0) {
+            console.log('');
+            for (const line of setupResult.log) console.log('  ' + line);
+          }
         } catch (e) {
           console.error(`  Security setup: ${e.message}`);
           console.error('  Run manually with sudo: sudo npx @junction41/secure-setup --dispatcher');
-          // Continue — non-fatal
         }
       } else {
-        console.warn('  @junction41/secure-setup not installed. Install it:');
-        console.warn('    yarn add @junction41/secure-setup');
-        console.warn('  Or run manually:');
-        console.warn('    yarn dlx @junction41/secure-setup --dispatcher');
+        console.error('  First start checks isolation; installing to /etc/j41 needs root:');
+        console.error('    sudo npx @junction41/secure-setup --dispatcher');
+        console.error('  Or use the TUI Security screen ([6] Security Setup).');
+        if (!secureSetup) {
+          console.warn('  @junction41/secure-setup is not installed (optionalDependency).');
+        }
       }
       console.log('');
     }
 
     // ── Task 19: Startup security quick-check ──────────────────
+    // Timeout ≡ fail. A hung quickCheck used to warn "unavailable" and continue.
     if (secureSetup) {
+      let checkResult = null;
+      let checkError = null;
       try {
-        const checkResult = await Promise.race([
+        checkResult = await Promise.race([
           secureSetup.quickCheck('dispatcher'),
           new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 10000)),
         ]);
-        if (!checkResult.passed) {
-          console.error('');
-          console.error('  ══════════════════════════════════════════════════');
-          console.error('  SECURITY CHECK FAILED — dispatcher will not start');
-          console.error('  ══════════════════════════════════════════════════');
-          for (const issue of (checkResult.checks || []).filter(c => c.status === 'fail')) {
-            console.error(`  - ${issue.name}: ${issue.detail}`);
-          }
-          console.error('');
-          console.error('  Fix: yarn dlx @junction41/secure-setup --dispatcher --fix');
-          console.error('');
-          if (!state._devUnsafe) {
-            process.exit(1);
-          }
-          console.warn('  Continuing anyway (--dev-unsafe mode)...');
-        } else {
-          console.log(`  Security: ${checkResult.score}/10 (${checkResult.mode})`);
-        }
       } catch (e) {
-        console.warn(`  Security quick-check unavailable: ${e.message}`);
+        checkError = e;
+      }
+      const checkFailed = !!(checkError || !checkResult || !checkResult.passed);
+      if (checkFailed) {
+        console.error('');
+        console.error('  ══════════════════════════════════════════════════');
+        console.error('  SECURITY CHECK FAILED — dispatcher will not start');
+        console.error('  ══════════════════════════════════════════════════');
+        if (checkError) {
+          console.error(`  - quick-check: ${checkError.message}`);
+        }
+        for (const issue of ((checkResult && checkResult.checks) || []).filter(c => c.status === 'fail')) {
+          console.error(`  - ${issue.name}: ${issue.detail}`);
+        }
+        console.error('');
+        console.error('  Fix: yarn dlx @junction41/secure-setup --dispatcher --fix');
+        console.error('');
+        if (!state._devUnsafe) {
+          process.exit(1);
+        }
+        console.warn('  Continuing anyway (--dev-unsafe mode)...');
+      } else {
+        console.log(`  Security: ${checkResult.score}/10 (${checkResult.mode})`);
       }
     }
 
