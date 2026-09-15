@@ -226,6 +226,8 @@ Cat-2 attach still waits on vLLM `/models` (`readyFor` defaults to `'service'`).
 - Proxy `/j41/proxy/v1/chat/completions` uses undici `allowH2:false` (same as
   labour). Node `https.request` GET `/models` was 200 while POST chat hung 60s
   → buyer HTTP 504, meter never ran. NVIDIA Flash returns in ~15s on HTTP/1.1.
+- Proxy injects `max_tokens: 256` when the buyer omits it (`chat --message pong`
+  sends none). Unbounded NVIDIA reasoning NIMs sat until the 60s abort.
 - Labour idle pause refused on `accepted` keeps the chat session. `accepted` is
   not terminal; skipping `deliverJob` left pong on the room with no worker.
 - `browse` is kind=data only. `job-chat` refuses gpu-rental/api-endpoint.

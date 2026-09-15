@@ -313,6 +313,14 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
 
   const model = parsedBody.model || '';
   const isStreaming = parsedBody.stream === true;
+  // Buyer CLI chat sends no max_tokens. NVIDIA reasoning NIMs (Flash, Kimi)
+  // then think until the 60s proxy abort → HTTP 504, meter never runs.
+  // Labour sets a bound; the proxy must too. Explicit max_tokens is unchanged.
+  if (!Number.isFinite(Number(parsedBody.max_tokens)) || Number(parsedBody.max_tokens) <= 0) {
+    parsedBody.max_tokens = Number(cfg.proxy.default_max_tokens) > 0
+      ? Number(cfg.proxy.default_max_tokens)
+      : 256;
+  }
 
   // Reject unpriced models up front. calculateCost returns 0 for unknown models, which would
   // let requests through for free — the seller explicitly declared which models they serve by
