@@ -1,7 +1,14 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { checkUpstreamHostSafe, makePinnedLookup, applyUpstreamModelAlias, applyUpstreamThinkingDefault } = require('../src/proxy-handler');
+const {
+  checkUpstreamHostSafe,
+  makePinnedLookup,
+  applyUpstreamModelAlias,
+  applyUpstreamThinkingDefault,
+  applyUpstreamNimStream,
+  assembleSseChatCompletion,
+} = require('../src/proxy-handler');
 
 const cfgGuardOn = { runtime: { allow_local_upstream: false } };
 
@@ -78,4 +85,29 @@ test('loopback sellers do not get NVIDIA thinking kwargs', () => {
   const body = { model: 'gpt-4', messages: [] };
   applyUpstreamThinkingDefault(body, { endpointUrl: 'http://127.0.0.1:9/v1' });
   assert.equal(body.chat_template_kwargs, undefined);
+});
+
+test('NVIDIA non-stream buyer is forwarded as SSE so headers are not held until CoT ends', () => {
+  const body = { model: 'deepseek-ai/deepseek-v4-flash-0731', messages: [] };
+  applyUpstreamNimStream(body, { endpointUrl: 'https://integrate.api.nvidia.com/v1' }, false);
+  assert.equal(body.stream, true);
+  assert.equal(body.stream_options.include_usage, true);
+});
+
+test('buyer who asked to stream is not rewritten by NVIDIA SSE inject', () => {
+  const body = { model: 'deepseek-ai/deepseek-v4-flash-0731', stream: false };
+  applyUpstreamNimStream(body, { endpointUrl: 'https://integrate.api.nvidia.com/v1' }, true);
+  assert.equal(body.stream, false);
+});
+
+test('assembleSseChatCompletion promotes reasoning_content when content is empty', () => {
+  const raw = [
+    'data: {"id":"chatcmpl-x","model":"moonshotai/kimi-k3","choices":[{"delta":{"reasoning_content":"Ping"}}]}',
+    'data: {"usage":{"prompt_tokens":2,"completion_tokens":1}}',
+    'data: [DONE]',
+  ].join('\n');
+  const out = assembleSseChatCompletion(raw);
+  assert.equal(out.choices[0].message.content, 'Ping');
+  assert.equal(out.choices[0].message.reasoning_content, 'Ping');
+  assert.equal(out.usage.completion_tokens, 1);
 });

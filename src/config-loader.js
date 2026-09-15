@@ -38,9 +38,9 @@ const DEFAULTS = Object.freeze({
     // low; 60s aborted every Mac pong. trycloudflare origin is ~100s.
     upstream_timeout_ms: 90000,
     // Buyer CLI chat omits max_tokens. NVIDIA reasoning NIMs then fill an
-    // unbounded (or 256-token) CoT until the 60s abort → HTTP 504, no meter.
-    // 64 is enough for a pong and finishes under the webhook cutoff.
-    default_max_tokens: 64,
+    // unbounded CoT until the proxy abort → HTTP 504, no meter. 32 is enough
+    // for a pong and leaves headroom under trycloudflare's ~100s origin cutoff.
+    default_max_tokens: 32,
     estimated_input_tokens: 4000,
     estimated_output_tokens: 2000,
     // Worst-case reservation (audit H3): the buyer is admitted only if their

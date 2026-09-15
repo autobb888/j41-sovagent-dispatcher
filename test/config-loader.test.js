@@ -164,7 +164,7 @@ test('extended schema sections load with defaults', withTmpHome(async () => {
   invalidateConfigCache();
   const cfg = loadDispatcherConfig({ skipMigration: true });
   assert.strictEqual(cfg.proxy.upstream_timeout_ms, 90000);
-  assert.strictEqual(cfg.proxy.default_max_tokens, 64);
+  assert.strictEqual(cfg.proxy.default_max_tokens, 32);
   assert.strictEqual(cfg.proxy.estimated_input_tokens, 4000);
   assert.strictEqual(cfg.proxy.estimated_output_tokens, 2000);
   assert.strictEqual(cfg.proxy.suggested_topup_vrsc, 10);

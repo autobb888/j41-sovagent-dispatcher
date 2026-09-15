@@ -269,7 +269,7 @@ test('H2: stream:true injects stream_options.include_usage=true into the forward
     `forwarded body must carry stream_options.include_usage=true; got ${lastUpstreamBody}`);
 });
 
-test('missing max_tokens is forwarded as 64 so NVIDIA reasoning NIMs cannot run unbounded', async () => {
+test('missing max_tokens is forwarded as 32 so NVIDIA reasoning NIMs cannot run unbounded', async () => {
   inflight._reset();
   upstreamMode = 'json';
   const agentId = 'agent-default-max';
@@ -279,8 +279,9 @@ test('missing max_tokens is forwarded as 64 so NVIDIA reasoning NIMs cannot run 
   const r = await runProxy(agentId, key, { model: MODEL, messages: [{ role: 'user', content: 'pong' }] });
   assert.equal(r.statusCode, 200, r.body);
   const fwd = JSON.parse(lastUpstreamBody);
-  assert.equal(fwd.max_tokens, 64);
+  assert.equal(fwd.max_tokens, 32);
   assert.equal(fwd.chat_template_kwargs, undefined);
+  assert.equal(fwd.stream, undefined);
 });
 
 test('H2: missing-usage streaming settle charges max_tokens, not the flat estimate', async () => {

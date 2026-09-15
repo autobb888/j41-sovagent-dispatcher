@@ -240,11 +240,22 @@ function makePinnedLookup(pinnedIp) {
 // NVIDIA integrate hangs Node https.request (HTTP/2 ALPN) from this host.
 // Labour already uses undici allowH2:false; GET /v1/models returns 200 on
 // https.request while POST /chat/completions sits until proxy timeout → 504.
-let _http1Agent;
 function http1Fetch() {
   const undici = require('undici');
-  if (!_http1Agent) _http1Agent = new undici.Agent({ allowH2: false });
-  return { fetch: undici.fetch, dispatcher: _http1Agent };
+  // New Agent per request. A shared keep-alive pool to integrate.api.nvidia.com
+  // reused aborted sockets across duskseek AND moonkimi (same host, two keys),
+  // so a 90s abort on one listing hung the next listing until the same abort.
+  const dispatcher = new undici.Agent({
+    allowH2: false,
+    connections: 1,
+    keepAliveTimeout: 1,
+  });
+  return {
+    fetch: undici.fetch,
+    dispatcher,
+    close() { dispatcher.close().catch(() => {}); },
+    destroy() { try { dispatcher.destroy(); } catch { /* already closed */ } },
+  };
 }
 
 function applyUpstreamModelAlias(parsedBody, config) {
@@ -287,6 +298,82 @@ function applyUpstreamThinkingDefault(parsedBody, config) {
     ctk && typeof ctk === 'object' ? ctk : {},
     { thinking: false, reasoning_effort: 'low' },
   );
+}
+
+/**
+ * NVIDIA non-stream holds HTTP headers until the full completion is ready, so
+ * a slow CoT looks like a dead socket until we abort. Ask for SSE internally;
+ * the buyer still gets a normal JSON chat.completion unless they asked to stream.
+ */
+function applyUpstreamNimStream(parsedBody, config, buyerStreaming) {
+  if (buyerStreaming) return;
+  if (!parsedBody || typeof parsedBody !== 'object') return;
+  if (!nvidiaIntegrateHost(config)) return;
+  parsedBody.stream = true;
+  const so = (parsedBody.stream_options && typeof parsedBody.stream_options === 'object')
+    ? { ...parsedBody.stream_options, include_usage: true }
+    : { include_usage: true };
+  parsedBody.stream_options = so;
+}
+
+function assembleSseChatCompletion(raw) {
+  let id;
+  let modelName;
+  let created;
+  let content = '';
+  let reasoning = '';
+  let finish = 'stop';
+  let usage;
+  const consume = (json) => {
+    if (!json || json === '[DONE]') return;
+    let frame;
+    try { frame = JSON.parse(json); } catch { return; }
+    if (frame.id) id = frame.id;
+    if (frame.model) modelName = frame.model;
+    if (frame.created) created = frame.created;
+    if (frame.usage) usage = frame.usage;
+    const choice = frame.choices && frame.choices[0];
+    if (!choice) return;
+    if (choice.finish_reason) finish = choice.finish_reason;
+    const delta = choice.delta || {};
+    const msg = choice.message || {};
+    if (typeof delta.content === 'string') content += delta.content;
+    if (typeof delta.reasoning_content === 'string') reasoning += delta.reasoning_content;
+    if (typeof delta.reasoning === 'string') reasoning += delta.reasoning;
+    if (typeof msg.content === 'string') content += msg.content;
+    if (typeof msg.reasoning_content === 'string') reasoning += msg.reasoning_content;
+  };
+  for (const line of String(raw || '').split(/\r?\n/)) {
+    if (!line.startsWith('data:')) continue;
+    consume(line.slice(5).trim());
+  }
+  const message = { role: 'assistant', content: content || null };
+  if (reasoning) message.reasoning_content = reasoning;
+  if ((message.content == null || message.content === '') && reasoning) {
+    message.content = reasoning;
+  }
+  return {
+    id: id || 'chatcmpl-j41',
+    object: 'chat.completion',
+    created: created || Math.floor(Date.now() / 1000),
+    model: modelName || '',
+    choices: [{ index: 0, message, finish_reason: finish }],
+    usage,
+  };
+}
+
+async function readUpstreamChatBody(upstreamRes) {
+  const ctype = String((upstreamRes.headers && (upstreamRes.headers.get
+    ? upstreamRes.headers.get('content-type')
+    : upstreamRes.headers['content-type'])) || '');
+  if (!/text\/event-stream/i.test(ctype)) {
+    return Buffer.from(await upstreamRes.arrayBuffer());
+  }
+  let raw = '';
+  for await (const chunk of upstreamRes.body) {
+    raw += Buffer.from(chunk).toString();
+  }
+  return Buffer.from(JSON.stringify(assembleSseChatCompletion(raw)));
 }
 
 function filterHeaders(upstreamHeaders) {
@@ -349,7 +436,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   if (!Number.isFinite(Number(parsedBody.max_tokens)) || Number(parsedBody.max_tokens) <= 0) {
     parsedBody.max_tokens = Number(cfg.proxy.default_max_tokens) > 0
       ? Number(cfg.proxy.default_max_tokens)
-      : 64;
+      : 32;
   }
 
   // Reject unpriced models up front. calculateCost returns 0 for unknown models, which would
@@ -496,6 +583,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   // upstream (the original `body` is left intact for callers/logging).
   applyUpstreamModelAlias(parsedBody, config);
   applyUpstreamThinkingDefault(parsedBody, config);
+  applyUpstreamNimStream(parsedBody, config, isStreaming);
   if (isStreaming) {
     const so = (parsedBody.stream_options && typeof parsedBody.stream_options === 'object')
       ? { ...parsedBody.stream_options, include_usage: true }
@@ -512,13 +600,13 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
   };
 
-  const { fetch: doFetch, dispatcher } = http1Fetch();
+  const session = http1Fetch();
   const controller = new AbortController();
   const started = Date.now();
   const timer = setTimeout(() => controller.abort(), cfg.proxy.upstream_timeout_ms);
   let upstreamRes;
   try {
-    upstreamRes = await doFetch(upstreamUrl.href, {
+    upstreamRes = await session.fetch(upstreamUrl.href, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -526,15 +614,17 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         ...(config.upstreamAuth ? { Authorization: config.upstreamAuth } : {}),
       },
       body: forwardBody,
-      dispatcher,
+      dispatcher: session.dispatcher,
       signal: controller.signal,
     });
   } catch (err) {
     clearTimeout(timer);
+    session.destroy();
     if (res.headersSent || res.writableEnded) { releaseOnce(); return; }
     const timedOut = err && (err.name === 'AbortError' || /aborted/i.test(String(err.message || '')));
+    const think = parsedBody.chat_template_kwargs && parsedBody.chat_template_kwargs.thinking;
     console.error(timedOut
-      ? `[PROXY] Upstream timeout after ${cfg.proxy.upstream_timeout_ms}ms agent=${agentId} model=${model} fwd=${parsedBody.model} max_tokens=${parsedBody.max_tokens} host=${upstreamUrl.hostname} elapsed_ms=${Date.now() - started}`
+      ? `[PROXY] Upstream timeout after ${cfg.proxy.upstream_timeout_ms}ms agent=${agentId} model=${model} fwd=${parsedBody.model} max_tokens=${parsedBody.max_tokens} stream=${!!parsedBody.stream} thinking=${think} host=${upstreamUrl.hostname} elapsed_ms=${Date.now() - started}`
       : `[PROXY] Upstream error: ${err.message}`);
     refundOnce();
     releaseOnce();
@@ -543,6 +633,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     return;
   }
   clearTimeout(timer);
+  console.log(`[PROXY] upstream headers ${upstreamRes.status} agent=${agentId} elapsed_ms=${Date.now() - started}`);
 
   const proxyRes = {
     statusCode: upstreamRes.status,
@@ -677,13 +768,15 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         if (!res.writableEnded) res.end();
         settleStream('stream error', true);
       }
+      session.close();
     } else {
-      // Non-streaming: read full response, adjust reservation, then send
+      // Non-streaming: read full response (or reassemble NVIDIA SSE), then send
       let responseBody;
       try {
-        responseBody = Buffer.from(await upstreamRes.arrayBuffer());
+        responseBody = await readUpstreamChatBody(upstreamRes);
       } catch (err) {
         console.error(`[PROXY] Upstream response error: ${err.message}`);
+        session.close();
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
           res.end(JSON.stringify({ error: 'Upstream response interrupted' }));
@@ -692,6 +785,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         releaseOnce();
         return;
       }
+      session.close();
       _refunded = true;
         let inputTok = estimatedInput;
         let outputTok = estimatedOutput;
@@ -755,4 +849,15 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   }
 }
 
-module.exports = { handleProxyRequest, maybeNotifyCreditLow, resolveCreditLowThreshold, isPrivateIp, checkUpstreamHostSafe, makePinnedLookup, applyUpstreamModelAlias, applyUpstreamThinkingDefault };
+module.exports = {
+  handleProxyRequest,
+  maybeNotifyCreditLow,
+  resolveCreditLowThreshold,
+  isPrivateIp,
+  checkUpstreamHostSafe,
+  makePinnedLookup,
+  applyUpstreamModelAlias,
+  applyUpstreamThinkingDefault,
+  applyUpstreamNimStream,
+  assembleSseChatCompletion,
+};
