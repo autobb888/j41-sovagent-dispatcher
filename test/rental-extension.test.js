@@ -204,6 +204,52 @@ test('a platform fetch failure adopts anyway — not adopting is what strands th
   assert.equal(state.active.get('job-1').kind, 'gpu-rental');
 });
 
+test('re-adopt with outboundSshV1 re-attaches and reseals the public SSH port', async () => {
+  const { controller } = await bootRental({ jobTimeoutMin: 60, amount: 2 });
+  const state = afterRestart(controller);
+  const posted = [];
+  const attached = [];
+  const n = await adoptLiveRentals({
+    state,
+    getSession: async () => ({
+      client: {
+        async getJob() { return { id: 'job-1', status: 'delivered' }; },
+        async postRentalSecret(_id, body) { posted.push(body.ssh); },
+      },
+    }),
+    now: NOW,
+    persist: () => {},
+    outboundSshV1: true,
+    attachEdge: async (opts) => {
+      attached.push(opts.localPort);
+      return { host: 'sovcompute.junction41.io', port: 40111, remote: { destroy() {} }, stopHold() {} };
+    },
+  });
+  assert.equal(n, 1);
+  assert.equal(attached[0], 2222, 'attach splices to the jail local port, not the old public port');
+  assert.equal(posted[0].host, 'sovcompute.junction41.io');
+  assert.equal(posted[0].port, 40111);
+  assert.equal(state.active.get('job-1').edge.port, 40111);
+  assert.equal(controller.getLeases().find((l) => l.jobId === 'job-1').state, 'ready');
+});
+
+test('re-attach failure after restart keeps the paid jail and still tracks the rental', async () => {
+  const { controller } = await bootRental({ jobTimeoutMin: 60, amount: 2 });
+  const state = afterRestart(controller);
+  const n = await adoptLiveRentals({
+    state,
+    getSession: session('delivered'),
+    now: NOW,
+    persist: () => {},
+    outboundSshV1: true,
+    attachEdge: async () => { throw new Error('COMPUTE_EDGE_DIAL'); },
+  });
+  assert.equal(n, 1);
+  assert.equal(state.active.get('job-1').kind, 'gpu-rental');
+  assert.match(state.active.get('job-1').edgeAttachError, /COMPUTE_EDGE_DIAL/);
+  assert.equal(controller.getLeases().find((l) => l.jobId === 'job-1').state, 'ready', 'do not release a paid box because attach failed');
+});
+
 // ── Wiring. Every assertion below dies if its line is deleted from cli.js. ────────
 const CLI = fs.readFileSync(require.resolve('../src/cli.js'), 'utf8');
 
@@ -232,10 +278,13 @@ test('cli.js decides rental extensions on the lease, not on host CPU/RAM', () =>
 
 test('cli.js re-adopts live rentals on boot, after crash recovery and before the first poll', () => {
   const recovery = CLI.indexOf('await handleCrashRecovery(state);');
-  const adopt = CLI.indexOf('adoptLiveRentals({ state');
+  const adopt = CLI.indexOf('adoptLiveRentals({');
   const firstPoll = CLI.indexOf('await pollForJobs(state);', recovery);
   assert.ok(adopt > recovery, 'crash recovery clears active-jobs.json — re-adopt after it, never before');
   assert.ok(adopt < firstPoll, 'the teardown sweep must already see the rental on the first pass');
+  const bootAdopt = CLI.slice(adopt, firstPoll);
+  assert.match(bootAdopt, /outboundSshV1:\s*!!state\.outboundSshV1/, 'restart must re-attach the public SSH door');
+  assert.match(bootAdopt, /signMessage:/, 'attach challenge is J41-COMPUTE-ATTACH| signed by the seller');
 });
 
 test('cli.js tells the buyer their new expiry from both paid paths', () => {

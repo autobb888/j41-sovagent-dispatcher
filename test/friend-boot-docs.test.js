@@ -126,8 +126,10 @@ test('compute signup TUI routes to provider config then rental-setup, not straig
 
 test('API Endpoint Setup and Configure Services refuse compute listings', () => {
   const apiBody = dashScreenBody('apiEndpointSetupScreen');
-  assert.match(apiBody, /kind !== 'compute'|kind === 'compute'/);
+  assert.match(apiBody, /k !== 'compute'|kind !== 'compute'|kind === 'compute'/);
+  assert.match(apiBody, /k !== 'data'|kind === 'data'|kind !== 'data'/);
   assert.match(apiBody, /rental-setup/);
+  assert.match(apiBody, /data-setup/);
   const svcBody = dashScreenBody('configureServicesScreen');
   assert.match(svcBody, /listingKindOf\(keys\) === 'compute'|kind === 'compute'/);
   // 2026-08-25: this used to require the literal substring "rental-setup"

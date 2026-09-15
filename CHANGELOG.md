@@ -215,6 +215,17 @@ Cat-2 attach still waits on vLLM `/models` (`readyFor` defaults to `'service'`).
 
 ## Unreleased
 
+### Restart re-attaches GPU SSH; seller TUI cannot homemade session reviews; no labour/API on data
+
+- Boot `adoptLiveRentals` re-runs `attachAndDial` + `keepOutboundUntilBuyer` and
+  POSTs rental-secret with the new public host:port when
+  `compute.outbound-ssh-v1` is on. Attach failure logs and keeps the paid jail.
+- TUI session review prints buyer `review-session` argv (GET
+  `J41-REVIEW-SESSION|`). It no longer homemade-signs JSON with the seller WIF.
+- `setup` / `register` / `finalize` do not `registerService` labour on
+  kind=data, model, or compute. TUI `[18]` / `api-setup` refuse kind=data
+  (`API_SETUP_WRONG_KIND`).
+
 ### data-setup VDXF rind and kind-aware Next
 
 `j41-dispatcher data-setup <id> --website` writes website / networkEndpoints

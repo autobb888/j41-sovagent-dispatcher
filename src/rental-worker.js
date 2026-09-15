@@ -130,43 +130,17 @@ async function startRentalJob(opts) {
 
   let edge = null;
   if (opts.outboundSshV1) {
-    const { attachAndDial, keepOutboundUntilBuyer } = require('./compute-edge');
-    const attach = typeof opts.attachEdge === 'function' ? opts.attachEdge : attachAndDial;
-    const localPort = deliverable && deliverable.ssh && deliverable.ssh.port;
-    const attachOpts = {
-      client,
-      jobId: job.id,
-      signMessage: opts.signMessage,
-      localHost: '127.0.0.1',
-      localPort,
-      connect: opts.connect,
-    };
     try {
-      edge = await attach(attachOpts);
-      deliverable = {
-        ...deliverable,
-        ssh: {
-          ...deliverable.ssh,
-          host: edge.host,
-          port: edge.port,
-        },
-      };
-      if (edge && edge.remote) {
-        keepOutboundUntilBuyer(edge, {
-          attach,
-          attachOpts,
-          onReattached: async ({ host, port }) => {
-            // Upsert after deliver is allowed; buyer re-GETs rental-access for the live port.
-            console.warn(`[Rental] outbound TCP died — re-sealed ${host}:${port} for ${job.id}`);
-            deliverable = {
-              ...deliverable,
-              ssh: { ...deliverable.ssh, host, port },
-            };
-            const { postRentalSecret } = require('./rental-delivery');
-            await postRentalSecret(client, job.id, deliverable);
-          },
-        });
-      }
+      const attached = await attachRentalOutbound({
+        client,
+        jobId: job.id,
+        deliverable,
+        signMessage: opts.signMessage,
+        attachEdge: opts.attachEdge,
+        connect: opts.connect,
+      });
+      edge = attached.edge;
+      deliverable = attached.deliverable;
     } catch (e) {
       try { await controller.releaseLease(lease); } catch (relErr) {
         console.error(`[Rental] release after edge attach failure: ${relErr && relErr.message}`);
@@ -290,6 +264,67 @@ const YANK_RENTAL_STATUSES = Object.freeze([
 ]);
 
 /**
+ * Seller→edge TCP for a sealed gpu-rental. Rewrites deliverable.ssh host:port
+ * from attach 200. keepOutboundUntilBuyer POSTs rental-secret on later TCP death.
+ * Caller posts the first secret (deliverSealed on hire, postRentalSecret on adopt).
+ */
+async function attachRentalOutbound({
+  client, jobId, deliverable, signMessage, attachEdge, connect,
+} = {}) {
+  const { attachAndDial, keepOutboundUntilBuyer } = require('./compute-edge');
+  const attach = typeof attachEdge === 'function' ? attachEdge : attachAndDial;
+  const localPort = deliverable && deliverable.ssh && deliverable.ssh.port;
+  const attachOpts = {
+    client,
+    jobId,
+    signMessage,
+    localHost: '127.0.0.1',
+    localPort,
+    connect,
+  };
+  const edge = await attach(attachOpts);
+  let live = {
+    ...deliverable,
+    ssh: {
+      ...(deliverable && deliverable.ssh),
+      host: edge.host,
+      port: edge.port,
+    },
+  };
+  if (edge && edge.remote) {
+    keepOutboundUntilBuyer(edge, {
+      attach,
+      attachOpts,
+      onReattached: async ({ host, port }) => {
+        // Upsert after deliver is allowed; buyer re-GETs rental-access for the live port.
+        console.warn(`[Rental] outbound TCP died — re-sealed ${host}:${port} for ${jobId}`);
+        live = {
+          ...live,
+          ssh: { ...live.ssh, host, port },
+        };
+        const { postRentalSecret } = require('./rental-delivery');
+        await postRentalSecret(client, jobId, live);
+      },
+    });
+  }
+  return { edge, deliverable: live };
+}
+
+function rentalDeliverableForAdopt(lease) {
+  try {
+    const { formatRentalDeliverable } = require('./rental-job');
+    return formatRentalDeliverable(lease, { jobTimeoutMin: lease && lease.rentalPeriodMin });
+  } catch {
+    // persistLeases redacts password/privateKey. Buyer already holds the job key;
+    // re-seal only needs the new attach host:port on rental-secret upsert.
+    return {
+      ssh: { ...((lease && lease.ssh) || {}) },
+      expiresAt: lease && lease.expiresAt,
+    };
+  }
+}
+
+/**
  * Re-adopt rentals that outlived a dispatcher restart.
  *
  * A Cat-1 rental is `delivered` from the moment credentials go out, and nothing puts a
@@ -310,10 +345,14 @@ const YANK_RENTAL_STATUSES = Object.freeze([
  * The lease itself survives a restart intact (it is persisted whole, including the period
  * and the applied-extension ids), so re-adoption needs no platform state to reconstruct.
  */
-async function adoptLiveRentals({ state, getSession, now = Date.now(), persist } = {}) {
+async function adoptLiveRentals({
+  state, getSession, now = Date.now(), persist,
+  outboundSshV1, signMessage, attachEdge, connect,
+} = {}) {
   const ctrl = resolveComputeController(state);
   if (!ctrl || typeof ctrl.getLeases !== 'function' || !state || !state.active) return 0;
   let adopted = 0;
+  const wantEdge = !!(outboundSshV1 || (state && state.outboundSshV1));
   for (const lease of ctrl.getLeases() || []) {
     if (!lease || !lease.jobId) continue;
     if (lease.state === 'released' || lease.state === 'release-pending') continue;
@@ -326,16 +365,17 @@ async function adoptLiveRentals({ state, getSession, now = Date.now(), persist }
     // a reason to skip: leaving it unadopted is what strands the box. Adopt, and let the
     // teardown sweep — which re-checks the status every pass — correct it.
     let status = null;
+    let session = null;
     if (typeof getSession === 'function') {
       try {
-        const session = await getSession(agentInfo);
+        session = await getSession(agentInfo);
         const job = await session.client.getJob(lease.jobId);
         status = job && job.status;
       } catch { /* adopt anyway; the sweep re-checks */ }
     }
     if (status && YANK_RENTAL_STATUSES.includes(status)) continue;
 
-    state.active.set(lease.jobId, {
+    const rec = {
       kind: 'gpu-rental',
       leaseId: lease.id,
       agentId: agentInfo.id,
@@ -345,11 +385,46 @@ async function adoptLiveRentals({ state, getSession, now = Date.now(), persist }
       rentalPeriodMin: lease.rentalPeriodMin ?? null,
       rentalPeriodAmount: lease.rentalPeriodAmount ?? null,
       readopted: true,
-    });
+    };
+    state.active.set(lease.jobId, rec);
     if (Array.isArray(state.available)) {
       state.available = state.available.filter((a) => a.id !== agentInfo.id);
     }
     adopted++;
+
+    // Seller→edge TCP died with the process. Re-attach the paid jail; do NOT
+    // release on failure — the buyer already paid and the box is still running.
+    if (wantEdge) {
+      try {
+        if (!session || !session.client) {
+          session = typeof getSession === 'function' ? await getSession(agentInfo) : session;
+        }
+        const client = session && session.client;
+        if (!client) throw new Error('COMPUTE_EDGE_NO_CLIENT');
+        const sign = typeof signMessage === 'function'
+          ? (message) => signMessage(message, agentInfo)
+          : undefined;
+        const attached = await attachRentalOutbound({
+          client,
+          jobId: lease.jobId,
+          deliverable: rentalDeliverableForAdopt(lease),
+          signMessage: sign,
+          attachEdge,
+          connect,
+        });
+        rec.edge = attached.edge;
+        const { postRentalSecret } = require('./rental-delivery');
+        await postRentalSecret(client, lease.jobId, attached.deliverable);
+        const ssh = attached.deliverable && attached.deliverable.ssh;
+        console.log(`[Rental] Re-attached public SSH ${ssh && ssh.host}:${ssh && ssh.port} for ${lease.jobId}`);
+      } catch (e) {
+        rec.edgeAttachError = (e && e.message) || String(e);
+        console.error(
+          `[Rental] re-attach after restart failed for ${lease.jobId}: ${rec.edgeAttachError} `
+          + '(jail kept; public SSH is down until this process re-attaches)',
+        );
+      }
+    }
   }
   if (adopted) {
     // Rewrite active-jobs.json so the NEXT boot's orphan sweep still sees these as live.
@@ -437,4 +512,5 @@ module.exports = {
   decideRentalExtension,
   applyRentalExtension,
   adoptLiveRentals,
+  attachRentalOutbound,
 };

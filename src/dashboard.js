@@ -37,6 +37,7 @@ const {
   leafFromIdentity,
   listingIdPrefix,
   listingsCollide,
+  identitiesEqual,
   KIND_BLURB,
 } = require('./listing-kind.js');
 const { descriptionHasEphemeralUrl, isDataListing } = require('./listing-description.js');
@@ -1432,6 +1433,10 @@ async function addAgentScreen(inquirer) {
     console.log('  Press Ctrl+C to return to menu — registration continues on the platform.\n');
     const setupArgs = [process.argv[1], 'setup', agentId, name, '--kind', kind];
     if (template) setupArgs.push('--template', template);
+    if (kind !== 'agent') {
+      setupArgs.push('--profile-name', name);
+      setupArgs.push('--profile-description', KIND_BLURB[kind] || `${kind} listing`);
+    }
     const exitCode = await runCommandAsync(process.execPath, setupArgs);
     if (exitCode === 0) {
       console.log('\n  ✅ Listing created successfully.\n');
@@ -1611,7 +1616,7 @@ async function configureServicesScreen(inquirer) {
       actionChoices.push({ name: '  View credit meters', value: 'api_credits' });
       actionChoices.push({ name: '  Revoke an API key', value: 'api_revoke' });
       actionChoices.push({ name: '  View deposits (pending + confirmed)', value: 'api_deposits' });
-      actionChoices.push({ name: '  Submit review for a buyer session', value: 'api_review' });
+      actionChoices.push({ name: '  Buyer session review (review-session CLI)', value: 'api_review' });
     }
     actionChoices.push(new inquirer.Separator());
     actionChoices.push({ name: '  ← Back', value: '__back' });
@@ -1951,42 +1956,54 @@ async function configureServicesScreen(inquirer) {
         const reqs = Object.values(b.usage || {}).reduce((n, u) => n + (u.requests || 0), 0);
         return { name: `  ${id}  (${reqs} reqs, ${b.totalSpent.toFixed(4)} VRSC spent)`, value: id };
       })}]);
-      const b = buyers[buyerVerusId];
-      const models = Object.keys(b.usage || {});
-      const requestCount = Object.values(b.usage || {}).reduce((n, u) => n + (u.requests || 0), 0);
       const { rating } = await promptWithEsc(inquirer, [{ type: 'list', name: 'rating', message: 'Rating:', choices: [{ name: '5 — excellent', value: 5 }, { name: '4 — good', value: 4 }, { name: '3 — neutral', value: 3 }, { name: '2 — poor', value: 2 }, { name: '1 — avoid', value: 1 }] }]);
       const { message } = await promptWithEsc(inquirer, [{ type: 'input', name: 'message', message: 'Review comment (optional):' }]);
-      const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: `Submit ${rating}-star review for ${untrusted(buyerVerusId, 60)}?`, default: false }]);
-      if (!confirm) continue;
+      const sellerId = keys.identity || keys.iAddress;
+      const msgFlag = message ? ` --message ${JSON.stringify(message)}` : '';
+      const argv = `j41-dispatcher review-session <buyer-id> ${sellerId} --rating ${rating}${msgFlag}`;
+      console.log('\n  Session reviews are buyer-signed over GET J41-REVIEW-SESSION| bytes.');
+      console.log('  This seller TUI cannot homemade-sign JSON onto POST /v1/reviews/api-session.');
+      console.log('  The buyer runs:\n');
+      console.log(`    ${argv}\n`);
 
+      let localBuyer = null;
       try {
-        const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
-        // json-canonicalize exports { canonicalize }, not a callable default — the
-        // bare `require(...)` made canonicalize(payload) throw "not a function",
-        // breaking this review-submit signing path (same bug fixed in deposit-watcher).
-        const { canonicalize } = require('json-canonicalize');
-        const timestamp = Date.now();
-        const sessionId = `api-session-${agentId}-${buyerVerusId}`;
-        const payload = {
-          agentVerusId: keys.iAddress || keys.identity,
-          buyerVerusId,
-          sessionId,
-          model: models[0] || '',
-          requestCount,
-          totalSpent: b.totalSpent,
-          message: message || '',
-          rating,
-          timestamp,
-        };
-        const signature = signMessage(keys.wif, canonicalize(payload), loadCfg().platform.network);
-
-        const agent = await createAgent(keys);
-        try {
-          const result = await agent.client.submitApiSessionReview({ ...payload, signature });
-          console.log(`\n  ✅ Review submitted (id: ${result.id}).\n`);
-        } finally { agent.stop(); }
-      } catch (e) {
-        console.log(`\n  ❌ Failed: ${e.message}\n`);
+        localBuyer = getAgents().find((a) => a && a.id
+          && (identitiesEqual(a.identity, buyerVerusId) || identitiesEqual(a.iAddress, buyerVerusId)));
+      } catch { localBuyer = null; }
+      if (localBuyer) {
+        const { runLocal } = await promptWithEsc(inquirer, [{
+          type: 'confirm', name: 'runLocal',
+          message: `Local identity ${localBuyer.id} matches this buyer. Submit via GET-canonical review-session now?`,
+          default: false,
+        }]);
+        if (runLocal) {
+          try {
+            const buyerKeys = readKeysFile(path.join(AGENTS_DIR, localBuyer.id, 'keys.json'));
+            const { submitBuyerApiSessionReview } = require('./buyer-review-session');
+            const agent = await createAgent(buyerKeys);
+            try {
+              const result = await submitBuyerApiSessionReview({
+                client: agent.client,
+                keys: buyerKeys,
+                seller: sellerId,
+                rating,
+                message: message || '',
+                agentsDir: AGENTS_DIR,
+                buyerId: localBuyer.id,
+                network: loadCfg().platform.network,
+              });
+              if (!result.ok) {
+                console.log(`\n  ❌ ${result.code}: ${result.message}\n`);
+              } else {
+                console.log(`\n  ✅ Session review submitted (${result.result && (result.result.inboxId || result.result.id) || 'ok'}).\n`);
+                if (result.inboxWarning) console.log(`     ${result.inboxWarning}\n`);
+              }
+            } finally { agent.stop(); }
+          } catch (e) {
+            console.log(`\n  ❌ Failed: ${e.message}\n`);
+          }
+        }
       }
       await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
       continue;
@@ -3770,10 +3787,14 @@ async function apiEndpointSetupScreen(inquirer) {
   // getAgents() is allowLocked (no wif). Secret-read happens below.
   const agents = getAgents()
     .filter(a => a.identity && a.iAddress)
-    .filter(a => a.kind !== 'compute');
+    .filter(a => {
+      const k = listingKindOf(a);
+      return k !== 'compute' && k !== 'data';
+    });
   if (agents.length === 0) {
     console.log('  No agent/model listings available for API Endpoint Setup.');
-    console.log('  Compute listings use: j41-dispatcher rental-setup <agent-id>\n');
+    console.log('  Compute listings use: j41-dispatcher rental-setup <agent-id>');
+    console.log('  Data listings use: j41-dispatcher data-setup <agent-id> --website\n');
     await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
     return;
   }

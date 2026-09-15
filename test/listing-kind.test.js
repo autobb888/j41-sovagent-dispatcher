@@ -17,6 +17,9 @@ const {
   kindFromIdentityName,
   listingIdPrefix,
   listingsCollide,
+  labourServicesAllowed,
+  labourServicesOrEmpty,
+  assertApiSetupKind,
   LISTING_KINDS,
 } = require('../src/listing-kind.js');
 
@@ -75,6 +78,24 @@ test('TUI signup offers model as a live kind under agentplatform@', () => {
   assert.match(DASH, /value: 'model'/);
   assert.equal(/coming soon/i.test(DASH), false);
   assert.match(DASH, /--kind/);
+});
+
+test('labour registerService is kind=agent only', () => {
+  assert.equal(labourServicesAllowed('agent'), true);
+  assert.equal(labourServicesAllowed('data'), false);
+  assert.equal(labourServicesAllowed('model'), false);
+  assert.equal(labourServicesAllowed('compute'), false);
+  assert.deepEqual(labourServicesOrEmpty('data', 'apples.agentplatform@', [{ name: 'labour' }]), []);
+  assert.deepEqual(labourServicesOrEmpty('agent', 'alice.agentplatform@', [{ name: 'labour' }]), [{ name: 'labour' }]);
+});
+
+test('assertApiSetupKind refuses kind=data', () => {
+  assert.throws(
+    () => assertApiSetupKind({ kind: 'data', identity: 'apples.agentplatform@' }),
+    (e) => e && e.code === 'API_SETUP_WRONG_KIND' && /data-setup/.test(e.message),
+  );
+  assert.doesNotThrow(() => assertApiSetupKind({ kind: 'model', identity: 'kimi.agentplatform@' }));
+  assert.doesNotThrow(() => assertApiSetupKind({ kind: 'agent', identity: 'alice.agentplatform@' }));
 });
 
 test('TUI refuses to reuse a working agent name for a GPU box', () => {

@@ -79,6 +79,31 @@ function listingsCollide(existing, candidate, kind) {
     && leafFromIdentity(existing) === leafFromIdentity(want);
 }
 
+function resolveListingKind(kind, identity) {
+  return parseListingKind(kind) || kindFromIdentityName(identity) || 'agent';
+}
+
+/** Labour `registerService` is kind=agent only. Data is VDXF, model is api-setup, compute is rental-setup. */
+function labourServicesAllowed(kind, identity) {
+  return resolveListingKind(kind, identity) === 'agent';
+}
+
+function labourServicesOrEmpty(kind, identity, services) {
+  if (!labourServicesAllowed(kind, identity)) return [];
+  return Array.isArray(services) ? services : [];
+}
+
+function assertApiSetupKind({ kind, identity } = {}) {
+  const k = parseListingKind(kind) || kindFromIdentityName(identity) || kind;
+  if (k === 'data') {
+    const err = new Error(
+      'API_SETUP_WRONG_KIND: api-setup is for model (or agent) listings, not kind=data. Use: j41-dispatcher data-setup <id> --website https://...',
+    );
+    err.code = 'API_SETUP_WRONG_KIND';
+    throw err;
+  }
+}
+
 module.exports = {
   LISTING_KINDS,
   KIND_PARENTS,
@@ -91,4 +116,8 @@ module.exports = {
   listingIdPrefix,
   identitiesEqual,
   listingsCollide,
+  resolveListingKind,
+  labourServicesAllowed,
+  labourServicesOrEmpty,
+  assertApiSetupKind,
 };

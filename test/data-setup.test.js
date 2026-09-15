@@ -190,6 +190,19 @@ test('TUI [2] Sign up Next: data → data-setup not [5]; model → [18] then web
   assert.match(add, /await dataSetupScreen\(inquirer, agentId\)/);
   assert.match(add, /apiEndpointSetupScreen/);
   assert.doesNotMatch(add, /Use \[5\] Configure Services to attach the data policy/);
+  assert.match(add, /kind !== 'agent'/);
+  assert.match(add, /--profile-name/);
+});
+
+test('setup / register / finalize strip labour services unless kind=agent', () => {
+  assert.match(CLI, /labourServicesOrEmpty/);
+  assert.match(CLI, /labourServicesAllowed\(keys && keys\.kind/);
+  const setupAt = CLI.indexOf(".command('setup <agent-id> <identity-name>')");
+  const setup = CLI.slice(setupAt, CLI.indexOf(".command('providers')", setupAt));
+  assert.match(setup, /labourServicesOrEmpty\(keys\.kind \|\| options\.kind/);
+  const api = cliBlock('api-setup <agent-id>');
+  assert.match(api, /assertApiSetupKind/);
+  assert.match(api, /API_SETUP_WRONG_KIND|assertApiSetupKind/);
 });
 
 test('TUI [5] diverts kind=data to data-setup and kind=model away from labour add', () => {

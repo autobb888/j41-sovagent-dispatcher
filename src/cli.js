@@ -294,6 +294,9 @@ const {
   advertisedIdentity,
   listingsCollide,
   listingIdPrefix,
+  labourServicesAllowed,
+  labourServicesOrEmpty,
+  assertApiSetupKind,
 } = require('./listing-kind.js');
 const { refuseDataListingDescriptions } = require('./listing-description.js');
 
@@ -761,7 +764,7 @@ function mergeTemplateIntoOptions(tpl, options) {
       if (options.sessionMessageLimit == null && sess.messageLimit != null) options.sessionMessageLimit = sess.messageLimit;
     }
   }
-  if (tpl.service) {
+  if (tpl.service && labourServicesAllowed(options.kind, options.identity || options.profileName)) {
     if (!options.serviceName) options.serviceName = tpl.service.name;
     if (!options.serviceDescription) options.serviceDescription = tpl.service.description;
     if (!options.servicePrice) options.servicePrice = tpl.service.price;
@@ -885,32 +888,38 @@ async function interactiveProfileSetup(keys, soulContent) {
   const protocols = protosRaw ? protosRaw.split(',').map(s => s.trim()).filter(Boolean) : ['MCP', 'REST'];
 
   // ── Service listing (the thing buyers actually see) ──
-  console.log('\n── Marketplace Listing ──');
-  console.log('  This is what buyers see when they browse services.\n');
   const services = [];
-  let addService = await yesNo('  Create a service listing?', 'Y');
-  while (addService) {
-    const svcName = await ask('    Service name (e.g. "Code Review", "Write Blog Post")');
-    if (!svcName) break;
-    const svcDesc = await ask('    What does the buyer get?', description);
-    const svcPrice = parseFloat(await ask(`    Price in ${NATIVE_COIN}`, '0.5')) || 0.5;
-    const svcTurnaround = await ask('    How long does it take? (e.g. "15 min", "1 hour")', '15 min');
+  if (!labourServicesAllowed(keys && keys.kind, keys && keys.identity)) {
+    console.log('\n── Marketplace Listing ──');
+    console.log('  Labour services are for kind=agent only.');
+    console.log('  Data uses data-setup; model uses api-setup; compute uses rental-setup.\n');
+  } else {
+    console.log('\n── Marketplace Listing ──');
+    console.log('  This is what buyers see when they browse services.\n');
+    let addService = await yesNo('  Create a service listing?', 'Y');
+    while (addService) {
+      const svcName = await ask('    Service name (e.g. "Code Review", "Write Blog Post")');
+      if (!svcName) break;
+      const svcDesc = await ask('    What does the buyer get?', description);
+      const svcPrice = parseFloat(await ask(`    Price in ${NATIVE_COIN}`, '0.5')) || 0.5;
+      const svcTurnaround = await ask('    How long does it take? (e.g. "15 min", "1 hour")', '15 min');
 
-    services.push({
-      name: svcName,
-      description: svcDesc || undefined,
-      category: category || undefined,
-      price: svcPrice,
-      currency: NATIVE_COIN,
-      turnaround: svcTurnaround,
-      paymentTerms: 'prepay',
-      sovguard: true,
-      resolutionWindow: 72,
-      refundPolicy: { policy: 'fixed', percent: 100 },
-    });
-    console.log(`    ✓ "${svcName}" — ${svcPrice} ${NATIVE_COIN}\n`);
+      services.push({
+        name: svcName,
+        description: svcDesc || undefined,
+        category: category || undefined,
+        price: svcPrice,
+        currency: NATIVE_COIN,
+        turnaround: svcTurnaround,
+        paymentTerms: 'prepay',
+        sovguard: true,
+        resolutionWindow: 72,
+        refundPolicy: { policy: 'fixed', percent: 100 },
+      });
+      console.log(`    ✓ "${svcName}" — ${svcPrice} ${NATIVE_COIN}\n`);
 
-    addService = await yesNo('  Add another service?', 'N');
+      addService = await yesNo('  Add another service?', 'N');
+    }
   }
 
   // ── Workspace (simple yes/no) ──
@@ -1084,7 +1093,7 @@ function addServiceOptions(cmd) {
  * Interactive walkthrough — prompts for all profile and service fields.
  * Used by setup --interactive.
  */
-async function interactiveOnboarding(identityName) {
+async function interactiveOnboarding(identityName, kind) {
   requireInteractiveConfirm('interactive onboarding'); // B11 — same TTY-hang class as interactiveProfileSetup
   const readline = require('readline');
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -1115,31 +1124,48 @@ async function interactiveOnboarding(identityName) {
   const trustLevel = await ask('Trust level (basic|verified|audited)', 'basic');
   const disputeResolution = await ask('Dispute resolution (platform|arbitration|mutual)', 'platform');
 
-  console.log('\n── Service Listing ──\n');
-  const serviceName = await ask('Service name');
-  const serviceDescription = await ask('Service description', profileDescription);
-  const servicePrice = await ask('Primary price', '0.5');
-  const serviceCurrency = await ask('Primary currency', NATIVE_COIN);
-  const serviceCategory = await ask('Service category', 'development');
-  const serviceTurnaround = await ask('Turnaround time', '5 minutes');
-  const servicePaymentTerms = await ask('Payment terms (prepay|postpay|split)', 'prepay');
-  const servicePrivateMode = await ask('Private mode? (y/N)', 'N');
-  const serviceSovguard = await ask('Require SovGuard? (Y/n)', 'Y');
+  const labour = labourServicesAllowed(kind, identityName);
+  let serviceName;
+  let serviceDescription;
+  let servicePrice;
+  let serviceCurrency;
+  let serviceCategory;
+  let serviceTurnaround;
+  let servicePaymentTerms;
+  let servicePrivateMode = 'N';
+  let serviceSovguard = 'Y';
+  let serviceAcceptedCurrencies;
 
-  // Multi-currency pricing
-  const addMoreCurrencies = await ask('Accept additional currencies? (y/N)', 'N');
-  const serviceAcceptedCurrencies = [{ currency: serviceCurrency, price: parseFloat(servicePrice) || 0 }];
-  if (addMoreCurrencies.toLowerCase() === 'y') {
-    let addMore = true;
-    while (addMore && serviceAcceptedCurrencies.length < 20) {
-      const cur = await ask('  Currency (e.g. tBTC.vETH, vETH)');
-      if (!cur) break;
-      const price = await ask(`  Price in ${cur}`);
-      if (!price) break;
-      serviceAcceptedCurrencies.push({ currency: cur, price: parseFloat(price) || 0 });
-      const more = await ask('  Add another? (y/N)', 'N');
-      addMore = more.toLowerCase() === 'y';
+  if (labour) {
+    console.log('\n── Service Listing ──\n');
+    serviceName = await ask('Service name');
+    serviceDescription = await ask('Service description', profileDescription);
+    servicePrice = await ask('Primary price', '0.5');
+    serviceCurrency = await ask('Primary currency', NATIVE_COIN);
+    serviceCategory = await ask('Service category', 'development');
+    serviceTurnaround = await ask('Turnaround time', '5 minutes');
+    servicePaymentTerms = await ask('Payment terms (prepay|postpay|split)', 'prepay');
+    servicePrivateMode = await ask('Private mode? (y/N)', 'N');
+    serviceSovguard = await ask('Require SovGuard? (Y/n)', 'Y');
+
+    // Multi-currency pricing
+    const addMoreCurrencies = await ask('Accept additional currencies? (y/N)', 'N');
+    serviceAcceptedCurrencies = [{ currency: serviceCurrency, price: parseFloat(servicePrice) || 0 }];
+    if (addMoreCurrencies.toLowerCase() === 'y') {
+      let addMore = true;
+      while (addMore && serviceAcceptedCurrencies.length < 20) {
+        const cur = await ask('  Currency (e.g. tBTC.vETH, vETH)');
+        if (!cur) break;
+        const price = await ask(`  Price in ${cur}`);
+        if (!price) break;
+        serviceAcceptedCurrencies.push({ currency: cur, price: parseFloat(price) || 0 });
+        const more = await ask('  Add another? (y/N)', 'N');
+        addMore = more.toLowerCase() === 'y';
+      }
     }
+  } else {
+    console.log('\n── Service Listing ──');
+    console.log('  Labour services are for kind=agent only. Skipped.\n');
   }
 
   rl.close();
@@ -1864,6 +1890,7 @@ program
         disputePolicyData = result.disputePolicy;
       }
 
+      serviceData = labourServicesOrEmpty(kind, keys.identity, serviceData);
       assertDataDescriptions(kind, keys.identity || preview, [
         profileData && profileData.description,
         ...(serviceData || []).map((s) => s && s.description),
@@ -2060,6 +2087,7 @@ program
       }
     }
 
+    services = labourServicesOrEmpty(keys.kind || options.kind, keys.identity, services);
     assertDataDescriptions(keys.kind, keys.identity, [
       options.profileDescription,
       options.serviceDescription,
@@ -4719,7 +4747,7 @@ program
 
     // Interactive mode: prompt for all fields before proceeding
     if (options.interactive) {
-      const answers = await interactiveOnboarding(identityName);
+      const answers = await interactiveOnboarding(identityName, options.kind);
       // Merge interactive answers into options (CLI flags take precedence)
       for (const [key, value] of Object.entries(answers)) {
         if (options[key] == null || options[key] === undefined) {
@@ -4854,6 +4882,7 @@ program
       services = buildServiceFromOptions(options, profileData.description);
     }
 
+    services = labourServicesOrEmpty(keys.kind || options.kind, keys.identity, services);
     assertDataDescriptions(keys.kind || options.kind, keys.identity, [
       options.profileDescription,
       options.serviceDescription,
@@ -5042,6 +5071,18 @@ program
     } catch {}
     try {
       assertApiEligibleAgent(existingServices);
+    } catch (e) {
+      console.error(`✗ ${e.message}`);
+      process.exit(1);
+    }
+
+    const keysPathEarly = path.join(agentDir, 'keys.json');
+    let apiKindKeys = {};
+    try {
+      if (fs.existsSync(keysPathEarly)) apiKindKeys = readKeysFile(keysPathEarly, { allowLocked: true });
+    } catch {}
+    try {
+      assertApiSetupKind({ kind: apiKindKeys.kind, identity: apiKindKeys.identity });
     } catch (e) {
       console.error(`✗ ${e.message}`);
       process.exit(1);
@@ -7015,7 +7056,16 @@ program
     if (cfg.compute && cfg.compute.enabled) {
       try {
         await ensureComputeController(state, cfg);
-        const readopted = await adoptLiveRentals({ state, getSession: (ai) => getAgentSession(state, ai) });
+        const { createLocalSigner } = require('./job-signer');
+        const readopted = await adoptLiveRentals({
+          state,
+          getSession: (ai) => getAgentSession(state, ai),
+          outboundSshV1: !!state.outboundSshV1,
+          signMessage: (message, agentInfo) => {
+            const signer = createLocalSigner({ wif: agentInfo.wif, network: J41_NETWORK });
+            return signer.signMessage(message);
+          },
+        });
         if (readopted) console.log(`[Rental] Re-adopted ${readopted} live rental(s) after restart`);
       } catch (e) {
         console.error(`[Rental] Boot re-adoption failed (a live rental may be untracked): ${e.message}`);

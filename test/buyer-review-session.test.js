@@ -392,6 +392,21 @@ test('CLI review-session is a thin rind over buyer-review-session', () => {
   assert.match(chatRind, /persistGrantSession/);
 });
 
+test('TUI api_review does not homemade-sign JSON onto POST /v1/reviews/api-session', () => {
+  const dash = fs.readFileSync(path.join(__dirname, '../src/dashboard.js'), 'utf8');
+  const start = dash.indexOf("if (action === 'api_review')");
+  assert.ok(start > -1);
+  const next = dash.indexOf("if (action === 'api_deposits')", start);
+  const block = dash.slice(start, next > start ? next : start + 4000);
+  assert.doesNotMatch(block, /api-session-\$\{agentId\}/);
+  assert.doesNotMatch(block, /json-canonicalize/);
+  assert.doesNotMatch(block, /canonicalize\(payload\)/);
+  assert.doesNotMatch(block, /submitApiSessionReview/);
+  assert.match(block, /submitBuyerApiSessionReview/);
+  assert.match(block, /J41-REVIEW-SESSION\|/);
+  assert.match(block, /review-session <buyer-id>/);
+});
+
 test('CHANGELOG and help do not claim reviews shipped', () => {
   const changelog = fs.readFileSync(path.join(__dirname, '../CHANGELOG.md'), 'utf8');
   const cli = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
