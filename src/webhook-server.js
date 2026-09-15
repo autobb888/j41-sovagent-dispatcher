@@ -112,7 +112,7 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
   const HEADERS_TIMEOUT_MS = Number(process.env.J41_WEBHOOK_HEADERS_TIMEOUT_MS || 30_000);
   // Must sit above proxy.upstream_timeout_ms so a NIM abort can still write 504
   // before this server kills the socket. trycloudflare origin is ~100s.
-  const REQUEST_TIMEOUT_MS = Number(process.env.J41_WEBHOOK_REQUEST_TIMEOUT_MS || 95_000);
+  const REQUEST_TIMEOUT_MS = Number(process.env.J41_WEBHOOK_REQUEST_TIMEOUT_MS || 99_000);
   const IDLE_TIMEOUT_MS = Number(process.env.J41_WEBHOOK_IDLE_TIMEOUT_MS || 120_000);
   const MAX_CONNECTIONS = Number(process.env.J41_WEBHOOK_MAX_CONNECTIONS || 512);
 

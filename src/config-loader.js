@@ -34,9 +34,9 @@ const DEFAULTS = Object.freeze({
     cohere: '', perplexity: '', openrouter: '', kimi: '',
   },
   proxy: {
-    // Kimi-K3 TTFB on integrate.api.nvidia.com is ~68s even at reasoning_effort
-    // low; 60s aborted every Mac pong. trycloudflare origin is ~100s.
-    upstream_timeout_ms: 90000,
+    // Kimi-K3 TTFB on integrate.api.nvidia.com is 68–91s. 90s aborted the Mac
+    // pong at ~92s. trycloudflare origin is ~100s.
+    upstream_timeout_ms: 95000,
     // Buyer CLI chat omits max_tokens. NVIDIA reasoning NIMs then fill an
     // unbounded CoT until the proxy abort → HTTP 504, no meter. 32 is enough
     // for a pong and leaves headroom under trycloudflare's ~100s origin cutoff.
