@@ -12160,8 +12160,17 @@ function getDispatcherNetworkMode() {
   // It MUST be egress-capable — the job agent has to reach the platform API + the
   // LLM endpoint. Do NOT auto-create it here: a dispatcher-created `--internal`
   // network has no external DNS/egress and silently breaks every job (M10 regression).
+  //
+  // J41_FORCE_BRIDGE=1: skip j41-isolated even when it exists. On this host a
+  // present j41-isolated still cannot hairpin to the host CONNECT proxy
+  // (container → 172.18.0.1:9847 times out). Isolated jobs then hang on
+  // authenticate (Dns 0.0.0.0 + J41_EGRESS_PROXY) and the buyer never gets a
+  // seller chat reply. Bridge NATs 443; skip the proxy (same as the comment
+  // below). Keep the network around so quickCheck still passes.
+  const forceBridge = process.env.J41_FORCE_BRIDGE === '1';
   try {
     require('child_process').execSync('docker network inspect j41-isolated', { stdio: 'ignore', timeout: 5000 });
+    if (forceBridge) return 'bridge';
     return 'j41-isolated';
   } catch {
     console.warn('[security] j41-isolated network absent — using the default bridge (egress works; less network isolation). Run @junction41/secure-setup to provision an egress-capable j41-isolated.');

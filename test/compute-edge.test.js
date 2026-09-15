@@ -10,6 +10,7 @@ const {
   parseAttachBody,
   challengeAndAttach,
   attachAndDial,
+  holdRemoteToLocal,
   keepOutboundUntilBuyer,
 } = require('../src/compute-edge');
 
@@ -209,6 +210,41 @@ test('local sshd close does not destroy the edge TCP (denied login must not drop
   assert.equal(edge.remote.destroyed, false);
   assert.equal(edge.remote.pipeOpts && edge.remote.pipeOpts.end, false);
   assert.equal(local.pipeOpts && local.pipeOpts.end, false);
+});
+
+test('after SSH bytes, jail sshd close destroys the edge socket (no second banner on the same port)', async () => {
+  const destroyed = [];
+  const mkSock = (name) => {
+    const handlers = {};
+    const sock = {
+      name,
+      destroyed: false,
+      pipe() { return sock; },
+      unpipe() {},
+      on(ev, fn) { (handlers[ev] = handlers[ev] || []).push(fn); return sock; },
+      once(ev, fn) {
+        (handlers[ev] = handlers[ev] || []).push(fn);
+        if (ev === 'connect') queueMicrotask(fn);
+        return sock;
+      },
+      emit(ev, ...a) { for (const fn of handlers[ev] || []) fn(...a); },
+      destroy() { sock.destroyed = true; destroyed.push(name); },
+    };
+    return sock;
+  };
+  const remote = mkSock('edge');
+  const locals = [];
+  holdRemoteToLocal(remote, {
+    localHost: '127.0.0.1',
+    localPort: 2222,
+    connect: () => { const s = mkSock(`local-${locals.length}`); locals.push(s); return s; },
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  remote.emit('data', Buffer.from('SSH-2.0-OpenSSH'));
+  locals[0].emit('close');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(destroyed.includes('edge'), 'second sshd banner on a live client is a MAC failure');
+  assert.equal(locals.length, 1, 'must not reconnect jail sshd onto the same edge TCP');
 });
 
 function mockEdgeSock(name) {

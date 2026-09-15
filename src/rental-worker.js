@@ -119,6 +119,9 @@ async function startRentalJob(opts) {
     providerName,
     now,
   });
+  try {
+    require('./config').persistRentalSshSecret(job.id, deliverable && deliverable.ssh);
+  } catch { /* restart re-seal is best-effort */ }
 
   try {
     if (typeof client.confirmWorkerAttached === 'function') {
@@ -311,14 +314,19 @@ async function attachRentalOutbound({
 }
 
 function rentalDeliverableForAdopt(lease) {
+  const saved = (() => {
+    try { return require('./config').loadRentalSshSecret(lease && lease.jobId); } catch { return null; }
+  })();
+  const ssh = {
+    ...((lease && lease.ssh) || {}),
+    ...(saved || {}),
+  };
   try {
     const { formatRentalDeliverable } = require('./rental-job');
-    return formatRentalDeliverable(lease, { jobTimeoutMin: lease && lease.rentalPeriodMin });
+    return formatRentalDeliverable({ ...lease, ssh }, { jobTimeoutMin: lease && lease.rentalPeriodMin });
   } catch {
-    // persistLeases redacts password/privateKey. Buyer already holds the job key;
-    // re-seal only needs the new attach host:port on rental-secret upsert.
     return {
-      ssh: { ...((lease && lease.ssh) || {}) },
+      ssh,
       expiresAt: lease && lease.expiresAt,
     };
   }
@@ -413,10 +421,17 @@ async function adoptLiveRentals({
           connect,
         });
         rec.edge = attached.edge;
-        const { postRentalSecret } = require('./rental-delivery');
-        await postRentalSecret(client, lease.jobId, attached.deliverable);
         const ssh = attached.deliverable && attached.deliverable.ssh;
         console.log(`[Rental] Re-attached public SSH ${ssh && ssh.host}:${ssh && ssh.port} for ${lease.jobId}`);
+        const { postRentalSecret } = require('./rental-delivery');
+        try {
+          await postRentalSecret(client, lease.jobId, attached.deliverable);
+        } catch (secretErr) {
+          console.error(
+            `[Rental] re-seal after restart failed for ${lease.jobId}: ${secretErr && secretErr.message} `
+            + `(outbound is up at ${ssh && ssh.host}:${ssh && ssh.port}; buyer GET rental-access may still show the old port)`,
+          );
+        }
       } catch (e) {
         rec.edgeAttachError = (e && e.message) || String(e);
         console.error(
@@ -471,6 +486,7 @@ async function stopRentalJob(state, jobId, { skipReturnAgent = false } = {}) {
   const ctrl = resolveComputeController(state);
   const lease = findRentalLease(ctrl, active, jobId);
   try { require('./compute-edge').dropEdgeSockets(active.edge); } catch { /* ignore */ }
+  try { require('./config').clearRentalSshSecret(jobId); } catch { /* ignore */ }
 
   if (ctrl && typeof ctrl.releaseLease === 'function' && lease && lease.state !== 'released') {
     try {

@@ -401,7 +401,7 @@ async function fetchChatCompletions(payload) {
   let lastErr = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 20000);
+    const timer = setTimeout(() => controller.abort(), 60000);
     try {
       const res = await doFetch(`${LLM_CONFIG.baseUrl}/chat/completions`, {
         method: 'POST',

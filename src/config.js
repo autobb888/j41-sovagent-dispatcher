@@ -11,6 +11,7 @@ const CONFIG_PATH = path.join(DISPATCHER_DIR, 'config.json');
 const ACTIVE_JOBS_PATH = path.join(DISPATCHER_DIR, 'active-jobs.json');
 const REACTIVATION_QUEUE_PATH = path.join(DISPATCHER_DIR, 'reactivation-queue.json');
 const LEASES_PATH = path.join(DISPATCHER_DIR, 'leases.json');
+const RENTAL_SECRETS_PATH = path.join(DISPATCHER_DIR, 'rental-secrets.json');
 
 const DEFAULTS = {
   runtime: 'docker',
@@ -170,6 +171,63 @@ function loadLeases() {
   }
 }
 
+function loadRentalSecretsFile() {
+  try {
+    if (!fs.existsSync(RENTAL_SECRETS_PATH)) return {};
+    const rec = JSON.parse(fs.readFileSync(RENTAL_SECRETS_PATH, 'utf8'));
+    return rec && typeof rec === 'object' ? rec : {};
+  } catch {
+    return {};
+  }
+}
+
+function persistRentalSshSecret(jobId, ssh) {
+  if (!jobId || !ssh || typeof ssh !== 'object') return;
+  const key = ssh.privateKey != null && String(ssh.privateKey).length > 0;
+  const pw = ssh.password != null && String(ssh.password).length > 0;
+  if (!key && !pw) return;
+  try {
+    fs.mkdirSync(DISPATCHER_DIR, { recursive: true, mode: 0o700 });
+    const rec = loadRentalSecretsFile();
+    rec[jobId] = {
+      user: ssh.user || 'renter',
+      privateKey: key ? ssh.privateKey : undefined,
+      password: pw ? ssh.password : undefined,
+    };
+    const tmp = `${RENTAL_SECRETS_PATH}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(rec, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, RENTAL_SECRETS_PATH);
+    fs.chmodSync(RENTAL_SECRETS_PATH, 0o600);
+  } catch (e) {
+    console.error(`[config] Failed to persist rental SSH secret: ${e.message}`);
+  }
+}
+
+function loadRentalSshSecret(jobId) {
+  if (!jobId) return null;
+  const rec = loadRentalSecretsFile()[jobId];
+  return rec && typeof rec === 'object' ? rec : null;
+}
+
+function clearRentalSshSecret(jobId) {
+  if (!jobId) return;
+  try {
+    const rec = loadRentalSecretsFile();
+    if (!(jobId in rec)) return;
+    delete rec[jobId];
+    if (Object.keys(rec).length === 0) {
+      try { fs.unlinkSync(RENTAL_SECRETS_PATH); } catch { /* gone */ }
+      return;
+    }
+    const tmp = `${RENTAL_SECRETS_PATH}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(rec, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, RENTAL_SECRETS_PATH);
+    fs.chmodSync(RENTAL_SECRETS_PATH, 0o600);
+  } catch (e) {
+    console.error(`[config] Failed to clear rental SSH secret: ${e.message}`);
+  }
+}
+
 module.exports = {
   CONFIG_PATH,
   ACTIVE_JOBS_PATH,
@@ -187,4 +245,8 @@ module.exports = {
   persistLeases,
   loadLeases,
   redactLeaseSecrets,
+  persistRentalSshSecret,
+  loadRentalSshSecret,
+  clearRentalSshSecret,
+  RENTAL_SECRETS_PATH,
 };

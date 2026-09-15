@@ -215,6 +215,21 @@ Cat-2 attach still waits on vLLM `/models` (`readyFor` defaults to `'service'`).
 
 ## Unreleased
 
+### GPU SSH splice no longer injects a second banner; labour LLM abort is 60s
+
+- `holdRemoteToLocal` reconnects jail sshd only **before** any SSH bytes. After
+  the buyer (or sshd) has spoken, a local close destroys the edge TCP so
+  keepOutbound can mint a **new** attach port. Splicing a fresh sshd into a
+  live client made OpenSSH read `SSH-` as packet length 1397966893
+  (`Bad packet length` / `message authentication code incorrect`).
+- Restart re-seal keeps the job SSH private key in `rental-secrets.json` (0600),
+  because `leases.json` redacts it and `POST rental-secret` without the key is
+  `Invalid rental secret`.
+- Labour `callLLM` abort timeout is 60s (was 20s). NVIDIA from the job
+  container aborted the pong turn after a successful greeting.
+- `J41_FORCE_BRIDGE=1` runs job containers on Docker `bridge` even when
+  `j41-isolated` exists (this host cannot hairpin the CONNECT proxy).
+
 ### Restart re-attaches GPU SSH; seller TUI cannot homemade session reviews; no labour/API on data
 
 - Boot `adoptLiveRentals` re-runs `attachAndDial` + `keepOutboundUntilBuyer` and

@@ -187,10 +187,17 @@ const SPLICE_OPTS = { end: false };
 function holdRemoteToLocal(remote, { localHost, localPort, connect }) {
   let currentLocal = null;
   let stopped = false;
+  // Once any SSH byte has moved, a new jail sshd must NOT be spliced into the
+  // same edge socket: its identification string is ASCII "SSH-2.0-…", which
+  // OpenSSH reads as a binary packet length (0x5353482d = 1397966893) →
+  // "Bad packet length" / "message authentication code incorrect".
+  let bytesMoved = false;
+  const markBytes = () => { bytesMoved = true; };
   const stop = () => {
     stopped = true;
     try { if (currentLocal) currentLocal.destroy(); } catch { /* ignore */ }
   };
+  if (remote && typeof remote.on === 'function') remote.on('data', markBytes);
   const attachLocal = () => {
     if (stopped || !remote || remote.destroyed) return;
     connectOnce(connect, { host: localHost, port: localPort }).then((local) => {
@@ -199,6 +206,7 @@ function holdRemoteToLocal(remote, { localHost, localPort, connect }) {
         return;
       }
       currentLocal = local;
+      if (typeof local.on === 'function') local.on('data', markBytes);
       if (typeof remote.pipe === 'function' && typeof local.pipe === 'function') {
         remote.pipe(local, SPLICE_OPTS);
         local.pipe(remote, SPLICE_OPTS);
@@ -207,12 +215,19 @@ function holdRemoteToLocal(remote, { localHost, localPort, connect }) {
         try { if (typeof remote.unpipe === 'function') remote.unpipe(local); } catch { /* ignore */ }
         try { if (typeof local.unpipe === 'function') local.unpipe(remote); } catch { /* ignore */ }
         currentLocal = null;
-        if (!stopped && !remote.destroyed) setTimeout(attachLocal, 50);
+        if (stopped || remote.destroyed) return;
+        if (bytesMoved) {
+          // Handshake already started — drop the public door so keepOutbound
+          // can allocate a fresh attach port instead of injecting a second banner.
+          try { if (typeof remote.destroy === 'function') remote.destroy(); } catch { /* ignore */ }
+          return;
+        }
+        setTimeout(attachLocal, 50);
       };
       local.once('close', onLocalGone);
       local.once('error', onLocalGone);
     }).catch(() => {
-      if (!stopped && !remote.destroyed) setTimeout(attachLocal, 200);
+      if (!stopped && !remote.destroyed && !bytesMoved) setTimeout(attachLocal, 200);
     });
   };
   if (typeof remote.once === 'function') {
@@ -223,6 +238,7 @@ function holdRemoteToLocal(remote, { localHost, localPort, connect }) {
   return {
     stop,
     get local() { return currentLocal; },
+    get bytesMoved() { return bytesMoved; },
   };
 }
 

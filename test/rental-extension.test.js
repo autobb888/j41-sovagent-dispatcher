@@ -233,6 +233,36 @@ test('re-adopt with outboundSshV1 re-attaches and reseals the public SSH port', 
   assert.equal(controller.getLeases().find((l) => l.jobId === 'job-1').state, 'ready');
 });
 
+test('restart re-seal uses the sidecar SSH private key, not the redacted lease', async () => {
+  const fs = require('fs');
+  const { persistRentalSshSecret, loadRentalSshSecret, clearRentalSshSecret } = require('../src/config');
+  persistRentalSshSecret('job-secret', { user: 'renter', privateKey: 'BEGIN KEY' });
+  assert.equal(loadRentalSshSecret('job-secret').privateKey, 'BEGIN KEY');
+  const { adoptLiveRentals } = require('../src/rental-worker');
+  const { controller } = await bootRental({ jobTimeoutMin: 60, amount: 2 });
+  const lease = controller.getLeases().find((l) => l.jobId === 'job-1');
+  persistRentalSshSecret('job-1', { ...lease.ssh });
+  if (lease.ssh) { delete lease.ssh.password; delete lease.ssh.privateKey; }
+  const state = afterRestart(controller);
+  const posted = [];
+  await adoptLiveRentals({
+    state,
+    getSession: async () => ({
+      client: {
+        async getJob() { return { id: 'job-1', status: 'delivered' }; },
+        async postRentalSecret(_id, body) { posted.push(body.ssh && (body.ssh.privateKey || body.ssh.password)); },
+      },
+    }),
+    now: NOW,
+    persist: () => {},
+    outboundSshV1: true,
+    attachEdge: async () => ({ host: 'sovcompute.junction41.io', port: 40004, remote: { destroy() {} }, stopHold() {} }),
+  });
+  assert.equal(posted[0], 'secretpw');
+  clearRentalSshSecret('job-1');
+  clearRentalSshSecret('job-secret');
+});
+
 test('re-attach failure after restart keeps the paid jail and still tracks the rental', async () => {
   const { controller } = await bootRental({ jobTimeoutMin: 60, amount: 2 });
   const state = afterRestart(controller);
@@ -274,6 +304,12 @@ test('cli.js decides rental extensions on the lease, not on host CPU/RAM', () =>
   assert.ok(rentalBranch > 0, 'rental jobs need their own decision');
   assert.ok(cpuGate > rentalBranch, 'the rental branch must return before the host-capacity gate');
   assert.match(handler.slice(rentalBranch, cpuGate), /decideRentalExtension\(/);
+});
+
+test('cli.js J41_FORCE_BRIDGE skips j41-isolated when set', () => {
+  const fn = CLI.slice(CLI.indexOf('function getDispatcherNetworkMode()'), CLI.indexOf('function getDispatcherBwrapConfig()'));
+  assert.match(fn, /J41_FORCE_BRIDGE === '1'/);
+  assert.match(fn, /if \(forceBridge\) return 'bridge'/);
 });
 
 test('cli.js re-adopts live rentals on boot, after crash recovery and before the first poll', () => {
