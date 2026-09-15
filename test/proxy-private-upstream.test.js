@@ -40,6 +40,13 @@ test('makePinnedLookup honors { all: true } with address objects (Node 22)', () 
   });
 });
 
+test('proxy chat completions uses undici HTTP/1.1 (NVIDIA hangs Node https/h2)', () => {
+  const src = require('fs').readFileSync(require.resolve('../src/proxy-handler.js'), 'utf8');
+  assert.match(src, /allowH2:\s*false/);
+  assert.match(src, /http1Fetch/);
+  assert.doesNotMatch(src, /transport\.request/);
+});
+
 test('applyUpstreamModelAlias rewrites grant Pro to Flash before forward', () => {
   const body = { model: 'deepseek-ai/deepseek-v4-pro-0813', messages: [] };
   applyUpstreamModelAlias(body, {

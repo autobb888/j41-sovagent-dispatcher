@@ -4,8 +4,6 @@
  * Supports both streaming (SSE) and non-streaming responses.
  */
 
-const http = require('http');
-const https = require('https');
 const crypto = require('crypto');
 const dns = require('dns').promises;
 const net = require('net');
@@ -239,6 +237,16 @@ function makePinnedLookup(pinnedIp) {
   };
 }
 
+// NVIDIA integrate hangs Node https.request (HTTP/2 ALPN) from this host.
+// Labour already uses undici allowH2:false; GET /v1/models returns 200 on
+// https.request while POST /chat/completions sits until proxy timeout → 504.
+let _http1Agent;
+function http1Fetch() {
+  const undici = require('undici');
+  if (!_http1Agent) _http1Agent = new undici.Agent({ allowH2: false });
+  return { fetch: undici.fetch, dispatcher: _http1Agent };
+}
+
 function applyUpstreamModelAlias(parsedBody, config) {
   if (!parsedBody || typeof parsedBody !== 'object') return;
   const requested = parsedBody.model;
@@ -457,30 +465,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   }
   const forwardBody = JSON.stringify(parsedBody);
 
-  // Forward request to seller's backend
-  const isHttps = upstreamUrl.protocol === 'https:';
-  const transport = isHttps ? https : http;
-
-  // Fix 2 — DNS-rebind pin: supply the already-validated IP as the `lookup`
-  // callback so http.request never re-resolves the hostname via DNS.
-  // This closes the TOCTOU window between our SSRF check (above) and the
-  // actual TCP connect.  When allow_local_upstream is set (dev/test) or the
-  // host was already a bare IP literal, resolvedIp may be null — fall back
-  // to Node's default lookup in those cases only.
-  const pinnedIp = safety.resolvedIp;
-  const pinnedLookup = pinnedIp ? makePinnedLookup(pinnedIp) : undefined;
-
-  // Set once a streaming response is in flight, so the request-level error handler
-  // below settles through the SAME policy instead of its own.
-  let settleActiveStream = null;
-
-  // ONE refund, whoever gets there first. A TCP reset mid-response fires BOTH
-  // `proxyReq.on('error')` (headers not yet sent → refunds, writes 502, which makes
-  // headersSent true) and then `proxyRes.on('error')` (its own local `settled` still
-  // false → refunds AGAIN). Reproduced during review: the buyer GAINED a full
-  // worst-case reservation of free credit. The two handlers each had a guard; neither
-  // guard was shared, which is the same "one control, two sites" shape as the
-  // streaming settle — fixed there in this release, missed here.
+  // ONE refund, whoever gets there first.
   let _refunded = false;
   const refundOnce = () => {
     if (_refunded) return;
@@ -488,18 +473,43 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
   };
 
-  const proxyReq = transport.request(upstreamUrl.href, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': 'j41-proxy/1.0',
-      ...(config.upstreamAuth ? { 'Authorization': config.upstreamAuth } : {}),
-    },
-    timeout: cfg.proxy.upstream_timeout_ms,
-    // NVIDIA chat hangs on HTTP/2 from this host; Node https may ALPN to h2.
-    ...(isHttps ? { ALPNProtocols: ['http/1.1'] } : {}),
-    ...(pinnedLookup ? { lookup: pinnedLookup } : {}),
-  }, (proxyRes) => {
+  const { fetch: doFetch, dispatcher } = http1Fetch();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), cfg.proxy.upstream_timeout_ms);
+  let upstreamRes;
+  try {
+    upstreamRes = await doFetch(upstreamUrl.href, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'j41-proxy/1.0',
+        ...(config.upstreamAuth ? { Authorization: config.upstreamAuth } : {}),
+      },
+      body: forwardBody,
+      dispatcher,
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    if (res.headersSent || res.writableEnded) { releaseOnce(); return; }
+    const timedOut = err && (err.name === 'AbortError' || /aborted/i.test(String(err.message || '')));
+    console.error(timedOut
+      ? `[PROXY] Upstream timeout after ${cfg.proxy.upstream_timeout_ms}ms agent=${agentId} model=${model}`
+      : `[PROXY] Upstream error: ${err.message}`);
+    refundOnce();
+    releaseOnce();
+    res.writeHead(timedOut ? 504 : 502, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
+    res.end(JSON.stringify({ error: timedOut ? 'Upstream endpoint timed out' : 'Upstream endpoint unavailable' }));
+    return;
+  }
+  clearTimeout(timer);
+
+  const proxyRes = {
+    statusCode: upstreamRes.status,
+    headers: Object.fromEntries(upstreamRes.headers),
+  };
+
+  {
     const j41Headers = {
       'X-J41-Request-Id': requestId,
       'X-J41-Session': `${record.buyerVerusId}:${requestId}`,
@@ -522,12 +532,6 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
 
       let fullResponse = '';
       let deducted = false;
-
-      proxyRes.on('data', (chunk) => {
-        if (res.writableEnded) return;
-        fullResponse += chunk.toString();
-        res.write(chunk);
-      });
 
       // ONE settle policy for the streaming response, shared by BOTH terminal
       // events. `end` and `error` used to implement different rules: `error`
@@ -621,48 +625,34 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         console.log(`[PROXY] ${agentId} ${model} ${inputTok}+${outputTok} tok, cost ${result.cost.toFixed(6)} VRSC, remaining ${result.remaining.toFixed(4)}`);
       };
 
-      proxyRes.on('end', () => {
+      try {
+        for await (const chunk of upstreamRes.body) {
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          fullResponse += buf.toString();
+          if (!res.writableEnded) res.write(buf);
+        }
         if (!res.writableEnded) res.end();
         settleStream('end');
-      });
-
-      proxyRes.on('error', () => {
+      } catch {
         if (!res.writableEnded) res.end();
-        // Same policy as `end`, including the statusCode check and any usage frames
-        // that did arrive before the socket failed. `deducted` inside settleStream
-        // guards against double-settling if both events fire.
         settleStream('stream error', true);
-      });
-
-      // Publish the settle so `proxyReq.on('error')` can call it. A socket that dies
-      // mid-response fires BOTH `proxyRes.on('error')` and `proxyReq.on('error')`,
-      // and they used to implement different outcomes — worst-case billing vs. a
-      // full refund — so the price a buyer paid for an aborted stream depended on
-      // which listener Node happened to reach first. Same event, two prices.
-      settleActiveStream = settleStream;
+      }
     } else {
       // Non-streaming: read full response, adjust reservation, then send
-      let chunks = [];
-      proxyRes.on('data', (chunk) => chunks.push(chunk));
-      let settled = false;
-      proxyRes.on('error', (err) => {
+      let responseBody;
+      try {
+        responseBody = Buffer.from(await upstreamRes.arrayBuffer());
+      } catch (err) {
         console.error(`[PROXY] Upstream response error: ${err.message}`);
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
           res.end(JSON.stringify({ error: 'Upstream response interrupted' }));
         }
-        if (!settled) {
-          settled = true;
-          refundOnce();
-          releaseOnce();
-        }
-      });
-      proxyRes.on('end', () => {
-        if (settled) return;
-        settled = true;
-        // Billing has happened; no later handler may hand the reservation back.
-        _refunded = true;
-        const responseBody = Buffer.concat(chunks);
+        refundOnce();
+        releaseOnce();
+        return;
+      }
+      _refunded = true;
         let inputTok = estimatedInput;
         let outputTok = estimatedOutput;
 
@@ -721,44 +711,8 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
 
         maybeNotifyCreditLow(agentId, record.buyerVerusId, result.remaining, cfg, config);
         console.log(`[PROXY] ${agentId} ${model} ${inputTok}+${outputTok} tok, cost ${result.cost.toFixed(6)} VRSC, remaining ${result.remaining.toFixed(4)}`);
-      });
     }
-  });
-
-  proxyReq.on('error', (err) => {
-    // Always free the in-flight slot, even if the response already started
-    // streaming (releaseOnce is idempotent). Only refund/respond when the
-    // request never produced a (billable) response.
-    if (res.headersSent || res.writableEnded) {
-      // A streaming response was already in flight. A socket that dies mid-response
-      // fires this AND `proxyRes.on('error')`, and the two used to disagree — this
-      // one refunded in full, that one billed the worst case — so an aborted stream
-      // cost the buyer either nothing or the entire `max_tokens` reservation
-      // depending on which listener Node reached first. Route both through the one
-      // settle; `deducted` makes the second call a no-op.
-      if (settleActiveStream) settleActiveStream('request error', true);
-      releaseOnce();
-      return;
-    }
-    console.error(`[PROXY] Upstream error: ${err.message}`);
-    refundOnce();
-    releaseOnce();
-    res.writeHead(502, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
-    res.end(JSON.stringify({ error: 'Upstream endpoint unavailable' }));
-  });
-
-  proxyReq.on('timeout', () => {
-    console.error(`[PROXY] Upstream timeout after ${cfg.proxy.upstream_timeout_ms}ms agent=${agentId} model=${model}`);
-    proxyReq.destroy();
-    if (res.headersSent || res.writableEnded) { releaseOnce(); return; }
-    refundOnce();
-    releaseOnce();
-    res.writeHead(504, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
-    res.end(JSON.stringify({ error: 'Upstream endpoint timed out' }));
-  });
-
-  proxyReq.write(forwardBody);
-  proxyReq.end();
+  }
 }
 
 module.exports = { handleProxyRequest, maybeNotifyCreditLow, resolveCreditLowThreshold, isPrivateIp, checkUpstreamHostSafe, makePinnedLookup, applyUpstreamModelAlias };

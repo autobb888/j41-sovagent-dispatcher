@@ -223,6 +223,9 @@ Cat-2 attach still waits on vLLM `/models` (`readyFor` defaults to `'service'`).
 - Start drops leftover `*.trycloudflare.com` webhooks that are not the live
   host (platform cap 5). Dead webhook origins made `POST /v1/proxy/access`
   502 even when listing VDXF and `/j41/health` were already on the new tunnel.
+- Proxy `/j41/proxy/v1/chat/completions` uses undici `allowH2:false` (same as
+  labour). Node `https.request` GET `/models` was 200 while POST chat hung 60s
+  → buyer HTTP 504, meter never ran. NVIDIA Flash returns in ~15s on HTTP/1.1.
 - Labour idle pause refused on `accepted` keeps the chat session. `accepted` is
   not terminal; skipping `deliverJob` left pong on the room with no worker.
 - `browse` is kind=data only. `job-chat` refuses gpu-rental/api-endpoint.
