@@ -215,6 +215,13 @@ Cat-2 attach still waits on vLLM `/models` (`readyFor` defaults to `'service'`).
 
 ## Unreleased
 
+### Parked: Cat-1 CPU rental (backlog)
+
+- Same contained SSH jail + `compute.outbound-ssh-v1` as `home-gpu`, without
+  NVIDIA devices / toolkit. Goal: any Linux Docker host can list compute, not
+  only GPU boxes. Still never host SSH / `0.0.0.0`. Do not mix with
+  `api-endpoint` on one agent. Not this release.
+
 ### GPU SSH splice no longer injects a second banner; labour LLM abort is 60s
 
 - `holdRemoteToLocal` reconnects jail sshd only **before** any SSH bytes. After
