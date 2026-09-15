@@ -293,6 +293,13 @@ function applyUpstreamThinkingDefault(parsedBody, config) {
       (ctk.thinking != null || ctk.enable_thinking != null || ctk.reasoning_effort != null)) {
     return;
   }
+  const model = String(parsedBody.model || '').toLowerCase();
+  // Kimi-K3 thinking is always on. Sending thinking:false makes integrate
+  // hold the socket with no headers until we abort. DeepSeek Flash accepts it.
+  if (/kimi|moonshot/.test(model)) {
+    parsedBody.reasoning_effort = 'low';
+    return;
+  }
   parsedBody.chat_template_kwargs = Object.assign(
     {},
     ctk && typeof ctk === 'object' ? ctk : {},

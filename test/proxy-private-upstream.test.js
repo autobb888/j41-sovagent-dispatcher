@@ -71,6 +71,13 @@ test('NVIDIA integrate injects thinking:false when the buyer omitted it', () => 
   assert.equal(body.chat_template_kwargs.reasoning_effort, 'low');
 });
 
+test('Kimi does not get thinking:false (NVIDIA hangs); only reasoning_effort low', () => {
+  const body = { model: 'moonshotai/kimi-k3', messages: [] };
+  applyUpstreamThinkingDefault(body, { endpointUrl: 'https://integrate.api.nvidia.com/v1' });
+  assert.equal(body.chat_template_kwargs, undefined);
+  assert.equal(body.reasoning_effort, 'low');
+});
+
 test('NVIDIA thinking default does not override a buyer who opted in', () => {
   const body = {
     model: 'deepseek-ai/deepseek-v4-flash-0731',
