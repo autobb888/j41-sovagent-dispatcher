@@ -274,6 +274,15 @@ test('seller ACCESS_NOT_API_ENDPOINT is above verifyAccessRequest and checkNonce
     '_isApiEndpoint stamp is not sufficient for mint');
 });
 
+test('start drops stale trycloudflare webhooks that are not the live host', () => {
+  const src = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
+  const start = src.indexOf('Register if not already registered for this URL');
+  const slice = src.slice(start, start + 2200);
+  assert.match(slice, /deleteWebhook/);
+  assert.match(slice, /trycloudflare\.com/);
+  assert.match(slice, /dropped stale webhook/);
+});
+
 test('poll skips labour start for api-endpoint jobs', () => {
   const src = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
   assert.match(src, /skip labour start for api-endpoint/);

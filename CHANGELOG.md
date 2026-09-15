@@ -220,6 +220,9 @@ Cat-2 attach still waits on vLLM `/models` (`readyFor` defaults to `'service'`).
 - Start `--webhook-url` wins over a stale `agent-config.json` `publicUrl` and
   persists it. Dead trycloudflare hostnames were minted into buyer grants
   (`ACCESS_GRANT_STALE` / HTTP 502) while `/j41/health` on the new tunnel was 200.
+- Start drops leftover `*.trycloudflare.com` webhooks that are not the live
+  host (platform cap 5). Dead webhook origins made `POST /v1/proxy/access`
+  502 even when listing VDXF and `/j41/health` were already on the new tunnel.
 - Labour idle pause refused on `accepted` keeps the chat session. `accepted` is
   not terminal; skipping `deliverJob` left pong on the room with no worker.
 - `browse` is kind=data only. `job-chat` refuses gpu-rental/api-endpoint.

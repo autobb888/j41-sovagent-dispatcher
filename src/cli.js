@@ -6470,8 +6470,30 @@ program
           // Register if not already registered for this URL
           try {
             const agentWebhookUrl = `${webhookUrl}/webhook/${agentInfo.id}`;
+            let liveHost = '';
+            try { liveHost = new URL(webhookUrl).host; } catch { /* ignore */ }
             const existing = await agent.client.listWebhooks();
-            const found = existing.find(w => w.url === agentWebhookUrl);
+            const list = Array.isArray(existing) ? existing : [];
+            // Ephemeral trycloudflare URLs die overnight. The platform cap is 5
+            // per agent; leftover dead hosts make registerWebhook skip and can
+            // leave POST /v1/proxy/access forwarding at a 502 origin.
+            for (const w of list) {
+              const u = w && w.url;
+              const wid = w && (w.id || w.webhookId);
+              if (!u || !wid || u === agentWebhookUrl) continue;
+              let host = '';
+              try { host = new URL(u).host; } catch { continue; }
+              if (liveHost && host.endsWith('trycloudflare.com') && host !== liveHost) {
+                try {
+                  await agent.client.deleteWebhook(wid);
+                  console.log(`  ${agentInfo.id}: dropped stale webhook ${host}`);
+                } catch (de) {
+                  console.log(`  ${agentInfo.id}: could not drop stale webhook ${host} (${de.message})`);
+                }
+              }
+            }
+            const after = await agent.client.listWebhooks();
+            const found = (Array.isArray(after) ? after : []).find((w) => w && w.url === agentWebhookUrl);
             if (!found) {
               await agent.client.registerWebhook(agentWebhookUrl, ['*'], whConfig.secret);
               console.log(`  ${agentInfo.id}: webhook registered`);
