@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { checkUpstreamHostSafe, makePinnedLookup, applyUpstreamModelAlias } = require('../src/proxy-handler');
+const { checkUpstreamHostSafe, makePinnedLookup, applyUpstreamModelAlias, applyUpstreamThinkingDefault } = require('../src/proxy-handler');
 
 const cfgGuardOn = { runtime: { allow_local_upstream: false } };
 
@@ -55,4 +55,27 @@ test('applyUpstreamModelAlias rewrites grant Pro to Flash before forward', () =>
     },
   });
   assert.equal(body.model, 'deepseek-ai/deepseek-v4-flash-0731');
+});
+
+test('NVIDIA integrate injects thinking:false when the buyer omitted it', () => {
+  const body = { model: 'deepseek-ai/deepseek-v4-flash-0731', messages: [] };
+  applyUpstreamThinkingDefault(body, { endpointUrl: 'https://integrate.api.nvidia.com/v1' });
+  assert.equal(body.chat_template_kwargs.thinking, false);
+  assert.equal(body.chat_template_kwargs.reasoning_effort, 'low');
+});
+
+test('NVIDIA thinking default does not override a buyer who opted in', () => {
+  const body = {
+    model: 'deepseek-ai/deepseek-v4-flash-0731',
+    chat_template_kwargs: { thinking: true, reasoning_effort: 'high' },
+  };
+  applyUpstreamThinkingDefault(body, { endpointUrl: 'https://integrate.api.nvidia.com/v1' });
+  assert.equal(body.chat_template_kwargs.thinking, true);
+  assert.equal(body.chat_template_kwargs.reasoning_effort, 'high');
+});
+
+test('loopback sellers do not get NVIDIA thinking kwargs', () => {
+  const body = { model: 'gpt-4', messages: [] };
+  applyUpstreamThinkingDefault(body, { endpointUrl: 'http://127.0.0.1:9/v1' });
+  assert.equal(body.chat_template_kwargs, undefined);
 });

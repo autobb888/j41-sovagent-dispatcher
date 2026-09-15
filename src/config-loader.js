@@ -34,7 +34,13 @@ const DEFAULTS = Object.freeze({
     cohere: '', perplexity: '', openrouter: '', kimi: '',
   },
   proxy: {
-    upstream_timeout_ms: 60000,
+    // Kimi-K3 TTFB on integrate.api.nvidia.com is ~68s even at reasoning_effort
+    // low; 60s aborted every Mac pong. trycloudflare origin is ~100s.
+    upstream_timeout_ms: 90000,
+    // Buyer CLI chat omits max_tokens. NVIDIA reasoning NIMs then fill an
+    // unbounded (or 256-token) CoT until the 60s abort → HTTP 504, no meter.
+    // 64 is enough for a pong and finishes under the webhook cutoff.
+    default_max_tokens: 64,
     estimated_input_tokens: 4000,
     estimated_output_tokens: 2000,
     // Worst-case reservation (audit H3): the buyer is admitted only if their
@@ -143,6 +149,7 @@ const ENV_OVERRIDES = [
   ['J41_SKIP_STATUS_CHECK',  'runtime.skip_status_check','bool1'],
   ['J41_ALLOW_LOCAL_UPSTREAM','runtime.allow_local_upstream','bool1'],
   ['J41_PROXY_UPSTREAM_TIMEOUT','proxy.upstream_timeout_ms','int'],
+  ['J41_PROXY_DEFAULT_MAX_TOKENS','proxy.default_max_tokens','int'],
   ['J41_PROXY_ESTIMATED_INPUT', 'proxy.estimated_input_tokens','int'],
   ['J41_PROXY_ESTIMATED_OUTPUT','proxy.estimated_output_tokens','int'],
   ['J41_PROXY_MAX_OUTPUT_TOKENS_CAP','proxy.max_output_tokens_cap','int'],

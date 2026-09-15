@@ -259,6 +259,36 @@ function applyUpstreamModelAlias(parsedBody, config) {
   }
 }
 
+function nvidiaIntegrateHost(config) {
+  try {
+    return new URL(config && config.endpointUrl).hostname === 'integrate.api.nvidia.com';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * NVIDIA DeepSeek V4 / Kimi default thinking ON. Buyer CLI chat sends only
+ * {model, messages}, so Flash fills max_tokens with reasoning_content and
+ * sits until the 60s abort. Inject thinking:false when the buyer did not
+ * opt in. Loopback / non-NVIDIA sellers are left untouched.
+ */
+function applyUpstreamThinkingDefault(parsedBody, config) {
+  if (!parsedBody || typeof parsedBody !== 'object') return;
+  if (!nvidiaIntegrateHost(config)) return;
+  if (parsedBody.thinking != null || parsedBody.reasoning_effort != null) return;
+  const ctk = parsedBody.chat_template_kwargs;
+  if (ctk && typeof ctk === 'object' &&
+      (ctk.thinking != null || ctk.enable_thinking != null || ctk.reasoning_effort != null)) {
+    return;
+  }
+  parsedBody.chat_template_kwargs = Object.assign(
+    {},
+    ctk && typeof ctk === 'object' ? ctk : {},
+    { thinking: false, reasoning_effort: 'low' },
+  );
+}
+
 function filterHeaders(upstreamHeaders) {
   const filtered = {};
   for (const [key, value] of Object.entries(upstreamHeaders)) {
@@ -319,7 +349,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   if (!Number.isFinite(Number(parsedBody.max_tokens)) || Number(parsedBody.max_tokens) <= 0) {
     parsedBody.max_tokens = Number(cfg.proxy.default_max_tokens) > 0
       ? Number(cfg.proxy.default_max_tokens)
-      : 256;
+      : 64;
   }
 
   // Reject unpriced models up front. calculateCost returns 0 for unknown models, which would
@@ -465,6 +495,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   // every stream:true request before forwarding. forwardBody is what we send
   // upstream (the original `body` is left intact for callers/logging).
   applyUpstreamModelAlias(parsedBody, config);
+  applyUpstreamThinkingDefault(parsedBody, config);
   if (isStreaming) {
     const so = (parsedBody.stream_options && typeof parsedBody.stream_options === 'object')
       ? { ...parsedBody.stream_options, include_usage: true }
@@ -483,6 +514,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
 
   const { fetch: doFetch, dispatcher } = http1Fetch();
   const controller = new AbortController();
+  const started = Date.now();
   const timer = setTimeout(() => controller.abort(), cfg.proxy.upstream_timeout_ms);
   let upstreamRes;
   try {
@@ -502,7 +534,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     if (res.headersSent || res.writableEnded) { releaseOnce(); return; }
     const timedOut = err && (err.name === 'AbortError' || /aborted/i.test(String(err.message || '')));
     console.error(timedOut
-      ? `[PROXY] Upstream timeout after ${cfg.proxy.upstream_timeout_ms}ms agent=${agentId} model=${model}`
+      ? `[PROXY] Upstream timeout after ${cfg.proxy.upstream_timeout_ms}ms agent=${agentId} model=${model} fwd=${parsedBody.model} max_tokens=${parsedBody.max_tokens} host=${upstreamUrl.hostname} elapsed_ms=${Date.now() - started}`
       : `[PROXY] Upstream error: ${err.message}`);
     refundOnce();
     releaseOnce();
@@ -723,4 +755,4 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   }
 }
 
-module.exports = { handleProxyRequest, maybeNotifyCreditLow, resolveCreditLowThreshold, isPrivateIp, checkUpstreamHostSafe, makePinnedLookup, applyUpstreamModelAlias };
+module.exports = { handleProxyRequest, maybeNotifyCreditLow, resolveCreditLowThreshold, isPrivateIp, checkUpstreamHostSafe, makePinnedLookup, applyUpstreamModelAlias, applyUpstreamThinkingDefault };
