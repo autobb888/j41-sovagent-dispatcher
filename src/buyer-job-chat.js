@@ -55,8 +55,18 @@ function isSellerChatLine(msg, keys) {
   return !buyerAliases(keys).includes(actor);
 }
 
-function pickSellerReply(raw, keys) {
-  return chatLines(raw).find((m) => isSellerChatLine(m, keys)) || null;
+function sellerLineKey(msg) {
+  if (!msg || typeof msg !== 'object') return '';
+  return [msg.id, msg.timestamp, msg.ts, msg.content || msg.message || ''].join('|');
+}
+
+function pickSellerReply(raw, keys, seenKeys) {
+  const seen = seenKeys instanceof Set ? seenKeys : null;
+  return chatLines(raw).find((m) => {
+    if (!isSellerChatLine(m, keys)) return false;
+    if (!seen) return true;
+    return !seen.has(sellerLineKey(m));
+  }) || null;
 }
 
 async function defaultSleep(ms) {
@@ -139,6 +149,16 @@ async function sendBuyerJobChat({
   if (!job.jobHash) {
     return { ok: false, code: 'JOB_CHAT_NO_HASH', message: 'Job is missing jobHash — cannot sign chat.' };
   }
+  const serviceType = job.serviceType || job.service_type;
+  const jobKind = job.kind || job.listingKind;
+  if (serviceType === 'gpu-rental' || serviceType === 'api-endpoint' || jobKind === 'compute' || jobKind === 'model') {
+    return {
+      ok: false,
+      code: 'JOB_CHAT_NOT_LABOUR',
+      message: 'job-chat is for labour hires. GPU is SSH; models are access/chat.',
+      jobId: job.id,
+    };
+  }
 
   const timestamp = Number.isFinite(Number(now)) ? Number(now) : Math.floor(Date.now() / 1000);
   const payload = buildJobChatMessage({ jobHash: job.jobHash, timestamp, content: text });
@@ -157,6 +177,15 @@ async function sendBuyerJobChat({
   }
 
   const body = { content: text, signature, timestamp };
+  const seenSeller = new Set();
+  if (wait && typeof client.getChatMessages === 'function') {
+    try {
+      const prior = await client.getChatMessages(job.id);
+      for (const m of chatLines(prior)) {
+        if (isSellerChatLine(m, keys)) seenSeller.add(sellerLineKey(m));
+      }
+    } catch { /* poll loop will surface a hard getChatMessages failure */ }
+  }
   let sent;
   try {
     sent = await postSignedJobChat(client, job.id, body);
@@ -189,7 +218,7 @@ async function sendBuyerJobChat({
     } catch (e) {
       return { ok: false, code: 'JOB_CHAT_FAILED', message: e.message || String(e), jobId: job.id };
     }
-    const seller = pickSellerReply(raw, keys);
+    const seller = pickSellerReply(raw, keys, seenSeller);
     if (seller) {
       result.sellerReply = seller;
       result.timedOut = false;
@@ -209,6 +238,7 @@ module.exports = {
   sendBuyerJobChat,
   postSignedJobChat,
   isSellerChatLine,
+  sellerLineKey,
   isTerminalJobStatus,
   JOB_CHAT_TERMINAL,
   DEFAULT_WAIT_MS,

@@ -115,6 +115,15 @@ async function fetchSellerListing(seller, { apiUrl, fetchImpl } = {}) {
 
 async function browseSeller({ seller, listing, path, apiUrl, fetchImpl } = {}) {
   const rec = listing || await fetchSellerListing(seller, { apiUrl, fetchImpl });
+  const { parseListingKind } = require('./listing-kind');
+  const kind = parseListingKind(rec && (rec.kind || rec.listingKind || rec.listing_kind));
+  if (kind && kind !== 'data') {
+    return {
+      ok: false,
+      code: 'BROWSE_NOT_DATA',
+      message: `browse is for kind=data listings, not ${kind}.`,
+    };
+  }
   return browseListing({ listing: rec, path, fetchImpl });
 }
 

@@ -164,6 +164,17 @@ test('browseSeller fetches listing then GETs website, never description trycloud
   assert.ok(!urls.some((u) => /trycloudflare/i.test(u)));
 });
 
+test('browseSeller refuses labour/model/compute listings', async () => {
+  for (const kind of ['agent', 'model', 'compute']) {
+    const r = await browseSeller({
+      listing: { kind, website: 'https://not-data.example' },
+      fetchImpl: async () => { throw new Error('must not GET'); },
+    });
+    assert.equal(r.ok, false, kind);
+    assert.equal(r.code, 'BROWSE_NOT_DATA', kind);
+  }
+});
+
 test('DATA_NOT_HIREABLE is unchanged', () => {
   const data = assertHireAllowed({ sellerKind: 'data', serviceType: 'agent', serviceId: 's1' });
   assert.equal(data.ok, false);

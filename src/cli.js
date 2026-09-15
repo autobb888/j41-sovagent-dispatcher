@@ -3014,7 +3014,7 @@ program
 program
   .command('hire <buyer-agent-id> <seller>')
   .description('Hire a listing as this fleet identity (create job; --pay broadcasts dual payment)')
-  .requiredOption('--amount <n>', 'Job price in the listing currency')
+  .option('--amount <n>', 'Job price in the listing currency (required only when the listing is hireable)')
   .option('--service <id>', 'Marketplace service id (required for compute gpu-rental and model api-endpoint)')
   .option('--description <text>', 'Job description')
   .option('--currency <c>', 'Payment currency', NATIVE_COIN)
@@ -3044,10 +3044,13 @@ program
     await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
 
-    const amount = Number(options.amount);
-    if (!Number.isFinite(amount) || amount <= 0) {
-      fail('BAD_AMOUNT', '--amount must be a positive number');
+    if (options.amount != null && options.amount !== '') {
+      const amountEarly = Number(options.amount);
+      if (!Number.isFinite(amountEarly) || amountEarly <= 0) {
+        fail('BAD_AMOUNT', '--amount must be a positive number');
+      }
     }
+
     const keys = loadAgentKeys(buyerAgentId);
     if (!keys) {
       fail('BUYER_NOT_FOUND', `Agent ${buyerAgentId} not found.`);
@@ -3081,6 +3084,10 @@ program
       });
       if (!gate.ok) {
         fail(gate.code, gate.message);
+      }
+      const amount = Number(options.amount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        fail('BAD_AMOUNT', '--amount must be a positive number');
       }
 
       const description = options.description || (service && service.description) || `Hire via dispatcher (${buyerAgentId})`;
@@ -3445,7 +3452,7 @@ program
     }
   });
 
-async function runBuyerComplete(keys, agent, jobId, options) {
+async function runBuyerComplete(keys, agent, jobId, options, buyerAgentId) {
   const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
   const say = (line) => { if (!options.json) console.log(line); };
   const job = await agent.client.getJob(jobId);
@@ -3485,6 +3492,9 @@ async function runBuyerComplete(keys, agent, jobId, options) {
     const rec = witness.data || witness;
     say(`   Witness signedByName=${(rec.witness && rec.witness.signedByName) || rec.signedByName || '—'}`);
   }
+  if (!options.json) {
+    say(`Next: j41-dispatcher review ${buyerAgentId || '<buyer>'} ${job.id} --rating N`);
+  }
   if (options.json) console.log(JSON.stringify(out.json, null, 2));
 }
 
@@ -3497,7 +3507,7 @@ program
     const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
     if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
     const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
-    await runBuyerComplete(keys, agent, jobId, options);
+    await runBuyerComplete(keys, agent, jobId, options, buyerAgentId);
   });
 
 program
@@ -6518,10 +6528,23 @@ program
             const profile = cap && cap.profile;
             const vdxfEndpoints = profile && profile.network && profile.network.endpoints;
             const vdxfWebsite = profile && profile.profile && profile.profile.website;
+            const webhookUrl = options.webhookUrl && String(options.webhookUrl).trim();
+            // Live --webhook-url must win over a stale agent-config publicUrl.
+            // Ephemeral trycloudflare hostnames die overnight; minting the dead
+            // origin is ACCESS_GRANT_STALE / HTTP 502 for every buyer grant.
+            if (webhookUrl && localCfg.publicUrl !== webhookUrl) {
+              localCfg.publicUrl = webhookUrl;
+              try {
+                const localCfgPath = path.join(AGENTS_DIR, a.id, 'agent-config.json');
+                fs.writeFileSync(localCfgPath, JSON.stringify(localCfg, null, 2), { mode: 0o600 });
+              } catch (e) {
+                console.warn(`[API] ${a.id}: could not persist publicUrl from --webhook-url: ${e.message}`);
+              }
+            }
             let publicUrl;
             for (const c of [
+              webhookUrl,
               localCfg.publicUrl,
-              options.webhookUrl,
               Array.isArray(vdxfEndpoints) ? vdxfEndpoints[0] : null,
               vdxfWebsite,
             ]) {

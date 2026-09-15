@@ -103,3 +103,13 @@ test('canary registration failure is reported as a security-posture warning', ()
     'registration failure must say leak detection is disabled for the job',
   );
 });
+
+test('idle pause refused on accepted keeps the chat session (does not skip deliverJob)', () => {
+  assert.ok(CODE.includes('_idlePauseUnsupported'));
+  const accepted = CODE.indexOf("curStatus === 'accepted'");
+  assert.ok(accepted > 0);
+  const keep = CODE.indexOf('_idlePauseUnsupported = true', accepted);
+  const nextElse = CODE.indexOf('} else {', accepted);
+  assert.ok(keep > accepted && keep < nextElse, 'accepted branch must keep the session');
+  assert.equal(CODE.slice(accepted, nextElse).includes('_skipDelivery'), false);
+});

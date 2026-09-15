@@ -190,6 +190,52 @@ test('--wait polls getChatMessages until a non-buyer line exists', async () => {
   assert.ok(polls >= 2);
 });
 
+test('--wait does not latch a canned greeting already on the job', async () => {
+  const clock = fakeClock();
+  const greeting = { id: 'g1', senderVerusId: JOB.sellerVerusId, role: 'seller', content: 'Hi there canned' };
+  const pong = { id: 'g2', senderVerusId: JOB.sellerVerusId, role: 'seller', content: 'pong' };
+  let polls = 0;
+  const r = await sendBuyerJobChat({
+    client: {
+      getJob: async () => JOB,
+      request: async () => ({ data: { id: 'm1', content: 'ping' } }),
+      getChatMessages: async () => {
+        polls += 1;
+        if (polls === 1) return { data: [greeting] };
+        if (polls === 2) return { data: [greeting] };
+        return { data: [greeting, pong] };
+      },
+    },
+    keys: BUYER,
+    jobId: JOB.id,
+    content: 'ping',
+    signMessage: () => 'sig',
+    wait: true,
+    waitMs: 30_000,
+    pollMs: 5_000,
+    nowMs: clock.nowMs,
+    sleep: clock.sleep,
+    now: clock.nowSec(),
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.sellerReply && r.sellerReply.content, 'pong');
+});
+
+test('job-chat refuses gpu-rental', async () => {
+  const r = await sendBuyerJobChat({
+    client: {
+      getJob: async () => ({ ...JOB, serviceType: 'gpu-rental' }),
+      request: async () => { throw new Error('must not POST'); },
+    },
+    keys: BUYER,
+    jobId: JOB.id,
+    content: 'ping',
+    signMessage: () => 'sig',
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'JOB_CHAT_NOT_LABOUR');
+});
+
 test('--wait timeout is exit-0: ok true, sellerReply null', async () => {
   const clock = fakeClock();
   const r = await sendBuyerJobChat({

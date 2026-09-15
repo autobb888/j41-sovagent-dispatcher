@@ -108,6 +108,16 @@ test('missing --amount is a non-zero exit', () => {
   assert.notEqual(r.status, 0);
 });
 
+test('hire kind-gate runs before --amount is required', () => {
+  const start = CLI.indexOf(".command('hire <buyer-agent-id> <seller>')");
+  const hireSrc = CLI.slice(start, CLI.indexOf(".command('buyers')", start));
+  assert.match(hireSrc, /\.option\('--amount <n>'/);
+  assert.doesNotMatch(hireSrc, /\.requiredOption\('--amount/);
+  const gate = hireSrc.indexOf('assertHireAllowed(');
+  const amtAfterGate = hireSrc.indexOf("fail('BAD_AMOUNT'", gate);
+  assert.ok(gate > -1 && amtAfterGate > gate, 'kind refuse must not require --amount first');
+});
+
 // ------------------------------------------------------- wiring the behavioural tests can't reach
 
 // The hire action's source, isolated so these assertions cannot be satisfied by an unrelated

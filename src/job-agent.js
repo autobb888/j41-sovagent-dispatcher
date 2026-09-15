@@ -1361,8 +1361,10 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
 
   // Idle timer — check periodically if we should pause (not auto-deliver)
   _idleMessageSent = false;
+  let _idlePauseUnsupported = false;
   const idleCheck = setInterval(async () => {
     const idleMs = Date.now() - _lastActivityAt;
+    if (_idlePauseUnsupported) return;
     if (idleMs >= IDLE_TIMEOUT_MS && !sessionEnded && !_paused) {
       if (!_idleMessageSent) {
         _idleMessageSent = true;
@@ -1394,6 +1396,12 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
             _paused = true; // stops the idle timer from re-requesting a pause
             if (process.send) process.send({ type: 'job_idle', jobId: job.id });
             log.info('Job paused by platform on idle — staying paused (awaiting resume/TTL)', { jobId: job.id });
+          } else if (curStatus === 'accepted' || curStatus === 'in_progress') {
+            // Labour chat often stays `accepted` (never in_progress). Pause is
+            // refused; that is not terminal. Keep polling chat so pong can land,
+            // and do not skip deliverJob.
+            log.warn('Pause refused on a live job — keeping chat session', { jobId: job.id, status: curStatus });
+            _idlePauseUnsupported = true;
           } else {
             // Terminal / not-deliverable — nothing to deliver. End the session and
             // flag main() to skip delivery so we exit cleanly instead of crashing.

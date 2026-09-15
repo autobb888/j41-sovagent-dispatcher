@@ -290,6 +290,9 @@ test('mint payload uses mintBuyerProxyBase(publicUrl) and never cfg.endpointUrl'
   const cfg = cliAgentConfigs();
   assert.match(cfg, /publicUrl/);
   assert.match(cfg, /localCfg\.publicUrl/);
+  const live = cfg.indexOf('webhookUrl');
+  const file = cfg.indexOf('localCfg.publicUrl');
+  assert.ok(live > -1 && file > live, '--webhook-url must win over a stale agent-config publicUrl');
   assert.match(cfg, /endpointUrl:\s*apiSvc\.endpointUrl/);
   assert.match(cfg, /buyer UNREACHABLE/);
   assert.match(cfg, /hostsEqual\(buyerUrl,\s*apiSvc\.endpointUrl\)/);
