@@ -258,6 +258,18 @@ function http1Fetch() {
   };
 }
 
+// One in-flight NVIDIA POST per seller. Aborting a 95s hang RSTs the NIM but
+// leaves it generating; the next Mac chat queues behind that zombie and 504s
+// too. Gate + drain (no abort) lets the slot free before the next POST.
+const _upstreamGates = new Map();
+function withUpstreamGate(key, fn) {
+  const prev = _upstreamGates.get(key) || Promise.resolve();
+  let unlock = () => {};
+  const mine = new Promise((resolve) => { unlock = resolve; });
+  _upstreamGates.set(key, prev.then(() => mine, () => mine));
+  return prev.catch(() => {}).then(fn).finally(() => unlock());
+}
+
 function applyUpstreamModelAlias(parsedBody, config) {
   if (!parsedBody || typeof parsedBody !== 'object') return;
   const requested = parsedBody.model;
@@ -607,39 +619,59 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
   };
 
+  return withUpstreamGate(agentId, async () => {
   const session = http1Fetch();
-  const controller = new AbortController();
   const started = Date.now();
-  const timer = setTimeout(() => controller.abort(), cfg.proxy.upstream_timeout_ms);
-  let upstreamRes;
-  try {
-    upstreamRes = await session.fetch(upstreamUrl.href, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'j41-proxy/1.0',
-        ...(config.upstreamAuth ? { Authorization: config.upstreamAuth } : {}),
-      },
-      body: forwardBody,
-      dispatcher: session.dispatcher,
-      signal: controller.signal,
-    });
-  } catch (err) {
-    clearTimeout(timer);
-    session.destroy();
-    if (res.headersSent || res.writableEnded) { releaseOnce(); return; }
-    const timedOut = err && (err.name === 'AbortError' || /aborted/i.test(String(err.message || '')));
+  const fetchP = session.fetch(upstreamUrl.href, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': 'j41-proxy/1.0',
+      ...(config.upstreamAuth ? { Authorization: config.upstreamAuth } : {}),
+    },
+    body: forwardBody,
+    dispatcher: session.dispatcher,
+  });
+  let timeoutHandle;
+  const outcome = await Promise.race([
+    fetchP.then((res) => ({ type: 'res', res }), (err) => ({ type: 'err', err })),
+    new Promise((resolve) => {
+      timeoutHandle = setTimeout(() => resolve({ type: 'timeout' }), cfg.proxy.upstream_timeout_ms);
+    }),
+  ]);
+  clearTimeout(timeoutHandle);
+  if (outcome.type !== 'res') {
+    const timedOut = outcome.type === 'timeout';
     const think = parsedBody.chat_template_kwargs && parsedBody.chat_template_kwargs.thinking;
+    if (res.headersSent || res.writableEnded) {
+      if (timedOut) {
+        await Promise.race([
+          fetchP.then(async (r) => { try { await r.arrayBuffer(); } catch { /* drain */ } }).catch(() => {}),
+          new Promise((r) => setTimeout(r, 120000)),
+        ]);
+      }
+      session.destroy();
+      releaseOnce();
+      return;
+    }
     console.error(timedOut
       ? `[PROXY] Upstream timeout after ${cfg.proxy.upstream_timeout_ms}ms agent=${agentId} model=${model} fwd=${parsedBody.model} max_tokens=${parsedBody.max_tokens} stream=${!!parsedBody.stream} thinking=${think} host=${upstreamUrl.hostname} elapsed_ms=${Date.now() - started}`
-      : `[PROXY] Upstream error: ${err.message}`);
+      : `[PROXY] Upstream error: ${outcome.err && outcome.err.message}`);
     refundOnce();
     releaseOnce();
     res.writeHead(timedOut ? 504 : 502, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
     res.end(JSON.stringify({ error: timedOut ? 'Upstream endpoint timed out' : 'Upstream endpoint unavailable' }));
+    if (timedOut) {
+      // Do not RST NVIDIA — drain so the next chat is not queued behind a zombie.
+      await Promise.race([
+        fetchP.then(async (r) => { try { await r.arrayBuffer(); } catch { /* drain */ } }).catch(() => {}),
+        new Promise((r) => setTimeout(r, 120000)),
+      ]);
+    }
+    session.destroy();
     return;
   }
-  clearTimeout(timer);
+  const upstreamRes = outcome.res;
   console.log(`[PROXY] upstream headers ${upstreamRes.status} agent=${agentId} elapsed_ms=${Date.now() - started}`);
 
   const proxyRes = {
@@ -854,6 +886,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         console.log(`[PROXY] ${agentId} ${model} ${inputTok}+${outputTok} tok, cost ${result.cost.toFixed(6)} VRSC, remaining ${result.remaining.toFixed(4)}`);
     }
   }
+  });
 }
 
 module.exports = {
