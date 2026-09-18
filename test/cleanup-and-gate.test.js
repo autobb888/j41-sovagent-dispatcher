@@ -248,8 +248,9 @@ test('the inbox startup gate is BOUNDED — a wedged startup cannot silence it f
   assert.match(body, /INBOX_STARTUP_GRACE_MS/, 'and it must be time-bounded');
   assert.match(body, /_warnedInboxUngated/, 'and it must say so when it gives up waiting');
   // The bound is only real if the fallback compares against something that exists.
-  const si = CLI.indexOf('const state = {');
-  assert.match(CLI.slice(si, si + 2600), /startedAt:/,
+  const si = CLI.indexOf('When this process began. Read by the inbox sweep');
+  assert.ok(si > -1, 'the listener state must document startedAt');
+  assert.match(CLI.slice(si, si + 700), /startedAt: Date\.now\(\)/,
     'state.startedAt must exist or the bound silently never defers');
 });
 

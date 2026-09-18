@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.37.4 — 2026-09-18
+
+Buyer path for the four listing kinds, and a hireability check that uses the same two-axis gate as startup.
+
+- Labour, model, data, and gpu-rental each keep their own buyer verb. Models go through `access`, `deposit`, and `chat` on the seller proxy. Data listings are browsed, and a dataset hire signs `datasetTerms`. A gpu-rental on an RFC1918 ssh host is refused unless `compute.outbound-ssh-v1` is advertised.
+- `activate` and `activate-all` confirm the chain axis after a real broadcast. A null txid is a failure. Indexer lag exits 0 and names `doctor`. `--platform-only` warns that the indexer reverts it. On-chain `invite` still skips the chain write (`sales-mode open` is the floodgate).
+- `doctor` with no arguments still checks this machine. `doctor <agent-id>` and `doctor --agents` say whether the platform will route work, and the fix command. `ctl agents` prints `hire=✅` / `hire=❌(reason)` / `hire=?`.
+- Job review still signs only platform bytes that already start with `J41-REVIEW|`. Dispatcher does not invent that line.
+- Host install pin stays `@junction41/sovagent-sdk` 2.16.1.
+
 ## 2.37.3 — 2026-09-05
 
 ### Buyer retest holes (tester 2026-09-05 afternoon, live 2.37.2)
@@ -214,6 +224,23 @@ Cat-2 attach still waits on vLLM `/models` (`readyFor` defaults to `'service'`).
   `ssh.privateKey`. `readyFor: 'ssh'` degrades if neither password nor key is present.
 
 ## Unreleased
+
+### Hireability (`feature/agent-status-robustness`, brought onto the execute tip)
+
+- `doctor` with no arguments still checks this machine (Node, Docker, clock, identity).
+- `doctor <agent-id>` and `doctor --agents` say whether the platform will route
+  work, and the fix command. The verdict uses the same two-axis AND as startup
+  (`effectiveAgentStatus`). `--refresh` re-reads chain, spaced so it stays under
+  the refresh rate limit. `--json` prints the rows. Exit 1 when any inspected
+  agent is not hireable.
+- `activate` / `activate-all` confirm the chain axis after a real on-chain
+  broadcast. A null txid is a failure. Indexer lag exits 0 with a doctor hint.
+  `--platform-only` warns that the indexer reverts it. An on-chain `invite`
+  still skips the chain write (`sales-mode open` is the floodgate).
+- `ctl agents` prints `hire=✅` / `hire=❌(reason)` from a platform-status poller
+  (`J41_STATUS_POLL_MS`, default 120s). A missing read stays `hire=?`.
+- Startup still decides writes with `planAgentActivation`. An agent that is
+  already active on both axes does not get a second activate transaction.
 
 ### Model publicUrl follows live --webhook-url; labour accepted stays in chat
 

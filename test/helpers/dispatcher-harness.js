@@ -364,6 +364,7 @@ async function runStart(scenario = {}) {
             return { close(cb) { if (typeof cb === 'function') cb(); }, on() { return this; } };
           },
           readBody: async () => null,
+          setOrchardDoor: () => {},
         };
       }
       if (request === 'dockerode') return DockerStub;

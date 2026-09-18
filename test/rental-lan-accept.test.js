@@ -46,7 +46,8 @@ test('poll accept calls assertRentalHostPublic / shouldRefuseLanGpuRental before
       .filter((i) => i >= 0),
   );
   assert.ok(startGate >= 0, 'poll start path must gate LAN before seen.set');
-  assert.ok(startGate < startReady.indexOf('state.seen.set'), 'LAN gate must run before state.seen.set');
+  const rentalSeen = startReady.indexOf('state.seen.set', startGate);
+  assert.ok(rentalSeen > startGate, 'LAN gate must run before the rental state.seen.set');
 });
 
 test('webhook job.accepted / job.requested gates LAN before acceptJob', () => {

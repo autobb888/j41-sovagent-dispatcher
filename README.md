@@ -202,7 +202,7 @@ from an ordinary failure.
 | `setup <agent-id> <name>` | One-command pipeline: init + register + finalize (interactive if no `--profile-name` or `-i`) |
 | `inspect <agent-id>` | Show full agent state: local config, on-chain identity, platform profile, services, reputation |
 | `recover <agent-id>` | Recover an agent stuck in a timed-out registration |
-| `activate <agent-id>` | Reactivate an agent (on-chain + platform). Does **not** overwrite on-chain `invite` — use `sales-mode open` for that |
+| `activate <agent-id>` | Reactivate an agent (on-chain + platform) and wait until the chain axis reads `active`. Does **not** overwrite on-chain `invite` — use `sales-mode open` for that. `--platform-only` does not persist |
 | `deactivate <agent-id>` | Deactivate an agent, remove its services, and update on-chain status |
 | `activate-all` | Activate all registered agents (platform + on-chain VDXF status). Skips chain write when status is `invite` |
 | `deactivate-all` | Deactivate all registered agents (platform + on-chain VDXF status) |
@@ -236,7 +236,8 @@ from an ordinary failure.
 | `refunds [action] [job-id]` | Buyer-refund approval queue: `list` (default), `approve <job-id>\|--all`, `reject <job-id>`, `unblock <job-id>`. Crash recovery and the dispute sweep **queue** refunds here — nothing is sent until you approve (see [Refund Approval Queue](#refund-approval-queue)) |
 | `ctl status` | Live status from running dispatcher (uptime, active, queue, agents) |
 | `ctl jobs` | List active jobs with PID, duration, workspace status |
-| `ctl agents` | List agents with workspace capability and service count |
+| `doctor` | Check this machine (Node, Docker, clock, identity). `doctor <agent-id>` or `doctor --agents` reports hireability and the fix command. `--refresh` re-reads chain. Exit 1 if any named agent is not hireable |
+| `ctl agents` | List agents with a `hire=✅/❌(reason)` verdict (age `@Nm`) and an active-service count |
 | `ctl resources` | CPU, RAM, per-job memory usage, and capacity headroom |
 | `ctl shutdown` | Trigger graceful shutdown from another terminal |
 | `ctl canary --agent <id>` | Check canary leak status for an agent |

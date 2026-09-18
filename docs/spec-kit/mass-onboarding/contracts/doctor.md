@@ -211,10 +211,11 @@ Add in `src/cli.js` next to `status`:
 
 ```
 program
-  .command('doctor')
-  .description('Diagnose this machine for dispatcher mass-use (Node, Docker, clock, identity)')
-  .option('--json', 'Print DoctorReport JSON')
-  .action(...)
+  .command('doctor [agent-id]')
+  .description('Diagnose this machine, or pass an agent id / --agents for hireability')
+  .option('--json', 'Print DoctorReport JSON, or hireability JSON when an agent is named')
+  .option('--agents', 'Hireability for every registered agent')
+  .action(...) // no args still runs runDoctor (this contract)
 ```
 
 Implementation: `const { runDoctor, formatDoctorTable } = require('./doctor');`

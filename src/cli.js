@@ -35,6 +35,7 @@ const {
   probeClock,
   ntpBlock,
 } = require('./doctor');
+const { interpretActivation, diagnoseAgent, formatDoctorReport, hireCell } = require('./agent-status.js');
 const { isIndexerLagError, retryRegisterWithJ41, INDEXER_LAG_HINT, planOnboardingAfterProfile } = require('./indexer-lag');
 const { jobPaymentReady, isDatasetJob } = require('./job-payment');
 
@@ -2624,18 +2625,8 @@ program
         }
       } catch {}
 
-      // Tell J41 to re-read identity from chain
-      try { await agent._client.refreshAgent(keys.iAddress); } catch {}
-
-      console.log(`\n✅ Agent activated`);
-      console.log(`   activated`);
-      await warnIfPlatformDisagrees(agent._client, keys.iAddress, 'active');
-      if (svcCount > 0) console.log(`   Services reactivated: ${svcCount}`);
-      if (result.onChainTxid) {
-        console.log(`   On-chain txid: ${result.onChainTxid}`);
-      }
-
-      // Update local finalize state
+      // Update local finalize state before the confirm wait, so a pending
+      // chain read still records that this command attempted the activate.
       const agentDir = path.join(AGENTS_DIR, agentId);
       const finalizePath = path.join(agentDir, FINALIZE_STATE_FILENAME);
       if (fs.existsSync(finalizePath)) {
@@ -2647,7 +2638,52 @@ program
         fs.writeFileSync(finalizePath, JSON.stringify(state, null, 2));
       }
 
-      console.log(`\n   Start dispatcher: j41-dispatcher start`);
+      // Invite skip and --platform-only do not broadcast. A null txid there is
+      // intentional, not a failed broadcast.
+      if (!onChain) {
+        if (options.platformOnly) {
+          console.log(`\n⚠️  --platform-only: wrote ONLY the platform DB (no on-chain status update).`);
+          console.log(`   The indexer will REVERT this to its on-chain status on its next chain read,`);
+          console.log(`   unless the chain already reads 'active'. Run a real on-chain activate to make it stick.`);
+        }
+        try { await agent._client.refreshAgent(keys.iAddress); } catch {}
+        console.log(`\n✅ Agent activated`);
+        console.log(`   activated`);
+        await warnIfPlatformDisagrees(agent._client, keys.iAddress, 'active');
+        if (svcCount > 0) console.log(`   Services reactivated: ${svcCount}`);
+        console.log(`\n   Start dispatcher: j41-dispatcher start`);
+        return;
+      }
+
+      if (!result.onChainTxid) {
+        const verdict = interpretActivation({
+          expected: 'active',
+          onChainTxid: null,
+          canSignOnChain: !!keys.wif,
+        });
+        console.error(`\n❌ ${verdict.reason}`);
+        process.exit(1);
+      }
+
+      const { verdict, budgetMs } = await confirmOnChainActivation({
+        agent, keys, onChainTxid: result.onChainTxid,
+      });
+      if (verdict.state === 'confirmed') {
+        console.log(`\n✅ Agent activated (on-chain status confirmed)`);
+        console.log(`   activated`);
+        await warnIfPlatformDisagrees(agent._client, keys.iAddress, 'active');
+        if (svcCount > 0) console.log(`   Services reactivated: ${svcCount}`);
+        console.log(`   On-chain txid: ${result.onChainTxid}`);
+        console.log(`\n   Start dispatcher: j41-dispatcher start`);
+        return;
+      }
+      if (verdict.state === 'failed') {
+        console.error(`\n❌ activation failed: ${verdict.reason}`);
+        process.exit(1);
+      }
+      console.log(`\n⚠️  activation submitted but not confirmed within ${Math.round(budgetMs / 1000)}s — run: j41-dispatcher doctor ${agentId} in a few minutes`);
+      if (result.onChainTxid) console.log(`   On-chain txid: ${result.onChainTxid}`);
+      await warnIfPlatformDisagrees(agent._client, keys.iAddress, 'active');
     } catch (e) {
       console.error(`\n❌ Activation failed: ${e.message}`);
       process.exit(1);
@@ -2677,10 +2713,15 @@ program
     }
 
     console.log(`\n→ Activating ${agents.length} agent(s)...\n`);
+    if (options.platformOnly) {
+      console.log(`⚠️  --platform-only: wrote ONLY the platform DB. The indexer will REVERT each`);
+      console.log(`   to its on-chain status on its next chain read unless the chain already reads 'active'.\n`);
+    }
 
     const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
     let succeeded = 0;
     let failed = 0;
+    const pending = [];
 
     for (const agentId of agents) {
       const keys = loadAgentKeys(agentId);
@@ -2717,9 +2758,6 @@ program
             if (svc.status !== 'active') try { await agent._client.updateService(svc.id, { status: 'active' }); } catch {}
           }
         } catch {}
-        try { await agent._client.refreshAgent(keys.iAddress); } catch {}
-        console.log(`  ✓ ${agentId} (${keys.identity}) — activated${result.onChainTxid ? ' tx:' + result.onChainTxid.substring(0, 12) + '...' : ''}`);
-        await warnIfPlatformDisagrees(agent._client, keys.iAddress, 'active');
 
         // Update finalize state
         const finalizePath = path.join(AGENTS_DIR, agentId, FINALIZE_STATE_FILENAME);
@@ -2731,14 +2769,93 @@ program
           state.notes.push(`${new Date().toISOString()} Batch activated (on-chain: ${onChain})`);
           fs.writeFileSync(finalizePath, JSON.stringify(state, null, 2));
         }
-        succeeded++;
+
+        if (!onChain) {
+          try { await agent._client.refreshAgent(keys.iAddress); } catch {}
+          console.log(`  ✓ ${agentId} (${keys.identity}) — activated${result.onChainTxid ? ' tx:' + result.onChainTxid.substring(0, 12) + '...' : ''}`);
+          await warnIfPlatformDisagrees(agent._client, keys.iAddress, 'active');
+          succeeded++;
+        } else if (!result.onChainTxid) {
+          const verdict = interpretActivation({
+            expected: 'active',
+            onChainTxid: null,
+            canSignOnChain: !!keys.wif,
+          });
+          console.log(`  ✗ ${agentId} (${keys.identity}) — ${verdict.reason}`);
+          failed++;
+        } else {
+          console.log(`  → ${agentId} (${keys.identity}) — submitted tx:${result.onChainTxid.substring(0, 12)}...`);
+          await warnIfPlatformDisagrees(agent._client, keys.iAddress, 'active');
+          pending.push({ agentId, keys, agent, result });
+        }
       } catch (e) {
         console.log(`  ✗ ${agentId} (${keys?.identity || '?'}) — ${e.message}`);
         failed++;
       }
     }
 
-    console.log(`\n✅ Done: ${succeeded} activated, ${failed} failed`);
+    if (pending.length > 0) {
+      console.log(`\n→ Re-reading chain for ${pending.length} agent(s) (spaced)...`);
+      const refreshGapMs = process.env.NODE_ENV === 'test' ? 0 : 12000;
+      for (let i = 0; i < pending.length; i++) {
+        const p = pending[i];
+        try {
+          await p.agent._client.refreshAgent(p.keys.iAddress);
+          p.refreshError = undefined;
+        } catch (e) {
+          const is429 = e && (e.status === 429 || /429/.test(e.message || ''));
+          p.refreshError = is429 ? 429 : undefined;
+        }
+        if (i < pending.length - 1 && refreshGapMs > 0) await new Promise((r) => setTimeout(r, refreshGapMs));
+      }
+
+      const budgetMs = activateConfirmBudgetMs();
+      const deadline = Date.now() + budgetMs;
+      const delays = [5000, 20000, 30000, 45000, 45000, 45000];
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const confirmOne = async (p) => {
+        let verdict;
+        for (let i = 0; i < delays.length; i++) {
+          const wait = Math.min(delays[i], Math.max(0, deadline - Date.now()));
+          if (wait > 0) await sleep(wait);
+          const detail = await p.agent._client.getAgent(p.keys.iAddress || p.keys.identity).catch(() => ({}));
+          verdict = interpretActivation({
+            expected: 'active',
+            onChainTxid: p.result.onChainTxid,
+            getAgentStatus: detail && detail.status,
+            refresh: { agent: !p.refreshError },
+            refreshError: p.refreshError,
+            canSignOnChain: !!p.keys.wif,
+          });
+          if (verdict.state === 'confirmed') break;
+          if (Date.now() >= deadline) break;
+        }
+        return { p, verdict: verdict || { state: 'pending', reason: 'no read' } };
+      };
+      const settled = await Promise.allSettled(pending.map(confirmOne));
+      for (const s of settled) {
+        if (s.status !== 'fulfilled') {
+          console.log(`  ❌ confirm error: ${s.reason && s.reason.message ? s.reason.message : s.reason}`);
+          continue;
+        }
+        const { p, verdict } = s.value;
+        const label = `${p.agentId} (${p.keys.identity})`;
+        if (verdict.state === 'confirmed') {
+          console.log(`  ✅ ${label} — activated (on-chain confirmed) tx:${p.result.onChainTxid.substring(0, 12)}...`);
+        } else if (verdict.state === 'failed') {
+          console.log(`  ❌ ${label} — failed [${verdict.code || 'unknown'}]: ${verdict.reason}`);
+        } else {
+          console.log(`  ⚠️  ${label} — submitted but not yet confirmed (run: j41-dispatcher doctor ${p.agentId})`);
+        }
+      }
+      const stateOf = (s) => (s.status !== 'fulfilled' ? 'failed' : s.value.verdict.state);
+      succeeded += settled.filter((s) => stateOf(s) === 'confirmed').length;
+      failed += settled.filter((s) => stateOf(s) === 'failed').length;
+      const pendingCount = settled.filter((s) => stateOf(s) === 'pending').length;
+      console.log(`\n✅ Done: ${succeeded} confirmed, ${pendingCount > 0 ? pendingCount + ' pending, ' : ''}${failed} failed`);
+    } else {
+      console.log(`\n✅ Done: ${succeeded} activated, ${failed} failed`);
+    }
   });
 
 // Deactivate all agents at once
@@ -6612,6 +6729,9 @@ program
     const _unregisteredAgents = [];
     let _lastSeenPlatformStatus = null;
     let _lastSeenChainStatus = null;
+    // id -> { status, platform, chain, at }. `status` is the hire-gate AND
+    // (effectiveAgentStatus), which is what ctl agents and doctor agree on.
+    const hireStatus = new Map();
     for (const agentId of agents) {
       // RESET PER ITERATION, at the top.
       //
@@ -6684,6 +6804,15 @@ program
             // knowledge that the chain axis is still `inactive` is destroyed, and
             // with it any chance of /health reporting the fleet's real state.
             _lastSeenChainStatus = chainAgentStatus(profile);
+            const _hireEff = effectiveAgentStatus(profile);
+            if (_hireEff && _hireEff !== 'unknown') {
+              hireStatus.set(agentId, {
+                status: _hireEff,
+                platform: platformAgentStatus(profile),
+                chain: chainAgentStatus(profile),
+                at: Date.now(),
+              });
+            }
             // Already active and listed in the marker: nothing to restore, but it IS
             // dealt with. Leaving it in the marker would make a LATER deliberate
             // `deactivate` get silently undone by the next start.
@@ -6857,6 +6986,8 @@ program
       capabilities: new Map(), // agentId -> { workspace: bool, services: [] }
       disputePolicy: new Map(), // agentId -> policy object
       agentMarkup: new Map(), // agentId -> markup percentage
+      platformStatus: hireStatus, // agentId -> { status, at } hire-gate cache for ctl agents
+      network: J41_NETWORK, // read by control.js buildAgents for currency-aware diagnosis
       pendingPayment: new Map(), // jobId -> payment info
       _lastSentStatus: new Map(), // jobId -> last status sent
       _lastExtensionCheck: new Map(), // ext.id -> { ts, jobId } (dedup of dispatched extension requests; pruned by jobId at job teardown)
@@ -7946,6 +8077,9 @@ program
     // ── Start VRSC/USD rate poller (WP-D4 P0-2) ──
     startVrscRatePoller();
 
+    // Feeds ctl agents hireability. Startup already seeded state.platformStatus.
+    startPlatformStatusPoller(state);
+
     // ── Set agents active on-chain + platform ──
     // J41_NO_STATUS_TOGGLE=1: leave platform state alone at startup. Useful for
     // broker-validation runs where the operator pre-activates specific agents
@@ -8214,6 +8348,7 @@ program
           if (_toggleOnChain && result && result.onChainTxid) {
             state._inboxLastWrite.set(agentInfo.id, { txid: result.onChainTxid, at: Date.now() });
           }
+          noteHireStatus(state, agentInfo);
           console.log(`  ✅ ${agentInfo.id}: active` +
             (result.onChainTxid ? ` (on-chain txid: ${result.onChainTxid})` : ''));
           // Clear the diagnostic only if nothing in THIS pass recorded one.
@@ -8454,6 +8589,7 @@ program
         safely('stopControlServer', () => stopControlServer(controlServer));
         safely('stopControlApi', () => stopControlApi(controlApi));
         safely('stopVrscRatePoller', () => stopVrscRatePoller());
+        safely('stopPlatformStatusPoller', () => stopPlatformStatusPoller());
         clearTimeout(hardExit);
         process.exit(0);
       }
@@ -8476,6 +8612,7 @@ program
           safely('stopControlServer', () => stopControlServer(controlServer));
           safely('stopControlApi', () => stopControlApi(controlApi));
           safely('stopVrscRatePoller', () => stopVrscRatePoller());
+          safely('stopPlatformStatusPoller', () => stopPlatformStatusPoller());
           clearTimeout(hardExit);
           process.exit(0);
         }
@@ -8488,6 +8625,7 @@ program
           safely('stopControlServer', () => stopControlServer(controlServer));
           safely('stopControlApi', () => stopControlApi(controlApi));
           safely('stopVrscRatePoller', () => stopVrscRatePoller());
+          safely('stopPlatformStatusPoller', () => stopPlatformStatusPoller());
           clearTimeout(hardExit);
           process.exit(1);
         }
@@ -8641,10 +8779,16 @@ program
 
 // Doctor — mass-use machine diagnosis (single classifier shared with the TUI)
 program
-  .command('doctor')
-  .description('Diagnose this machine for dispatcher mass-use (Node, Docker, clock, identity)')
-  .option('--json', 'Print DoctorReport JSON')
-  .action(async (options) => {
+  .command('doctor [agent-id]')
+  .description('Diagnose this machine, or pass an agent id / --agents for hireability')
+  .option('--json', 'Print DoctorReport JSON, or hireability JSON when an agent is named')
+  .option('--refresh', 'Hireability only: force an on-chain re-read (rate-limited; spaced ≥12s/agent)', false)
+  .option('--agents', 'Hireability for every registered agent. With no args, doctor still checks this machine', false)
+  .action(async (agentId, options) => {
+    if (agentId || options.agents) {
+      const code = await runHireabilityDoctor(agentId, options);
+      process.exit(code);
+    }
     const report = await runDoctor(await doctorLiveInputs());
     if (options.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     else process.stdout.write(formatDoctorTable(report));
@@ -8936,6 +9080,153 @@ function startVrscRatePoller() {
 
 function stopVrscRatePoller() {
   if (_vrscRateTimer) { clearTimeout(_vrscRateTimer); _vrscRateTimer = null; }
+}
+
+let _platformStatusTimer = null;
+
+function startPlatformStatusPoller(state) {
+  const intervalMs = Number(process.env.J41_STATUS_POLL_MS) || 120000;
+
+  async function poll() {
+    if (!state.platformStatus) state.platformStatus = new Map();
+    for (let i = 0; i < state.agents.length; i++) {
+      const agentInfo = state.agents[i];
+      if (i > 0) await new Promise((r) => setTimeout(r, 1500));
+      try {
+        const agent = await getAgentSession(state, agentInfo);
+        const client = agent.client || agent._client;
+        const detail = await client.getAgent(agentInfo.iAddress || agentInfo.identity);
+        const eff = effectiveAgentStatus(detail);
+        if (eff && eff !== 'unknown') {
+          state.platformStatus.set(agentInfo.id, {
+            status: eff,
+            platform: platformAgentStatus(detail),
+            chain: chainAgentStatus(detail),
+            at: Date.now(),
+          });
+          const platform = platformAgentStatus(detail);
+          const chain = chainAgentStatus(detail);
+          if (platform) agentInfo.platformStatus = platform;
+          if (chain) agentInfo.chainStatus = chain;
+        }
+      } catch (e) {
+        console.log(`[Status] ${agentInfo.id}: could not refresh platform status (${e.message?.slice(0, 60)})`);
+      }
+    }
+    _platformStatusTimer = setTimeout(poll, intervalMs);
+  }
+
+  _platformStatusTimer = setTimeout(poll, intervalMs);
+}
+
+function stopPlatformStatusPoller() {
+  if (_platformStatusTimer) { clearTimeout(_platformStatusTimer); _platformStatusTimer = null; }
+}
+
+async function gatherHireSnapshot(keys, opts = {}) {
+  const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+  const agent = new J41Agent({
+    apiUrl: J41_API_URL,
+    wif: keys.wif,
+    identityName: keys.identity,
+    iAddress: keys.iAddress,
+  });
+  const lookupId = keys.iAddress || keys.identity;
+  try {
+    await agent.authenticate();
+    const detail = await agent._client.getAgent(lookupId).catch(() => ({}));
+    const eff = effectiveAgentStatus(detail);
+    const platformStatus = eff && eff !== 'unknown' ? eff : null;
+    const svcResp = await agent._client.getAgentServices(lookupId).catch(() => ({ data: [] }));
+    const services = svcResp.data || [];
+    const isApiEndpoint = services.some(
+      (s) => s && (s.serviceType === 'api-endpoint' || s.endpointUrl || s._isApiEndpoint),
+    );
+    let refresh;
+    if (opts.refresh) {
+      const r = await agent._client.refreshAgent(keys.iAddress).catch((e) => ({
+        _error: e && (e.status === 429 || /429/.test((e && e.message) || '')) ? 429 : true,
+      }));
+      if (r && !r._error) refresh = r;
+    }
+    return { platformStatus, network: J41_NETWORK, services, isApiEndpoint, refresh };
+  } finally {
+    try { agent.stop(); } catch { /* session is per diagnosis */ }
+  }
+}
+
+async function runHireabilityDoctor(agentId, options) {
+  ensureDirs();
+  let targets;
+  if (agentId) {
+    const keys = loadAgentKeys(agentId);
+    if (!keys) {
+      console.error(`❌ Agent ${agentId} not found.`);
+      return 1;
+    }
+    targets = [{ id: agentId, keys }];
+  } else {
+    targets = listRegisteredAgents()
+      .map((id) => ({ id, keys: loadAgentKeys(id) }))
+      .filter((t) => t.keys && t.keys.identity);
+  }
+  if (targets.length === 0) {
+    console.error('❌ No registered agents found. Run: j41-dispatcher register <agent> <name>');
+    return 1;
+  }
+
+  const rowFor = (t, snapshotOrErr) => {
+    const identity = (t.keys && t.keys.identity) || null;
+    if (snapshotOrErr && snapshotOrErr._gatherError) {
+      return {
+        id: t.id,
+        identity,
+        diagnosis: {
+          hireable: false,
+          blockers: [{
+            code: 'diagnosis_failed',
+            problem: `could not read agent state: ${snapshotOrErr._gatherError}`,
+            fix: 'check network/auth and retry: j41-dispatcher doctor ' + t.id,
+          }],
+          warnings: [],
+        },
+      };
+    }
+    return { id: t.id, identity, diagnosis: diagnoseAgent(snapshotOrErr) };
+  };
+
+  const rows = [];
+  if (options.refresh) {
+    const gapMs = process.env.NODE_ENV === 'test' ? 0 : 12000;
+    for (let i = 0; i < targets.length; i++) {
+      if (i > 0 && gapMs > 0) await new Promise((r) => setTimeout(r, gapMs));
+      const t = targets[i];
+      try {
+        rows.push(rowFor(t, await gatherHireSnapshot(t.keys, { refresh: true })));
+      } catch (e) {
+        rows.push(rowFor(t, { _gatherError: (e && e.message) || String(e) }));
+      }
+    }
+  } else {
+    const settled = await Promise.allSettled(
+      targets.map((t) => gatherHireSnapshot(t.keys, { refresh: false })),
+    );
+    settled.forEach((res, i) => {
+      const t = targets[i];
+      if (res.status === 'fulfilled') rows.push(rowFor(t, res.value));
+      else {
+        const e = res.reason;
+        rows.push(rowFor(t, { _gatherError: (e && e.message) || String(e) }));
+      }
+    });
+  }
+
+  const anyBlocked = rows.some(
+    (r) => r.diagnosis && Array.isArray(r.diagnosis.blockers) && r.diagnosis.blockers.length > 0,
+  );
+  if (options.json) console.log(JSON.stringify(rows, null, 2));
+  else formatDoctorReport(rows, { refreshed: !!options.refresh }).lines.forEach((l) => console.log(l));
+  return anyBlocked ? 1 : 0;
 }
 
 async function getAgentSession(state, agentInfo) {
@@ -9466,6 +9757,65 @@ function planAgentActivation(agentInfo, opts = {}) {
 /** False when the VDXF is already `invite` — `sales-mode open` is the floodgate, not activate. */
 function shouldWriteChainActiveOnActivate(chainStatus) {
   return String(chainStatus || '').trim().toLowerCase() !== 'invite';
+}
+
+function activateConfirmBudgetMs() {
+  const configured = process.env.J41_ACTIVATE_CONFIRM_MS;
+  if (configured != null && configured !== '') {
+    const n = Number(configured);
+    return Number.isFinite(n) ? n : 210000;
+  }
+  return process.env.NODE_ENV === 'test' ? 0 : 210000;
+}
+
+/** One refresh, then poll getAgent until the chain axis reads active or the budget ends. */
+async function confirmOnChainActivation({ agent, keys, onChainTxid }) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let refreshError;
+  try {
+    await agent._client.refreshAgent(keys.iAddress);
+  } catch (e) {
+    const is429 = e && (e.status === 429 || /429/.test(String(e.message || '')));
+    if (is429) refreshError = 429;
+  }
+  const budgetMs = activateConfirmBudgetMs();
+  const deadline = Date.now() + budgetMs;
+  const delays = [5000, 20000, 30000, 45000, 45000, 45000];
+  let verdict;
+  for (let i = 0; i < delays.length; i++) {
+    const wait = Math.min(delays[i], Math.max(0, deadline - Date.now()));
+    if (wait > 0) await sleep(wait);
+    const detail = await agent._client.getAgent(keys.iAddress || keys.identity).catch(() => ({}));
+    verdict = interpretActivation({
+      expected: 'active',
+      onChainTxid,
+      getAgentStatus: detail && detail.status,
+      refresh: { agent: !refreshError },
+      refreshError,
+      canSignOnChain: !!(keys && keys.wif),
+    });
+    if (verdict.state === 'confirmed') break;
+    if (Date.now() >= deadline) break;
+  }
+  return {
+    verdict: verdict || { state: 'pending', reason: 'no confirmation read performed' },
+    budgetMs,
+  };
+}
+
+function noteHireStatus(state, agentInfo) {
+  if (!state || !state.platformStatus || !agentInfo) return;
+  const eff = effectiveAgentStatus({
+    status: agentInfo.chainStatus,
+    platformStatus: agentInfo.platformStatus,
+  });
+  if (!eff || eff === 'unknown') return;
+  state.platformStatus.set(agentInfo.id, {
+    status: eff,
+    platform: agentInfo.platformStatus || null,
+    chain: agentInfo.chainStatus || null,
+    at: Date.now(),
+  });
 }
 
 // ── Shutdown/start fleet-state handoff ───────────────────────────────────────
@@ -14530,7 +14880,9 @@ program
           for (const a of (result.agents || [])) {
             const statusIcon = a.status === 'available' ? '🟢' : '🔴';
             const wsIcon = a.workspace ? ' [WS]' : '';
-            console.log(`  ${statusIcon} ${a.id}  ${a.identity}  ${a.status}${wsIcon}  svc=${a.services}${a.currentJob ? `  job=${a.currentJob}` : ''}`);
+            const hire = hireCell(a);
+            const age = (a.statusAge != null) ? ` (@${Math.round(a.statusAge / 60000)}m)` : '';
+            console.log(`  ${statusIcon} ${a.id}  ${a.identity}  ${a.status}${wsIcon}  hire=${hire}${age}  svc=${a.activeServices ?? a.services}${a.currentJob ? `  job=${a.currentJob}` : ''}`);
           }
           console.log('');
           break;

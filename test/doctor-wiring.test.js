@@ -13,7 +13,11 @@ const CLI = fs.readFileSync(path.join(SRC, 'cli.js'), 'utf8');
 const DASH = fs.readFileSync(path.join(SRC, 'dashboard.js'), 'utf8');
 
 test('cli.js registers doctor command', () => {
-  assert.match(CLI, /\.command\('doctor'\)/);
+  assert.match(CLI, /\.command\('doctor \[agent-id\]'\)/);
+  const start = CLI.indexOf(".command('doctor [agent-id]')");
+  const body = CLI.slice(start, start + 700);
+  assert.match(body, /runDoctor\(await doctorLiveInputs\(\)\)/, 'no-arg doctor still checks the machine');
+  assert.match(body, /agentId \|\| options\.agents/, 'an agent id or --agents runs hireability');
 });
 
 test('cli.js refuses Node <20 immediately after umask, before secure-setup', () => {

@@ -288,7 +288,7 @@ test('CLI extend is a thin rind over buyer-extend; --pay default on', () => {
   assert.match(cli, /\.command\('extend <buyer-agent-id> <job-id>'\)/);
   const start = cli.indexOf(".command('extend <buyer-agent-id> <job-id>')");
   assert.ok(start > -1);
-  const next = cli.indexOf(".command('access <buyer-agent-id> <seller>')", start);
+  const next = cli.indexOf(".command(", start + ".command('extend".length);
   const extendSrc = cli.slice(start, next > -1 ? next : start + 2500);
   assert.match(extendSrc, /require\('\.\/buyer-extend'\)/);
   assert.match(extendSrc, /runBuyerExtend/);
