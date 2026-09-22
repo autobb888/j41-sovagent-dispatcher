@@ -260,10 +260,11 @@ function applyRentalExtension({ state, jobId, extensionId, amount, now = Date.no
   };
 }
 
-// Delivered/completed is NOT a yank — Cat-1 credentials delivered means the buyer
-// still owns the box until expiresAt. Compute-supply reconcile releases on expiry.
+// `delivered` is the start of a rental: the buyer keeps the box until they
+// complete, cancel, or the lease expires. `completed` frees the card. The
+// no-refund rule is unchanged — release does not move money.
 const YANK_RENTAL_STATUSES = Object.freeze([
-  'cancelled', 'resolved', 'resolved_rejected',
+  'completed', 'cancelled', 'resolved', 'resolved_rejected',
 ]);
 
 /**

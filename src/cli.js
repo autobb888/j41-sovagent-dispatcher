@@ -3934,7 +3934,8 @@ program
       });
     }
     if (chat.result && chat.result.sessionId) {
-      persistGrantSession(AGENTS_DIR, buyerAgentId, seller, chat.result.sessionId);
+      const { sessionTokenFromHeader } = require('./session-token');
+      persistGrantSession(AGENTS_DIR, buyerAgentId, seller, sessionTokenFromHeader(chat.result.sessionId));
     }
     const body = chat.result && chat.result.body;
     const text = body && body.choices && body.choices[0] && body.choices[0].message

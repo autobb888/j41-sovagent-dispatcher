@@ -410,7 +410,7 @@ function filterHeaders(upstreamHeaders) {
  */
 async function handleProxyRequest(req, res, agentConfigs, body) {
   const cfg = loadDispatcherConfig();
-  const requestId = crypto.randomBytes(8).toString('hex');
+  const requestId = crypto.randomUUID();
 
   // Extract API key from Authorization header
   const authHeader = req.headers['authorization'] || '';
