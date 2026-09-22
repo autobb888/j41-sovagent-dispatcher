@@ -395,13 +395,32 @@ function http1Fetch() {
   return { fetch: undici.fetch, dispatcher: _http1Agent };
 }
 
+// Kimi's time-to-first-byte on this host is about 91s. 60s shipped the canned
+// "temporary issue" line and the labour job never delivered. The buyer→proxy
+// hop is capped near 95s by Cloudflare. This call is the container talking to
+// NVIDIA directly, so it can wait past that.
+const CHAT_ABORT_MS = 120000;
+// Labour answers, not the model-proxy ping budget (that one stays 32).
+// A reasoning model can spend the whole 120s abort on chain-of-thought if
+// this is unbounded. 2048 is the ceiling; higher is a code change.
+const LABOUR_MAX_TOKENS_DEFAULT = 1024;
+const LABOUR_MAX_TOKENS_CEILING = 2048;
+
+function labourMaxTokens(env = process.env) {
+  const raw = env && env.J41_LLM_MAX_TOKENS;
+  if (raw == null || String(raw).trim() === '') return LABOUR_MAX_TOKENS_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1) return LABOUR_MAX_TOKENS_DEFAULT;
+  return Math.min(Math.floor(n), LABOUR_MAX_TOKENS_CEILING);
+}
+
 async function fetchChatCompletions(payload) {
   const body = JSON.stringify(payload);
   const { fetch: doFetch, dispatcher } = http1Fetch();
   let lastErr = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 60000);
+    const timer = setTimeout(() => controller.abort(), CHAT_ABORT_MS);
     try {
       const res = await doFetch(`${LLM_CONFIG.baseUrl}/chat/completions`, {
         method: 'POST',
@@ -438,7 +457,7 @@ async function callLLM(systemPrompt, messages) {
     model: LLM_CONFIG.model,
     messages: apiMessages,
     temperature: 0.6,
-    max_tokens: 256,
+    max_tokens: labourMaxTokens(),
   });
 
   if (!fetched.ok) {
@@ -477,7 +496,7 @@ async function callLLMWithTools(systemPrompt, messages, tools) {
     model: LLM_CONFIG.model,
     messages: apiMessages,
     temperature: 0.6,
-    max_tokens: 256,
+    max_tokens: labourMaxTokens(),
   };
   if (tools.length > 0) {
     body.tools = tools;
@@ -562,4 +581,7 @@ function generateTemplateResponse(message, job, soulPrompt) {
   return `Thanks for your message. I'm processing your request regarding: "${job.description.substring(0, 60)}". Is there anything specific you'd like me to focus on?`;
 }
 
-module.exports = { LocalLLMExecutor, LLM_PRESETS, LLM_CONFIG, resolveLLMConfig };
+module.exports = {
+  LocalLLMExecutor, LLM_PRESETS, LLM_CONFIG, resolveLLMConfig, CHAT_ABORT_MS,
+  labourMaxTokens, LABOUR_MAX_TOKENS_DEFAULT, LABOUR_MAX_TOKENS_CEILING,
+};

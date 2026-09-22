@@ -50,6 +50,11 @@ const IDENTITY = process.env.J41_IDENTITY;
 const JOB_ID = process.env.J41_JOB_ID;
 const TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS || '3600000');
 const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '480000'); // idle → pause (8 min, before backend's 10-min auto-deliver)
+const ACCEPTED_IDLE_NOTE = 'This job is still accepted, so it cannot be paused. Delivering the work so far.';
+
+function labourExtensionClosed(status) {
+  return status === 'accepted';
+}
 // Token budget enforcement (WP-D4): warning threshold for extension asks,
 // and how long an exhausted budget may wait for approval before the session
 // hard-stops and delivers partial work.
@@ -980,8 +985,26 @@ async function main() {
  * not invent a price — it logs, and the budget watchdog delivers partial
  * work if no extension arrives.
  */
+async function currentLabourStatus(agent, job) {
+  try {
+    if (agent && agent.client && typeof agent.client.getJob === 'function' && job && job.id) {
+      const full = await agent.client.getJob(job.id);
+      if (full && full.status) return full.status;
+    }
+  } catch { /* the status on the job object is the fallback */ }
+  return job && job.status;
+}
+
 async function requestBudgetExtension(job, agent, executor, usage, budget) {
   if (executor._extensionRequested) return; // one ask in flight; re-armed when granted
+  const status = await currentLabourStatus(agent, job);
+  if (labourExtensionClosed(status)) {
+    if (!executor._extensionClosedLogged) {
+      executor._extensionClosedLogged = true;
+      console.warn(`[BUDGET] Job ${job && job.id} is still accepted — the platform will not take an extension until it is in_progress. Not asking.`);
+    }
+    return;
+  }
   const now = Date.now();
   if (executor._lastExtensionAttemptAt && now - executor._lastExtensionAttemptAt < EXTENSION_RETRY_INTERVAL_MS) return;
   executor._lastExtensionAttemptAt = now;
@@ -1397,11 +1420,17 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
             if (process.send) process.send({ type: 'job_idle', jobId: job.id });
             log.info('Job paused by platform on idle — staying paused (awaiting resume/TTL)', { jobId: job.id });
           } else if (curStatus === 'accepted' || curStatus === 'in_progress') {
-            // Labour chat often stays `accepted` (never in_progress). Pause is
-            // refused; that is not terminal. Keep polling chat so pong can land,
-            // and do not skip deliverJob.
-            log.warn('Pause refused on a live job — keeping chat session', { jobId: job.id, status: curStatus });
+            // Labour chat often stays `accepted`, so pause is refused. The idle
+            // window already waited for another buyer message. End the session
+            // so the deliver below runs. Do not set _skipDelivery.
+            // The flag is set before the note so a second idle tick cannot
+            // send the line again.
             _idlePauseUnsupported = true;
+            if (curStatus === 'accepted') {
+              try { agent.sendChatMessage(job.id, ACCEPTED_IDLE_NOTE); } catch { /* deliver anyway */ }
+            }
+            log.warn('Pause refused on a live job — delivering', { jobId: job.id, status: curStatus });
+            if (resolveSession) resolveSession('idle-pause-refused');
           } else {
             // Terminal / not-deliverable — nothing to deliver. End the session and
             // flag main() to skip delivery so we exit cleanly instead of crashing.
@@ -2424,5 +2453,5 @@ if (require.main === module) {
 // Export testable helpers when running under NODE_ENV=test.
 // Avoids shipping a test seam in production while keeping coverage honest.
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach, isTerminalAttachError, ATTACH_CONFIRM_BACKOFF_MS, resumeJob, ensureChatConnected, containDownload };
+  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach, isTerminalAttachError, ATTACH_CONFIRM_BACKOFF_MS, resumeJob, ensureChatConnected, containDownload, labourExtensionClosed, requestBudgetExtension, ACCEPTED_IDLE_NOTE };
 }

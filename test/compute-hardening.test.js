@@ -26,6 +26,37 @@ test('C2: a failing release keeps the lease as release-pending and retries next 
 });
 
 // C3 — a still-active rental at boot is rehydrated (not wiped) so it can be released later.
+test('releaseOrphansOnBoot keeps an unexpired job lease after active-jobs was cleared', async () => {
+  const future = Date.now() + 60 * 60 * 1000;
+  persistLeases(new Map([['home:paid', {
+    id: 'home:paid', provider: 'home-gpu', state: 'ready', jobId: 'job-paid',
+    boundAgentId: 'gpu-1', expiresAt: future, usdPerHour: 0, meta: {},
+  }]]));
+  const ctrl = createSupplyController({
+    cfg: { compute: { enabled: true, providers: {} } },
+    agentConfigs: new Map(),
+  });
+  // The live boot calls this with no callback, which reads active-jobs.json.
+  // That file is empty after crash recovery. The paid jail must still be kept.
+  await ctrl.releaseOrphansOnBoot();
+  assert.equal(ctrl.getLeases().some((l) => l.jobId === 'job-paid' && l.state === 'ready'), true);
+  assert.ok(loadLeases()['home:paid'], 'unexpired rental stays on disk');
+});
+
+test('an uncertain probe does not release a paid rental', async () => {
+  const released = [];
+  const provider = {
+    get capabilities() { return { canProvision: true, canSsh: true, isElastic: false }; },
+    async probe() { return { healthy: false, uncertain: true, reason: 'connect ECONNREFUSED' }; },
+    async release(l) { released.push(l.id); return { ...l, state: 'released' }; },
+  };
+  const ctrl = createSupplyController({ cfg: { compute: { enabled: true, providers: {} } }, agentConfigs: new Map(), now: () => 1000 });
+  ctrl._injectBoundLease({ id: 'home:1', provider: 'home-gpu', state: 'ready', jobId: 'job-1', expiresAt: 9_000_000, usdPerHour: 0, meta: {} }, provider, 'gpu-1');
+  await ctrl.reconcileTick();
+  assert.deepEqual(released, []);
+  assert.equal(ctrl.getLeases()[0].state, 'ready');
+});
+
 test('C3: releaseOrphansOnBoot rehydrates a still-active rental instead of wiping it', async () => {
   persistLeases(new Map([['vast:r', { id: 'vast:r', provider: 'vast', state: 'ready', jobId: 'job-live', providerName: 'cloud', boundAgentId: 'a1', usdPerHour: 0.3, meta: { instanceId: 5 } }]]));
   const ctrl = createSupplyController({ cfg: { compute: { enabled: true, providers: { cloud: { type: 'vast', api_key: 'k' } } } }, agentConfigs: new Map() });

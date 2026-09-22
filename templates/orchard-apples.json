@@ -1,0 +1,17 @@
+{
+  "dataset": "orchardapples",
+  "query": { "q": "", "color": "", "kind": "" },
+  "count": 10,
+  "items": [
+    { "kind": "Red Delicious", "color": "red", "taste": "sweet" },
+    { "kind": "Granny Smith", "color": "green", "taste": "tart" },
+    { "kind": "Golden Delicious", "color": "yellow", "taste": "sweet" },
+    { "kind": "Honeycrisp", "color": "red-yellow", "taste": "sweet-tart" },
+    { "kind": "Fuji", "color": "red", "taste": "sweet" },
+    { "kind": "Gala", "color": "red-yellow", "taste": "sweet" },
+    { "kind": "McIntosh", "color": "red-green", "taste": "tart" },
+    { "kind": "Pink Lady", "color": "pink", "taste": "tart" },
+    { "kind": "Braeburn", "color": "red-orange", "taste": "sweet-tart" },
+    { "kind": "Jonagold", "color": "red-yellow", "taste": "sweet" }
+  ]
+}

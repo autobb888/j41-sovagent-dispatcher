@@ -288,6 +288,18 @@ test('deposit kind allows a second similar top-up when jobPrice equals this send
   });
   assert.equal(g2.allowed, true, 'second similar autonomous deposit must be allowed');
 
+  // Mac run: history 0.10, next scripted top-up 0.01, ceiling was 0.033.
+  const small = SP.gateExternalSend({
+    jobId: 'seller-repeat@',
+    toAddress: iAddr,
+    amount: 0.01,
+    jobPrice: 0.01 * 3,
+    kind: 'deposit',
+    expectedRecipients: [iAddr],
+    now: now + 120_000,
+  });
+  assert.equal(small.allowed, true, 'a smaller later top-up must not be capped at 1.1x of itself');
+
   const pay1 = SP.gateExternalSend({
     jobId: 'job-once', toAddress: iAddr, amount: 1, jobPrice: 1,
     kind: 'payment', expectedRecipients: [iAddr], now,

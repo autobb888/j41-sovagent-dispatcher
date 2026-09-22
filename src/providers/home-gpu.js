@@ -587,7 +587,12 @@ class HomeGpuProvider extends ComputeProvider {
       void port;
       return { healthy: true };
     } catch (err) {
-      return { healthy: false, reason: (err && err.message) || 'inspect failed' };
+      const status = err && (err.statusCode || err.status);
+      const msg = (err && err.message) || '';
+      if (status === 404 || /no such container/i.test(msg)) {
+        return { healthy: false, reason: 'container not found' };
+      }
+      return { healthy: false, uncertain: true, reason: msg || 'inspect failed' };
     }
   }
 

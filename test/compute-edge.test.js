@@ -125,7 +125,7 @@ test('attachAndDial connects to dial immediately (seller first accept)', async (
     },
   });
   assert.deepEqual(connected[0], 'gpu.junction41.io:40123');
-  assert.ok(connected.includes('127.0.0.1:2222'));
+  assert.equal(connected.includes('127.0.0.1:2222'), false, 'jail sshd waits for the buyer');
   assert.equal(order[0], 'GET');
   assert.equal(order[1], 'POST');
 });
@@ -172,13 +172,18 @@ test('local sshd close does not destroy the edge TCP (denied login must not drop
       pipeOpts: null,
       pipe(_other, opts) { sock.pipeOpts = opts || {}; return sock; },
       unpipe() {},
+      on(ev, fn) {
+        handlers[ev] = handlers[ev] || [];
+        handlers[ev].push(fn);
+        return sock;
+      },
       once(ev, fn) {
         handlers[ev] = handlers[ev] || [];
         handlers[ev].push(fn);
         if (ev === 'connect') queueMicrotask(fn);
         return sock;
       },
-      emit(ev) { for (const fn of handlers[ev] || []) fn(); },
+      emit(ev, ...args) { for (const fn of handlers[ev] || []) fn(...args); },
       destroy() { sock.destroyed = true; destroyed.push(name); },
     };
     return sock;
@@ -202,14 +207,17 @@ test('local sshd close does not destroy the edge TCP (denied login must not drop
     },
   });
   await new Promise((r) => setTimeout(r, 20));
+  const localEarly = socks.find((s) => s.name === '127.0.0.1:2222');
+  assert.equal(localEarly, undefined, 'sshd must not start until the buyer sends a byte');
+  assert.equal(edge.remote.destroyed, false);
+  edge.remote.emit('data', Buffer.from('SSH-2.0-client'));
+  await new Promise((r) => setTimeout(r, 20));
   const local = socks.find((s) => s.name === '127.0.0.1:2222');
   assert.ok(local);
+  assert.equal(local.pipeOpts && local.pipeOpts.end, false);
   local.emit('close');
   await new Promise((r) => setTimeout(r, 20));
-  assert.equal(destroyed.includes('gpu.junction41.io:40123'), false);
-  assert.equal(edge.remote.destroyed, false);
-  assert.equal(edge.remote.pipeOpts && edge.remote.pipeOpts.end, false);
-  assert.equal(local.pipeOpts && local.pipeOpts.end, false);
+  assert.ok(destroyed.includes('gpu.junction41.io:40123'));
 });
 
 test('after SSH bytes, jail sshd close destroys the edge socket (no second banner on the same port)', async () => {
@@ -241,6 +249,7 @@ test('after SSH bytes, jail sshd close destroys the edge socket (no second banne
   });
   await new Promise((r) => setTimeout(r, 20));
   remote.emit('data', Buffer.from('SSH-2.0-OpenSSH'));
+  await new Promise((r) => setTimeout(r, 20));
   locals[0].emit('close');
   await new Promise((r) => setTimeout(r, 20));
   assert.ok(destroyed.includes('edge'), 'second sshd banner on a live client is a MAC failure');
@@ -292,6 +301,33 @@ test('keepOutboundUntilBuyer re-attaches a new port if outbound dies before firs
   assert.deepEqual(reseal, [{ host: 'sovcompute.junction41.io', port: 40003 }]);
   assert.equal(session.port, 40003);
   assert.equal(session.remote, second);
+});
+
+test('keepOutboundUntilBuyer retries a failed re-attach and still arms after a secret POST throw', async () => {
+  const first = mockEdgeSock('edge-1');
+  const second = mockEdgeSock('edge-2');
+  const third = mockEdgeSock('edge-3');
+  const session = { host: 'sovcompute.junction41.io', port: 1, remote: first, stopHold() {} };
+  let attaches = 0;
+  keepOutboundUntilBuyer(session, {
+    maxReattach: 3,
+    log() {},
+    attach: async () => {
+      attaches += 1;
+      if (attaches === 1) throw new Error('edge down');
+      const remote = attaches === 2 ? second : third;
+      return { host: 'sovcompute.junction41.io', port: 40010 + attaches, remote, stopHold() {} };
+    },
+    onReattached: async () => { throw new Error('rental-secret post failed'); },
+  });
+  first.emit('close');
+  await new Promise((r) => setTimeout(r, 450));
+  assert.equal(attaches, 2, 'a thrown attach is retried inside the budget');
+  assert.equal(session.remote, second, 'the new socket is installed even when rental-secret throws');
+  second.emit('close');
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(attaches, 3, 'the socket is still watched after the secret POST failed');
+  assert.equal(session.remote, third);
 });
 
 test('keepOutboundUntilBuyer re-attaches even after a failed SSH (buyer bytes then close)', async () => {

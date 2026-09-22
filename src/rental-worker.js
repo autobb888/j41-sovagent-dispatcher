@@ -175,6 +175,7 @@ async function startRentalJob(opts) {
     rentalPeriodAmount: periodAmount,
     jobAmount: job.amount || null,
     buyerPayAddress: job.buyerPayAddress || (job.buyer && job.buyer.payAddress) || null,
+    buyerVerusId: job.buyerVerusId || (job.buyer && job.buyer.verusId) || null,
     currency: job.currency || null,
     edge,
   };
@@ -260,10 +261,11 @@ function applyRentalExtension({ state, jobId, extensionId, amount, now = Date.no
   };
 }
 
-// Delivered/completed is NOT a yank — Cat-1 credentials delivered means the buyer
-// still owns the box until expiresAt. Compute-supply reconcile releases on expiry.
+// `delivered` is not a yank: the buyer still owns the box until complete, cancel,
+// or expiresAt. `completed` releases the card on the next cleanup pass. Completing
+// does not refund. Compute-supply reconcile still releases on expiry.
 const YANK_RENTAL_STATUSES = Object.freeze([
-  'cancelled', 'resolved', 'resolved_rejected',
+  'completed', 'cancelled', 'resolved', 'resolved_rejected',
 ]);
 
 /**
@@ -381,7 +383,16 @@ async function adoptLiveRentals({
         status = job && job.status;
       } catch { /* adopt anyway; the sweep re-checks */ }
     }
-    if (status && YANK_RENTAL_STATUSES.includes(status)) continue;
+    if (status && YANK_RENTAL_STATUSES.includes(status)) {
+      // Boot now keeps an unexpired job lease even after crash recovery clears
+      // active-jobs.json. A cancelled rental must not ride that until expiry.
+      try {
+        if (typeof ctrl.releaseLease === 'function') await ctrl.releaseLease(lease);
+      } catch (e) {
+        console.error(`[Rental] release of ${status} ${lease.jobId} failed: ${e && e.message}`);
+      }
+      continue;
+    }
 
     const rec = {
       kind: 'gpu-rental',

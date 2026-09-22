@@ -71,6 +71,7 @@ function persistActiveJobs(activeMap) {
       // Crash recovery fields
       jobAmount: active.jobAmount || null,
       buyerPayAddress: active.buyerPayAddress || null,
+      buyerVerusId: active.buyerVerusId || null,
       currency: active.currency || null,
       agentInfoId: active.agentInfoId || null,
       reworkCount: active.reworkCount || 0,

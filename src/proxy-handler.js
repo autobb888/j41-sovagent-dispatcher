@@ -410,7 +410,9 @@ function filterHeaders(upstreamHeaders) {
  */
 async function handleProxyRequest(req, res, agentConfigs, body) {
   const cfg = loadDispatcherConfig();
-  const requestId = crypto.randomBytes(8).toString('hex');
+  // Review POST /v1/reviews for a model session requires a UUID. A
+  // buyer:hex token is "Invalid uuid" and no session review can land.
+  const requestId = crypto.randomUUID();
 
   // Extract API key from Authorization header
   const authHeader = req.headers['authorization'] || '';
@@ -622,6 +624,24 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   return withUpstreamGate(agentId, async () => {
   const session = http1Fetch();
   const started = Date.now();
+  // Cloudflare drops a silent origin around 100s. Kimi often sends no headers
+  // until after that. A streaming buyer can take SSE comments while we wait.
+  let waitTimer = null;
+  const stopWait = () => { if (waitTimer) { clearInterval(waitTimer); waitTimer = null; } };
+  if (isStreaming && !res.headersSent) {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'X-Accel-Buffering': 'no',
+      'X-J41-Request-Id': requestId,
+      'X-J41-Session': requestId,
+    });
+    res.write(': j41-wait\n\n');
+    waitTimer = setInterval(() => {
+      if (!res.writableEnded) res.write(': j41-wait\n\n');
+    }, 10000);
+    if (typeof waitTimer.unref === 'function') waitTimer.unref();
+  }
   const fetchP = session.fetch(upstreamUrl.href, {
     method: 'POST',
     headers: {
@@ -640,32 +660,36 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     }),
   ]);
   clearTimeout(timeoutHandle);
+  stopWait();
   if (outcome.type !== 'res') {
     const timedOut = outcome.type === 'timeout';
     const think = parsedBody.chat_template_kwargs && parsedBody.chat_template_kwargs.thinking;
-    if (res.headersSent || res.writableEnded) {
-      if (timedOut) {
-        await Promise.race([
-          fetchP.then(async (r) => { try { await r.arrayBuffer(); } catch { /* drain */ } }).catch(() => {}),
-          new Promise((r) => setTimeout(r, 120000)),
-        ]);
-      }
-      session.destroy();
-      releaseOnce();
-      return;
-    }
+    // Streaming commits 200 + `: j41-wait` before NVIDIA answers, so the old
+    // headersSent return skipped refundOnce and never ended the SSE. The
+    // buyer kept a hung 200 and the reservation stayed debited.
     console.error(timedOut
       ? `[PROXY] Upstream timeout after ${cfg.proxy.upstream_timeout_ms}ms agent=${agentId} model=${model} fwd=${parsedBody.model} max_tokens=${parsedBody.max_tokens} stream=${!!parsedBody.stream} thinking=${think} host=${upstreamUrl.hostname} elapsed_ms=${Date.now() - started}`
       : `[PROXY] Upstream error: ${outcome.err && outcome.err.message}`);
     refundOnce();
     releaseOnce();
-    res.writeHead(timedOut ? 504 : 502, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
-    res.end(JSON.stringify({ error: timedOut ? 'Upstream endpoint timed out' : 'Upstream endpoint unavailable' }));
+    const errText = timedOut ? 'Upstream endpoint timed out' : 'Upstream endpoint unavailable';
+    if (res.headersSent) {
+      if (!res.writableEnded) {
+        try {
+          res.write(`data: ${JSON.stringify({ error: errText })}\n\n`);
+          res.end();
+        } catch { /* client already gone */ }
+      }
+    } else if (!res.writableEnded) {
+      res.writeHead(timedOut ? 504 : 502, { 'Content-Type': 'application/json', 'X-J41-Request-Id': requestId });
+      res.end(JSON.stringify({ error: errText }));
+    }
     if (timedOut) {
       // Do not RST NVIDIA — drain so the next chat is not queued behind a zombie.
+      const drainCap = Number(process.env.J41_PROXY_DRAIN_CAP_MS || 120000);
       await Promise.race([
         fetchP.then(async (r) => { try { await r.arrayBuffer(); } catch { /* drain */ } }).catch(() => {}),
-        new Promise((r) => setTimeout(r, 120000)),
+        new Promise((r) => setTimeout(r, drainCap)),
       ]);
     }
     session.destroy();
@@ -682,7 +706,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   {
     const j41Headers = {
       'X-J41-Request-Id': requestId,
-      'X-J41-Session': `${record.buyerVerusId}:${requestId}`,
+      'X-J41-Session': requestId,
       'X-J41-Model': model,
     };
 
@@ -698,7 +722,9 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         j41Headers['X-J41-Seller-PayAddress'] = config.payAddress || '';
       }
       const safeHeaders = filterHeaders(proxyRes.headers);
-      res.writeHead(proxyRes.statusCode, { ...safeHeaders, ...j41Headers });
+      if (!res.headersSent) {
+        res.writeHead(proxyRes.statusCode, { ...safeHeaders, ...j41Headers });
+      }
 
       let fullResponse = '';
       let deducted = false;

@@ -297,6 +297,15 @@ test('cli.js applies a paid rental extension to the lease from BOTH delivery pat
   assert.match(poll, /applyRentalExtension\(/);
 });
 
+test('a labour extension waits for a free slot instead of being rejected', () => {
+  const handler = CLI.slice(CLI.indexOf('async function handleExtensionRequest'), CLI.indexOf('Insert a job into the priority queue'));
+  const gate = handler.indexOf('const canApprove = queueEmpty && slotsOpen && cpuOk && memOk');
+  assert.ok(gate > 0);
+  const tail = handler.slice(gate);
+  assert.match(tail, /return \{ deferred: true \}/);
+  assert.equal(tail.includes('rejectExtension'), false, 'host capacity must not reject the extension');
+});
+
 test('cli.js decides rental extensions on the lease, not on host CPU/RAM', () => {
   const handler = CLI.slice(CLI.indexOf('async function handleExtensionRequest'), CLI.indexOf('Insert a job into the priority queue'));
   const rentalBranch = handler.indexOf("kind === 'gpu-rental'");

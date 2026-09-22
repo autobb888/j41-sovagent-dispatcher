@@ -54,8 +54,16 @@ test('parseDataSetupUrls requires HTTP(S) website and/or networkEndpoints', () =
   assert.throws(() => parseDataSetupUrls({}), /DATA_SETUP_NO_ENDPOINT/);
   assert.throws(() => parseDataSetupUrls({ website: 'ftp://x' }), /DATA_SETUP_BAD_URL/);
   assert.throws(() => parseDataSetupUrls({ website: 'https://foo.trycloudflare.com' }), /DESCRIPTION_EPHEMERAL_URL/);
+  const own = parseDataSetupUrls({
+    website: 'https://foo.trycloudflare.com/j41/datasets/orchard-apples.json',
+    allowHosts: ['foo.trycloudflare.com'],
+  });
+  assert.equal(own.website, 'https://foo.trycloudflare.com/j41/datasets/orchard-apples.json');
   assert.throws(() => parseDataSetupUrls({ website: 'http://127.0.0.1/data' }), /DESCRIPTION_EPHEMERAL_URL/);
   assert.throws(() => parseDataSetupUrls({ networkEndpoints: 'http://192.168.1.9/x' }), /DESCRIPTION_EPHEMERAL_URL/);
+  assert.throws(() => parseDataSetupUrls({ website: 'http://169.254.169.254/latest' }), /DESCRIPTION_EPHEMERAL_URL/);
+  assert.throws(() => parseDataSetupUrls({ website: 'http://[::1]/data' }), /DESCRIPTION_EPHEMERAL_URL/);
+  assert.throws(() => parseDataSetupUrls({ website: 'http://127.0.0.2/data' }), /DESCRIPTION_EPHEMERAL_URL/);
   const ok = parseDataSetupUrls({ website: 'https://data.example/apples.json' });
   assert.equal(ok.website, 'https://data.example/apples.json');
   const both = parseDataSetupUrls({

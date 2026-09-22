@@ -69,4 +69,84 @@ function buildAbandonedJobRefund(job, jobId, refundPercent, refundedJobs, pendin
   };
 }
 
-module.exports = { shouldRefundOrphan, isRefundAlreadyHandled, buildAbandonedJobRefund, FINISHED_STATUSES };
+/**
+ * What crash recovery should do with one active-jobs row.
+ *
+ * `clear`  — terminal, or already not owed a refund. Drop the active row.
+ * `refund` — write `record` (pending_approval, or needs_review when the pay
+ *            address was never stored). Drop the active row; the ledger has it.
+ * `keep`   — paid-or-unknown and we still cannot file a ledger row. The active
+ *            row stays. Wiping it is how a restart used to lose the buyer.
+ *
+ * A missing pay address with a buyer identity is needs_review, not a silent drop.
+ * refunds approve refuses needs_review, so this does not send.
+ */
+function classifyCrashOrphan({ orphan, currentJob, fetchFailed = false, refundPercent = 100 } = {}) {
+  if (currentJob && !shouldRefundOrphan(currentJob)) return { action: 'clear' };
+
+  const jobAmount = Number(orphan && orphan.jobAmount) || Number(currentJob && currentJob.amount) || 0;
+  const buyerAddress = (orphan && orphan.buyerPayAddress)
+    || (currentJob && (currentJob.buyerPayAddress || (currentJob.buyer && currentJob.buyer.payAddress)))
+    || null;
+  const buyerVerusId = (orphan && orphan.buyerVerusId)
+    || (currentJob && currentJob.buyerVerusId)
+    || null;
+  const currency = (orphan && orphan.currency) || (currentJob && currentJob.currency) || 'VRSC';
+  const agentInfoId = (orphan && orphan.agentInfoId) || null;
+
+  if (!(jobAmount > 0)) {
+    if (fetchFailed || !currentJob) return { action: 'keep' };
+    return { action: 'clear' };
+  }
+
+  const pct = Number.isFinite(Number(refundPercent)) ? Number(refundPercent) : 100;
+  const refundAmount = jobAmount * (pct / 100);
+  if (!(refundAmount > 0)) return { action: 'keep' };
+
+  const record = {
+    agentInfoId,
+    orphan: {
+      jobAmount,
+      buyerPayAddress: buyerAddress,
+      buyerVerusId,
+      currency,
+      agentInfoId,
+    },
+    refundAmount,
+    refundPercent: pct,
+    buyerAddress: buyerAddress || null,
+  };
+
+  if (buyerAddress) {
+    record.status = 'pending_approval';
+    record.reason = 'crash-recovery: job interrupted (dispatcher restart) — undelivered paid job';
+    return { action: 'refund', record };
+  }
+  if (buyerVerusId) {
+    record.status = 'needs_review';
+    record.reason = 'crash-recovery: paid job has no pay address — needs_review, not sent';
+    return { action: 'refund', record };
+  }
+  return { action: 'keep' };
+}
+
+/** Move a needs_review crash row to pending_approval once a pay address is known. */
+function promoteNeedsReview(entry, payAddress) {
+  if (!entry || entry.status !== 'needs_review' || !payAddress) return null;
+  const orphan = Object.assign({}, entry.orphan, { buyerPayAddress: payAddress });
+  return Object.assign({}, entry, {
+    status: 'pending_approval',
+    buyerAddress: payAddress,
+    orphan,
+    reason: 'crash-recovery: pay address found on a later read — pending approval, not sent',
+  });
+}
+
+module.exports = {
+  shouldRefundOrphan,
+  isRefundAlreadyHandled,
+  buildAbandonedJobRefund,
+  classifyCrashOrphan,
+  promoteNeedsReview,
+  FINISHED_STATUSES,
+};

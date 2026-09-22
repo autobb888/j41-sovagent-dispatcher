@@ -148,6 +148,7 @@ test('README CLI table lists buyer verbs that cli.js already registers', () => {
     ['chat', 'chat <buyer'],
     ['deposit', 'deposit <buyer'],
     ['browse', 'browse <seller'],
+    ['query', 'query <seller'],
     ['job-chat', 'job-chat <buyer'],
   ];
   for (const [cmd, tableCell] of verbs) {

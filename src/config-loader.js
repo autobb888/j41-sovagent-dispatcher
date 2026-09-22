@@ -36,11 +36,11 @@ const DEFAULTS = Object.freeze({
   proxy: {
     // Kimi-K3 TTFB on integrate.api.nvidia.com is 68–91s. 90s aborted the Mac
     // pong at ~92s. trycloudflare origin is ~100s.
-    upstream_timeout_ms: 95000,
-    // Buyer CLI chat omits max_tokens. NVIDIA reasoning NIMs then fill an
-    // unbounded CoT until the proxy abort → HTTP 504, no meter. 32 is enough
-    // for a pong and leaves headroom under trycloudflare's ~100s origin cutoff.
-    default_max_tokens: 32,
+    upstream_timeout_ms: 120000,
+    // Buyer CLI chat omits max_tokens. Kimi keeps thinking on, so 32 tokens
+    // finish with reason "length" and the buyer sees a cut sentence. 512 is
+    // enough for a short answer after that reasoning, and still bounded.
+    default_max_tokens: 512,
     estimated_input_tokens: 4000,
     estimated_output_tokens: 2000,
     // Worst-case reservation (audit H3): the buyer is admitted only if their

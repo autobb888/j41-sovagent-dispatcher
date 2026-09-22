@@ -10,7 +10,7 @@
 //   (c) produce NONE for a job already refunded OR already queued (idempotency).
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { buildAbandonedJobRefund } = require('../src/refund.js');
+const { buildAbandonedJobRefund, classifyCrashOrphan, promoteNeedsReview } = require('../src/refund.js');
 
 // The crash-recovery fields persistActiveJobs stores on an active-job entry.
 const paidJob = {
@@ -64,6 +64,52 @@ test('(b) an UNPAID abandoned job produces no refund record', () => {
   );
   // No job at all.
   assert.equal(buildAbandonedJobRefund(null, 'job-2', 100, new Set(), {}), null);
+});
+
+test('a crash with a pay address is pending_approval and a missing address is needs_review', () => {
+  const paid = classifyCrashOrphan({
+    orphan: { jobAmount: 4, buyerPayAddress: 'iBuyer', buyerVerusId: 'buyer@', agentInfoId: 'a1', currency: 'VRSCTEST' },
+    currentJob: { status: 'in_progress', amount: 4 },
+  });
+  assert.equal(paid.action, 'refund');
+  assert.equal(paid.record.status, 'pending_approval');
+  assert.equal(paid.record.buyerAddress, 'iBuyer');
+
+  const missing = classifyCrashOrphan({
+    orphan: { jobAmount: 4, buyerPayAddress: null, buyerVerusId: 'buyer@', agentInfoId: 'a1' },
+    currentJob: null,
+    fetchFailed: true,
+  });
+  assert.equal(missing.action, 'refund');
+  assert.equal(missing.record.status, 'needs_review');
+  assert.equal(missing.record.buyerAddress, null);
+  assert.equal(missing.record.orphan.buyerVerusId, 'buyer@');
+
+  const unknown = classifyCrashOrphan({
+    orphan: { jobAmount: null, buyerPayAddress: null, buyerVerusId: null },
+    currentJob: null,
+    fetchFailed: true,
+  });
+  assert.equal(unknown.action, 'keep');
+
+  const delivered = classifyCrashOrphan({
+    orphan: { jobAmount: 4, buyerPayAddress: 'iBuyer', buyerVerusId: 'buyer@' },
+    currentJob: { status: 'delivered', amount: 4 },
+  });
+  assert.equal(delivered.action, 'clear');
+});
+
+test('a later pay address promotes needs_review to pending_approval', () => {
+  const row = classifyCrashOrphan({
+    orphan: { jobAmount: 4, buyerVerusId: 'buyer@', agentInfoId: 'a1', currency: 'VRSCTEST' },
+    fetchFailed: true,
+  }).record;
+  assert.equal(promoteNeedsReview(row, null), null);
+  const next = promoteNeedsReview(row, 'iBuyer');
+  assert.equal(next.status, 'pending_approval');
+  assert.equal(next.buyerAddress, 'iBuyer');
+  assert.equal(next.orphan.buyerPayAddress, 'iBuyer');
+  assert.equal(promoteNeedsReview(next, 'iOther'), null);
 });
 
 test('(c) an already-refunded OR already-queued job produces no refund record', () => {

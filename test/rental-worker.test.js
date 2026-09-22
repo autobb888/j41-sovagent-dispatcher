@@ -250,14 +250,14 @@ test('stopRentalJob releases the lease, returns the agent, and never touches con
   assert.equal(state.available[0] && state.available[0].id, 'gpu-1');
 });
 
-test('shouldTeardownRental yanks on cancel/dispute-terminal or expired/gone lease, not on delivered', () => {
+test('shouldTeardownRental releases on completed or cancel, and keeps a delivered lease until expiry', () => {
   const lease = { id: 'home:1', jobId: 'job-1', state: 'ready', expiresAt: 5000 };
   const state = {
     computeSupply: { getLeases() { return [lease]; } },
   };
   const active = { kind: 'gpu-rental', leaseId: 'home:1' };
   assert.equal(shouldTeardownRental({ state, jobId: 'job-1', active, job: { status: 'delivered' }, now: 1000 }), false);
-  assert.equal(shouldTeardownRental({ state, jobId: 'job-1', active, job: { status: 'completed' }, now: 1000 }), false);
+  assert.equal(shouldTeardownRental({ state, jobId: 'job-1', active, job: { status: 'completed' }, now: 1000 }), true);
   assert.equal(shouldTeardownRental({ state, jobId: 'job-1', active, job: { status: 'cancelled' }, now: 1000 }), true);
   assert.equal(shouldTeardownRental({ state, jobId: 'job-1', active, job: { status: 'resolved' }, now: 1000 }), true);
   assert.equal(shouldTeardownRental({ state, jobId: 'job-1', active, job: { status: 'in_progress' }, now: 1000 }), false);

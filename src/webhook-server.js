@@ -6,7 +6,9 @@
  * This allows O(1) secret lookup instead of iterating all secrets.
  */
 
+const fs = require('fs');
 const http = require('http');
+const path = require('path');
 const { verifyWebhookSignature, verifyWebhookSignatureWithTimestamp } = require('@junction41/sovagent-sdk/dist/webhook/verify.js');
 const { handleProxyRequest } = require('./proxy-handler.js');
 
@@ -110,10 +112,16 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
   //   - timeout: idle connection timeout
   //   - maxConnections: hard cap on concurrent TCP connections
   const HEADERS_TIMEOUT_MS = Number(process.env.J41_WEBHOOK_HEADERS_TIMEOUT_MS || 30_000);
-  // Must sit above proxy.upstream_timeout_ms so a NIM abort can still write 504
-  // before this server kills the socket. trycloudflare origin is ~100s.
-  const REQUEST_TIMEOUT_MS = Number(process.env.J41_WEBHOOK_REQUEST_TIMEOUT_MS || 99_000);
-  const IDLE_TIMEOUT_MS = Number(process.env.J41_WEBHOOK_IDLE_TIMEOUT_MS || 120_000);
+  // Must sit above proxy.upstream_timeout_ms so a NIM abort can still finish
+  // the response before this server kills the socket. Kimi's first byte is
+  // often past 95s. Streaming requests emit keepalive comments so Cloudflare's
+  // ~100s idle cut does not turn that wait into a 502.
+  const REQUEST_TIMEOUT_MS = Number(process.env.J41_WEBHOOK_REQUEST_TIMEOUT_MS || 150_000);
+  // Non-stream chat writes nothing until NVIDIA finishes. server.timeout is
+  // socket inactivity, so 120s idle killed a slow Kimi body at the same moment
+  // the 120s upstream abort wanted to return 504. Sit above that wait plus the
+  // proxy drain. Override with J41_WEBHOOK_IDLE_TIMEOUT_MS.
+  const IDLE_TIMEOUT_MS = Number(process.env.J41_WEBHOOK_IDLE_TIMEOUT_MS || 300_000);
   const MAX_CONNECTIONS = Number(process.env.J41_WEBHOOK_MAX_CONNECTIONS || 512);
 
   const server = http.createServer(async (req, res) => {
@@ -126,6 +134,24 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
         agents: agentWebhooks.size,
         proxy: !!proxyContext,
       }));
+      return;
+    }
+
+    // Fixed dataset for the local data seller. One file, no path parameters.
+    const datasetPath = (req.url || '').split('?')[0];
+    if (req.method === 'GET' && datasetPath === '/j41/datasets/orchard-apples.json') {
+      try {
+        const file = path.join(__dirname, '..', 'templates', 'orchard-apples.json');
+        const body = fs.readFileSync(file);
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'public, max-age=60',
+        });
+        res.end(body);
+      } catch {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'dataset missing' }));
+      }
       return;
     }
 

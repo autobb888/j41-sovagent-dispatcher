@@ -108,7 +108,7 @@ const { EgressProxyHost, deriveAllowedHosts, isolatedGatewayIp, EGRESS_PROXY_POR
 const { defaultExecutors, expiryForIdentity } = require('./broker-executors.js');
 const { findMainnetSecurityViolations, resolveIsMainnet } = require('./mainnet-guard.js');
 const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, liveLogPath, archiveLogPath } = require('./job-log.js');
-const { shouldRefundOrphan, isRefundAlreadyHandled, buildAbandonedJobRefund } = require('./refund.js');
+const { shouldRefundOrphan, isRefundAlreadyHandled, buildAbandonedJobRefund, classifyCrashOrphan, promoteNeedsReview } = require('./refund.js');
 const { isValidJobId } = require('./job-id.js');
 const { verifyInboxJobRecord } = require('./inbox-job-record.js');
 const { writeKeysFile, readKeysFile } = require('./keys-file.js');
@@ -298,10 +298,18 @@ const {
   labourServicesOrEmpty,
   assertApiSetupKind,
 } = require('./listing-kind.js');
-const { refuseDataListingDescriptions } = require('./listing-description.js');
+const { refuseDataListingDescriptions, refuseDataListingUrls } = require('./listing-description.js');
 
 function assertDataDescriptions(kind, identity, descriptions) {
   const err = refuseDataListingDescriptions({ kind, identity, descriptions });
+  if (err) {
+    console.error(`❌ ${err.message}`);
+    process.exit(1);
+  }
+}
+
+function assertDataUrls(kind, identity, urls) {
+  const err = refuseDataListingUrls({ kind, identity, urls });
   if (err) {
     console.error(`❌ ${err.message}`);
     process.exit(1);
@@ -3332,7 +3340,8 @@ program
       }
       if (hasData) {
         console.log('  Data identities are browse-only (DATA_NOT_HIREABLE) even with 0 services.');
-        console.log('  Browse: j41-dispatcher browse <seller>');
+        console.log('  Browse: j41-dispatcher browse <seller> [--query limit=50&offset=0]');
+        console.log('  Query:  j41-dispatcher query <seller> [--where color=red] [--select kind,taste]');
       }
       if (hasHire) console.log('  Buyer ids: j41-dispatcher buyers\n');
       else console.log('');
@@ -3934,7 +3943,8 @@ program
       });
     }
     if (chat.result && chat.result.sessionId) {
-      persistGrantSession(AGENTS_DIR, buyerAgentId, seller, chat.result.sessionId);
+      const { sessionTokenFromHeader } = require('./session-token');
+      persistGrantSession(AGENTS_DIR, buyerAgentId, seller, sessionTokenFromHeader(chat.result.sessionId));
     }
     const body = chat.result && chat.result.body;
     const text = body && body.choices && body.choices[0] && body.choices[0].message
@@ -4179,7 +4189,8 @@ program
 program
   .command('browse <seller>')
   .description('GET a data listing website/endpoints (not a hire)')
-  .option('--path <path>', 'Append when the listing URL has no path')
+  .option('--path <path>', 'Append when the listing URL has no path. A URL that already has a path keeps it.')
+  .option('--query <params>', 'Merge key=value&... onto the listing URL. Empty and repeated keys are refused.')
   .option('--json', 'One JSON object on stdout')
   .action(async (seller, options) => {
     const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
@@ -4187,6 +4198,7 @@ program
     const r = await browseSeller({
       seller,
       path: options.path,
+      query: options.query,
       apiUrl: J41_API_URL,
     });
     if (!r.ok) fail(r.code, r.message, { url: r.url, status: r.status });
@@ -4202,6 +4214,64 @@ program
         status: r.status,
         body: r.body,
       }, null, 2));
+    }
+  });
+
+program
+  .command('query <seller>')
+  .description('Query a data listing JSON collection (not a hire). Equality filters are sent to the seller URL and applied again to the rows.')
+  .option('--where <expr>', 'field=value, or !=, ~=, >, <, >=, <=. Repeat to AND.', (value, acc) => { acc.push(value); return acc; }, [])
+  .option('--q <text>', 'Search text. Sent as q= and matched against row fields.')
+  .option('--select <fields>', 'Comma-separated fields to keep')
+  .option('--sort <field>', 'Field name, or -field for descending')
+  .option('--limit <n>', 'Page size, 1 to 200 (default 20)')
+  .option('--offset <n>', 'Rows to skip after the filter (default 0)')
+  .option('--path <path>', 'Append when the listing URL has no path')
+  .option('--json', 'One JSON object on stdout, including scanned and matched counts')
+  .action(async (seller, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const { browseSeller } = require('./buyer-browse');
+    const { planDataQuery, runDataQuery } = require('./data-query');
+    const plan = planDataQuery({
+      where: options.where,
+      q: options.q,
+      select: options.select,
+      sort: options.sort,
+      limit: options.limit,
+      offset: options.offset,
+    });
+    if (!plan.ok) fail(plan.code, plan.message);
+    const fetched = await browseSeller({
+      seller,
+      path: options.path,
+      query: plan.serverQuery,
+      apiUrl: J41_API_URL,
+    });
+    if (!fetched.ok) fail(fetched.code, fetched.message, { url: fetched.url, status: fetched.status });
+    const result = runDataQuery({
+      body: fetched.body,
+      where: plan.where,
+      q: plan.q,
+      select: plan.select,
+      sort: plan.sort,
+      limit: plan.limit,
+      offset: plan.offset,
+    });
+    if (!result.ok) fail(result.code, result.message, { url: fetched.url });
+    const payload = {
+      ok: true,
+      seller,
+      url: fetched.url,
+      scanned: result.scanned,
+      matched: result.matched,
+      returned: result.returned,
+      rows: result.rows,
+    };
+    if (options.json) {
+      console.log(JSON.stringify(payload, null, 2));
+    } else {
+      console.error(`${seller}: ${result.returned} returned, ${result.matched} matched, ${result.scanned} scanned`);
+      process.stdout.write(`${JSON.stringify(result.rows, null, 2)}\n`);
     }
   });
 
@@ -4325,6 +4395,10 @@ program
     }
 
     assertDataDescriptions(keys.kind, keys.identity, [options.description]);
+    assertDataUrls(keys.kind, keys.identity, [
+      options.profileWebsite,
+      ...(options.networkEndpoints ? options.networkEndpoints.split(',') : []),
+    ]);
 
     // Map CLI flags to VDXF field names
     const fieldsToUpdate = {};
@@ -5231,6 +5305,11 @@ program
     let config = {};
     try { if (fs.existsSync(configPath)) config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch {}
 
+    let allowHosts = [];
+    try {
+      const saved = loadDispatcherConfig().runtime.webhook_url;
+      if (saved) allowHosts.push(new URL(saved).hostname);
+    } catch { /* a missing webhook does not allow tunnel URLs */ }
     let plan;
     try {
       plan = planDataSetup({
@@ -5239,6 +5318,7 @@ program
         website: options.website,
         networkEndpoints: options.networkEndpoints,
         description: options.description,
+        allowHosts,
       });
     } catch (e) {
       console.error(`✗ ${e.message}`);
@@ -6563,6 +6643,36 @@ program
                 console.warn(`[API] ${a.id}: could not persist publicUrl from --webhook-url: ${e.message}`);
               }
             }
+            // Buyer chat refreshes a stale grant from the listing, not from this file.
+            if (a.kind === 'model' && webhookUrl) {
+              const { listingPublicUrlStale, livePublicUrlFields } = require('./model-public-url');
+              const published = {
+                website: vdxfWebsite,
+                networkEndpoints: Array.isArray(vdxfEndpoints) ? vdxfEndpoints : [],
+              };
+              if (listingPublicUrlStale(published, webhookUrl)) {
+                try {
+                  const { removeAndRewriteVdxfFields } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
+                  const session = await getAgentSession(state, a);
+                  const fields = livePublicUrlFields(webhookUrl);
+                  console.log(`[API] ${a.id}: publishing live public URL (${fields.profileWebsite})`);
+                  await removeAndRewriteVdxfFields({
+                    agent: session,
+                    identityName: a.identity,
+                    fieldsToUpdate: fields,
+                    chain: J41_NETWORK,
+                    wif: a.wif,
+                    onProgress: (msg) => console.log(`  ${a.id}: ${msg}`),
+                  });
+                  try {
+                    const client = session._client || session.client;
+                    if (client && a.iAddress) await client.refreshAgent(a.iAddress);
+                  } catch {}
+                } catch (e) {
+                  console.warn(`[API] ${a.id}: could not publish public URL: ${e.message}`);
+                }
+              }
+            }
             let publicUrl;
             for (const c of [
               webhookUrl,
@@ -6871,8 +6981,8 @@ program
             const agent = await getAgentSession(state, agentInfo);
             const count = await agent.client.getInboxCount();
             if (count.pending > 0) {
-              console.log(`[Safety] ${agentInfo.id}: ${count.pending} pending inbox items — triggering poll`);
-              await pollForJobs(state);
+              console.log(`[Safety] ${agentInfo.id}: ${count.pending} pending inbox items — triggering inbox sweep`);
+              await checkPendingInbox(state);
               break;
             }
           } catch {
@@ -6884,6 +6994,13 @@ program
       // Cheap poll in addition to the HTTP receiver. Do not add this in poll
       // mode — that branch already starts the 60s loop below.
       safeInterval(() => pollForJobs(state), pollInterval, 'Poll');
+
+      // Reviews are accepted here, not inside the job container. A missed
+      // review.received webhook (the platform could not resolve the tunnel at
+      // boot) must not leave the seller inbox pending until restart.
+      const reviewInterval = Math.max(60000, agentCount * 1000);
+      console.log(`  Inbox sweep: every ${Math.round(reviewInterval / 1000)}s`);
+      safeInterval(() => checkPendingInbox(state), reviewInterval, 'Inbox');
 
     } else {
       // ── POLL MODE (default — works behind NAT) ──
@@ -8321,6 +8438,11 @@ async function loadAgentCapabilities(state, agentInfo) {
         } catch {}
 
         for (const svc of services) {
+          // A public networkEndpoints entry is the dispatcher tunnel, not an
+          // LLM upstream. Stamping it onto labour and gpu-rental services makes
+          // health probe a dead trycloudflare host and registers those sellers
+          // as API proxies. Only a real api-endpoint service is upstream.
+          if (svc.serviceType !== 'api-endpoint' && !svc.endpointUrl) continue;
           svc._isApiEndpoint = true;
           // Priority: agent-config > on-chain VDXF networkEndpoints
           if (!svc.endpointUrl) svc.endpointUrl = agentConfigEndpoint || onChainEndpoint;
@@ -10113,7 +10235,59 @@ async function refundsApproveAll(state, opts = {}, ledgerPath) {
  * Handle crash recovery: detect orphaned jobs from active-jobs.json,
  * issue refunds for interrupted jobs, clean up Docker containers.
  */
+async function ensurePayee(state, agentInfo, job) {
+  const out = {
+    jobAmount: Number(job && job.amount) || 0,
+    buyerPayAddress: (job && (job.buyerPayAddress || (job.buyer && job.buyer.payAddress))) || null,
+    buyerVerusId: (job && (job.buyerVerusId || (job.buyer && job.buyer.verusId))) || null,
+    currency: (job && job.currency) || 'VRSC',
+  };
+  if (out.buyerPayAddress || !job || !job.id || !agentInfo) return out;
+  try {
+    const agent = await getAgentSession(state, agentInfo);
+    const full = await agent.client.getJob(job.id);
+    if (full) {
+      out.buyerPayAddress = full.buyerPayAddress || (full.buyer && full.buyer.payAddress) || null;
+      out.buyerVerusId = out.buyerVerusId || full.buyerVerusId || null;
+      if (!(out.jobAmount > 0) && full.amount) out.jobAmount = Number(full.amount) || 0;
+    }
+  } catch (e) {
+    console.warn(`[Payee] ${String(job.id).substring(0, 8)} pay address missing and getJob failed: ${e.message}`);
+  }
+  return out;
+}
+
+async function promoteCrashRefunds(state) {
+  const pending = loadPendingRefunds();
+  let changed = false;
+  for (const [jobId, entry] of Object.entries(pending || {})) {
+    if (!entry || entry.status !== 'needs_review') continue;
+    const agentInfo = (state.agents || []).find((a) => a && a.id === entry.agentInfoId);
+    if (!agentInfo) continue;
+    let job = null;
+    try {
+      const agent = await getAgentSession(state, agentInfo);
+      job = await agent.client.getJob(jobId);
+    } catch (e) {
+      console.warn(`[refund] needs_review ${jobId.substring(0, 8)}: ${e.message}`);
+      continue;
+    }
+    if (job && !shouldRefundOrphan(job)) {
+      console.log(`[refund] ${jobId.substring(0, 8)} is ${job.status} — leaving needs_review`);
+      continue;
+    }
+    const addr = job && (job.buyerPayAddress || (job.buyer && job.buyer.payAddress));
+    const next = promoteNeedsReview(entry, addr);
+    if (!next) continue;
+    pending[jobId] = next;
+    changed = true;
+    console.log(`[refund] ${jobId.substring(0, 8)} pay address found — pending_approval (refunds approve still required)`);
+  }
+  if (changed) savePendingRefunds(pending);
+}
+
 async function handleCrashRecovery(state) {
+  await promoteCrashRefunds(state);
   const orphanedJobs = loadActiveJobs();
   const jobIds = Object.keys(orphanedJobs);
   if (jobIds.length === 0) return;
@@ -10132,8 +10306,47 @@ async function handleCrashRecovery(state) {
 
   // ── Step 1: build the set of jobs that need a refund ────────────────────
   const pendingRefunds = {};
+  const keep = new Map();
 
   const alreadyRefunded = loadRefundedJobs();
+
+  async function killOrphanContainer(jobId) {
+    if (RUNTIME !== 'docker') return;
+    try {
+      const Docker = require('dockerode');
+      const docker = new Docker();
+      const containers = await docker.listContainers({
+        all: true,
+        filters: { label: [`j41.job.id=${jobId}`] },
+      });
+      for (const containerInfo of containers) {
+        try {
+          const container = docker.getContainer(containerInfo.Id);
+          await container.stop().catch(() => {});
+          await container.remove().catch(() => {});
+          console.log(`    🗑️  Removed container ${containerInfo.Id.substring(0, 12)}`);
+        } catch (e) {
+          console.log(`    ⚠️  Container cleanup failed: ${e.message}`);
+        }
+      }
+    } catch (e) {
+      console.log(`    ⚠️  Docker cleanup failed: ${e.message}`);
+    }
+  }
+
+  function applyCrashDecision(jobId, orphan, decision) {
+    if (!decision || decision.action === 'keep') {
+      keep.set(jobId, orphan);
+      console.log(`    ⚠️  Keeping ${jobId.substring(0, 8)} in active-jobs — no refund row yet`);
+      return;
+    }
+    if (decision.action === 'refund' && decision.record) {
+      pendingRefunds[jobId] = decision.record;
+      const tag = decision.record.status === 'needs_review' ? 'needs_review (not sent)' : 'pending_approval';
+      console.log(`    [refund] ${jobId.substring(0, 8)} → ${tag}`);
+      return;
+    }
+  }
 
   for (const jobId of jobIds) {
     const orphan = orphanedJobs[jobId];
@@ -10154,81 +10367,51 @@ async function handleCrashRecovery(state) {
     try {
       // Find the agent session
       const agentInfo = state.agents.find(a => a.id === orphan.agentInfoId);
+      const policy = agentInfo && state.disputePolicy?.get(agentInfo.id);
+      const refundPercent = policy?.systemCrashRefund ?? 100;
       if (!agentInfo) {
-        console.log(`    ⚠️  Agent ${orphan.agentInfoId} not found — skipping`);
+        console.log(`    ⚠️  Agent ${orphan.agentInfoId} not found — classifying from the saved row`);
+        applyCrashDecision(jobId, orphan, classifyCrashOrphan({
+          orphan, currentJob: null, fetchFailed: true, refundPercent,
+        }));
         continue;
       }
 
       const agent = await getAgentSession(state, agentInfo);
 
-      // Query platform for current job state
-      let currentJob;
+      // Query platform for current job state. A fetch failure is not a reason
+      // to forget a paid job: classify from the saved amount and identity.
+      let currentJob = null;
+      let fetchFailed = false;
       try {
         currentJob = await agent.client.getJob(jobId);
       } catch (e) {
         console.log(`    ⚠️  Could not fetch job status: ${e.message}`);
-        if (orphan.jobAmount && orphan.buyerPayAddress) {
-          console.log(`    Using persisted data for refund`);
-          currentJob = { status: 'in_progress', amount: orphan.jobAmount };
-        } else {
-          continue;
+        fetchFailed = true;
+        if (orphan.jobAmount || orphan.buyerPayAddress || orphan.buyerVerusId) {
+          currentJob = {
+            status: 'in_progress',
+            amount: orphan.jobAmount,
+            buyerPayAddress: orphan.buyerPayAddress,
+            buyerVerusId: orphan.buyerVerusId,
+            currency: orphan.currency,
+          };
         }
       }
 
       // 'delivered' is terminal here: the work was delivered (and payment earned),
       // so a dispatcher restart must NOT auto-refund it — that would make the
       // operator eat the compute AND the payout. Disputes handle disagreements.
-      if (!shouldRefundOrphan(currentJob)) {
-        console.log(`    ✅ Job already ${currentJob.status} — cleaning up`);
-        continue;
-      }
-
-      // Job was interrupted — queue for refund
-      const policy = state.disputePolicy?.get(agentInfo.id);
-      const refundPercent = policy?.systemCrashRefund ?? 100;
-      const jobAmount = orphan.jobAmount || currentJob.amount || 0;
-      const refundAmount = jobAmount * (refundPercent / 100);
-      const buyerAddress = orphan.buyerPayAddress || currentJob.buyerPayAddress;
-
-      if (refundAmount > 0 && buyerAddress) {
-        pendingRefunds[jobId] = {
-          agentInfoId: orphan.agentInfoId,
-          orphan,
-          refundAmount,
-          refundPercent,
-          buyerAddress,
-          status: 'pending_approval',
-          reason: 'crash-recovery: job interrupted (dispatcher restart) — undelivered paid job',
-        };
+      const decision = classifyCrashOrphan({ orphan, currentJob, fetchFailed, refundPercent });
+      if (decision.action === 'clear') {
+        console.log(`    ✅ Job already ${currentJob && currentJob.status ? currentJob.status : 'not refundable'} — cleaning up`);
       } else {
-        console.log(`    ⚠️  Cannot issue refund — missing amount (${jobAmount}) or address (${untrusted(buyerAddress, 60)})`);
+        applyCrashDecision(jobId, orphan, decision);
       }
-
-      // Kill orphaned Docker containers
-      if (RUNTIME === 'docker') {
-        try {
-          const Docker = require('dockerode');
-          const docker = new Docker();
-          const containers = await docker.listContainers({
-            all: true,
-            filters: { label: [`j41.job.id=${jobId}`] },
-          });
-          for (const containerInfo of containers) {
-            try {
-              const container = docker.getContainer(containerInfo.Id);
-              await container.stop().catch(() => {});
-              await container.remove().catch(() => {});
-              console.log(`    🗑️  Removed container ${containerInfo.Id.substring(0, 12)}`);
-            } catch (e) {
-              console.log(`    ⚠️  Container cleanup failed: ${e.message}`);
-            }
-          }
-        } catch (e) {
-          console.log(`    ⚠️  Docker cleanup failed: ${e.message}`);
-        }
-      }
+      if (decision.action === 'refund') await killOrphanContainer(jobId);
     } catch (e) {
       console.error(`  ❌ Recovery failed for ${jobId.substring(0, 8)}: ${e.message}`);
+      if (!pendingRefunds[jobId]) keep.set(jobId, orphan);
     }
   }
 
@@ -10245,20 +10428,30 @@ async function handleCrashRecovery(state) {
   // Use `j41-dispatcher refunds approve <jobId>` to approve and send.
   for (const jobId of Object.keys(pendingRefunds)) {
     const entry = pendingRefunds[jobId];
-    state.emitEvent?.('refund.pending_approval', {
+    const eventType = entry.status === 'needs_review' ? 'refund.needs_review' : 'refund.pending_approval';
+    state.emitEvent?.(eventType, {
       jobId,
       agentId: entry.agentInfoId,
       amount: entry.refundAmount,
       buyerAddress: entry.buyerAddress,
+      buyerVerusId: entry.orphan && entry.orphan.buyerVerusId,
       reason: entry.reason,
     });
-    console.log('  [refund] ⏸️  Queued for owner approval (j41-dispatcher refunds approve): ' + jobId.substring(0, 8) + ' → ' + entry.buyerAddress);
+    if (entry.status === 'needs_review') {
+      console.log('  [refund] ⏸️  needs_review (not sent, pay address missing): ' + jobId.substring(0, 8)
+        + ' identity ' + untrusted(entry.orphan && entry.orphan.buyerVerusId, 60));
+    } else {
+      console.log('  [refund] ⏸️  Queued for owner approval (j41-dispatcher refunds approve): ' + jobId.substring(0, 8) + ' → ' + entry.buyerAddress);
+    }
   }
 
-  // ── Step 4: clear the active-jobs ledger (orphans are now handled) ───────
-  // This ONLY clears active-jobs.json. pending-refunds.json retains any unsent
-  // refunds so they survive the next crash without duplication.
-  persistActiveJobs(new Map());
+  // ── Step 4: drop only the rows that now have a ledger entry or are terminal.
+  // A job with neither pending_approval nor needs_review stays in active-jobs.
+  const keepMap = new Map(keep);
+  persistActiveJobs(keepMap);
+  if (keepMap.size) {
+    console.log(`[Crash] kept ${keepMap.size} job(s) in active-jobs — no refund row yet`);
+  }
   console.log(`✅ Crash recovery complete\n`);
 }
 
@@ -10407,17 +10600,22 @@ async function handleExtensionRequest(state, jobId, extensionId, agentInfo, amou
   try {
     const agent = await getAgentSession(state, agentInfo);
     if (canApprove) {
+      if (state._extensionQueued) state._extensionQueued.delete(extensionId);
       await agent.client.approveExtension(jobId, extensionId);
       console.log(`[Extension] Auto-approved ${extensionId.substring(0, 8)} for job ${jobId.substring(0, 8)} (queue=0, slots=${MAX_AGENTS - state.active.size}, load=${loadAvg1m.toFixed(1)}/${cpuCount}, mem=${Math.round(freeMem / 1024 / 1024)}MB)`);
-    } else {
-      const reasons = [];
-      if (!queueEmpty) reasons.push(`queue=${state.queue.length}`);
-      if (!slotsOpen) reasons.push('no slots');
-      if (!cpuOk) reasons.push(`load=${loadAvg1m.toFixed(1)}/${cpuCount}`);
-      if (!memOk) reasons.push(`mem=${Math.round(freeMem / 1024 / 1024)}MB`);
-      await agent.client.rejectExtension(jobId, extensionId);
-      console.log(`[Extension] Rejected ${extensionId.substring(0, 8)} for job ${jobId.substring(0, 8)} — ${reasons.join(', ')}`);
+      return { deferred: false };
     }
+    const reasons = [];
+    if (!queueEmpty) reasons.push(`queue=${state.queue.length}`);
+    if (!slotsOpen) reasons.push('no slots');
+    if (!cpuOk) reasons.push(`load=${loadAvg1m.toFixed(1)}/${cpuCount}`);
+    if (!memOk) reasons.push(`mem=${Math.round(freeMem / 1024 / 1024)}MB`);
+    if (!state._extensionQueued) state._extensionQueued = new Set();
+    if (!state._extensionQueued.has(extensionId)) {
+      state._extensionQueued.add(extensionId);
+      console.log(`[Extension] Queued ${extensionId.substring(0, 8)} for job ${jobId.substring(0, 8)} — ${reasons.join(', ')}. Approves when a slot is free.`);
+    }
+    return { deferred: true };
   } catch (e) {
     console.error(`[Extension] Failed to handle ${extensionId.substring(0, 8)}: ${e.message}`);
   }
@@ -10669,11 +10867,13 @@ async function pollForJobs(state) {
           continue;
         }
 
-        // Mark seen BEFORE starting to prevent duplicate spawns from concurrent polls.
-        // If start throws (stale GPU lock, attach 402, …) unsee so the next poll retries
-        // a paid job instead of leaving it stranded in seen with no jail.
+        // Mark seen in memory BEFORE starting so a concurrent poll cannot spawn
+        // the same paid job twice. Persist that mark only once the job is in
+        // state.active. The capacity queue is memory-only; writing seen-jobs.json
+        // here made a restart skip a paid job that never started, for 7 days.
+        // startJobContainer catches spawn errors and returns, so a missing
+        // active row is the same failure as a throw.
         state.seen.set(job.id, Date.now());
-        saveSeenJobs(state.seen);
 
         if (state.active.size >= MAX_AGENTS) {
           console.log(`   → Queueing (max capacity, ${job.amount || '?'} ${job.currency || NATIVE_COIN})`);
@@ -10686,6 +10886,13 @@ async function pollForJobs(state) {
             state.seen.delete(job.id);
             try { saveSeenJobs(state.seen); } catch { /* retry path still live in memory */ }
             throw startErr;
+          }
+          if (!state.active.has(job.id)) {
+            state.seen.delete(job.id);
+            try { saveSeenJobs(state.seen); } catch { /* next poll retries */ }
+            console.error(`[Poll] Job ${job.id} did not start — leaving it unseen so the next poll retries`);
+          } else {
+            try { saveSeenJobs(state.seen); } catch { /* in-memory seen still blocks a double start */ }
           }
         }
       }
@@ -10818,8 +11025,10 @@ async function pollForJobs(state) {
       if (pending?.length > 0) {
         for (const ext of pending) {
           if (state._lastExtensionCheck.has(ext.id)) continue;
-          state._lastExtensionCheck.set(ext.id, { ts: Date.now(), jobId });
-          await handleExtensionRequest(state, jobId, ext.id, activeInfo.agentInfo, ext.amount);
+          const decision = await handleExtensionRequest(state, jobId, ext.id, activeInfo.agentInfo, ext.amount);
+          if (!decision || decision.deferred !== true) {
+            state._lastExtensionCheck.set(ext.id, { ts: Date.now(), jobId });
+          }
         }
       }
       // A PAID rental extension must reach the lease even if the webhook never arrived:
@@ -11729,6 +11938,13 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
     console.warn(`[Inbox] ${String(f.id).substring(0, 8)} written on-chain but ack failed (uncounted): ${f.error}`);
   }
   if (res.acked.length > 0) {
+    const typeById = new Map(batch.map((b) => [b.id, b.type]));
+    for (const id of res.acked) {
+      const type = typeById.get(id);
+      if (type === 'review') console.log(`[Inbox] ✅ Review accepted ${id}`);
+      else if (type === 'attestation') console.log(`[Inbox] ✅ Attestation accepted ${id}`);
+      else if (type === 'job_record') console.log(`[Inbox] ✅ Job record accepted ${id}`);
+    }
     console.log(`[Inbox] ✅ ${agentInfo.id}: ${res.acked.length} item(s) accepted${res.txid ? ` in tx ${String(res.txid).slice(0, 8)}` : ' (already on-chain)'}`);
   }
   return res;
@@ -12029,7 +12245,7 @@ function loadAgentConfig(agentId) {
 // cfg.provider_keys (NOT process.env), so the dispatcher process can run
 // without provider keys in its own environment.
 function buildContainerEnv(job, agentInfo, agentCfg, canaryToken, jobDir, keysPath) {
-  const { LLM_PRESETS } = require('./executors/local-llm.js');
+  const { LLM_PRESETS, labourMaxTokens } = require('./executors/local-llm.js');
   // Per-agent override > global cfg
   const provider = (agentCfg && agentCfg.llmProvider) || cfg.llm.provider || '';
   const preset = LLM_PRESETS[provider];
@@ -12065,6 +12281,12 @@ function buildContainerEnv(job, agentInfo, agentCfg, canaryToken, jobDir, keysPa
     J41_LLM_MODEL: model,
     J41_LLM_API_KEY: apiKey,
   };
+
+  const configuredMax = (agentCfg && (agentCfg.llmMaxTokens || agentCfg.llm_max_tokens))
+    || process.env.J41_LLM_MAX_TOKENS;
+  if (configuredMax != null && String(configuredMax).trim() !== '') {
+    env.J41_LLM_MAX_TOKENS = String(labourMaxTokens({ J41_LLM_MAX_TOKENS: String(configuredMax) }));
+  }
 
   // Also populate the preset-specific env-key (e.g. OPENAI_API_KEY) for
   // executors that look it up by preset.envKey rather than the generic name.
@@ -12581,6 +12803,7 @@ async function startJobContainer(state, job, agentInfo) {
     // IPC that was "already sent" to a process that no longer exists.
     state._lastSentStatus.delete(job.id);
 
+    const payee = await ensurePayee(state, agentInfo, job);
     state.active.set(job.id, {
       agentId: agentInfo.id,
       job,
@@ -12589,9 +12812,10 @@ async function startJobContainer(state, job, agentInfo) {
       agentInfo,
       workspaceNotified: false,
       workspaceChecked: false,
-      jobAmount: job.amount || 0,
-      buyerPayAddress: job.buyerPayAddress || job.buyer?.payAddress || null,
-      currency: job.currency || 'VRSC',
+      jobAmount: payee.jobAmount || job.amount || 0,
+      buyerPayAddress: payee.buyerPayAddress,
+      buyerVerusId: payee.buyerVerusId,
+      currency: payee.currency || job.currency || 'VRSC',
       agentInfoId: agentInfo.id,
       reworkCount: 0,
       reactivationFee: job.lifecycle?.reactivationFee ?? null,
@@ -13042,6 +13266,7 @@ async function startJobLocal(state, job, agentInfo) {
     // last-sent status must not suppress the next transition message.
     state._lastSentStatus.delete(job.id);
 
+    const payee = await ensurePayee(state, agentInfo, job);
     state.active.set(job.id, {
       agentId: agentInfo.id,
       job,
@@ -13053,9 +13278,10 @@ async function startJobLocal(state, job, agentInfo) {
       workspaceChecked: false,
       pauseTTL: job.lifecycle?.pauseTTL || 60,
       pauseTtlMin: job.lifecycle?.pauseTTL || 60,
-      jobAmount: job.amount || 0,
-      buyerPayAddress: job.buyerPayAddress || job.buyer?.payAddress || null,
-      currency: job.currency || 'VRSC',
+      jobAmount: payee.jobAmount || job.amount || 0,
+      buyerPayAddress: payee.buyerPayAddress,
+      buyerVerusId: payee.buyerVerusId,
+      currency: payee.currency || job.currency || 'VRSC',
       agentInfoId: agentInfo.id,
       reworkCount: 0,
       _logStream: logStream,
@@ -13204,6 +13430,9 @@ async function startRentalJobWired(state, job, agentInfo) {
   const { createLocalSigner } = require('./job-signer');
   const signer = createLocalSigner({ wif: agentInfo.wif, network: J41_NETWORK });
   const agentCfg = loadAgentConfig(agentInfo.id);
+  const payee = await ensurePayee(state, agentInfo, job);
+  if (!job.buyerPayAddress && payee.buyerPayAddress) job.buyerPayAddress = payee.buyerPayAddress;
+  if (!job.buyerVerusId && payee.buyerVerusId) job.buyerVerusId = payee.buyerVerusId;
   await startRentalJob({
     state,
     job,

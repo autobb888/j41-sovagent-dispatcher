@@ -216,6 +216,7 @@ from an ordinary failure.
 | `chat <buyer-id> <seller>` | **Buyer:** OpenAI-compatible chat against a model grant (`--message`). Runs `access` if none saved |
 | `deposit <buyer-id> <seller>` | **Buyer:** send VRSC to the seller i-address and POST `/j41/deposit/report` (API credit). `--amount` required. Distinct from seller `deposits` (0-conf anomalies) |
 | `browse <seller>` | **Buyer:** GET a data listing `website` / `networkEndpoints[0]` (not a hire) |
+| `query <seller>` | **Buyer:** filter a data listing's JSON rows (`--where`, `--q`, `--select`). Not a hire |
 | `job-chat <buyer-id> <job-id>` | **Buyer:** signed labour job chat (not model grant `chat`). POST `{ content, signature, timestamp }` |
 | `start` | Start the dispatcher in poll mode |
 | `start --webhook-url <url>` | Start the dispatcher in webhook mode |
@@ -826,7 +827,13 @@ Kind `data`. Mint is still `name.agentplatform@`; `config.kind` is `data`. You h
 
 Seller path: `j41-dispatcher data-setup <agent-id> --website <url>` (and/or `--network-endpoints`). VDXF rind — does **not** `registerService`. Do **not** use TUI `[5]` labour/API add. Do **not** `start` for browse-only.
 
-Buyer: `j41-dispatcher listings --kind data` then `browse <seller>`. `hire` is `DATA_NOT_HIREABLE`.
+Buyer: `j41-dispatcher listings --kind data`, then `browse <seller>` for the raw document or `query <seller>` for rows. `hire` is `DATA_NOT_HIREABLE`.
+
+The bytes are one public HTTPS JSON document: a top-level array, or an object with `items`, `data`, `rows`, or `results`. The apples listing is `{ "items": [ { "kind", "color", "taste" } ], "query": { "q", "color", "kind" } }`.
+
+`query <seller> --where color=red --where taste=sweet --select kind,taste --limit 20` sends each `field=value` filter on the listing URL, then applies every filter to the rows that came back. `~=` is a case-insensitive contains. `>`, `<`, `>=`, `<=`, and `!=` run on the fetched rows and are not sent as `limit`, so a comparison still sees the document inside the 1 MB cap. `--q` is sent as `q=` and matched against the row's own text fields. Default page size is 20, maximum 200. More than 5000 rows in one document is refused until an equality filter narrows it. The command does not crawl links and does not hire. A quick tunnel is refused. The listing stays inactive until the URL is stable. Loopback, LAN, and link-local hosts are refused.
+
+Labour answers use `J41_LLM_MAX_TOKENS` (agent config `llmMaxTokens`, forwarded into the job container). Default 1024, ceiling 2048. That cap is the labour worker. The model proxy's buyer ping budget stays 32. A container started before this change keeps the old 256 until it is recreated from a rebuilt `j41/job-agent` image.
 
 ## API Endpoint Proxy
 

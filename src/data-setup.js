@@ -6,7 +6,7 @@
 
 const { parseListingKind, kindFromIdentityName } = require('./listing-kind');
 const { httpUrlString } = require('./buyer-browse');
-const { descriptionHasEphemeralUrl, refuseDataListingDescriptions } = require('./listing-description');
+const { descriptionHasEphemeralUrl, blockedDataHost, refuseDataListingDescriptions } = require('./listing-description');
 
 function listingKindOfKeys(keys) {
   return parseListingKind(keys && keys.kind)
@@ -33,15 +33,18 @@ function assertDataSetupAllowed({ kind, identity, agentConfig } = {}) {
   }
 }
 
-function assertHttpUrl(value, label) {
+function assertHttpUrl(value, label, allowHosts) {
   const raw = String(value || '').trim();
   const url = httpUrlString(raw);
   if (!url) {
     throw fail('DATA_SETUP_BAD_URL', `DATA_SETUP_BAD_URL: ${label} must be an HTTP(S) URL`);
   }
-  if (descriptionHasEphemeralUrl(url)) {
+  let host = '';
+  try { host = new URL(url).hostname; } catch { host = ''; }
+  const allowed = (allowHosts || []).some((h) => h && String(h).toLowerCase() === host.toLowerCase());
+  if (!allowed && (descriptionHasEphemeralUrl(url) || blockedDataHost(host))) {
     throw fail('DESCRIPTION_EPHEMERAL_URL',
-      'DESCRIPTION_EPHEMERAL_URL: data listing URLs cannot be tunnel or LAN. Use a stable HTTP(S) website / network endpoint.');
+      'DESCRIPTION_EPHEMERAL_URL: data listing URLs cannot be tunnel, LAN, loopback, or link-local. Use a stable HTTP(S) website / network endpoint.');
   }
   return url;
 }
@@ -52,11 +55,11 @@ function parseCsvUrls(raw) {
   return String(raw).split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-function parseDataSetupUrls({ website, networkEndpoints } = {}) {
+function parseDataSetupUrls({ website, networkEndpoints, allowHosts } = {}) {
   const site = website != null && String(website).trim() !== ''
-    ? assertHttpUrl(website, '--website')
+    ? assertHttpUrl(website, '--website', allowHosts)
     : null;
-  const endpoints = parseCsvUrls(networkEndpoints).map((u) => assertHttpUrl(u, '--network-endpoints'));
+  const endpoints = parseCsvUrls(networkEndpoints).map((u) => assertHttpUrl(u, '--network-endpoints', allowHosts));
   if (!site && endpoints.length === 0) {
     throw fail('DATA_SETUP_NO_ENDPOINT',
       'DATA_SETUP_NO_ENDPOINT: pass --website and/or --network-endpoints (HTTP(S) only)');
@@ -109,7 +112,9 @@ function dataEndpointRefusal(agentConfig) {
       message: 'data.endpoint: no HTTP(S) website or networkEndpoints — run data-setup --website https://...',
     };
   }
-  if (descriptionHasEphemeralUrl(url)) {
+  let host = '';
+  try { host = new URL(url).hostname; } catch { host = ''; }
+  if (descriptionHasEphemeralUrl(url) || blockedDataHost(host)) {
     return {
       code: 'data.endpoint',
       message: 'data.endpoint: website/networkEndpoints is ephemeral (trycloudflare/ngrok/localhost/RFC1918) — run data-setup --website https://...',
@@ -149,11 +154,11 @@ function dataSetupNextLines(identity, { localOnly, agentId } = {}) {
   ];
 }
 
-function planDataSetup({ keys, agentConfig, website, networkEndpoints, description } = {}) {
+function planDataSetup({ keys, agentConfig, website, networkEndpoints, description, allowHosts } = {}) {
   const kind = listingKindOfKeys(keys);
   const identity = keys && keys.identity;
   assertDataSetupAllowed({ kind, identity, agentConfig });
-  const parsed = parseDataSetupUrls({ website, networkEndpoints });
+  const parsed = parseDataSetupUrls({ website, networkEndpoints, allowHosts });
   assertDataSetupDescription({ kind, identity, description });
   return {
     kind,

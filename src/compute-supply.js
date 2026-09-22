@@ -241,6 +241,14 @@ function createSupplyController({ cfg, agentConfigs, now = Date.now }) {
           continue;
         }
 
+        // docker inspect blips (daemon restart, socket timeout) are not a dead
+        // jail. Releasing here deleted a paid box. A real "not running" / 404
+        // stays healthy:false without uncertain and still releases.
+        if (health.uncertain && lease.jobId) {
+          console.warn(`[Compute] probe uncertain for ${id} (${health.reason || 'inspect failed'}) — keeping the paid rental`);
+          continue;
+        }
+
         // Unhealthy. A job-bound rental is NEVER replaced — the buyer holds credentials
         // for THIS box; release it and let the job path handle the refund (H2).
         if (lease.jobId) { await tryRelease(lease, provider); unpublishUpstream(agentId); continue; }
@@ -281,8 +289,14 @@ function createSupplyController({ cfg, agentConfigs, now = Date.now }) {
     const keep = new Map();
     for (const [id, lease] of Object.entries(persisted)) {
       if (!lease || !lease.state || lease.state === 'released') continue;
-      if (lease.jobId && active(lease.jobId)) {
-        // Still-serving rental: rehydrate.
+      // A delivered rental is wiped from active-jobs.json by crash recovery
+      // before poll-mode boots the controller. active-jobs is therefore the
+      // wrong signal. An unexpired job lease is still paid time — keep the
+      // jail and let adoptLiveRentals re-attach. Expired, or no expiry, still
+      // releases (the old orphan path).
+      const expiresAt = Number(lease.expiresAt);
+      const paidStill = !!(lease.jobId && Number.isFinite(expiresAt) && expiresAt > now());
+      if (lease.jobId && (active(lease.jobId) || paidStill)) {
         leases.set(id, lease);
         bound.set(id, { provider: reconstructProvider(lease), agentId: lease.boundAgentId || null, jobId: lease.jobId });
         keep.set(id, lease);

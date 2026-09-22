@@ -129,7 +129,9 @@ async function challengeAndAttach({ client, jobId, signMessage }) {
 // Idle NAT on the GPU box dropped 764f781e in ~2.5 min. Node/libuv sets
 // TCP_KEEPIDLE from this delay, TCP_KEEPINTVL=1s, TCP_KEEPCNT=10.
 const KEEP_ALIVE_MS = 15000;
-const REATTACH_MAX = 3;
+// A long SSH copy (hundreds of MB) drops the seller→edge TCP. Three reseals
+// froze port 40023 mid-scp. Keep offering a new port for the life of the lease.
+const REATTACH_MAX = 30;
 
 function applyTcpKeepAlive(sock, delayMs = KEEP_ALIVE_MS) {
   if (!sock) return sock;
@@ -187,26 +189,29 @@ const SPLICE_OPTS = { end: false };
 function holdRemoteToLocal(remote, { localHost, localPort, connect }) {
   let currentLocal = null;
   let stopped = false;
-  // Once any SSH byte has moved, a new jail sshd must NOT be spliced into the
-  // same edge socket: its identification string is ASCII "SSH-2.0-…", which
-  // OpenSSH reads as a binary packet length (0x5353482d = 1397966893) →
-  // "Bad packet length" / "message authentication code incorrect".
+  // Buyer bytes, not the jail sshd banner. LoginGraceTime is 60s. Splicing
+  // sshd at attach time starts that clock before anyone dials, the banner
+  // counts as "bytes moved", and the grace close then burns the public port.
+  // Wait for the buyer. A second sshd banner on a socket the buyer already
+  // touched is still a MAC failure, so that close destroys the edge socket.
   let bytesMoved = false;
-  const markBytes = () => { bytesMoved = true; };
+  let started = false;
   const stop = () => {
     stopped = true;
     try { if (currentLocal) currentLocal.destroy(); } catch { /* ignore */ }
   };
-  if (remote && typeof remote.on === 'function') remote.on('data', markBytes);
-  const attachLocal = () => {
-    if (stopped || !remote || remote.destroyed) return;
+  const attachLocal = (buffered) => {
+    if (started || stopped || !remote || remote.destroyed) return;
+    started = true;
     connectOnce(connect, { host: localHost, port: localPort }).then((local) => {
       if (stopped || remote.destroyed) {
         try { local.destroy(); } catch { /* ignore */ }
         return;
       }
       currentLocal = local;
-      if (typeof local.on === 'function') local.on('data', markBytes);
+      if (buffered && buffered.length && typeof local.write === 'function') {
+        try { local.write(buffered); } catch { /* the pipe below still carries the rest */ }
+      }
       if (typeof remote.pipe === 'function' && typeof local.pipe === 'function') {
         remote.pipe(local, SPLICE_OPTS);
         local.pipe(remote, SPLICE_OPTS);
@@ -217,24 +222,37 @@ function holdRemoteToLocal(remote, { localHost, localPort, connect }) {
         currentLocal = null;
         if (stopped || remote.destroyed) return;
         if (bytesMoved) {
-          // Handshake already started — drop the public door so keepOutbound
-          // can allocate a fresh attach port instead of injecting a second banner.
           try { if (typeof remote.destroy === 'function') remote.destroy(); } catch { /* ignore */ }
           return;
         }
-        setTimeout(attachLocal, 50);
+        started = false;
+        setTimeout(() => attachLocal(), 50);
       };
       local.once('close', onLocalGone);
       local.once('error', onLocalGone);
     }).catch(() => {
-      if (!stopped && !remote.destroyed && !bytesMoved) setTimeout(attachLocal, 200);
+      started = false;
+      if (!stopped && !remote.destroyed && !bytesMoved) setTimeout(() => attachLocal(buffered), 200);
     });
   };
+  if (remote && typeof remote.on === 'function') {
+    const onBuyer = (chunk) => {
+      bytesMoved = true;
+      if (typeof remote.pause === 'function') {
+        try { remote.pause(); } catch { /* ignore */ }
+      }
+      if (typeof remote.removeListener === 'function') remote.removeListener('data', onBuyer);
+      attachLocal(chunk);
+      if (typeof remote.resume === 'function') {
+        try { remote.resume(); } catch { /* ignore */ }
+      }
+    };
+    remote.on('data', onBuyer);
+  }
   if (typeof remote.once === 'function') {
     remote.once('close', stop);
     remote.once('error', stop);
   }
-  attachLocal();
   return {
     stop,
     get local() { return currentLocal; },
@@ -295,9 +313,8 @@ function keepOutboundUntilBuyer(session, opts = {}) {
     if (!remote) return;
     applyTcpKeepAlive(remote);
     let handled = false;
-    const onGone = () => {
-      if (handled || stopped || busy) return;
-      handled = true;
+    const startAttempt = () => {
+      if (stopped || busy) return;
       if (attempts >= max) {
         log('[ComputeEdge] outbound TCP died; re-attach budget exhausted');
         return;
@@ -312,17 +329,30 @@ function keepOutboundUntilBuyer(session, opts = {}) {
           return attach(opts.attachOpts || {});
         })
         .then(async (next) => {
-          if (!next || stopped) return;
+          if (stopped) return;
+          if (!next) throw new Error('COMPUTE_EDGE_REATTACH_EMPTY');
           adopt(next);
-          if (typeof opts.onReattached === 'function') {
-            await opts.onReattached({ host: next.host, port: next.port, session });
+          // A rental-secret POST failure must not leave the new socket
+          // unwatched. The old once('close') already fired.
+          try {
+            if (typeof opts.onReattached === 'function') {
+              await opts.onReattached({ host: next.host, port: next.port, session });
+            }
+          } catch (e) {
+            log(`[ComputeEdge] rental-secret after re-attach failed: ${e && e.message}`);
           }
-          arm(session);
+          if (!stopped) arm(session);
         })
         .catch((e) => {
           log(`[ComputeEdge] re-attach failed: ${e && e.message}`);
+          if (!stopped && attempts < max) setTimeout(() => startAttempt(), 200);
         })
         .finally(() => { busy = false; });
+    };
+    const onGone = () => {
+      if (handled || stopped || busy) return;
+      handled = true;
+      startAttempt();
     };
     if (typeof remote.once === 'function') {
       remote.once('close', onGone);

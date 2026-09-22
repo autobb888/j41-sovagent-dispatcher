@@ -662,11 +662,24 @@ function _rateCheckField(checks, reason) {
  * cap, cooldown, and absolute per-tx cap still bind. An explicit wider
  * `jobPrice` is kept.
  */
-function depositScopedJobPrice(amount, jobPrice) {
+function depositScopedJobPrice(amount, jobPrice, alreadySent = 0) {
   const LIM = effectiveLimits();
   const scoped = amount * LIM.maxSendsPerJob;
   const given = Number.isFinite(jobPrice) && jobPrice > 0 ? jobPrice : 0;
-  return Math.max(given, scoped);
+  const sent = Number(alreadySent);
+  const covered = (Number.isFinite(sent) && sent > 0 ? sent : 0) + amount;
+  // A later 0.01 top-up must not be capped at 1.1 × 0.01 after 0.10 is already
+  // on this seller. The lifetime send-count cap is what stops the loop.
+  return Math.max(given, scoped, covered);
+}
+
+function depositAlreadySent(limiterKey) {
+  try {
+    const rows = (loadSendHistory().perJob || {})[limiterKey] || [];
+    return rows.reduce((sum, row) => sum + (Number(row.amount) || 0), 0);
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -737,7 +750,9 @@ function gateExternalSend({ jobId, toAddress, amount, amountSats, jobPrice, kind
 
   // 2. Suspension + rate family.
   if (external) {
-    const priceForLimit = kind === 'deposit' ? depositScopedJobPrice(amtNum, jobPrice) : jobPrice;
+    const priceForLimit = kind === 'deposit'
+      ? depositScopedJobPrice(amtNum, jobPrice, depositAlreadySent(limiterKey))
+      : jobPrice;
     const rl = checkDispatcherRateLimit(limiterKey, amtNum, priceForLimit, now);
     if (!rl.allowed) { _rateCheckField(checks, rl.reason); return finish(false, rl.retryable, rl.reason); }
     checks.suspension = 'pass';

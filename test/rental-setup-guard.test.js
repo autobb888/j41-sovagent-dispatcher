@@ -15,6 +15,13 @@ test('rental-setup guard allows a clean agent', () => {
   assert.doesNotThrow(() => assertRentalEligibleAgent([]));
 });
 
+test('capability load does not stamp labour or gpu services as api endpoints', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, '../src/cli.js'), 'utf8');
+  const loop = src.slice(src.indexOf('for (const svc of services)'), src.indexOf('state.capabilities.set(agentInfo.id)'));
+  assert.match(loop, /serviceType !== 'api-endpoint'/);
+  assert.match(loop, /continue;/);
+});
+
 test('api-setup guard (reverse) blocks mixing an api endpoint onto a rental agent', () => {
   assert.throws(() => assertApiEligibleAgent([{ serviceType: 'gpu-rental', name: 'a100' }]), /API_SLOT_CONFLICT/);
 });

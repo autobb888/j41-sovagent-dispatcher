@@ -47,6 +47,13 @@ test('descriptionHasEphemeralUrl does not treat nearby public / non-RFC1918 as L
   assert.equal(descriptionHasEphemeralUrl('192.169.1.1'), false);
 });
 
+test('descriptionHasEphemeralUrl refuses loopback, unspecified, and link-local', () => {
+  assert.equal(descriptionHasEphemeralUrl('http://127.0.0.2/latest'), true);
+  assert.equal(descriptionHasEphemeralUrl('http://0.0.0.0/'), true);
+  assert.equal(descriptionHasEphemeralUrl('http://169.254.169.254/latest/meta-data'), true);
+  assert.equal(descriptionHasEphemeralUrl('169.254.1.1'), true);
+});
+
 test('isDataListing is kind=data or parent sovdata@', () => {
   assert.equal(isDataListing('data', 'pippinapples.agentplatform@'), true);
   assert.equal(isDataListing('agent', 'corpus.sovdata@'), true);

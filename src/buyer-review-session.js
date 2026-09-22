@@ -69,13 +69,13 @@ async function getSessionReviewMessage(client, params) {
 }
 
 function resolveSessionId({ sessionId, grant, agentsDir, buyerId, seller }) {
-  if (sessionId) return String(sessionId);
-  if (grant && grant.sessionId) return String(grant.sessionId);
-  if (agentsDir && buyerId && seller) {
+  const { sessionTokenFromHeader } = require('./session-token');
+  let raw = sessionId || (grant && grant.sessionId) || '';
+  if (!raw && agentsDir && buyerId && seller) {
     const rec = loadAccessGrant(agentsDir, buyerId, seller);
-    if (rec && rec.sessionId) return String(rec.sessionId);
+    if (rec && rec.sessionId) raw = rec.sessionId;
   }
-  return '';
+  return raw ? sessionTokenFromHeader(String(raw)) : '';
 }
 
 function canonicalNotBound(message, sessionId, rating, seller) {

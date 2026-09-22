@@ -127,6 +127,8 @@ function startUpstream() {
           res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': '9999' });
           res.write('{"choices"');
           setTimeout(() => { try { req.socket.resetAndDestroy(); } catch { res.destroy(); } }, 40);
+        } else if (upstreamMode === 'hang') {
+          // Never respond. Streaming clients have already been sent : j41-wait.
         } else if (upstreamMode === 'stream-no-usage') {
           // Upstream ignores include_usage → never emits a usage frame.
           res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -253,6 +255,27 @@ test('H3: in-flight slot is released after a normal request (finally)', async ()
 
 // ── H2: streaming under-billing ──────────────────────────────────────────────
 
+test('stream timeout refunds the reservation and ends the SSE', async () => {
+  inflight._reset();
+  upstreamMode = 'hang';
+  process.env.J41_PROXY_UPSTREAM_TIMEOUT = '200';
+  process.env.J41_PROXY_DRAIN_CAP_MS = '30';
+  const { invalidateConfigCache } = require('../src/config-loader.js');
+  invalidateConfigCache();
+  const agentId = 'agent-stream-timeout';
+  const buyer = 'iBuyerStreamTimeout';
+  const key = mintApiKey(agentId, buyer).key;
+  creditDeposit(agentId, buyer, 1000, 'tx-stream-timeout');
+  const r = await runProxy(agentId, key, { model: MODEL, stream: true, max_tokens: 32, messages: [] });
+  delete process.env.J41_PROXY_UPSTREAM_TIMEOUT;
+  delete process.env.J41_PROXY_DRAIN_CAP_MS;
+  invalidateConfigCache();
+  assert.match(r.body, /j41-wait/);
+  assert.match(r.body, /Upstream endpoint timed out/);
+  assert.ok(Math.abs(getBalance(agentId, buyer) - 1000) < 1e-9,
+    `reservation must be refunded, balance=${getBalance(agentId, buyer)}`);
+});
+
 test('H2: stream:true injects stream_options.include_usage=true into the forwarded body', async () => {
   inflight._reset();
   upstreamMode = 'stream-with-usage';
@@ -269,7 +292,7 @@ test('H2: stream:true injects stream_options.include_usage=true into the forward
     `forwarded body must carry stream_options.include_usage=true; got ${lastUpstreamBody}`);
 });
 
-test('missing max_tokens is forwarded as 32 so NVIDIA reasoning NIMs cannot run unbounded', async () => {
+test('missing max_tokens is forwarded as 512 so a Kimi answer is not cut at finish:length', async () => {
   inflight._reset();
   upstreamMode = 'json';
   const agentId = 'agent-default-max';
@@ -279,7 +302,7 @@ test('missing max_tokens is forwarded as 32 so NVIDIA reasoning NIMs cannot run 
   const r = await runProxy(agentId, key, { model: MODEL, messages: [{ role: 'user', content: 'pong' }] });
   assert.equal(r.statusCode, 200, r.body);
   const fwd = JSON.parse(lastUpstreamBody);
-  assert.equal(fwd.max_tokens, 32);
+  assert.equal(fwd.max_tokens, 512);
   assert.equal(fwd.chat_template_kwargs, undefined);
   assert.equal(fwd.stream, undefined);
 });

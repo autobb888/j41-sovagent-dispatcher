@@ -329,6 +329,10 @@ function reverseDeposit(agentId, buyerVerusId, amount, txid) {
   buyer.totalDeposited -= amount;
   buyer.lastActivity = new Date().toISOString();
   if (txid) buyer.lastReversedTxid = txid;
+  // The credit was undone. Leaving lastDepositTxid set made creditDeposit
+  // treat a later restore (or a confirmed re-report of the same tx) as a
+  // duplicate and leave the balance at zero.
+  if (txid && buyer.lastDepositTxid === txid) buyer.lastDepositTxid = null;
   saveMeters(agentId, data);
   return { newBalance: buyer.balance };
   }, { failClosed: true });

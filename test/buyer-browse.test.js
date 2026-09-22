@@ -126,6 +126,116 @@ test('networkEndpoints[0] wins over website; path is not joined onto an existing
   assert.deepEqual(urls, ['https://ep.example/apples']);
 });
 
+test('a JSON-string networkEndpoints value is the data-setup on-chain shape', async () => {
+  const urls = [];
+  const r = await browseListing({
+    listing: { networkEndpoints: JSON.stringify(['https://ep.example/apples']) },
+    fetchImpl: async (url) => {
+      urls.push(String(url));
+      return { ok: true, status: 200, text: async () => '[]' };
+    },
+  });
+  assert.equal(r.ok, true);
+  assert.deepEqual(urls, ['https://ep.example/apples']);
+});
+
+test('browse refuses link-local and does not follow a redirect onto loopback', async () => {
+  let fetches = 0;
+  const blocked = await browseListing({
+    listing: { website: 'http://169.254.169.254/latest/meta-data' },
+    fetchImpl: async () => { fetches += 1; return { ok: true, status: 200, text: async () => 'nope' }; },
+  });
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.code, 'BROWSE_BLOCKED_HOST');
+  assert.equal(fetches, 0);
+
+  const redirected = await browseListing({
+    listing: { website: 'https://data.example/apples' },
+    fetchImpl: async (url) => {
+      fetches += 1;
+      if (String(url).includes('data.example')) {
+        return { ok: false, status: 302, headers: { get: (n) => (n === 'location' ? 'http://127.0.0.1:9842/health' : null) } };
+      }
+      return { ok: true, status: 200, text: async () => 'health' };
+    },
+  });
+  assert.equal(redirected.code, 'BROWSE_BLOCKED_HOST');
+  assert.equal(fetches, 1);
+});
+
+test('browse refuses a public name that resolves to a private address', async () => {
+  let fetches = 0;
+  const r = await browseListing({
+    listing: { website: 'https://data.example/apples' },
+    dnsLookup: async () => ['169.254.169.254'],
+    fetchImpl: async () => { fetches += 1; return { ok: true, status: 200, text: async () => 'x' }; },
+  });
+  assert.equal(r.code, 'BROWSE_BLOCKED_HOST');
+  assert.equal(fetches, 0);
+});
+
+test('--query merges onto a URL that already has a path and cannot retarget the host', async () => {
+  const urls = [];
+  const r = await browseListing({
+    listing: { website: 'https://data.example/apples' },
+    path: '/oranges',
+    query: 'limit=50&offset=10',
+    fetchImpl: async (url) => {
+      urls.push(String(url));
+      return { ok: true, status: 200, text: async () => '[]' };
+    },
+  });
+  assert.equal(r.ok, true);
+  assert.equal(urls.length, 1);
+  const u = new URL(urls[0]);
+  assert.equal(u.pathname, '/apples');
+  assert.equal(u.searchParams.get('limit'), '50');
+  assert.equal(u.searchParams.get('offset'), '10');
+
+  let fetches = 0;
+  const blocked = await browseListing({
+    listing: { website: 'https://data.example/apples' },
+    query: 'to=http://127.0.0.1/latest',
+    fetchImpl: async () => { fetches += 1; return { ok: true, status: 200, text: async () => 'no' }; },
+  });
+  assert.equal(blocked.code, 'BROWSE_QUERY');
+  assert.equal(fetches, 0);
+
+  const repeated = await browseListing({
+    listing: { website: 'https://data.example/apples' },
+    query: 'limit=1&limit=2',
+    fetchImpl: async () => { fetches += 1; return { ok: true, status: 200, text: async () => 'no' }; },
+  });
+  assert.equal(repeated.code, 'BROWSE_QUERY');
+  assert.equal(fetches, 0);
+
+  const empty = await browseListing({
+    listing: { website: 'https://data.example/apples' },
+    query: '   ',
+    fetchImpl: async () => { fetches += 1; return { ok: true, status: 200, text: async () => 'no' }; },
+  });
+  assert.equal(empty.code, 'BROWSE_QUERY');
+  assert.equal(fetches, 0);
+});
+
+test('a published quick-tunnel website is fetched; a private address is not', async () => {
+  const urls = [];
+  const r = await browseListing({
+    listing: { website: 'https://correctly-adaptor-label-deeply.trycloudflare.com/j41/datasets/orchard-apples.json' },
+    fetchImpl: async (url) => {
+      urls.push(String(url));
+      return { ok: true, status: 200, text: async () => '{"items":[]}' };
+    },
+  });
+  assert.equal(r.ok, true);
+  assert.equal(urls.length, 1);
+  const blocked = await browseListing({
+    listing: { website: 'http://169.254.169.254/latest' },
+    fetchImpl: async () => { throw new Error('fetched private'); },
+  });
+  assert.equal(blocked.code, 'BROWSE_BLOCKED_HOST');
+});
+
 test('HTTP non-2xx is BROWSE_HTTP_<status>', async () => {
   const r = await browseListing({
     listing: { website: 'https://data.example/apples' },

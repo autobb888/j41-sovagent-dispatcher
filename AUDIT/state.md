@@ -1085,3 +1085,100 @@ Artifacts: `AUDIT/gpu-jail.md`, `AUDIT/gpu-jail-claims.md`.
 - **Unrelated dirty files** in the same worktree: `src/executors/local-llm.js`, `src/proxy-handler.js`, `src/preflight-gate.js`, `src/llm-health.js`. Orchard-walk, not jail.
 - **Running tests / docker / live API.** Read-only pass.
 - **Commits / push.** Operator asked audit first.
+
+---
+
+## reviews — 2026-09-15 — DONE
+
+Artifacts: `AUDIT/reviews.md`, `AUDIT/reviews-claims.md`.
+HEAD `5ca8776` (clean GH clone of `execute-plan/ca3106a1-integrate`).
+
+**Counts by severity:** crit 0 · high 0 · med 1 · low 1 · total 2
+
+| Sev | Finding |
+|---|---|
+| med | R1 — TUI `api_review` homemade-signs JSON onto `POST /v1/reviews/api-session` with invented `api-session-${agentId}-${buyerVerusId}` and the seller WIF; no GET `J41-REVIEW-SESSION\|` |
+| low | R2 — CLI `review-session` has no `--session-id`; grant expiry drops a persisted chat `sessionId` → `REVIEW_SESSION_NO_SESSION` |
+
+**Claims:** 48 — 45 VERIFIED · 3 DRIFT · 0 MISSING · 0 UNVERIFIED.
+
+**CLI path is the contract** (job GET `J41-REVIEW|`, session GET `J41-REVIEW-SESSION|`, no `agent.submitReview`, no homemade session line, inbox-read after 2xx). CHANGELOG/README do not say “reviews shipped”.
+
+### Deliberately NOT covered
+
+- Live POST 200 against `api.junction41.io` (no buyer WIF on this clean box).
+- Seller inbox `acceptReview` sweep (daemon down).
+- Wave 4 evidence pack (operator-gated).
+
+---
+
+## gpu-jail — 2026-09-15 — DONE (re-pass)
+
+Artifacts: `AUDIT/gpu-jail.md`, `AUDIT/gpu-jail-claims.md` (overwrite of 2026-09-14 files; prior counts remain in the 2026-09-14 state entry above).
+
+**Prior G1–G5: FIXED.** G6 still open (low). New: G7 (low, PASTE RECIPE), G8 (med, adopt without re-attach).
+
+**Counts (open):** crit 0 · high 0 · med 1 · low 2 · total 3
+
+| Sev | Finding |
+|---|---|
+| med | G8 — `adoptLiveRentals` re-tracks jail/lease after restart but does not `attachAndDial`; paid public SSH dies with the dispatcher |
+| low | G6 — `assertNvidiaRuntime` still required after DeviceRequests removed |
+| low | G7 — `docs/config.toml.example` still says LAN `ssh_hostname` fails `rental-setup` |
+
+**Claims:** 24 VERIFIED · 2 VERIFIED-qualified · 2 DRIFT · 1 MISSING (A30 fingerprint) · 3 UNVERIFIED (backend A12–A14).
+
+Live image `j41/gpu-jail:latest` inspected: `LoginGraceTime 60`, fail-loud umount, no `|| true`.
+
+### Deliberately NOT covered
+
+- Backend attach/rental-access HTTP (A12–A14).
+- Banner-probe of `127.0.0.1:2222`.
+- Fingerprint hide PRs (physical limit).
+
+---
+
+## first-run-clean — 2026-09-15 — DONE
+
+Artifacts: `AUDIT/first-run-clean.md`, `AUDIT/first-run-clean-claims.md`.
+Does **not** skip the 2026-08-10 first-run pass; this is a new domain for HEAD after the 12 PRs + a live clean clone.
+
+**Counts:** crit 0 · high 1 · med 1 · low 1 · total 3
+
+| Sev | Finding |
+|---|---|
+| high | FRC1 — README `curl \| bash` / `npm i -g` still install published 2.37.3 (`1a340d8`), which does not contain this branch (F4/F5/F9/MO5/MO6 still live on npm). HEAD `package.json` is still 2.37.3, so a republish cannot replace npm latest |
+| med | FRC2 — GH clone has no `j41-dispatcher` on PATH; doctor/README Next always print `j41-dispatcher …` |
+| low | FRC3 — F6 residual: custom-template `network.capabilities` still dropped |
+
+On this tree the 12 PR first-run items hold (Node 20 gate, no 10s setup race, `[Health]` Start, clock 8s/30s, init 1–100, doctor Next `build-image` then `setup agent-1 --template code-review`). Observed live: doctor exit 0 with 0 identities as **warn**; no `~/.j41` created.
+
+### Deliberately NOT covered
+
+- Running `setup` (mints on-chain).
+- Restoring `~/.j41-orchard-backup-*`.
+- npm-publish / version bump (operator lock).
+- Full RELEASE-READINESS walk (encrypt-keys → dashboard Start → mid-job restart).
+
+---
+
+## four-kind — 2026-09-15 — DONE
+
+Artifacts: `AUDIT/four-kind.md`, `AUDIT/four-kind-claims.md`.
+
+**Counts:** crit 0 · high 0 · med 2 · low 0 · total 2
+
+| Sev | Finding |
+|---|---|
+| med | K1 — TUI `[2]` / CLI `setup` still `registerService` a labour listing on kind=data (and model). TUI `[5]` is diverted; `setup` is the remaining door |
+| med | K2 — TUI `[18]` / CLI `api-setup` do not refuse kind=data; `assertAccessAllowed` then treats it as a model |
+
+**Claims:** 54 VERIFIED · 5 DRIFT · 4 MISSING · 4 UNVERIFIED (platform).
+
+Buyer hire gates (`DATA_NOT_HIREABLE`, `MODEL_NOT_A_LABOUR_JOB`) and TUI hire print-argv hold. README CLI table, CHANGELOG Unreleased (no coming-soon / no “reviews shipped”), `data-setup` VDXF rind, doctor `data.endpoint`, `api-setup` Next `--webhook-url` all VERIFIED.
+
+### Deliberately NOT covered
+
+- DeFi remint / `sov*@` parents.
+- Live marketplace listing of a labour service on a kind=data identity (platform UNVERIFIED).
+- Jail G2/G3 (gpu-jail re-pass).
