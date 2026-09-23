@@ -35,6 +35,8 @@ test('normalizeModelId strips provider prefixes and maps aliases', () => {
   assert.equal(normalizeModelId('anthropic/claude-opus-4-6'), 'claude-opus-4.6');
   assert.equal(normalizeModelId('moonshotai/kimi-k2.5'), 'kimi-k2');
   assert.equal(normalizeModelId('deepseek-chat'), 'deepseek-v3');
+  assert.equal(normalizeModelId('deepseek-ai/deepseek-v4.1-flash'), 'deepseek-v3');
+  assert.equal(normalizeModelId('moonshotai/kimi-k3'), 'kimi-k2');
   assert.equal(normalizeModelId('mistral-large-latest'), 'mistral-large-3');
   assert.equal(normalizeModelId('grok-4'), 'grok-4.20');
 });
@@ -104,6 +106,15 @@ test('initialTokenBudget is always finite — no rate means fallback, never unli
   assert.equal(tokens, DEFAULT_FALLBACK_TOKEN_BUDGET);
   assert.match(basis, /fallback/);
   assert.ok(Number.isFinite(tokens));
+});
+
+test('deepseek-v4.1-flash is priced as deepseek-v3, not as o3', () => {
+  const env = envWithRate(0.5);
+  const flash = initialTokenBudget({ model: 'deepseek-ai/deepseek-v4.1-flash', amountVrsc: 0.05 }, env);
+  const o3 = initialTokenBudget({ model: 'o3', amountVrsc: 0.05 }, env);
+  assert.equal(flash.basis, 'priced:deepseek-v3');
+  assert.ok(flash.tokens > o3.tokens);
+  assert.ok(flash.tokens > 10000);
 });
 
 test('initialTokenBudget treats unknown models as the most expensive (fewest tokens)', () => {

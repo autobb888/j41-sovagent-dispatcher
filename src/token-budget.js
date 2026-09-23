@@ -51,6 +51,13 @@ const MODEL_ALIASES = {
   'kimi-k2.5': 'kimi-k2',
   'deepseek-chat': 'deepseek-v3',
   'deepseek-reasoner': 'deepseek-r1',
+  // Not in the SDK table. Pricing them as o3 made a 0.05 job a 1000-token
+  // budget, so the greeting's completion alone exhausted it.
+  'deepseek-v4.1-flash': 'deepseek-v3',
+  'deepseek-v4-flash': 'deepseek-v3',
+  'deepseek-v4-pro': 'deepseek-v3',
+  'kimi-k3': 'kimi-k2',
+  'kimi-k2.6': 'kimi-k2',
   'mistral-large-latest': 'mistral-large-3',
   'grok-4': 'grok-4.20',
 };

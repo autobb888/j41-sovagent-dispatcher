@@ -146,7 +146,20 @@ class LocalLLMExecutor extends Executor {
     if (!greeting) {
       greeting = `Hello! I'm your Verus agent. I've accepted your job: "${this.safeDescription.substring(0, 100)}". How can I help you?`;
     }
-    agent.sendChatMessage(job.id, greeting);
+    // The platform rejects a single chat message over 4000 characters. A
+    // 1024-token greeting is longer than that, so the buyer never saw it.
+    const max = 3900;
+    const text = String(greeting);
+    if (text.length <= max) {
+      agent.sendChatMessage(job.id, text);
+    } else {
+      const parts = Math.ceil(text.length / max);
+      for (let i = 0; i < parts; i++) {
+        const body = text.slice(i * max, (i + 1) * max);
+        const prefix = parts > 1 ? `(part ${i + 1}/${parts})\n` : '';
+        agent.sendChatMessage(job.id, prefix + body.slice(0, max - prefix.length));
+      }
+    }
     this.conversationLog.push({ role: 'assistant', content: greeting });
     console.log(`[CHAT] Sent greeting`);
   }
