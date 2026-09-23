@@ -146,22 +146,11 @@ class LocalLLMExecutor extends Executor {
     if (!greeting) {
       greeting = `Hello! I'm your Verus agent. I've accepted your job: "${this.safeDescription.substring(0, 100)}". How can I help you?`;
     }
-    // The platform rejects a single chat message over 4000 characters. A
-    // 1024-token greeting is longer than that, so the buyer never saw it.
-    const max = 3900;
-    const text = String(greeting);
-    if (text.length <= max) {
-      agent.sendChatMessage(job.id, text);
-    } else {
-      const parts = Math.ceil(text.length / max);
-      for (let i = 0; i < parts; i++) {
-        const body = text.slice(i * max, (i + 1) * max);
-        const prefix = parts > 1 ? `(part ${i + 1}/${parts})\n` : '';
-        agent.sendChatMessage(job.id, prefix + body.slice(0, max - prefix.length));
-      }
-    }
+    // The platform rejects one chat message over 4000 characters. A long
+    // greeting is sent in order, and every character is kept.
+    const sent = await sendWithinChatLimit(agent, job.id, greeting);
     this.conversationLog.push({ role: 'assistant', content: greeting });
-    console.log(`[CHAT] Sent greeting`);
+    console.log(`[CHAT] Sent greeting${sent > 1 ? ` in ${sent} parts` : ''}`);
   }
 
   /**
@@ -413,6 +402,34 @@ function http1Fetch() {
 // hop is capped near 95s by Cloudflare. This call is the container talking to
 // NVIDIA directly, so it can wait past that.
 const CHAT_ABORT_MS = 120000;
+const CHAT_MAX_LEN = 3900;
+
+function chatChunks(text, maxLen = CHAT_MAX_LEN) {
+  const s = String(text == null ? '' : text);
+  if (s.length <= maxLen) return [s];
+  const chunks = [];
+  let rest = s;
+  while (rest.length > maxLen) {
+    let cut = rest.lastIndexOf('\n\n', maxLen);
+    if (cut < maxLen * 0.5) cut = rest.lastIndexOf('\n', maxLen);
+    if (cut < maxLen * 0.5) cut = rest.lastIndexOf(' ', maxLen);
+    if (cut < maxLen * 0.5) cut = maxLen;
+    chunks.push(rest.slice(0, cut).replace(/\s+$/, ''));
+    rest = rest.slice(cut).replace(/^\s+/, '');
+  }
+  if (rest.length) chunks.push(rest);
+  return chunks;
+}
+
+async function sendWithinChatLimit(agent, jobId, text) {
+  const chunks = chatChunks(text, CHAT_MAX_LEN - 24);
+  for (let i = 0; i < chunks.length; i++) {
+    const prefix = chunks.length > 1 ? `(part ${i + 1}/${chunks.length})\n` : '';
+    await agent.sendChatMessage(jobId, prefix + chunks[i]);
+    if (i < chunks.length - 1) await new Promise((r) => setTimeout(r, 750));
+  }
+  return chunks.length;
+}
 // Labour answers, not the model-proxy ping budget (that one stays 32).
 // A reasoning model can spend the whole 120s abort on chain-of-thought if
 // this is unbounded. 2048 is the ceiling; higher is a code change.
@@ -597,4 +614,5 @@ function generateTemplateResponse(message, job, soulPrompt) {
 module.exports = {
   LocalLLMExecutor, LLM_PRESETS, LLM_CONFIG, resolveLLMConfig, CHAT_ABORT_MS,
   labourMaxTokens, LABOUR_MAX_TOKENS_DEFAULT, LABOUR_MAX_TOKENS_CEILING,
+  chatChunks,
 };
