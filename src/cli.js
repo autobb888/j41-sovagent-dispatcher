@@ -3204,7 +3204,7 @@ program
         }
 
         txid = await agent.sendMultiPayment(outputs);
-        saveWalletPending(buyerAgentId, { txid, at: Date.now(), kind: 'hire-pay' });
+        saveWalletPending(buyerAgentId, { txid, at: Date.now(), kind: 'hire-pay', amount });
         await agent.client.recordPaymentCombined(job.id, txid);
         if (autonomous) {
           recordSendOutcome({
@@ -3435,7 +3435,7 @@ program
       if (!g.allowed) fail('SPEND_DENIED', g.reason, { jobId: job.id, retryable: !!g.retryable });
     }
     const txid = await agent.sendMultiPayment(outputs);
-    saveWalletPending(buyerAgentId, { txid, at: Date.now(), kind: 'hire-pay' });
+    saveWalletPending(buyerAgentId, { txid, at: Date.now(), kind: 'hire-pay', amount });
     await agent.client.recordPaymentCombined(job.id, txid);
     if (autonomous) {
       recordSendOutcome({ kind: 'payment', jobId: job.id, toAddress: job.payment && job.payment.address, amount, txid });
@@ -4095,7 +4095,7 @@ program
       if (!g.allowed) fail('SPEND_DENIED', g.reason, { retryable: !!g.retryable });
     }
     const txid = await agent.sendMultiPayment([{ address: dest.toAddress, amount: amountNumber }]);
-    saveWalletPending(buyerAgentId, { txid, at: Date.now(), kind: 'deposit' });
+    saveWalletPending(buyerAgentId, { txid, at: Date.now(), kind: 'deposit', amount: amountNumber });
     if (autonomous) {
       recordSendOutcome({
         kind: 'deposit', jobId: seller, toAddress: dest.toAddress, amount: amountNumber, txid,
@@ -14546,10 +14546,26 @@ function loadWalletPending(agentId) {
  * demonstrably is not. Found by live-testing the sweep: agent-1's tx confirmed in
  * ~90s and the next command still refused.
  *
- * Fails CLOSED: any doubt (no txid, lookup error, zero/absent confirmations) keeps
- * the stamp. Costs one getTxStatus, and only when a stamp is actually present.
- * `confirmed:true` with `confirmations:0` is still mempool — see txConfirmations.
+ * Fails CLOSED: any doubt (no txid, lookup error, tx not visible) keeps the stamp.
+ * A confirmation count above zero always unlinks.
+ * Amounts under 2 never leave the mempool on this platform, so a stamp that
+ * records that amount unlinks once getTxStatus shows the tx (even at 0
+ * confirmations). Otherwise --wait sits for 180s and the next spend waits
+ * out the 30 minute backstop after a job that already paid.
+ * `confirmed:true` with `confirmations:0` and no amount still stays — see txConfirmations.
  */
+function txSeen(st) {
+  const nested = st && st.data && typeof st.data === 'object'
+    && !('confirmations' in st) && !('txid' in st) && !('hash' in st) && !('confirmed' in st)
+    ? st.data : st;
+  if (!nested || typeof nested !== 'object') return false;
+  if (nested.confirmations != null && nested.confirmations !== '') return true;
+  if (nested.confirmed != null) return true;
+  if (typeof nested.txid === 'string' && nested.txid) return true;
+  if (typeof nested.hash === 'string' && nested.hash) return true;
+  return false;
+}
+
 async function resolveWalletPending(client, agentId, stamp) {
   if (!stamp || stamp.malformed) return stamp;
   const txid = stamp.txid;
@@ -14557,7 +14573,10 @@ async function resolveWalletPending(client, agentId, stamp) {
   if (!client || typeof client.getTxStatus !== 'function') return stamp;
   try {
     const st = await client.getTxStatus(txid);
-    if (txConfirmations(st) > 0) {
+    const conf = txConfirmations(st);
+    const amount = Number(stamp.amount);
+    const zeroConfSettled = Number.isFinite(amount) && amount > 0 && amount < 2 && txSeen(st);
+    if (conf > 0 || zeroConfSettled) {
       try { fs.unlinkSync(walletPendingPath(agentId)); } catch { /* already gone — fine */ }
       return null;
     }

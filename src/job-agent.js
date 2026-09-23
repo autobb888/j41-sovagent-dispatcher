@@ -50,6 +50,9 @@ const IDENTITY = process.env.J41_IDENTITY;
 const JOB_ID = process.env.J41_JOB_ID;
 const TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS || '3600000');
 const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '480000'); // idle → pause (8 min, before backend's 10-min auto-deliver)
+// A job that stays `accepted` cannot be paused. After the buyer has been
+// answered, deliver on a short quiet period instead of the full pause TTL.
+const ACCEPTED_QUIET_MS = 90_000;
 const ACCEPTED_IDLE_NOTE = 'This job is still accepted, so it cannot be paused. Delivering the work so far.';
 
 function labourExtensionClosed(status) {
@@ -1385,9 +1388,23 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   // Idle timer — check periodically if we should pause (not auto-deliver)
   _idleMessageSent = false;
   let _idlePauseUnsupported = false;
+  let _acceptedQuietChecked = false;
   const idleCheck = setInterval(async () => {
     const idleMs = Date.now() - _lastActivityAt;
     if (_idlePauseUnsupported) return;
+    if (!_acceptedQuietChecked && messageCount > 0 && idleMs >= ACCEPTED_QUIET_MS
+        && idleMs < IDLE_TIMEOUT_MS && !sessionEnded && !_paused) {
+      _acceptedQuietChecked = true;
+      let quietStatus = null;
+      try { quietStatus = (await agent.client.getJob(job.id))?.status; } catch { /* full idle still runs */ }
+      if (quietStatus === 'accepted') {
+        _idlePauseUnsupported = true;
+        try { agent.sendChatMessage(job.id, ACCEPTED_IDLE_NOTE); } catch { /* deliver anyway */ }
+        log.warn('Accepted job quiet after a reply — delivering', { jobId: job.id, idleSec: Math.round(idleMs / 1000) });
+        if (resolveSession) resolveSession('idle-pause-refused');
+        return;
+      }
+    }
     if (idleMs >= IDLE_TIMEOUT_MS && !sessionEnded && !_paused) {
       if (!_idleMessageSent) {
         _idleMessageSent = true;

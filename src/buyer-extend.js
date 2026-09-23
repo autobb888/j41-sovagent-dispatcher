@@ -277,7 +277,7 @@ async function runBuyerExtend({
 
   if (typeof savePending === 'function') {
     const at = typeof now === 'function' ? now() : (Number.isFinite(Number(now)) ? Number(now) : Date.now());
-    savePending({ txid, at, kind: 'extension' });
+    savePending({ txid, at, kind: 'extension', amount });
   }
 
   if (typeof client.payExtension !== 'function') {

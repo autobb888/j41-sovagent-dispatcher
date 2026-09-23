@@ -578,6 +578,22 @@ test('a confirmed tx clears the stamp and unblocks the next command', async () =
   assert.equal(fs.existsSync(walletPendingPath('agent-2')), false, 'stamp file removed');
 });
 
+test('a sub-2 payment seen in the mempool clears the stamp', async () => {
+  saveWalletPending('agent-2', { txid: 'zeroconf-tx', at: Date.now(), kind: 'hire-pay', amount: 0.05 });
+  const client = { getTxStatus: async () => ({ confirmations: 0, txid: 'zeroconf-tx' }) };
+  const out = await resolveWalletPending(client, 'agent-2', loadWalletPending('agent-2'));
+  assert.equal(out, null);
+  assert.equal(fs.existsSync(walletPendingPath('agent-2')), false);
+});
+
+test('a 2-or-more unconfirmed payment keeps the stamp', async () => {
+  saveWalletPending('agent-2', { txid: 'big-tx', at: Date.now(), kind: 'hire-pay', amount: 5 });
+  const client = { getTxStatus: async () => ({ confirmations: 0, txid: 'big-tx' }) };
+  const out = await resolveWalletPending(client, 'agent-2', loadWalletPending('agent-2'));
+  assert.ok(out && out.txid === 'big-tx');
+  fs.unlinkSync(walletPendingPath('agent-2'));
+});
+
 test('an UNCONFIRMED tx keeps the stamp — the mempool hazard is real', async () => {
   saveWalletPending('agent-2', stampFor('mempool-tx'));
   const client = { getTxStatus: async () => ({ confirmations: 0 }) };
