@@ -129,6 +129,18 @@ test('firstDataEndpoint / dataEndpointRefusal fail closed on missing or ephemera
   assert.equal(firstDataEndpoint({ website: 'https://data.example' }), 'https://data.example');
   assert.equal(dataEndpointRefusal({ website: 'https://data.example' }), null);
   assert.equal(dataEndpointRefusal({ website: 'https://x.trycloudflare.com' }).code, 'data.endpoint');
+  assert.equal(dataEndpointRefusal(
+    { website: 'https://x.trycloudflare.com/j41/datasets/orchard-apples.json' },
+    { allowHosts: ['x.trycloudflare.com'] },
+  ), null);
+  assert.equal(dataEndpointRefusal(
+    { website: 'https://other.trycloudflare.com/j41/datasets/orchard-apples.json' },
+    { allowHosts: ['x.trycloudflare.com'] },
+  ).code, 'data.endpoint');
+  assert.equal(dataEndpointRefusal(
+    { website: 'http://127.0.0.1/j41/datasets/orchard-apples.json' },
+    { allowHosts: ['127.0.0.1'] },
+  ).code, 'data.endpoint');
   const localOnly = dataEndpointRefusal({ website: 'https://data.example', dataEndpointLocalOnly: true });
   assert.equal(localOnly.code, 'data.endpoint');
   assert.match(localOnly.message, /local-only|browse will not see/);

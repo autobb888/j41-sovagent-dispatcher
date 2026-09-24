@@ -298,8 +298,8 @@ function listingAdvertiseRefusal({
   }
   const data = row.kind === 'data' || require('./listing-description').isDataListing(row.kind, keys && keys.identity);
   if (data) {
-    const { dataEndpointRefusal } = require('./data-setup');
-    const refuse = dataEndpointRefusal(agentCfg);
+    const { dataEndpointRefusal, webhookAllowHosts } = require('./data-setup');
+    const refuse = dataEndpointRefusal(agentCfg, { allowHosts: webhookAllowHosts(cfg, webhookUrl) });
     if (refuse) return refuse;
   }
   if ((compute || model) && canonicalizeStatus === 'fail') {
@@ -892,10 +892,11 @@ async function runDoctor(opts = {}) {
     checks.push(mkCheck('data.endpoint', 'Data endpoint', 'skip',
       anyData ? 'data listing not on-chain yet' : 'no kind=data identity'));
   } else {
-    const { dataEndpointRefusal } = require('./data-setup');
+    const { dataEndpointRefusal, webhookAllowHosts } = require('./data-setup');
+    const allowHosts = webhookAllowHosts(cfg, deps.webhookUrl);
     const missing = [];
     for (const row of dataRows) {
-      const refuse = dataEndpointRefusal(loadLocalAgentConfig(agentsDir, row.id, deps.fs));
+      const refuse = dataEndpointRefusal(loadLocalAgentConfig(agentsDir, row.id, deps.fs), { allowHosts });
       if (refuse) missing.push({ id: row.id, refuse });
     }
     if (missing.length) {

@@ -36,7 +36,24 @@ const {
   ntpBlock,
 } = require('./doctor');
 const { isIndexerLagError, retryRegisterWithJ41, INDEXER_LAG_HINT, planOnboardingAfterProfile } = require('./indexer-lag');
-const { jobPaymentReady } = require('./job-payment');
+const { jobPaymentReady, isDatasetJob } = require('./job-payment');
+
+async function deliverDatasetNotice(agent, agentInfo, job) {
+  const full = await agent.client.getJob(job.id);
+  if (!full || !jobPaymentReady(full)) return 'wait';
+  if (full.status === 'delivered' || full.status === 'completed' || full.status === 'cancelled') return 'already';
+  if (!full.jobHash) return 'wait';
+  const note = 'Dataset hire paid. Run data-open after the review window is open. This notice has no rows and no token.';
+  const deliveryHash = crypto.createHash('sha256').update(note).digest('hex');
+  const timestamp = Math.floor(Date.now() / 1000);
+  const { buildDeliverMessage } = require('@junction41/sovagent-sdk/dist/signing/messages.js');
+  const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
+  const message = buildDeliverMessage({ jobHash: full.jobHash, deliveryHash, timestamp });
+  const signature = signMessage(agentInfo.wif, message, J41_NETWORK);
+  await agent.client.deliverJob(job.id, deliveryHash, signature, timestamp, note);
+  console.log(`[Data] delivered ${job.id} (no rows, no token)`);
+  return 'delivered';
+}
 const { planHirePayment, buyerOwnsJob, jobAlreadyPaid } = require('./hire-pay');
 const rq = require('./reactivation-queue.js');
 const {
@@ -3024,7 +3041,11 @@ program
   .description('Hire a listing as this fleet identity (create job; --pay broadcasts dual payment)')
   .option('--amount <n>', 'Job price in the listing currency (required only when the listing is hireable)')
   .option('--service <id>', 'Marketplace service id (required for compute gpu-rental and model api-endpoint)')
-  .option('--description <text>', 'Job description')
+  .option('--description <text>', 'Job description. For a dataset hire this is a label, not the filter.')
+  .option('--color <value>', 'Dataset hire term')
+  .option('--kind <value>', 'Dataset hire term')
+  .option('--taste <value>', 'Dataset hire term')
+  .option('--q <text>', 'Dataset hire search term')
   .option('--currency <c>', 'Payment currency', NATIVE_COIN)
   .option('--pay', 'Broadcast dual payment (seller + platform fee) after create')
   .option('--wait', 'With --pay: poll until wallet-pending clears (max 180s) then create+pay')
@@ -3084,7 +3105,23 @@ program
         service = await agent.client.getService(options.service);
       }
       const sellerKind = listing.kind || listing.listingKind || null;
-      const serviceType = service && (service.serviceType || service.service_type);
+      let serviceType = service && (service.serviceType || service.service_type);
+      if (sellerKind === 'data' && !options.service) {
+        const { pickDatasetService } = require('./hire.js');
+        let listed = [];
+        try {
+          const resp = await agent.client.getServices({
+            verusId: listing.id || listing.verusId || seller,
+          });
+          listed = (resp && (resp.data || resp)) || [];
+        } catch { listed = []; }
+        const picked = pickDatasetService(listed);
+        if (picked) {
+          options.service = picked.id;
+          service = picked;
+          serviceType = 'dataset';
+        }
+      }
       const gate = assertHireAllowed({
         sellerKind,
         serviceType,
@@ -3098,7 +3135,20 @@ program
         fail('BAD_AMOUNT', '--amount must be a positive number');
       }
 
-      const description = options.description || (service && service.description) || `Hire via dispatcher (${buyerAgentId})`;
+      const {
+        normalizeDatasetTerms, hasDatasetFilter, descriptionCarriesFilter,
+      } = require('./dataset-terms');
+      const datasetTerms = normalizeDatasetTerms({
+        color: options.color, kind: options.kind, taste: options.taste, q: options.q,
+      });
+      const datasetHire = sellerKind === 'data' || serviceType === 'dataset' || hasDatasetFilter(datasetTerms);
+      if (datasetHire && descriptionCarriesFilter(options.description)) {
+        fail('DATASET_TERMS_USE_FLAGS', 'Put color, kind, taste, and q on --color/--kind/--taste/--q. --description is only a label.');
+      }
+      if (datasetHire && amount < 0.0001) {
+        fail('BAD_AMOUNT', 'A dataset hire needs a positive amount of at least 0.0001. The price-0 placeholder is not a free job.');
+      }
+      const description = options.description || (datasetHire ? 'Dataset hire' : ((service && service.description) || `Hire via dispatcher (${buyerAgentId})`));
       say(`\n  Buyer:  ${keys.identity} (${buyerAgentId})`);
       say(`  Seller: ${listing.qualifiedName || listing.name || seller}  kind=${sellerKind || 'agent'}`);
       if (service) say(`  Service: ${service.id}  type=${serviceType || 'agent'}  listed=${service.price} ${service.currency || ''}`);
@@ -3146,13 +3196,30 @@ program
         }
       }
 
-      const job = await agent.createJob({
-        sellerVerusId: listing.id || listing.verusId || seller,
-        description,
-        amount,
-        currency: options.currency,
-        serviceId: options.service,
-      });
+      const sellerVerusId = listing.id || listing.verusId || seller;
+      let job;
+      if (datasetHire) {
+        const { createDatasetHire } = require('./dataset-hire');
+        job = await createDatasetHire({
+          agent,
+          wif: keys.wif,
+          network: J41_NETWORK,
+          sellerVerusId,
+          description,
+          amount,
+          currency: options.currency,
+          serviceId: options.service,
+          terms: datasetTerms,
+        });
+      } else {
+        job = await agent.createJob({
+          sellerVerusId,
+          description,
+          amount,
+          currency: options.currency,
+          serviceId: options.service,
+        });
+      }
       say(`✅ Job ${job.id} created (status=${job.status})`);
 
       let txid = null;
@@ -3774,6 +3841,54 @@ program
     if (options.json) console.log(JSON.stringify({ ok: true, jobId: result.jobId, status: result.status }, null, 2));
   });
 
+
+program
+  .command('data-open <buyer-agent-id> <job-id>')
+  .description('After a paid dataset delivery, fetch the bearer for that job. The token is not in the delivery notice.')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
+  .option('--yes', 'Required with --json')
+  .action(async (buyerAgentId, jobId, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    const keys = loadAgentKeys(buyerAgentId);
+    if (!keys || !keys.wif) fail('BUYER_NOT_FOUND', `Agent ${buyerAgentId} not found.`);
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+    const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
+    const agent = new J41Agent({
+      apiUrl: J41_API_URL, wif: keys.wif, identityName: keys.identity, iAddress: keys.iAddress,
+    });
+    try {
+      await agent.authenticate();
+      const job = await agent.client.getJob(jobId);
+      const seller = job && (job.sellerVerusId || job.seller);
+      const listing = seller ? await agent.client.getAgent(seller) : null;
+      const base = listing && (listing.website || (listing.endpoints && listing.endpoints[0] && listing.endpoints[0].url));
+      if (!base) fail('DATA_URL_MISSING', 'Seller listing has no website to open the dataset.');
+      const origin = new URL(base).origin;
+      const buyer = keys.identity && keys.identity.endsWith('@') ? keys.identity : `${keys.identity}@`;
+      const timestamp = Math.floor(Date.now() / 1000);
+      const message = `J41-DATA-OPEN|Job:${jobId}|Ts:${timestamp}|Buyer:${buyer}`;
+      const signature = signMessage(keys.wif, message, J41_NETWORK);
+      const res = await fetch(`${origin}/j41/datasets/open`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jobId, timestamp, signature, address: keys.address, buyer, iAddress: keys.iAddress,
+        }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok || !payload.token) {
+        fail(payload.error || 'DATA_OPEN_DENIED', payload.error || `data-open failed (${res.status})`, { jobId });
+      }
+      if (options.json) console.log(JSON.stringify({ ok: true, jobId, token: payload.token }, null, 2));
+      else {
+        console.log(`Token for ${jobId} (not a review, not a listing):`);
+        console.log(payload.token);
+      }
+    } finally {
+      try { agent.stop(); } catch { /* ignore */ }
+    }
+  });
 
 program
   .command('access <buyer-agent-id> <seller>')
@@ -6973,6 +7088,27 @@ program
       state._webhookServer = startWebhookServer(webhookPort, agentWebhooks, async (agentId, payload) => {
         await handleWebhookEvent(state, agentId, payload);
       }, proxyContext);
+      const { setOrchardDoor } = require('./webhook-server');
+      const { createOrchardDoor } = require('./dataset-door');
+      const { verifyMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
+      const tokenKeyPath = path.join(path.dirname(AGENTS_DIR), 'dataset-token.key');
+      let datasetSecret;
+      try { datasetSecret = fs.readFileSync(tokenKeyPath); } catch { datasetSecret = null; }
+      if (!datasetSecret || !datasetSecret.length) {
+        datasetSecret = crypto.randomBytes(32);
+        fs.writeFileSync(tokenKeyPath, datasetSecret, { mode: 0o600 });
+      }
+      setOrchardDoor(createOrchardDoor({
+        secret: datasetSecret,
+        verifyMessage: (message, address, signature) => verifyMessage(message, address, signature),
+        async getJob(jobId) {
+          const dataAgent = state.agents.find((a) => a.kind === 'data'
+            || String(a.identity || '').toLowerCase().startsWith('pippinapples'));
+          if (!dataAgent) return null;
+          const seller = await getAgentSession(state, dataAgent);
+          return seller.client.getJob(jobId);
+        },
+      }));
 
       // Safety-net: lightweight inbox count check every 5 minutes
       safeInterval(async () => {
@@ -10753,7 +10889,7 @@ async function pollForJobs(state) {
             if (fullJob?.jobHash && fullJob?.buyerVerusId) {
               const _rentalSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
               if (shouldRefuseLanGpuRental(agentInfo.id, fullJob, _rentalSvcs, undefined, { outboundSshV1: !!state.outboundSshV1 })) continue;
-              if (!isGpuRentalJob(fullJob, _rentalSvcs) && !(_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
+              if (!isGpuRentalJob(fullJob, _rentalSvcs) && !isDatasetJob(fullJob) && agentInfo.kind !== 'data' && !(_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
                 if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
                   console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${job.id.substring(0, 8)}, buyer not charged`);
                   state.emitEvent?.('job.declined_llm_down', { jobId: job.id, agentId: agentInfo.id });
@@ -10859,6 +10995,14 @@ async function pollForJobs(state) {
         console.log(`📥 New job: ${job.id} (${job.amount} ${job.currency})`);
 
         const _startSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
+        if (isDatasetJob(job) || agentInfo.kind === 'data') {
+          const delivered = await deliverDatasetNotice(agent, agentInfo, job);
+          if (delivered === 'delivered' || delivered === 'already') {
+            state.seen.set(job.id, Date.now());
+            saveSeenJobs(state.seen);
+          }
+          continue;
+        }
         if (shouldRefuseLanGpuRental(agentInfo.id, job, _startSvcs, undefined, { outboundSshV1: !!state.outboundSshV1 })) continue;
         if (isApiEndpointJob(job, _startSvcs)) {
           console.log(`[Poll] skip labour start for api-endpoint job ${job.id}`);

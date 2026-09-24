@@ -6,9 +6,13 @@
  * This allows O(1) secret lookup instead of iterating all secrets.
  */
 
-const fs = require('fs');
 const http = require('http');
-const path = require('path');
+const { publicOrchardCard } = require('./orchard-dataset');
+
+let orchardDoor = null;
+function setOrchardDoor(door) {
+  orchardDoor = door;
+}
 const { verifyWebhookSignature, verifyWebhookSignatureWithTimestamp } = require('@junction41/sovagent-sdk/dist/webhook/verify.js');
 const { handleProxyRequest } = require('./proxy-handler.js');
 
@@ -137,20 +141,47 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
       return;
     }
 
-    // Fixed dataset for the local data seller. One file, no path parameters.
+    // Public orchard URL. Rows are not served here, with or without a query
+    // string. The response is only how to hire the dataset.
     const datasetPath = (req.url || '').split('?')[0];
     if (req.method === 'GET' && datasetPath === '/j41/datasets/orchard-apples.json') {
-      try {
-        const file = path.join(__dirname, '..', 'templates', 'orchard-apples.json');
-        const body = fs.readFileSync(file);
-        res.writeHead(200, {
-          'Content-Type': 'application/json; charset=utf-8',
-          'Cache-Control': 'public, max-age=60',
-        });
-        res.end(body);
-      } catch {
+      const header = req.headers.authorization || '';
+      const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+      let body = publicOrchardCard();
+      if (token && orchardDoor && typeof orchardDoor.rowsForToken === 'function') {
+        try {
+          const query = new URL(req.url, 'http://127.0.0.1').searchParams;
+          const rows = await orchardDoor.rowsForToken(token, query);
+          if (rows) body = rows;
+        } catch {
+          body = publicOrchardCard();
+        }
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'private, no-store',
+      });
+      res.end(JSON.stringify(body));
+      return;
+    }
+
+    if (req.method === 'POST' && datasetPath === '/j41/datasets/open') {
+      if (!orchardDoor || typeof orchardDoor.openGrant !== 'function') {
         res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'dataset missing' }));
+        res.end(JSON.stringify({ error: 'dataset door unavailable' }));
+        return;
+      }
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      let parsed = {};
+      try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); } catch { parsed = {}; }
+      try {
+        const opened = await orchardDoor.openGrant(parsed);
+        res.writeHead(opened && opened.token ? 200 : 403, { 'Content-Type': 'application/json', 'Cache-Control': 'private, no-store' });
+        res.end(JSON.stringify(opened && opened.token ? { token: opened.token } : { error: (opened && opened.error) || 'denied' }));
+      } catch (e) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message || 'denied' }));
       }
       return;
     }
@@ -431,4 +462,4 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
   return server;
 }
 
-module.exports = { startWebhookServer, readBody };
+module.exports = { startWebhookServer, readBody, setOrchardDoor };

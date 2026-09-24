@@ -7,17 +7,34 @@ const fs = require('fs');
 const path = require('path');
 const {
   assertHireAllowed,
+  pickDatasetService,
   assertAccessAllowed,
   paymentOutputs,
   localBuyers,
   fetchMarketplaceListings,
 } = require('../src/hire');
 
-test('hire gate matches platform: agent labour ok, data refused', () => {
+test('hire gate matches platform: agent labour ok, dataset service ok, bare data refused', () => {
   assert.equal(assertHireAllowed({ sellerKind: 'agent', serviceId: 's1' }).ok, true);
-  const data = assertHireAllowed({ sellerKind: 'data', serviceType: 'agent', serviceId: 's1' });
-  assert.equal(data.ok, false);
-  assert.equal(data.code, 'DATA_NOT_HIREABLE');
+  const bare = assertHireAllowed({ sellerKind: 'data', serviceType: 'agent', serviceId: 's1' });
+  assert.equal(bare.ok, false);
+  assert.equal(bare.code, 'DATA_NOT_HIREABLE');
+  assert.equal(assertHireAllowed({
+    sellerKind: 'data', serviceType: 'dataset', serviceId: 's1',
+  }).ok, true);
+});
+
+test('one active dataset service is selected; two or none are not', () => {
+  const one = pickDatasetService([
+    { id: 'svc-1', serviceType: 'dataset', status: 'active', price: 0 },
+    { id: 'other', serviceType: 'agent', status: 'active' },
+  ]);
+  assert.equal(one.id, 'svc-1');
+  assert.equal(pickDatasetService([
+    { id: 'a', serviceType: 'dataset', status: 'active' },
+    { id: 'b', serviceType: 'dataset', status: 'active' },
+  ]), null);
+  assert.equal(pickDatasetService([{ id: 'a', serviceType: 'dataset', status: 'inactive' }]), null);
 });
 
 test('access is allowed only when some service is api-endpoint', () => {

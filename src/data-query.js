@@ -2,10 +2,9 @@
 /**
  * Buyer query for a SovData JSON collection.
  *
- * The seller hosts the document. Equality filters are also sent on the
- * listing URL so a site that already understands them (the apples listing
- * echoes q, color, and kind) can shrink the body. Rows are filtered again
- * locally, so a static file that ignores the query string still answers.
+ * The seller hosts the document. The public orchard URL does not return
+ * rows. A paid job is what delivers them. Local filtering still applies
+ * when a delivery body contains rows.
  * This is not a hire and it does not crawl links.
  */
 

@@ -18,10 +18,13 @@ function assertHireAllowed({ sellerKind, serviceType, serviceId }) {
     };
   }
   if (kind === 'data') {
+    if (serviceType === 'dataset' && serviceId) {
+      return { ok: true };
+    }
     return {
       ok: false,
       code: 'DATA_NOT_HIREABLE',
-      message: 'Data listings are browse-only. POST /v1/jobs refuses kind=data.',
+      message: 'Data is hired only as a dataset service with a positive amount. A public GET does not return rows.',
     };
   }
   if (kind === 'compute') {
@@ -105,7 +108,7 @@ function localBuyers(ids, loadKeys) {
   return out;
 }
 
-const SERVICE_TYPES = Object.freeze(['agent', 'gpu-rental', 'api-endpoint']);
+const SERVICE_TYPES = Object.freeze(['agent', 'gpu-rental', 'api-endpoint', 'dataset']);
 
 function parseServiceType(raw) {
   return SERVICE_TYPES.includes(raw) ? raw : null;
@@ -145,6 +148,17 @@ function listingRowFromService(s) {
     currency: s.currency || null,
     name: s.name || null,
   };
+}
+
+function pickDatasetService(services) {
+  const list = (Array.isArray(services) ? services : []).filter((s) => {
+    if (!s || !s.id) return false;
+    const type = s.serviceType || s.service_type;
+    if (type !== 'dataset') return false;
+    const status = String(s.status || 'active').toLowerCase();
+    return status === 'active' || status === '';
+  });
+  return list.length === 1 ? list[0] : null;
 }
 
 function listingRowFromDataAgent(a) {
@@ -238,6 +252,7 @@ module.exports = {
   defaultServiceTypeForKind,
   parseServiceType,
   SERVICE_TYPES,
+  pickDatasetService,
   listingRowFromService,
   listingRowFromDataAgent,
   fetchMarketplaceListings,

@@ -104,7 +104,17 @@ function firstDataEndpoint(agentConfig) {
   return httpUrlString(agentConfig.website) || null;
 }
 
-function dataEndpointRefusal(agentConfig) {
+function webhookAllowHosts(cfg, webhookUrl) {
+  const hosts = [];
+  const raws = [webhookUrl, cfg && cfg.runtime && cfg.runtime.webhook_url];
+  for (const raw of raws) {
+    if (!raw) continue;
+    try { hosts.push(new URL(String(raw)).hostname); } catch { /* ignore */ }
+  }
+  return hosts;
+}
+
+function dataEndpointRefusal(agentConfig, { allowHosts } = {}) {
   const url = firstDataEndpoint(agentConfig);
   if (!url) {
     return {
@@ -114,7 +124,10 @@ function dataEndpointRefusal(agentConfig) {
   }
   let host = '';
   try { host = new URL(url).hostname; } catch { host = ''; }
-  if (descriptionHasEphemeralUrl(url) || blockedDataHost(host)) {
+  // Private and link-local hosts stay refused. The operator's own webhook
+  // host is the orchard door, so that one quick-tunnel name may poll.
+  const allowed = (allowHosts || []).some((h) => h && String(h).toLowerCase() === host.toLowerCase());
+  if (blockedDataHost(host) || (!allowed && descriptionHasEphemeralUrl(url))) {
     return {
       code: 'data.endpoint',
       message: 'data.endpoint: website/networkEndpoints is ephemeral (trycloudflare/ngrok/localhost/RFC1918) — run data-setup --website https://...',
@@ -177,6 +190,7 @@ module.exports = {
   applyDataAgentConfig,
   buildDataVdxfFields,
   firstDataEndpoint,
+  webhookAllowHosts,
   dataEndpointRefusal,
   assertDataSetupDescription,
   dataSetupNextLines,
