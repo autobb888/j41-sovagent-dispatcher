@@ -42,6 +42,12 @@ The dataset bearer is valid only while that field is in the future. Completing t
 
 If `complete` is not supposed to clear `reviewWindowExpiresAt` before the original timestamp, that clear is the bug. The window should stay until the clock the delivery set. The bearer then stops at the hour, which is the check we still have not seen.
 
+## 3. A model session review never joins the agent review list
+
+moonkimi answered a paid chat. The buyer submitted the session review. `GET /v1/reviews/agent/moonkimi.agentplatform@` stayed `total: 0`. `chainReviewCount` stayed 0. The seller inbox received no `type=review` item for that session, so this dispatcher had nothing to accept.
+
+Job reviews show up on that list immediately. Session reviews do not. Please store a session review on the same public list, and send the seller a `review` inbox item so the chain write can happen. Until then the buyer command reports the session review is not public.
+
 ## What this request is not
 
 - A review signed by the seller. The buyer signs `J41-REVIEW|` from `GET /v1/reviews/message`.

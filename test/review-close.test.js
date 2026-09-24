@@ -71,7 +71,7 @@ test('waitForWrittenReview succeeds when chainReviewCount moves', async () => {
     now: () => t,
     sleep: async (ms) => { t += ms; },
     readCount: async () => ({ chainReviewCount: t >= 80 ? 2 : 0 }),
-    readPublished: async () => ({ id: 'rev-1', verified: true, jobHash: 'abc' }),
+    readPublished: async () => (t >= 80 ? { id: 'rev-1', verified: true, jobHash: 'abc' } : null),
     expect: { jobHash: 'abc' },
   });
   assert.equal(out.ok, true);
@@ -93,10 +93,10 @@ test('waitForWrittenReview reports a public review whose profile count stayed pu
     expect: { jobHash: 'abc' },
     onProgress: (row) => notes.push(row.count),
   });
-  assert.equal(out.ok, false);
-  assert.equal(out.code, 'REVIEW_COUNT_LAGGING');
-  assert.deepEqual(notes, [0]);
-  assert.match(reviewWriteMessage(out), /rev-9/);
+  assert.equal(out.ok, true);
+  assert.equal(out.code, 'REVIEW_PUBLIC');
+  assert.deepEqual(notes, []);
+  assert.match(reviewWriteMessage(out), /rev-9 is public/);
   assert.match(reviewWriteMessage(out), /chainReviewCount is still 0/);
 });
 

@@ -55,6 +55,39 @@ const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '480000'); // id
 const ACCEPTED_QUIET_MS = 90_000;
 const ACCEPTED_IDLE_NOTE = 'This job is still accepted, so it cannot be paused. Delivering the work so far.';
 
+function isOutageReply(text) {
+  return /I experienced a temporary issue/i.test(String(text || ''));
+}
+
+function lastAssistantText(executor) {
+  const log = executor && executor.conversationLog;
+  if (!Array.isArray(log)) return '';
+  for (let i = log.length - 1; i >= 0; i--) {
+    const row = log[i];
+    if (row && row.role === 'assistant' && row.content) return String(row.content);
+  }
+  return '';
+}
+
+/** A real answer to the hire description starts the short close. The outage line does not. */
+function hireAnswerStartsQuiet(executor) {
+  const text = lastAssistantText(executor);
+  return text.length > 0 && !isOutageReply(text);
+}
+
+function quietDeliverReady({
+  messageCount = 0,
+  hireAnswered = false,
+  idleMs = 0,
+  quietMs = ACCEPTED_QUIET_MS,
+  idleLimit = IDLE_TIMEOUT_MS,
+  checked = false,
+} = {}) {
+  if (checked) return false;
+  if (!(messageCount > 0 || hireAnswered)) return false;
+  return idleMs >= quietMs && idleMs < idleLimit;
+}
+
 function labourExtensionClosed(status) {
   return status === 'accepted';
 }
@@ -1091,6 +1124,7 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   let sessionEnded = false;
   let resolveSession;
   let messageCount = 0;
+  let hireAnswered = false;
   let messageQueue = Promise.resolve(); // J4: Serialize handleMessage calls
 
   // Promise that resolves when session ends or idle timeout
@@ -1172,6 +1206,12 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   // Initialize executor (sends greeting on first connect, skips on reconnect)
   const isReconnect = job.status === 'in_progress';
   await executor.init(job, agent, soulPrompt, { isReconnect });
+  // The hire description is the buyer's message. Answering it starts the
+  // 90s close. Waiting for a later chat message left the job on the 8-minute idle.
+  if (!isReconnect && hireAnswerStartsQuiet(executor)) {
+    _lastActivityAt = Date.now();
+    hireAnswered = true;
+  }
 
   // Shared dedup set for WS handler and poll fallback (Task 3)
   const _processedMsgIds = new Set();
@@ -1392,8 +1432,14 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   const idleCheck = setInterval(async () => {
     const idleMs = Date.now() - _lastActivityAt;
     if (_idlePauseUnsupported) return;
-    if (!_acceptedQuietChecked && messageCount > 0 && idleMs >= ACCEPTED_QUIET_MS
-        && idleMs < IDLE_TIMEOUT_MS && !sessionEnded && !_paused) {
+    if (quietDeliverReady({
+      messageCount,
+      hireAnswered,
+      idleMs,
+      quietMs: ACCEPTED_QUIET_MS,
+      idleLimit: IDLE_TIMEOUT_MS,
+      checked: _acceptedQuietChecked,
+    }) && !sessionEnded && !_paused) {
       _acceptedQuietChecked = true;
       let quietStatus = null;
       try { quietStatus = (await agent.client.getJob(job.id))?.status; } catch { /* full idle still runs */ }
@@ -2470,5 +2516,5 @@ if (require.main === module) {
 // Export testable helpers when running under NODE_ENV=test.
 // Avoids shipping a test seam in production while keeping coverage honest.
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach, isTerminalAttachError, ATTACH_CONFIRM_BACKOFF_MS, resumeJob, ensureChatConnected, containDownload, labourExtensionClosed, requestBudgetExtension, ACCEPTED_IDLE_NOTE };
+  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach, isTerminalAttachError, ATTACH_CONFIRM_BACKOFF_MS, resumeJob, ensureChatConnected, containDownload, labourExtensionClosed, requestBudgetExtension, ACCEPTED_IDLE_NOTE, hireAnswerStartsQuiet, quietDeliverReady, ACCEPTED_QUIET_MS };
 }

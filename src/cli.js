@@ -3662,7 +3662,7 @@ async function offerBuyerReview({
     jobHash,
     sessionId,
     baselineCount: baseline,
-    timeoutMs: process.env.NODE_ENV === 'test' ? 0 : REVIEW_COUNT_TIMEOUT_MS,
+    timeoutMs: process.env.NODE_ENV === 'test' ? 0 : (mode === 'session' ? 15000 : REVIEW_COUNT_TIMEOUT_MS),
     intervalMs: process.env.NODE_ENV === 'test' ? 0 : REVIEW_COUNT_INTERVAL_MS,
     onProgress: reviewCountProgress(say),
   });
@@ -3866,7 +3866,7 @@ program
       seller,
       sessionId: result.sessionId,
       baselineCount: baseline,
-      timeoutMs: process.env.NODE_ENV === 'test' ? 0 : REVIEW_COUNT_TIMEOUT_MS,
+      timeoutMs: process.env.NODE_ENV === 'test' ? 0 : 15000,
       intervalMs: process.env.NODE_ENV === 'test' ? 0 : REVIEW_COUNT_INTERVAL_MS,
       onProgress: reviewCountProgress(say),
     });

@@ -101,13 +101,20 @@ async function waitForWrittenReview({
         publicReview,
       };
     }
-    if (publicReview && typeof onProgress === 'function') {
-      onProgress({ publicReview, count, baseline: baselineCount });
+    // The review list is the public record. chainReviewCount catches up later.
+    if (publicReview) {
+      return {
+        ok: true,
+        code: 'REVIEW_PUBLIC',
+        count,
+        baseline: baselineCount,
+        publicReview,
+      };
     }
     if (now() - start >= timeoutMs) {
       return {
         ok: false,
-        code: publicReview ? 'REVIEW_COUNT_LAGGING' : 'REVIEW_NOT_PUBLIC',
+        code: 'REVIEW_NOT_PUBLIC',
         count,
         baseline: baselineCount,
         publicReview,
@@ -123,10 +130,10 @@ function reviewWriteMessage(result) {
   if (result.ok && result.code === 'REVIEW_WRITTEN') {
     return `Review written. chainReviewCount ${result.baseline} → ${result.count}.`;
   }
-  if (result.code === 'REVIEW_COUNT_LAGGING') {
+  if (result.code === 'REVIEW_PUBLIC' || result.code === 'REVIEW_COUNT_LAGGING') {
     const id = result.publicReview && result.publicReview.id;
     const shown = id ? `Review ${id} is public` : 'The review is public';
-    return `${shown} and chainReviewCount is still ${result.count}. The profile count lags the review list. J41_REVIEW_COUNT_TIMEOUT_MS waits longer.`;
+    return `${shown}. chainReviewCount is still ${result.count}.`;
   }
   if (result.message) return result.message;
   return 'Review was submitted and is not on the public review list yet.';
