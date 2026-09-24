@@ -38,6 +38,13 @@ function parseRating(raw) {
   return rating;
 }
 
+/** Platform reviews are open on these statuses. `delivered` is the open dispute hour. */
+const REVIEWABLE_JOB_STATUSES = new Set(['delivered', 'completed', 'disputed', 'cancelled']);
+
+function reviewableJobStatus(status) {
+  return REVIEWABLE_JOB_STATUSES.has(status);
+}
+
 function isJobCanonical(message) {
   return typeof message === 'string' && message.startsWith('J41-REVIEW|');
 }
@@ -122,8 +129,8 @@ async function submitBuyerJobReview({
   if (!buyerOwnsJob(keys, job)) {
     return fail('PAY_NOT_BUYER', 'This identity is not the buyer on that job.', { jobId: job.id });
   }
-  if (job.status !== 'completed') {
-    return fail('REVIEW_NOT_COMPLETED', `Job status is ${job.status}, not completed.`, {
+  if (!reviewableJobStatus(job.status)) {
+    return fail('REVIEW_NOT_COMPLETED', `Job status is ${job.status}. A review is open once the job is delivered.`, {
       jobId: job.id,
       status: job.status,
     });
@@ -226,6 +233,7 @@ async function submitBuyerJobReview({
 module.exports = {
   submitBuyerJobReview,
   parseRating,
+  reviewableJobStatus,
   getJobReviewMessage,
   readBuyerReviewInbox,
 };

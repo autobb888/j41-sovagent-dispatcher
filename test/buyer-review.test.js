@@ -60,6 +60,41 @@ test('buyer-review source GETs J41-REVIEW| and never homemade template / getAtte
   assert.doesNotMatch(src, /agent\.submitReview/);
 });
 
+test('a delivered job can be reviewed and a requested job cannot', async () => {
+  let posted = 0;
+  const delivered = await submitBuyerJobReview({
+    client: baseClient({
+      getJob: async () => ({ ...JOB, status: 'delivered' }),
+      submitReview: async () => { posted += 1; return { id: 'review-delivered' }; },
+    }),
+    keys: BUYER,
+    jobId: JOB.id,
+    rating: 5,
+    network: 'verustest',
+    now: 1_700_000_222,
+    getReviewMessage: async () => ({ message: jobCanonical(), timestamp: 1_700_000_222 }),
+    signMessage: () => 'sig',
+  });
+  assert.equal(delivered.ok, true);
+  assert.equal(posted, 1);
+
+  let signed = 0;
+  const early = await submitBuyerJobReview({
+    client: baseClient({
+      getJob: async () => ({ ...JOB, status: 'accepted' }),
+      submitReview: async () => { throw new Error('must not post'); },
+    }),
+    keys: BUYER,
+    jobId: JOB.id,
+    rating: 5,
+    signMessage: () => { signed += 1; return 'sig'; },
+  });
+  assert.equal(early.ok, false);
+  assert.equal(early.code, 'REVIEW_NOT_COMPLETED');
+  assert.equal(early.status, 'accepted');
+  assert.equal(signed, 0);
+});
+
 test('parseRating accepts 1-5 and rejects 1.5, 01, 1.0, empty, 9', () => {
   assert.equal(parseRating('1'), 1);
   assert.equal(parseRating(5), 5);

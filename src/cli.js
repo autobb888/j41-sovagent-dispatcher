@@ -43,7 +43,7 @@ async function deliverDatasetNotice(agent, agentInfo, job) {
   if (!full || !jobPaymentReady(full)) return 'wait';
   if (full.status === 'delivered' || full.status === 'completed' || full.status === 'cancelled') return 'already';
   if (!full.jobHash) return 'wait';
-  const note = 'Dataset hire paid. Run data-open after the review window is open. This notice has no rows and no token.';
+  const note = 'Dataset hire paid. Run data-open after the review window is open. This notice has no rows and no token. Review while that window is open. complete ends the bearer.';
   const { datasetDeliveryHash } = require('./dataset-terms');
   const deliveryHash = datasetDeliveryHash(full);
   const timestamp = Math.floor(Date.now() / 1000);
@@ -3530,6 +3530,156 @@ program
     }
   });
 
+function reviewCountProgress(say) {
+  let told = false;
+  return () => {
+    if (told) return;
+    told = true;
+    say('Review is public. Waiting for chainReviewCount.');
+  };
+}
+
+async function reviewAlreadyPublic({ agent, mode, jobId, seller, buyerAgentId, publishedReview }) {
+  try {
+    if (mode === 'session') {
+      const { loadAccessGrant } = require('./buyer-access');
+      const { sessionTokenFromHeader } = require('./session-token');
+      const grant = loadAccessGrant(AGENTS_DIR, buyerAgentId, seller);
+      const sessionId = grant && grant.sessionId ? sessionTokenFromHeader(String(grant.sessionId)) : '';
+      if (!sessionId || !agent.client.getAgentReviews) return false;
+      return !!publishedReview(await agent.client.getAgentReviews(seller, { limit: 20 }), { sessionId });
+    }
+    const job = await agent.client.getJob(jobId);
+    if (!job || !job.jobHash || typeof agent.client.getJobReview !== 'function') return false;
+    return !!publishedReview(await agent.client.getJobReview(job.jobHash), { jobHash: job.jobHash });
+  } catch {
+    return false;
+  }
+}
+
+function reviewNextLine(mode, buyerAgentId, target) {
+  if (mode === 'session') {
+    return `Next: j41-dispatcher review-session ${buyerAgentId || '<buyer>'} ${target || '<seller>'} --rating N`;
+  }
+  return `Next: j41-dispatcher review ${buyerAgentId || '<buyer>'} ${target || '<job>'} --rating N`;
+}
+
+async function readlineAsk(question) {
+  const readline = require('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return await new Promise((resolve) => rl.question(question, resolve));
+  } finally {
+    rl.close();
+  }
+}
+
+async function offerBuyerReview({
+  options, say, keys, agent, buyerAgentId, mode, jobId, seller,
+}) {
+  const {
+    decideReviewAsk, askReviewOnClose, readReviewBaseline, finishReviewWrite, reviewWriteMessage,
+    publishedReview, REVIEW_COUNT_TIMEOUT_MS, REVIEW_COUNT_INTERVAL_MS,
+  } = require('./review-close');
+  const decision = decideReviewAsk({
+    json: !!(options && options.json),
+    yes: !!(options && options.yes),
+    rating: options && options.rating,
+    tty: !!(process.stdin && process.stdin.isTTY),
+  });
+  const next = reviewNextLine(mode, buyerAgentId, mode === 'session' ? seller : jobId);
+  if (decision.action === 'bad-rating') {
+    return { ok: false, code: 'REVIEW_BAD_RATING', message: '--rating must be an integer 1-5.' };
+  }
+  if (await reviewAlreadyPublic({ agent, mode, jobId, seller, buyerAgentId, publishedReview })) {
+    if (decision.action === 'submit' && !(options && options.json)) say('Review is already public.');
+    return { ok: true, skipped: true, code: 'REVIEW_ALREADY' };
+  }
+  let rating = decision.rating;
+  let message = (options && options.message) || '';
+  if (decision.action === 'ask') {
+    const asked = await askReviewOnClose({ ask: readlineAsk });
+    if (asked.invalid) {
+      say('Rating must be an integer 1-5.');
+      say(next);
+      return { ok: false, skipped: true, code: 'REVIEW_SKIPPED' };
+    }
+    if (asked.skipped || asked.rating == null) {
+      say('Review skipped.');
+      say(next);
+      return { ok: false, skipped: true, code: 'REVIEW_SKIPPED' };
+    }
+    rating = asked.rating;
+    message = asked.message || message;
+  } else if (decision.action !== 'submit') {
+    if (!(options && options.json)) say(next);
+    return { ok: false, skipped: true, code: 'REVIEW_SKIPPED' };
+  }
+
+  const baseline = await readReviewBaseline(agent.client, seller);
+  let submitted;
+  let sessionId = null;
+  let jobHash = null;
+  if (mode === 'session') {
+    const { submitBuyerApiSessionReview } = require('./buyer-review-session');
+    const { loadAccessGrant } = require('./buyer-access');
+    const { sessionTokenFromHeader } = require('./session-token');
+    const grant = loadAccessGrant(AGENTS_DIR, buyerAgentId, seller);
+    sessionId = grant && grant.sessionId ? sessionTokenFromHeader(String(grant.sessionId)) : '';
+    submitted = await submitBuyerApiSessionReview({
+      client: agent.client,
+      keys,
+      seller,
+      rating,
+      message,
+      agentsDir: AGENTS_DIR,
+      buyerId: buyerAgentId,
+      network: J41_NETWORK,
+    });
+  } else {
+    const { submitBuyerJobReview } = require('./buyer-review');
+    try {
+      const job = await agent.client.getJob(jobId);
+      jobHash = job && job.jobHash;
+    } catch { /* submit reports the same failure */ }
+    submitted = await submitBuyerJobReview({
+      client: agent.client,
+      keys,
+      jobId,
+      rating,
+      message,
+      network: J41_NETWORK,
+    });
+  }
+  if (!submitted.ok) return submitted;
+  if (!(options && options.json)) {
+    say(`✅ Review submitted (${submitted.result && (submitted.result.inboxId || submitted.result.id) || 'ok'})`);
+    if (submitted.inboxWarning) say(`   ${submitted.inboxWarning}`);
+  }
+  const written = await finishReviewWrite({
+    client: agent.client,
+    seller,
+    jobHash,
+    sessionId,
+    baselineCount: baseline,
+    timeoutMs: process.env.NODE_ENV === 'test' ? 0 : REVIEW_COUNT_TIMEOUT_MS,
+    intervalMs: process.env.NODE_ENV === 'test' ? 0 : REVIEW_COUNT_INTERVAL_MS,
+    onProgress: reviewCountProgress(say),
+  });
+  const line = reviewWriteMessage(written);
+  if (written.ok) {
+    if (!(options && options.json)) say(`✅ ${line}`);
+  }
+  return { ...written, message: written.ok ? line : (written.message || line), rating };
+}
+
+function reportReviewWrite(review, options) {
+  if (!review || review.skipped || review.ok) return;
+  const line = review.message || 'Review was not written.';
+  if (!(options && options.json)) console.error(`❌ ${line}`);
+  process.exitCode = 1;
+}
+
 async function runBuyerComplete(keys, agent, jobId, options, buyerAgentId) {
   const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
   const say = (line) => { if (!options.json) console.log(line); };
@@ -3570,22 +3720,33 @@ async function runBuyerComplete(keys, agent, jobId, options, buyerAgentId) {
     const rec = witness.data || witness;
     say(`   Witness signedByName=${(rec.witness && rec.witness.signedByName) || rec.signedByName || '—'}`);
   }
-  if (!options.json) {
-    say(`Next: j41-dispatcher review ${buyerAgentId || '<buyer>'} ${job.id} --rating N`);
-  }
   if (options.json) console.log(JSON.stringify(out.json, null, 2));
 }
 
 program
   .command('complete <buyer-agent-id> <job-id>')
   .description('Buyer confirms delivery (SDK completeJob). Prints getJobWitness; does not write buyer VDXF.')
+  .option('--rating <n>', '1-5. Submits the review after complete. --yes and --json do not ask.')
+  .option('--message <text>', 'Review text when a rating is submitted')
   .option('--yes', 'Skip confirmation')
   .option('--json', 'One JSON object on stdout. Requires --yes.')
   .action(async (buyerAgentId, jobId, options) => {
     const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
     if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    const { parseRating } = require('./buyer-review');
+    if (options.rating != null && String(options.rating).trim() !== '' && parseRating(options.rating) == null) {
+      fail('REVIEW_BAD_RATING', '--rating must be an integer 1-5.');
+    }
     const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
     await runBuyerComplete(keys, agent, jobId, options, buyerAgentId);
+    const job = await agent.client.getJob(jobId);
+    const seller = job && (job.sellerVerusId || job.seller);
+    const review = await offerBuyerReview({
+      options, say, keys, agent, buyerAgentId, mode: 'job', jobId, seller,
+    });
+    if (review && review.code === 'REVIEW_BAD_RATING') fail(review.code, review.message);
+    reportReviewWrite(review, options);
   });
 
 program
@@ -3611,13 +3772,20 @@ program
     }
     if (!job || !job.id) fail('REVIEW_NOT_COMPLETED', `Job ${jobId} not found.`);
     if (!buyerOwnsJob(keys, job)) fail('PAY_NOT_BUYER', 'This identity is not the buyer on that job.', { jobId: job.id });
-    if (job.status !== 'completed') {
-      fail('REVIEW_NOT_COMPLETED', `Job status is ${job.status}, not completed.`, { jobId: job.id, status: job.status });
+    const { reviewableJobStatus } = require('./buyer-review');
+    if (!reviewableJobStatus(job.status)) {
+      fail('REVIEW_NOT_COMPLETED', `Job status is ${job.status}. A review is open once the job is delivered.`, { jobId: job.id, status: job.status });
     }
     if (!options.yes) {
       const ok = await confirmHire({ amountText: `review ${job.id} rating ${rating}`, pay: false });
       if (!ok) { console.log('Cancelled.'); process.exit(0); }
     }
+    const {
+      readReviewBaseline, finishReviewWrite, reviewWriteMessage,
+      REVIEW_COUNT_TIMEOUT_MS, REVIEW_COUNT_INTERVAL_MS,
+    } = require('./review-close');
+    const seller = job.sellerVerusId || job.seller;
+    const baseline = await readReviewBaseline(agent.client, seller);
     const result = await submitBuyerJobReview({
       client: agent.client,
       keys,
@@ -3629,11 +3797,26 @@ program
     if (!result.ok) fail(result.code, result.message, { jobId: result.jobId, status: result.status });
     say(`✅ Review submitted (${result.result && (result.result.inboxId || result.result.id) || 'ok'})`);
     if (result.inboxWarning) say(`   ${result.inboxWarning}`);
+    const written = await finishReviewWrite({
+      client: agent.client,
+      seller,
+      jobHash: job.jobHash,
+      baselineCount: baseline,
+      timeoutMs: process.env.NODE_ENV === 'test' ? 0 : REVIEW_COUNT_TIMEOUT_MS,
+      intervalMs: process.env.NODE_ENV === 'test' ? 0 : REVIEW_COUNT_INTERVAL_MS,
+      onProgress: reviewCountProgress(say),
+    });
+    const line = reviewWriteMessage(written);
+    if (written.ok) say(`✅ ${line}`);
+    else console.error(`❌ ${line}`);
+    if (!written.ok) process.exitCode = 1;
     if (options.json) {
       console.log(JSON.stringify({
-        ok: true,
+        ok: !!written.ok,
+        code: written.code,
         jobId: result.jobId,
         rating: result.rating,
+        chainReviewCount: written.count,
         result: result.result,
         inboxCount: result.inboxCount,
         ...(result.inboxWarning ? { inboxWarning: result.inboxWarning } : {}),
@@ -3660,6 +3843,11 @@ program
       const ok = await confirmHire({ amountText: `review-session ${seller} rating ${rating}`, pay: false });
       if (!ok) { console.log('Cancelled.'); process.exit(0); }
     }
+    const {
+      readReviewBaseline, finishReviewWrite, reviewWriteMessage,
+      REVIEW_COUNT_TIMEOUT_MS, REVIEW_COUNT_INTERVAL_MS,
+    } = require('./review-close');
+    const baseline = await readReviewBaseline(agent.client, seller);
     const result = await submitBuyerApiSessionReview({
       client: agent.client,
       keys,
@@ -3673,12 +3861,27 @@ program
     if (!result.ok) fail(result.code, result.message, { seller: result.seller, sessionId: result.sessionId });
     say(`✅ Session review submitted (${result.result && (result.result.inboxId || result.result.id) || 'ok'})`);
     if (result.inboxWarning) say(`   ${result.inboxWarning}`);
+    const written = await finishReviewWrite({
+      client: agent.client,
+      seller,
+      sessionId: result.sessionId,
+      baselineCount: baseline,
+      timeoutMs: process.env.NODE_ENV === 'test' ? 0 : REVIEW_COUNT_TIMEOUT_MS,
+      intervalMs: process.env.NODE_ENV === 'test' ? 0 : REVIEW_COUNT_INTERVAL_MS,
+      onProgress: reviewCountProgress(say),
+    });
+    const line = reviewWriteMessage(written);
+    if (written.ok) say(`✅ ${line}`);
+    else console.error(`❌ ${line}`);
+    if (!written.ok) process.exitCode = 1;
     if (options.json) {
       console.log(JSON.stringify({
-        ok: true,
+        ok: !!written.ok,
+        code: written.code,
         seller,
         sessionId: result.sessionId,
         rating: result.rating,
+        chainReviewCount: written.count,
         result: result.result,
         inboxCount: result.inboxCount,
         ...(result.inboxWarning ? { inboxWarning: result.inboxWarning } : {}),
@@ -3846,7 +4049,9 @@ program
 
 program
   .command('data-open <buyer-agent-id> <job-id>')
-  .description('After a paid dataset delivery, fetch the bearer for that job. The token is not in the delivery notice.')
+  .description('After a paid dataset delivery, fetch the bearer for that job. The token is not in the delivery notice. Asks for a review while the window is open.')
+  .option('--rating <n>', '1-5. Submits the review after the bearer. --yes and --json do not ask.')
+  .option('--message <text>', 'Review text when a rating is submitted')
   .option('--json', 'One JSON object on stdout. Requires --yes.')
   .option('--yes', 'Required with --json')
   .action(async (buyerAgentId, jobId, options) => {
@@ -3887,6 +4092,19 @@ program
         console.log(`Token for ${jobId} (not a review, not a listing):`);
         console.log(payload.token);
       }
+      const sellerId = job && (job.sellerVerusId || job.seller);
+      const review = await offerBuyerReview({
+        options,
+        say: (line) => { if (!options.json) console.log(line); },
+        keys,
+        agent,
+        buyerAgentId,
+        mode: 'job',
+        jobId,
+        seller: sellerId,
+      });
+      if (review && review.code === 'REVIEW_BAD_RATING') fail(review.code, review.message, { jobId });
+      reportReviewWrite(review, options);
     } finally {
       try { agent.stop(); } catch { /* ignore */ }
     }
@@ -3995,6 +4213,8 @@ program
   .description('OpenAI-compatible chat against a model grant (runs access if none saved)')
   .requiredOption('--message <text>', 'User message')
   .option('--model <id>', 'Model id from the grant (default: first listed)')
+  .option('--rating <n>', '1-5. Submits a session review after a paid chat. --json does not ask.')
+  .option('--review-message <text>', 'Review text when a rating is submitted')
   .option('--json', 'One JSON object on stdout')
   .action(async (buyerAgentId, seller, options) => {
     const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
@@ -4069,14 +4289,30 @@ program
       : null;
     if (text) say(text);
     else say(JSON.stringify(body, null, 2));
+    const sessionId = chat.result && chat.result.sessionId;
+    let review = null;
+    if (sessionId) {
+      review = await offerBuyerReview({
+        options: { ...options, message: options.reviewMessage },
+        say,
+        keys,
+        agent,
+        buyerAgentId,
+        mode: 'session',
+        seller,
+      });
+      if (review && review.code === 'REVIEW_BAD_RATING') fail(review.code, review.message);
+      reportReviewWrite(review, options);
+    }
     if (options.json) {
       console.log(JSON.stringify({
-        ok: true,
+        ok: !review || !!review.ok || !!review.skipped,
         seller,
         model: chat.model,
         body,
-        sessionId: chat.result && chat.result.sessionId,
+        sessionId,
         creditRemaining: chat.result && chat.result.creditRemaining,
+        ...(review && !review.skipped ? { review } : {}),
       }, null, 2));
     }
   });
@@ -4397,6 +4633,8 @@ program
   .description('Signed labour job chat (not model grant chat). POST { content, signature, timestamp } over J41-CHAT|.')
   .requiredOption('--message <text>', 'Chat message')
   .option('--wait', 'Poll getChatMessages until a seller line (max 180s)')
+  .option('--rating <n>', '1-5. Submits a review when the job is already delivered. --json does not ask.')
+  .option('--review-message <text>', 'Review text when a rating is submitted')
   .option('--json', 'One JSON object on stdout')
   .action(async (buyerAgentId, jobId, options) => {
     const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
@@ -4418,12 +4656,34 @@ program
     say(`✅ Sent signed job-chat on ${result.jobId}`);
     if (options.wait && result.timedOut) say('⚠ No seller reply within 180s');
     else if (reply) say(reply);
+    let review = null;
+    try {
+      const job = await agent.client.getJob(result.jobId);
+      const { reviewableJobStatus } = require('./buyer-review');
+      if (job && reviewableJobStatus(job.status)) {
+        review = await offerBuyerReview({
+          options: { ...options, message: options.reviewMessage },
+          say,
+          keys,
+          agent,
+          buyerAgentId,
+          mode: 'job',
+          jobId: result.jobId,
+          seller: job.sellerVerusId || job.seller,
+        });
+        if (review && review.code === 'REVIEW_BAD_RATING') fail(review.code, review.message, { jobId: result.jobId });
+        reportReviewWrite(review, options);
+      }
+    } catch (e) {
+      if (!options.json) say(`Review check skipped (${e.message}).`);
+    }
     if (options.json) {
       console.log(JSON.stringify({
-        ok: true,
+        ok: !review || !!review.ok || !!review.skipped,
         jobId: result.jobId,
         sellerReply: result.sellerReply || null,
         timedOut: !!result.timedOut,
+        ...(review && !review.skipped ? { review } : {}),
       }, null, 2));
     }
   });
@@ -4612,8 +4872,10 @@ program
 // Inspect command — agent dump, or with <job-id> a buyer job (status/dispute/refund_txid)
 program
   .command('inspect <agent-id> [job-id]')
-  .description('Show full agent state, or with <job-id> print that job status / dispute / refund_txid')
+  .description('Show full agent state, or with <job-id> print that job status / dispute / refund_txid. A delivered job asks for a review.')
   .option('--json', 'Output raw JSON instead of formatted text')
+  .option('--rating <n>', '1-5. Submits a review when this buyer owns a delivered job. --json does not ask.')
+  .option('--message <text>', 'Review text when a rating is submitted')
   .action(async (agentId, jobId, options) => {
     await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
@@ -4637,6 +4899,22 @@ program
       console.log(`  status: ${snap.status}`);
       if (snap.disputeAction) console.log(`  dispute: ${snap.disputeAction}`);
       if (snap.refundTxid) console.log(`  refund_txid: ${snap.refundTxid}`);
+      const job = await agent.client.getJob(jobId);
+      const { reviewableJobStatus } = require('./buyer-review');
+      if (job && buyerOwnsJob(keys, job) && reviewableJobStatus(job.status)) {
+        const review = await offerBuyerReview({
+          options,
+          say: (line) => console.log(line),
+          keys,
+          agent,
+          buyerAgentId: agentId,
+          mode: 'job',
+          jobId,
+          seller: job.sellerVerusId || job.seller,
+        });
+        if (review && review.code === 'REVIEW_BAD_RATING') fail(review.code, review.message, { jobId });
+        reportReviewWrite(review, options);
+      }
       return;
     }
 
