@@ -108,13 +108,25 @@ test('fetchMarketplaceListings refuses unknown kind/serviceType instead of sendi
   );
 });
 
-test('fetchMarketplaceListings maps services and treats data as browse-only', async () => {
+test('fetchMarketplaceListings lists a dataset service as hireable', async () => {
   const calls = [];
   const fetchImpl = async (url) => {
     calls.push(String(url));
-    const u = String(url);
-    if (u.includes('/v1/agents')) {
+    const u = new URL(String(url));
+    if (u.pathname.endsWith('/agents')) {
       return { ok: true, json: async () => ({ data: [{ id: 'iData', qualifiedName: 'set.agentplatform@', name: 'set' }], meta: { total: 1 } }) };
+    }
+    if (u.searchParams.get('serviceType') === 'dataset') {
+      return {
+        ok: true,
+        json: async () => ({
+          data: [{
+            id: 'svc-data', verusId: 'iData', qualifiedName: 'set.agentplatform@',
+            kind: 'data', serviceType: 'dataset', price: 0, currency: 'VRSCTEST', hireable: true,
+          }],
+          meta: { total: 1 },
+        }),
+      };
     }
     return {
       ok: true,
@@ -125,9 +137,12 @@ test('fetchMarketplaceListings maps services and treats data as browse-only', as
     };
   };
   const data = await fetchMarketplaceListings({ apiUrl: 'https://api.example', kind: 'data', fetchImpl });
-  assert.equal(data.browseOnly, true);
-  assert.equal(data.rows[0].hireable, false);
+  assert.equal(data.browseOnly, false);
+  assert.equal(data.rows[0].hireable, true);
+  assert.equal(data.rows[0].serviceType, 'dataset');
+  assert.equal(data.rows[0].refuseCode, null);
   assert.match(calls[0], /kind=data/);
+  assert.match(calls[0], /serviceType=dataset/);
 
   const compute = await fetchMarketplaceListings({ apiUrl: 'https://api.example/', kind: 'compute', fetchImpl });
   assert.equal(compute.browseOnly, false);

@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  datasetTermsCanonical, datasetTermsHash, jobLineWithDataFilter, descriptionCarriesFilter,
+  datasetTermsCanonical, datasetTermsHash, datasetDeliveryHash, jobLineWithDataFilter, descriptionCarriesFilter,
 } = require('../src/dataset-terms');
 const { mintDatasetToken, readDatasetToken } = require('../src/dataset-token');
 const { jobPaymentReady } = require('../src/job-payment');
@@ -11,11 +11,13 @@ test('dataset terms hash is stable and the job line gains DataFilter only as an 
   const a = datasetTermsHash({ color: 'red', taste: 'sweet' });
   const b = datasetTermsHash({ taste: 'sweet', color: 'red', kind: '', q: '' });
   assert.equal(a, b);
-  assert.equal(datasetTermsCanonical({ color: 'red' }).includes('"color":"red"'), true);
+  assert.equal(a, '002e67c2b74bae7194e9843a7730e614bd16a8432d440713346691b1c64fa5bf');
+  assert.equal(datasetTermsCanonical({ color: 'red', taste: 'sweet' }), '{"color":"red","taste":"sweet","v":1}');
   assert.equal(datasetTermsCanonical({ color: 'red', kind: '' }).includes('kind'), false);
-  const line = 'J41-JOB|To:seller@|Desc:Dataset hire|Amt:0.0500 VRSCTEST|Ts:1|I request this job and agree to pay upfront before work begins.';
+  const line = 'J41-JOB|To:seller@|Desc:Dataset hire|Amt:0.0500 VRSCTEST|Pay:prepay|SovGuard:yes|Retain:none|Train:no|3rdParty:no|DelAttest:yes|Deadline:None|Ts:1|I request this job and agree to pay upfront before work begins.';
   const next = jobLineWithDataFilter(line, a);
-  assert.match(next, new RegExp(`\\|DataFilter:${a}\\|I request this job`));
+  assert.equal(next.includes(`|DelAttest:yes|DataFilter:${a}|Deadline:None|Ts:1|`), true);
+  assert.equal(datasetDeliveryHash({ datasetTerms: { hash: a, color: 'red' } }), a);
   assert.equal(descriptionCarriesFilter('color=red'), true);
   assert.equal(descriptionCarriesFilter('Dataset hire'), false);
 });

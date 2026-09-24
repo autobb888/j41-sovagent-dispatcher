@@ -118,6 +118,7 @@ function defaultServiceTypeForKind(kind) {
   if (kind === 'compute') return 'gpu-rental';
   if (kind === 'model') return 'api-endpoint';
   if (kind === 'agent') return 'agent';
+  if (kind === 'data') return 'dataset';
   return undefined;
 }
 
@@ -135,9 +136,10 @@ function listingRowFromService(s) {
     serviceType,
     serviceId: s.id,
   });
+  const blocked = s.hireable === false;
   return {
-    hireable: !!gate.ok,
-    refuseCode: gate.ok ? null : gate.code,
+    hireable: !!gate.ok && !blocked,
+    refuseCode: !gate.ok ? gate.code : (blocked ? (s.hireBlockedReason || 'NOT_HIREABLE') : null),
     next: listingNext(gate),
     kind,
     seller: s.verusId || s.agentId,
@@ -203,11 +205,7 @@ async function fetchMarketplaceListings({
   const k = kind ? parseListingKind(kind) : null;
   if (kind && !k) throw new Error('INVALID_KIND: kind must be agent, compute, data, or model');
   if (serviceType && !parseServiceType(serviceType)) {
-    throw new Error('INVALID_SERVICE_TYPE: serviceType must be agent, gpu-rental, or api-endpoint');
-  }
-  if (k === 'data') {
-    const data = await fetchDataAgentRows({ base, lim, doFetch });
-    return { rows: data.rows, total: data.total, browseOnly: true };
+    throw new Error('INVALID_SERVICE_TYPE: serviceType must be agent, gpu-rental, api-endpoint, or dataset');
   }
 
   const u = new URL(`${base}/v1/services`);
@@ -227,8 +225,14 @@ async function fetchMarketplaceListings({
     let dataTotal = 0;
     try {
       const data = await fetchDataAgentRows({ base, lim, doFetch });
-      dataRows = data.rows;
-      dataTotal = data.total != null ? data.total : dataRows.length;
+      const covered = new Set();
+      for (const row of serviceRows) {
+        if (row.kind !== 'data') continue;
+        if (row.seller) covered.add(row.seller);
+        if (row.qualifiedName) covered.add(row.qualifiedName);
+      }
+      dataRows = data.rows.filter((row) => !covered.has(row.seller) && !covered.has(row.qualifiedName));
+      dataTotal = dataRows.length;
     } catch {
       dataRows = [];
     }

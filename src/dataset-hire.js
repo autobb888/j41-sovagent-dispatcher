@@ -10,7 +10,8 @@ const {
 /**
  * Dataset hire. The filter is datasetTerms on POST /v1/jobs, never on
  * GET /v1/jobs/message/request. The signed line is the platform J41-JOB
- * line plus |DataFilter:<hash>| before the request sentence.
+ * line plus |DataFilter:<hash>| after DelAttest and before Deadline.
+ * The hash is SHA-256 of the JCS terms with the server version v:1.
  */
 async function createDatasetHire({
   agent,

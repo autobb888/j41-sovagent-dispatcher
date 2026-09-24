@@ -44,7 +44,8 @@ async function deliverDatasetNotice(agent, agentInfo, job) {
   if (full.status === 'delivered' || full.status === 'completed' || full.status === 'cancelled') return 'already';
   if (!full.jobHash) return 'wait';
   const note = 'Dataset hire paid. Run data-open after the review window is open. This notice has no rows and no token.';
-  const deliveryHash = crypto.createHash('sha256').update(note).digest('hex');
+  const { datasetDeliveryHash } = require('./dataset-terms');
+  const deliveryHash = datasetDeliveryHash(full);
   const timestamp = Math.floor(Date.now() / 1000);
   const { buildDeliverMessage } = require('@junction41/sovagent-sdk/dist/signing/messages.js');
   const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
@@ -3357,9 +3358,9 @@ program
 
 program
   .command('listings')
-  .description('List marketplace listings (seller + service ids for hire). Data is browse-only.')
+  .description('List marketplace listings (seller + service ids for hire).')
   .option('--kind <kind>', 'agent | compute | data | model')
-  .option('--service-type <type>', 'agent | gpu-rental | api-endpoint')
+  .option('--service-type <type>', 'agent | gpu-rental | api-endpoint | dataset')
   .option('-q, --query <text>', 'Search')
   .option('--limit <n>', 'Max rows', '100')
   .option('--json', 'Raw JSON')
@@ -3406,7 +3407,8 @@ program
         console.log('  Chat:   j41-dispatcher chat <buyer-id> <seller> --message "..."');
       }
       if (hasData) {
-        console.log('  Data identities are browse-only (DATA_NOT_HIREABLE) even with 0 services.');
+        console.log('  Dataset hire: j41-dispatcher hire <buyer-id> <seller> --amount 0.0001 --color <color> --taste <taste> [--pay]');
+        console.log('  A data identity with no dataset service is DATA_NOT_HIREABLE.');
         console.log('  Browse: j41-dispatcher browse <seller> [--query limit=50&offset=0]');
         console.log('  Query:  j41-dispatcher query <seller> [--where color=red] [--select kind,taste]');
       }
