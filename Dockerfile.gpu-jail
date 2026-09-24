@@ -6,10 +6,20 @@ FROM debian:bookworm-slim
 
 COPY docker/gpu-jail-init.sh /usr/local/sbin/gpu-jail-init
 
+# Class tools are installed as root at build time. The renter is not root,
+# and the container runs with no-new-privileges, so apt-get install from an
+# SSH session cannot add packages. pip and venv write under /home/renter
+# and /workspace.
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       openssh-server \
       libcap2-bin \
+      python3 \
+      python3-pip \
+      python3-venv \
+      ca-certificates \
+      curl \
+      build-essential \
  && rm -rf /var/lib/apt/lists/* \
  && chmod 755 /usr/local/sbin/gpu-jail-init \
  && useradd --create-home --shell /bin/bash renter \

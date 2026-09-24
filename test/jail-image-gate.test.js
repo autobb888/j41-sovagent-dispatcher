@@ -17,6 +17,10 @@ test('gpu-jail renter is not a locked shadow account (pubkey must work with UseP
   assert.match(df, /mkdir -p \/workspace/);
   assert.match(df, /chown renter:renter \/workspace/);
   assert.match(df, /libcap2-bin/);
+  assert.match(df, /python3-pip/);
+  assert.match(df, /python3-venv/);
+  assert.match(df, /build-essential/);
+  assert.doesNotMatch(df, /^\s+sudo\s*\\?\s*$/m);
   assert.match(df, /gpu-jail-init/);
   assert.match(df, /LoginGraceTime 60/);
   assert.doesNotMatch(df, /LoginGraceTime 0/);
