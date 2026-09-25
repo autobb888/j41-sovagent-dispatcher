@@ -3,8 +3,9 @@
  * Buyer job review. Sign GET /v1/reviews/message?jobHash=…  J41-REVIEW|… only.
  * Homemade J41-REVIEW| or Junction41 Review is REVIEW_NOT_CANONICAL — never send it.
  * POST via client.submitReview (HTTP). Do not wrap the SDK agent helper
- * (it GETs again with its own timestamp). After 2xx, read buyer inbox only;
- * never write buyer VDXF.
+ * (it GETs again with its own timestamp). After 2xx, read the buyer inbox.
+ * This module does not publish it. complete, review, and inbox do, through
+ * the seller accept path.
  */
 const { buyerOwnsJob } = require('./hire-pay');
 

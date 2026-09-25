@@ -3564,6 +3564,126 @@ function reviewNextLine(mode, buyerAgentId, target) {
   return `Next: j41-dispatcher review ${buyerAgentId || '<buyer>'} ${target || '<job>'} --rating N`;
 }
 
+function buyerInboxTimeoutMs() {
+  const fromEnv = Number(process.env.J41_BUYER_INBOX_TIMEOUT_MS);
+  if (Number.isFinite(fromEnv) && fromEnv >= 0) return fromEnv;
+  if (process.env.NODE_ENV === 'test') return 0;
+  return require('./buyer-inbox').DEFAULT_TIMEOUT_MS;
+}
+
+async function jobContentWatch(agent, jobId, types) {
+  let jobHash = null;
+  let id = jobId;
+  try {
+    const job = await agent.client.getJob(jobId);
+    if (job) {
+      jobHash = job.jobHash || null;
+      id = job.id || jobId;
+    }
+  } catch { /* id alone still matches vdxfData.jobId */ }
+  return { jobId: id, jobHash, types, required: true };
+}
+
+async function confirmBuyerPublish(buyerAgentId) {
+  const readline = require('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await new Promise((resolve) => rl.question(
+      `Publish pending job_record, review, and attestation items for ${buyerAgentId}? `
+      + 'This spends identity-update fees. Leave it running until the write confirms. (y/N) ',
+      resolve,
+    ));
+    const a = String(answer || '').trim().toLowerCase();
+    return a === 'y' || a === 'yes';
+  } finally {
+    rl.close();
+  }
+}
+
+// Seller accept path, run as the buyer. The platform does not update the
+// buyer identity. One batch is one job.record, one review.record, and one
+// review.attestation. The command waits until that tx is the confirmed
+// prevOutput before it returns, so the next command cannot double-spend it.
+async function publishBuyerContentMaps({
+  agent, buyerAgentId, options, say, watch, timeoutMs, once,
+}) {
+  const {
+    drainBuyerInbox, drainMessage, BUYER_INBOX_TYPES, DEFAULT_CONFIRM_TIMEOUT_MS,
+  } = require('./buyer-inbox');
+  const { verifyWitness } = require('@junction41/sovagent-sdk/dist/index.js');
+  const state = {
+    _inboxFailures: new Map(),
+    _inboxLastWrite: new Map(),
+    _inboxBatchFailures: new Map(),
+    _inboxAckFailures: new Map(),
+    _agentErrors: new Map(),
+  };
+  const quiet = !!(options && options.json);
+  let toldWait = false;
+  let toldDefer = false;
+  let result;
+  try {
+    const drain = {
+      buyerId: buyerAgentId,
+      watch: watch || null,
+      once: !!once,
+      timeoutMs: timeoutMs != null ? timeoutMs : buyerInboxTimeoutMs(),
+      confirmTimeoutMs: process.env.NODE_ENV === 'test' ? 0 : DEFAULT_CONFIRM_TIMEOUT_MS,
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      fetchPending: async () => agent.client.getInbox('pending', 20, BUYER_INBOX_TYPES),
+      processOnce: async (pending) => {
+        const res = await processInboxForAgent(agent, { id: buyerAgentId }, pending, state, {
+          verifyInboxJobRecord,
+          verifyWitness,
+          network: J41_NETWORK,
+        });
+        const err = String(state._agentErrors.get(buyerAgentId) || '');
+        if (err.startsWith(FEE_TANK_ERROR_PREFIX)) {
+          return { ...(res || {}), stop: true, code: 'BUYER_INBOX_FUNDS', message: err };
+        }
+        return res;
+      },
+      onProgress: (info) => {
+        if (quiet || typeof say !== 'function') return;
+        if (info.waiting && !toldWait) {
+          toldWait = true;
+          say('Buyer inbox: waiting for the platform copy of this job.');
+        } else if (info.deferred && !toldDefer) {
+          toldDefer = true;
+          say('Buyer inbox: waiting for the identity write to confirm.');
+        }
+        if (info.txid) {
+          toldDefer = false;
+          say(`Buyer inbox: published ${info.accepted || 0} item(s) in ${String(info.txid).slice(0, 16)}…`);
+        }
+      },
+    };
+    if (process.env.NODE_ENV === 'test') drain.intervalMs = 0;
+    result = await drainBuyerInbox(drain);
+  } catch (e) {
+    result = {
+      ok: false,
+      code: 'BUYER_INBOX_READ_FAILED',
+      message: e.message || String(e),
+      pending: 0,
+      accepted: { job_record: 0, review: 0, attestation: 0 },
+      txids: [],
+      buyerId: buyerAgentId,
+    };
+  }
+  const line = drainMessage(result);
+  if (!quiet && typeof say === 'function') {
+    if (result.ok) say(line);
+    else console.error(`❌ ${line}`);
+  } else if (!result.ok) {
+    console.error(line);
+  }
+  if (!result.ok && (result.code === 'BUYER_INBOX_FUNDS' || result.code === 'BUYER_INBOX_UNCONFIRMED')) {
+    process.exitCode = 1;
+  }
+  return result;
+}
+
 async function readlineAsk(question) {
   const readline = require('readline');
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -3593,7 +3713,14 @@ async function offerBuyerReview({
   }
   if (await reviewAlreadyPublic({ agent, mode, jobId, seller, buyerAgentId, publishedReview })) {
     if (decision.action === 'submit' && !(options && options.json)) say('Review is already public.');
-    return { ok: true, skipped: true, code: 'REVIEW_ALREADY' };
+    let buyerInbox = null;
+    if (mode === 'job' && jobId) {
+      buyerInbox = await publishBuyerContentMaps({
+        agent, buyerAgentId, options, say,
+        watch: await jobContentWatch(agent, jobId, ['job_record', 'review', 'attestation']),
+      });
+    }
+    return { ok: true, skipped: true, code: 'REVIEW_ALREADY', buyerInbox };
   }
   let rating = decision.rating;
   let message = (options && options.message) || '';
@@ -3670,7 +3797,16 @@ async function offerBuyerReview({
   if (written.ok) {
     if (!(options && options.json)) say(`✅ ${line}`);
   }
-  return { ...written, message: written.ok ? line : (written.message || line), rating };
+  let buyerInbox = null;
+  if (mode === 'job' && jobId) {
+    buyerInbox = await publishBuyerContentMaps({
+      agent, buyerAgentId, options, say,
+      watch: await jobContentWatch(agent, jobId, ['job_record', 'review', 'attestation']),
+    });
+  } else if (mode === 'session' && !(options && options.json)) {
+    say('A session review is not copied into the buyer inbox.');
+  }
+  return { ...written, message: written.ok ? line : (written.message || line), rating, buyerInbox };
 }
 
 function reportReviewWrite(review, options) {
@@ -3725,7 +3861,7 @@ async function runBuyerComplete(keys, agent, jobId, options, buyerAgentId) {
 
 program
   .command('complete <buyer-agent-id> <job-id>')
-  .description('Buyer confirms delivery (SDK completeJob). Prints getJobWitness; does not write buyer VDXF.')
+  .description('Buyer confirms delivery (SDK completeJob), then publishes pending buyer inbox job_record, review, and attestation items.')
   .option('--rating <n>', '1-5. Submits the review after complete. --yes and --json do not ask.')
   .option('--message <text>', 'Review text when a rating is submitted')
   .option('--yes', 'Skip confirmation')
@@ -3745,6 +3881,12 @@ program
     const review = await offerBuyerReview({
       options, say, keys, agent, buyerAgentId, mode: 'job', jobId, seller,
     });
+    if (!(review && review.buyerInbox)) {
+      await publishBuyerContentMaps({
+        agent, buyerAgentId, options, say,
+        watch: await jobContentWatch(agent, jobId, ['job_record']),
+      });
+    }
     if (review && review.code === 'REVIEW_BAD_RATING') fail(review.code, review.message);
     reportReviewWrite(review, options);
   });
@@ -3810,6 +3952,10 @@ program
     if (written.ok) say(`✅ ${line}`);
     else console.error(`❌ ${line}`);
     if (!written.ok) process.exitCode = 1;
+    const buyerInbox = await publishBuyerContentMaps({
+      agent, buyerAgentId, options, say,
+      watch: await jobContentWatch(agent, job.id, ['job_record', 'review', 'attestation']),
+    });
     if (options.json) {
       console.log(JSON.stringify({
         ok: !!written.ok,
@@ -3820,6 +3966,13 @@ program
         result: result.result,
         inboxCount: result.inboxCount,
         ...(result.inboxWarning ? { inboxWarning: result.inboxWarning } : {}),
+        buyerInbox: {
+          ok: !!buyerInbox.ok,
+          code: buyerInbox.code,
+          pending: buyerInbox.pending,
+          accepted: buyerInbox.accepted,
+          txids: buyerInbox.txids,
+        },
       }, null, 2));
     }
   });
@@ -3874,6 +4027,7 @@ program
     if (written.ok) say(`✅ ${line}`);
     else console.error(`❌ ${line}`);
     if (!written.ok) process.exitCode = 1;
+    say('A session review is not copied into the buyer inbox.');
     if (options.json) {
       console.log(JSON.stringify({
         ok: !!written.ok,
@@ -3885,6 +4039,58 @@ program
         result: result.result,
         inboxCount: result.inboxCount,
         ...(result.inboxWarning ? { inboxWarning: result.inboxWarning } : {}),
+      }, null, 2));
+    }
+  });
+
+program
+  .command('inbox <buyer-agent-id>')
+  .description('Publish pending buyer job_record, review, and attestation items. Same accept path the seller uses. A session review is not in this inbox.')
+  .option('--once', 'One identity update, then stop')
+  .option('--timeout <seconds>', 'Stop after this many seconds (default 3000)')
+  .option('--yes', 'Skip confirmation')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
+  .action(async (buyerAgentId, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    const { actionableItems, BUYER_INBOX_TYPES, BACKLOG_TIMEOUT_MS, drainMessage } = require('./buyer-inbox');
+    const { agent } = await loadBuyerSession(buyerAgentId, options);
+    let pending = [];
+    try {
+      pending = actionableItems(await agent.client.getInbox('pending', 20, BUYER_INBOX_TYPES));
+    } catch (e) {
+      fail('BUYER_INBOX_READ_FAILED', e.message || String(e));
+    }
+    if (pending.length === 0) {
+      const empty = {
+        ok: true, code: 'BUYER_INBOX_EMPTY', pending: 0,
+        accepted: { job_record: 0, review: 0, attestation: 0 }, txids: [],
+      };
+      if (options.json) console.log(JSON.stringify(empty, null, 2));
+      else say('Buyer inbox has no pending job_record, review, or attestation.');
+      return;
+    }
+    if (!options.yes) {
+      const ok = await confirmBuyerPublish(buyerAgentId);
+      if (!ok) { console.log('Cancelled.'); process.exit(0); }
+    }
+    const timeoutSec = options.timeout != null ? Number(options.timeout) : null;
+    const timeoutMs = Number.isFinite(timeoutSec) && timeoutSec >= 0
+      ? timeoutSec * 1000
+      : (process.env.NODE_ENV === 'test' ? 0 : BACKLOG_TIMEOUT_MS);
+    const result = await publishBuyerContentMaps({
+      agent, buyerAgentId, options, say, once: !!options.once, timeoutMs,
+    });
+    if (!result.ok) process.exitCode = 1;
+    if (options.json) {
+      console.log(JSON.stringify({
+        ok: !!result.ok,
+        code: result.code,
+        pending: result.pending,
+        accepted: result.accepted,
+        txids: result.txids,
+        message: drainMessage(result),
       }, null, 2));
     }
   });

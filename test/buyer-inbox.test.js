@@ -1,0 +1,197 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert');
+
+const {
+  actionableItems,
+  preferWatched,
+  drainMessage,
+  drainBuyerInbox,
+} = require('../src/buyer-inbox.js');
+
+const job = (id, hash) => ({ id, type: 'job_record', jobHash: hash, status: 'pending' });
+const review = (id, hash) => ({ id, type: 'review', jobHash: hash, status: 'pending' });
+
+function scripted({ pages, batches, now }) {
+  let page = 0;
+  const calls = [];
+  const clock = { t: now == null ? 0 : now };
+  return {
+    calls,
+    clock,
+    async fetchPending() {
+      const rows = pages[Math.min(page, pages.length - 1)];
+      page += 1;
+      return { data: rows };
+    },
+    async processOnce(items) {
+      calls.push(items.map((it) => it.id));
+      if (typeof batches === 'function') return batches(items, calls.length);
+      const next = batches.shift();
+      return next || { acked: [], deferred: [], alreadyDone: [] };
+    },
+    async sleep(ms) { clock.t += ms; },
+    now() { return clock.t; },
+  };
+}
+
+test('actionable items drop expired and informational rows', () => {
+  const rows = actionableItems({
+    data: [
+      job('j1', 'h1'),
+      { id: 'n1', type: 'notification', status: 'pending' },
+      { id: 'e1', type: 'review', status: 'expired', jobHash: 'h1' },
+      review('r1', 'h1'),
+    ],
+  });
+  assert.deepEqual(rows.map((it) => it.id), ['j1', 'r1']);
+});
+
+test('preferWatched puts this job ahead of older packets', () => {
+  const ordered = preferWatched(
+    [job('old', 'old-hash'), job('new', 'new-hash'), review('rev', 'new-hash')],
+    { jobHash: 'new-hash' },
+  );
+  assert.deepEqual(ordered.map((it) => it.id), ['new', 'rev', 'old']);
+});
+
+test('empty inbox is success and does not write', async () => {
+  const s = scripted({ pages: [[]], batches: [] });
+  const result = await drainBuyerInbox({
+    ...s, timeoutMs: 0, confirmTimeoutMs: 0, buyerId: 'buyer',
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.code, 'BUYER_INBOX_EMPTY');
+  assert.equal(s.calls.length, 0);
+  assert.match(drainMessage(result), /no pending/);
+});
+
+test('one batch publishes and waits until the identity write is confirmed', async () => {
+  const s = scripted({
+    pages: [[job('j1', 'h1')], []],
+    batches: [
+      { txid: 'tx1', acked: ['j1'] },
+      { deferredAgent: true },
+      { empty: true },
+    ],
+  });
+  const result = await drainBuyerInbox({
+    ...s, timeoutMs: 0, confirmTimeoutMs: 60000, intervalMs: 1000, buyerId: 'mac',
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.code, 'BUYER_INBOX_PUBLISHED');
+  assert.equal(result.accepted.job_record, 1);
+  assert.deepEqual(result.txids, ['tx1']);
+  assert.deepEqual(s.calls[0], ['j1']);
+  assert.deepEqual(s.calls[1], []);
+  assert.deepEqual(s.calls[2], []);
+  assert.ok(s.clock.t >= 1000);
+});
+
+test('unconfirmed identity write is not success', async () => {
+  const s = scripted({
+    pages: [[job('j1', 'h1')], []],
+    batches: [{ txid: 'tx1', acked: ['j1'] }, { deferredAgent: true }],
+  });
+  const result = await drainBuyerInbox({
+    ...s, timeoutMs: 0, confirmTimeoutMs: 0, buyerId: 'mac',
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'BUYER_INBOX_UNCONFIRMED');
+  assert.match(drainMessage(result), /not confirmed/);
+});
+
+test('watched job returns once its copies are gone, and reports the rest', async () => {
+  const s = scripted({
+    pages: [
+      [job('new', 'new-hash'), job('old', 'old-hash')],
+      [job('old', 'old-hash')],
+    ],
+    batches: [{ txid: 'tx9', acked: ['new'] }, { empty: true }],
+  });
+  const result = await drainBuyerInbox({
+    ...s,
+    timeoutMs: 5000,
+    confirmTimeoutMs: 0,
+    watch: { jobHash: 'new-hash', types: ['job_record'], required: true },
+    buyerId: 'mac',
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.code, 'BUYER_INBOX_PUBLISHED');
+  assert.equal(result.pending, 1);
+  assert.deepEqual(s.calls[0], ['new', 'old']);
+  assert.match(drainMessage(result), /inbox mac --yes/);
+});
+
+test('a missing copy is waiting, not an empty inbox', async () => {
+  const s = scripted({ pages: [[]], batches: [] });
+  const result = await drainBuyerInbox({
+    ...s,
+    timeoutMs: 0,
+    confirmTimeoutMs: 0,
+    watch: { jobHash: 'missing', types: ['review', 'attestation'] },
+    buyerId: 'mac',
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'BUYER_INBOX_WAITING');
+  assert.match(drainMessage(result), /seller accept copies the review/);
+});
+
+test('a dry fee tank stops the publish', async () => {
+  const s = scripted({
+    pages: [[review('r1', 'h1')]],
+    batches: [{ stop: true, code: 'BUYER_INBOX_FUNDS', message: 'FEE TANK EMPTY' }],
+  });
+  const result = await drainBuyerInbox({
+    ...s, timeoutMs: 1000, confirmTimeoutMs: 0, buyerId: 'mac',
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'BUYER_INBOX_FUNDS');
+  assert.equal(drainMessage(result), 'FEE TANK EMPTY');
+});
+
+test('backlog drain stops when a later page is empty', async () => {
+  const s = scripted({
+    pages: [
+      [job('a', 'ha'), review('b', 'hb')],
+      [review('b', 'hb')],
+      [],
+    ],
+    batches: [
+      { txid: 'txa', acked: ['a', 'b'] },
+      { empty: true },
+    ],
+  });
+  const result = await drainBuyerInbox({
+    ...s, timeoutMs: 10000, intervalMs: 1000, confirmTimeoutMs: 0, buyerId: 'mac',
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.code, 'BUYER_INBOX_PUBLISHED');
+  assert.equal(result.accepted.job_record, 1);
+  assert.equal(result.accepted.review, 1);
+  assert.equal(result.pending, 0);
+});
+
+test('the buyer review and complete commands publish the inbox', () => {
+  const fs = require('fs');
+  const src = fs.readFileSync(require('path').join(__dirname, '../src/cli.js'), 'utf8');
+  const review = src.slice(src.indexOf(".command('review "), src.indexOf(".command('review-session"));
+  const complete = src.slice(src.indexOf(".command('complete "), src.indexOf(".command('review "));
+  assert.match(review, /publishBuyerContentMaps/);
+  assert.match(complete, /publishBuyerContentMaps/);
+  assert.match(src, /\.command\('inbox <buyer-agent-id>'\)/);
+  assert.doesNotMatch(fs.readFileSync(require('path').join(__dirname, '../src/buyer-inbox.js'), 'utf8'), /buildIdentityUpdateTx/);
+});
+
+test('timeout with rows still pending is not success', async () => {
+  const s = scripted({
+    pages: [[job('a', 'ha')]],
+    batches: [{ deferredAgent: true }],
+  });
+  const result = await drainBuyerInbox({
+    ...s, timeoutMs: 1000, intervalMs: 1000, confirmTimeoutMs: 0, maxCycles: 5, buyerId: 'mac',
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'BUYER_INBOX_PENDING');
+});
