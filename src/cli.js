@@ -210,6 +210,12 @@ const FINALIZE_STATE_FILENAME = 'finalize-state.json';
 
 const J41_API_URL = cfg.platform.api_url;
 const J41_NETWORK = cfg.platform.network;
+const { planPlatformSigner, applyPlatformSigner } = require('./platform-signer');
+const signerPlan = applyPlatformSigner(planPlatformSigner({
+  apiUrl: J41_API_URL,
+  network: J41_NETWORK,
+  signer: (cfg.platform && cfg.platform.signer) || process.env.J41_PLATFORM_SIGNER,
+}));
 const IS_MAINNET = resolveIsMainnet(fileConfiguredNetwork(), J41_NETWORK);
 // The chain's native coin, derived once. Service registration used to default
 // to the literal 'VRSC' on every surface regardless of network, so a testnet
@@ -3544,6 +3550,11 @@ function buyerCliFail(options, code, message, extra = {}) {
   process.exit(1);
 }
 
+function refuseUnsignedPlatform(options) {
+  if (signerPlan.ok) return;
+  buyerCliFail(options, signerPlan.code, signerPlan.message);
+}
+
 async function loadBuyerSession(buyerAgentId, options) {
   const keys = loadAgentKeys(buyerAgentId);
   if (!keys) buyerCliFail(options, 'BUYER_NOT_FOUND', `Buyer ${buyerAgentId} not found.`);
@@ -3724,6 +3735,21 @@ async function confirmBuyerPublish(buyerAgentId) {
 async function publishBuyerContentMaps({
   agent, buyerAgentId, options, say, watch, timeoutMs, once,
 }) {
+  if (!signerPlan.ok) {
+    const blocked = {
+      ok: false,
+      code: signerPlan.code,
+      message: signerPlan.message,
+      pending: 0,
+      accepted: { job_record: 0, review: 0, attestation: 0 },
+      txids: [],
+      buyerId: buyerAgentId,
+    };
+    if (!(options && options.json)) console.error(`❌ ${signerPlan.message}`);
+    else console.error(signerPlan.message);
+    process.exitCode = 1;
+    return blocked;
+  }
   const {
     drainBuyerInbox, drainMessage, BUYER_INBOX_TYPES, DEFAULT_CONFIRM_TIMEOUT_MS,
   } = require('./buyer-inbox');
@@ -3991,6 +4017,7 @@ program
     if (options.rating != null && String(options.rating).trim() !== '' && parseRating(options.rating) == null) {
       fail('REVIEW_BAD_RATING', '--rating must be an integer 1-5.');
     }
+    refuseUnsignedPlatform(options);
     const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
     await runBuyerComplete(keys, agent, jobId, options, buyerAgentId);
     const job = await agent.client.getJob(jobId);
@@ -4019,6 +4046,7 @@ program
     const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
     const say = (line) => { if (!options.json) console.log(line); };
     if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    refuseUnsignedPlatform(options);
     const { submitBuyerJobReview, parseRating } = require('./buyer-review');
     const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
     const rating = parseRating(options.rating);
@@ -4171,6 +4199,7 @@ program
     const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
     const say = (line) => { if (!options.json) console.log(line); };
     if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    refuseUnsignedPlatform(options);
     const { actionableItems, BUYER_INBOX_TYPES, BACKLOG_TIMEOUT_MS, drainMessage } = require('./buyer-inbox');
     const { agent } = await loadBuyerSession(buyerAgentId, options);
     let pending = [];

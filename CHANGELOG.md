@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.37.5 — 2026-09-26
+
+Buyer inbox, complete, and review can verify the platform witness before they write `job.record`.
+
+- Process start applies the keys-endpoint pin once. On VRSCTEST against `https://api.junction41.io` with no pin, `J41_PLATFORM_SIGNER` becomes `RBgxQwD7mMLCfciTN68RjBQHsH68vcnUKb`. An operator pin and `[platform] signer` still win.
+- Mainnet with no pin exits `PLATFORM_SIGNER_REQUIRED`. The fee-tank address `RAWwNeTLRg9urgnDPQtPyZ6NRycsmSY2J2` exits `PLATFORM_SIGNER_NOT_FEE`. Neither path reaches `verifyWitness` or an identity write.
+- `--json` on that refusal is one object: `ok: false`, the code, and the message.
+- SDK pin stays `@junction41/sovagent-sdk` 2.16.1. The SDK hostname check is unchanged.
+
 ## 2.37.4 — 2026-09-18
 
 Buyer path for the four listing kinds, and a hireability check that uses the same two-axis gate as startup.
@@ -224,6 +233,18 @@ Cat-2 attach still waits on vLLM `/models` (`readyFor` defaults to `'service'`).
   `ssh.privateKey`. `readyFor: 'ssh'` degrades if neither password nor key is present.
 
 ## Unreleased
+
+### Buyer publish uses the keys-endpoint pin
+
+- Process start runs `planPlatformSigner` / `applyPlatformSigner` once, beside
+  `J41_API_URL`. On VRSCTEST against `https://api.junction41.io` with no pin,
+  that sets `J41_PLATFORM_SIGNER` to `RBgxQwD7mMLCfciTN68RjBQHsH68vcnUKb`.
+  An operator pin and `[platform] signer` still win. The fee-tank R is refused.
+- `inbox`, `complete`, and `review` exit before `verifyWitness` and before any
+  identity write when that plan is not ok. `--json` is one object:
+  `ok: false`, `PLATFORM_SIGNER_REQUIRED` or `PLATFORM_SIGNER_NOT_FEE`, and
+  the message. A publisher that already quarantined `job.record` keeps that
+  quarantine until it is restarted onto this pin.
 
 ### Hireability (`feature/agent-status-robustness`, brought onto the execute tip)
 

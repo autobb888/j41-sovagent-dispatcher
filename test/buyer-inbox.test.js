@@ -184,6 +184,24 @@ test('the buyer review and complete commands publish the inbox', () => {
   assert.doesNotMatch(fs.readFileSync(require('path').join(__dirname, '../src/buyer-inbox.js'), 'utf8'), /buildIdentityUpdateTx/);
 });
 
+test('inbox, complete, and review refuse a bad keys pin before verifyWitness', () => {
+  const fs = require('fs');
+  const src = fs.readFileSync(require('path').join(__dirname, '../src/cli.js'), 'utf8');
+  const boot = src.slice(src.indexOf('const J41_API_URL'), src.indexOf('const IS_MAINNET'));
+  assert.match(boot, /applyPlatformSigner\(planPlatformSigner\(/);
+  assert.match(boot, /cfg\.platform && cfg\.platform\.signer/);
+  const publish = src.slice(src.indexOf('async function publishBuyerContentMaps'), src.indexOf('async function readlineAsk'));
+  assert.ok(publish.indexOf('if (!signerPlan.ok)') < publish.indexOf('verifyWitness'));
+  const inbox = src.slice(src.indexOf(".command('inbox <buyer-agent-id>')"), src.indexOf(".command('extend "));
+  const complete = src.slice(src.indexOf(".command('complete "), src.indexOf(".command('review "));
+  const review = src.slice(src.indexOf(".command('review "), src.indexOf(".command('review-session"));
+  for (const body of [inbox, complete, review]) {
+    const gate = body.indexOf('refuseUnsignedPlatform(options)');
+    const write = body.indexOf('publishBuyerContentMaps');
+    assert.ok(gate > -1 && write > gate);
+  }
+});
+
 test('timeout with rows still pending is not success', async () => {
   const s = scripted({
     pages: [[job('a', 'ha')]],
