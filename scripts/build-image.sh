@@ -40,6 +40,8 @@ mkdir -p .build-temp/src/executors
 # Copy dispatcher files needed by Dockerfile
 cp "$DISPATCHER_DIR/package.docker.json" .build-temp/package.docker.json
 cp "$DISPATCHER_DIR/src/job-agent.js" .build-temp/src/
+# Finished-job zip. Required when the worker delivers, not at process start.
+cp "$DISPATCHER_DIR/src/delivery-package.js" .build-temp/src/
 cp "$DISPATCHER_DIR/src/sign-attestation.js" .build-temp/src/
 cp "$DISPATCHER_DIR/src/container-entry.sh" .build-temp/src/
 cp "$DISPATCHER_DIR/src/logger.js" .build-temp/src/

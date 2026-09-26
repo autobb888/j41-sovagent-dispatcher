@@ -37,6 +37,8 @@ COPY src/sovguard-context.js ./
 
 # Copy runtime scripts (baked into image)
 COPY src/job-agent.js ./
+# Finished-job zip. job-agent.js requires this when it delivers.
+COPY src/delivery-package.js ./
 # Egress-proxy client — required by job-agent.js (installed before the SDK
 # require) to route all fetch through the host egress proxy via undici.
 COPY src/egress-proxy-client.js ./
