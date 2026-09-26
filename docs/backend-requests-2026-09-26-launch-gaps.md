@@ -2,7 +2,9 @@
 
 These three behaviors are in the backend tree and are not on the live API yet. Live api.junction41.io was still f8e7548 when this note was written. The dispatcher treats them as the contract.
 
-A session review with `verified: false` on `GET /v1/reviews/agent/:seller` is public. It does not satisfy a job-hash lookup and it does not change the star average. Submitting one also leaves a seller inbox item of type `review`, which this dispatcher publishes with the existing accept path. It is not copied into the buyer inbox.
+A session review with `verified: false` on `GET /v1/reviews/agent/:seller` is public. It does not satisfy a job-hash lookup. Submitting one also leaves a seller inbox item of type `review`, which this dispatcher publishes with the existing accept path. It is not copied into the buyer inbox.
+
+On 2026-09-26 a moonkimi session review `9e13f1cd` moved `rawAverage` from 4.75 to about 4.777 and `totalReviews` from 8 to 9. `verifiedReviews` stayed 0 and `score` stayed null. `rawAverage` and `totalReviews` are counting the unverified session row. Paid-only stars need to leave those two fields unchanged as well.
 
 `chainReviewCount` is the public-list size once the review is visible. A later identity-history check may raise it. It must not fall back to the single slot on the current content map.
 

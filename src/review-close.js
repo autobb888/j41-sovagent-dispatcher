@@ -131,7 +131,7 @@ function reviewWriteMessage(result) {
   if (!result) return 'Review was not checked.';
   if (result.skipped) return 'Review skipped.';
   const unverified = result.publicReview && result.publicReview.verified === false
-    ? ' This session review is unverified and does not change the star average.'
+    ? ' This session review is verified: false.'
     : '';
   if (result.ok && result.code === 'REVIEW_WRITTEN') {
     return `Review written. chainReviewCount ${result.baseline} → ${result.count}.${unverified}`;

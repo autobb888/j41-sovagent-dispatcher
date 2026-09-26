@@ -3815,15 +3815,15 @@ async function publishBuyerContentMaps({
     };
   }
   const line = drainMessage(result);
+  const broadcast = result.code === 'BUYER_INBOX_UNCONFIRMED' && result.txids && result.txids.length;
   if (!quiet && typeof say === 'function') {
-    if (result.ok) say(line);
+    if (result.ok || broadcast) say(line);
     else console.error(`❌ ${line}`);
-  } else if (!result.ok) {
+  } else if (!result.ok && !broadcast) {
     console.error(line);
   }
-  if (!result.ok && (result.code === 'BUYER_INBOX_FUNDS' || result.code === 'BUYER_INBOX_UNCONFIRMED')) {
-    process.exitCode = 1;
-  }
+  if (!result.ok && result.code === 'BUYER_INBOX_FUNDS') process.exitCode = 1;
+  if (!result.ok && result.code === 'BUYER_INBOX_UNCONFIRMED' && !broadcast) process.exitCode = 1;
   return result;
 }
 
@@ -3947,7 +3947,7 @@ async function offerBuyerReview({
       watch: await jobContentWatch(agent, jobId, ['job_record', 'review', 'attestation']),
     });
   } else if (mode === 'session' && !(options && options.json)) {
-    say('A session review is not copied into the buyer inbox. The seller inbox publishes it. It stays unverified and does not change the star average.');
+    say('A session review is not copied into the buyer inbox. The seller inbox publishes it. The row stays verified: false.');
   }
   return { ...written, message: written.ok ? line : (written.message || line), rating, buyerInbox };
 }
@@ -4172,7 +4172,8 @@ program
     if (written.ok) say(`✅ ${line}`);
     else console.error(`❌ ${line}`);
     if (!written.ok) process.exitCode = 1;
-    say('A session review is not copied into the buyer inbox. The seller inbox publishes it. It stays unverified and does not change the star average.');
+    if (result.sessionId) say(`Session ${result.sessionId}`);
+    say('A session review is not copied into the buyer inbox. The seller inbox publishes it. The row stays verified: false.');
     if (options.json) {
       console.log(JSON.stringify({
         ok: !!written.ok,
@@ -4691,6 +4692,7 @@ program
     if (text) say(text);
     else say(JSON.stringify(body, null, 2));
     const sessionId = chat.result && chat.result.sessionId;
+    if (sessionId) say(`Session ${sessionId}`);
     let review = null;
     if (sessionId) {
       review = await offerBuyerReview({
