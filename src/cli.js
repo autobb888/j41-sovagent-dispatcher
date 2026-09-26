@@ -3947,7 +3947,7 @@ async function offerBuyerReview({
       watch: await jobContentWatch(agent, jobId, ['job_record', 'review', 'attestation']),
     });
   } else if (mode === 'session' && !(options && options.json)) {
-    say('A session review is not copied into the buyer inbox.');
+    say('A session review is not copied into the buyer inbox. The seller inbox publishes it. It stays unverified and does not change the star average.');
   }
   return { ...written, message: written.ok ? line : (written.message || line), rating, buyerInbox };
 }
@@ -4172,7 +4172,7 @@ program
     if (written.ok) say(`✅ ${line}`);
     else console.error(`❌ ${line}`);
     if (!written.ok) process.exitCode = 1;
-    say('A session review is not copied into the buyer inbox.');
+    say('A session review is not copied into the buyer inbox. The seller inbox publishes it. It stays unverified and does not change the star average.');
     if (options.json) {
       console.log(JSON.stringify({
         ok: !!written.ok,

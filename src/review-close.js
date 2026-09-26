@@ -51,9 +51,12 @@ function publishedReview(row, expect) {
     return null;
   }
   if (Array.isArray(body.data)) return publishedReview(body.data, expect);
+  // A paid job review is public only when the platform verified it.
+  // A session review is on the same list with verified false. It must not
+  // be ignored, and it must not satisfy a job-hash lookup.
+  if (expect && expect.sessionId && body.sessionId === expect.sessionId) return body;
   if (body.verified !== true) return null;
   if (expect && expect.jobHash && body.jobHash === expect.jobHash) return body;
-  if (expect && expect.sessionId && body.sessionId === expect.sessionId) return body;
   return null;
 }
 
@@ -127,13 +130,16 @@ async function waitForWrittenReview({
 function reviewWriteMessage(result) {
   if (!result) return 'Review was not checked.';
   if (result.skipped) return 'Review skipped.';
+  const unverified = result.publicReview && result.publicReview.verified === false
+    ? ' This session review is unverified and does not change the star average.'
+    : '';
   if (result.ok && result.code === 'REVIEW_WRITTEN') {
-    return `Review written. chainReviewCount ${result.baseline} → ${result.count}.`;
+    return `Review written. chainReviewCount ${result.baseline} → ${result.count}.${unverified}`;
   }
   if (result.code === 'REVIEW_PUBLIC' || result.code === 'REVIEW_COUNT_LAGGING') {
     const id = result.publicReview && result.publicReview.id;
     const shown = id ? `Review ${id} is public` : 'The review is public';
-    return `${shown}. chainReviewCount is still ${result.count}.`;
+    return `${shown}. chainReviewCount is still ${result.count}.${unverified}`;
   }
   if (result.message) return result.message;
   return 'Review was submitted and is not on the public review list yet.';

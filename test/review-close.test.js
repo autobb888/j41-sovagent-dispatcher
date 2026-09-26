@@ -60,6 +60,15 @@ test('publishedReview matches a job review and a wrapped session list', () => {
     { sessionId: 'sess-1' },
   );
   assert.equal(session.sessionId, 'sess-1');
+  const unverified = publishedReview(
+    { id: 'sess-row', verified: false, sessionId: 'sess-2', rating: 5 },
+    { sessionId: 'sess-2' },
+  );
+  assert.equal(unverified.id, 'sess-row');
+  assert.equal(publishedReview(
+    { verified: false, jobHash: 'abc', rating: 5 },
+    { jobHash: 'abc' },
+  ), null);
 });
 
 test('waitForWrittenReview succeeds when chainReviewCount moves', async () => {
