@@ -4463,6 +4463,52 @@ program
   });
 
 program
+  .command('artifacts <buyer-agent-id> <job-id>')
+  .description('Write the seller delivery package into --out. Labour files plus the delivery notice. Fetch before complete. GPU has no file package. Dataset rows use data-open.')
+  .requiredOption('--out <dir>', 'Directory to write. Created if missing.')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
+  .option('--yes', 'Required with --json')
+  .action(async (buyerAgentId, jobId, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    const { fetchArtifacts } = require('./artifacts');
+    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    let job;
+    try {
+      job = await agent.client.getJob(jobId);
+    } catch (e) {
+      fail('ARTIFACTS_NOT_READY', e.message || String(e), { jobId });
+    }
+    if (!job || !job.id) fail('ARTIFACTS_NOT_READY', `Job ${jobId} not found.`, { jobId });
+    if (!buyerOwnsJob(keys, job)) fail('ARTIFACTS_NOT_BUYER', 'This identity is not the buyer on that job.', { jobId: job.id });
+    const serviceType = job.serviceType || null;
+    let files = [];
+    if (serviceType !== 'gpu-rental' && serviceType !== 'dataset') {
+      try {
+        const listed = await agent.listFiles(job.id);
+        files = (listed && listed.data) || [];
+      } catch (e) {
+        fail('ARTIFACTS_LIST_FAILED', e.message || String(e), { jobId: job.id, status: job.status });
+      }
+    }
+    let result;
+    try {
+      result = await fetchArtifacts({
+        job,
+        files,
+        outDir: options.out,
+        downloadFile: (fileId) => agent.downloadFile(job.id, fileId),
+      });
+    } catch (e) {
+      fail(e.code || 'ARTIFACTS_LIST_FAILED', e.message || String(e), { jobId: job.id, status: job.status });
+    }
+    if (!result.ok) fail(result.code, result.message, { jobId: job.id, status: result.status, artifactsVersion: result.artifactsVersion, sealed: false });
+    say(`Wrote ${result.files.length} file(s) to ${result.out}`);
+    if (options.json) console.log(JSON.stringify(result, null, 2));
+  });
+
+program
   .command('access <buyer-agent-id> <seller>')
   .description('Request ECDH API access from a model / api-endpoint seller (not a labour hire)')
   .option('--json', 'One JSON object on stdout (includes apiKey). Requires --yes.')

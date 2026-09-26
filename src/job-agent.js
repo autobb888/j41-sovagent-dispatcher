@@ -944,17 +944,32 @@ async function main() {
       log.info('Canary stripped from deliverable — hash recomputed', { jobId: JOB_ID });
     }
   }
-  // 'failed' is not a 64-char hex SHA-256 — the broker policy would reject
-  // it. Compute a real hash of the failure sentinel so both paths agree.
-  let deliverHash = result.hash;
+  // The finished work is delivery.zip: answer.txt plus anything the worker
+  // wrote under out/. The signed hash is sha256 of that zip. The notice is
+  // only a pointer. sealed stays false until the buyer has a z-address.
+  // The viewing key stays on the buyer.
+  const { buildDeliveryPackage, listOutputFiles } = require('./delivery-package');
+  const pkg = buildDeliveryPackage(result.content, listOutputFiles(path.join(JOB_DIR, 'out')));
+  if (pkg.tooBig) {
+    throw new Error('PACKAGE_TOO_LARGE: delivery is over 25MB');
+  }
+  let deliverHash = pkg.hash || result.hash;
   if (!deliverHash) {
     deliverHash = require('crypto').createHash('sha256').update('failed').digest('hex');
+  }
+  if (pkg.hash) result.hash = pkg.hash;
+  if (pkg.upload) {
+    await withRetry(
+      () => agent.uploadFileData(job.id, pkg.body, pkg.filename, 'application/zip'),
+      'uploadDelivery',
+      { maxAttempts: 5, baseDelayMs: 2000 }
+    );
   }
   const brokered = await signer.signDeliver({ jobId: job.id, jobHash: fullJob.jobHash, deliveryHash: deliverHash });
 
   try {
     await withRetry(
-      () => agent.client.deliverJob(job.id, deliverHash, brokered.signature, brokered.timestamp, result.content.substring(0, 200)),
+      () => agent.client.deliverJob(job.id, deliverHash, brokered.signature, brokered.timestamp, pkg.notice || ''),
       'deliverJob',
       { maxAttempts: 5, baseDelayMs: 2000 }
     );
