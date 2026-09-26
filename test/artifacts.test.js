@@ -25,6 +25,18 @@ test('paused with nothing is not ready', () => {
   assert.equal(plan.code, 'ARTIFACTS_NOT_READY');
 });
 
+test('accepted tells the buyer the zip is not listed yet', () => {
+  const plan = planArtifacts({ status: 'accepted', delivery: null }, []);
+  assert.equal(plan.code, 'ARTIFACTS_NOT_READY');
+  assert.match(plan.message, /not listed yet/);
+});
+
+test('rework keeps the previous zip until the new deliver', () => {
+  const plan = planArtifacts({ status: 'rework', delivery: { hash: 'ab', message: 'old' } }, []);
+  assert.equal(plan.code, 'ARTIFACTS_NOT_READY');
+  assert.match(plan.message, /previous zip stays/);
+});
+
 test('buyer inputs before delivery are not the package', () => {
   const plan = planArtifacts(
     { status: 'in_progress', delivery: null },
@@ -76,6 +88,8 @@ test('a delivery zip is unpacked next to the archive', async () => {
     downloadFile: async () => ({ data: pkg.body, filename: 'delivery.zip', checksum: pkg.hash }),
   });
   assert.equal(result.ok, true);
+  assert.match(result.summary, /sha256 matched delivery.hash/);
+  assert.match(result.summary, /answer.txt/);
   assert.equal(fs.readFileSync(path.join(dir, 'answer.txt'), 'utf8'), 'finished');
   assert.equal(fs.readFileSync(path.join(dir, 'drawings', 'part.dwg'), 'utf8'), 'cad');
   assert.equal(fs.readFileSync(path.join(dir, 'delivery.zip')).length, pkg.body.length);

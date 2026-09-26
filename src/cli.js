@@ -4507,7 +4507,7 @@ program
       fail(e.code || 'ARTIFACTS_LIST_FAILED', e.message || String(e), { jobId: job.id, status: job.status });
     }
     if (!result.ok) fail(result.code, result.message, { jobId: job.id, status: result.status, artifactsVersion: result.artifactsVersion, sealed: false });
-    say(`Wrote ${result.files.length} file(s) to ${result.out}`);
+    say(`Wrote ${result.files.length} file(s) to ${result.out}. ${result.summary || ''}`);
     if (options.json) console.log(JSON.stringify(result, null, 2));
   });
 
@@ -5277,6 +5277,7 @@ program
   .option('--json', 'Output raw JSON instead of formatted text')
   .option('--rating <n>', '1-5. Submits a review when this buyer owns a delivered job. --json does not ask.')
   .option('--message <text>', 'Review text when a rating is submitted')
+  .option('--yes', 'Skip confirmation when --rating submits a review')
   .action(async (agentId, jobId, options) => {
     await ensureKeystoreUnlockedIfEncrypted();
     ensureDirs();
@@ -9493,20 +9494,44 @@ async function loadAgentDisputePolicy(state, agentInfo) {
  * Send an IPC-style message to a running job-agent.
  * Local mode: process.send()  |  Docker mode: writes to /tmp/ipc-msg.json inside container
  */
+function containerHostPid(container) {
+  if (!container || !container.id) return null;
+  try {
+    const out = require('child_process').execFileSync(
+      'docker', ['inspect', '-f', '{{.State.Pid}}', container.id],
+      { encoding: 'utf8', timeout: 5000 },
+    );
+    const pid = Number(String(out).trim());
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch (e) {
+    console.error(`[IPC] could not read the worker pid (${e.message})`);
+    return null;
+  }
+}
+
 function sendToJobAgent(activeInfo, msg) {
   if (activeInfo.process?.send) {
-    activeInfo.process.send(msg);
-    return true;
+    try {
+      activeInfo.process.send(msg);
+      return true;
+    } catch (e) {
+      console.error(`[IPC] could not reach the local worker (${e.message})`);
+      return false;
+    }
   }
   if (activeInfo.container) {
+    // docker exec cannot fork inside this read-only job container, so a
+    // shell redirect never lands. The worker already polls this file.
+    const pid = containerHostPid(activeInfo.container);
+    if (!pid) return false;
+    const file = `/proc/${pid}/root/tmp/ipc-msg.jsonl`;
     try {
-      const msgJson = JSON.stringify(msg);
-      require('child_process').execFileSync('docker', [
-        'exec', '-i', activeInfo.container.id,
-        'sh', '-c', 'cat >> /tmp/ipc-msg.jsonl'
-      ], { input: msgJson + '\n', timeout: 5000, stdio: ['pipe', 'ignore', 'ignore'] });
+      fs.appendFileSync(file, JSON.stringify(msg) + '\n');
       return true;
-    } catch { return false; }
+    } catch (e) {
+      console.error(`[IPC] ${msg && msg.type} was not delivered to the worker (${e.message})`);
+      return false;
+    }
   }
   return false;
 }
@@ -9601,8 +9626,8 @@ async function queueDisputedJobForRespawn(state, jobId, opts = {}) {
 
   const active = state.active.get(jobId);
   if (active) {
-    send(active, { type: 'dispute.filed', data: { jobId, reason: opts.reason } });
-    return { forwarded: true };
+    const forwarded = send(active, { type: 'dispute.filed', data: { jobId, reason: opts.reason } });
+    return { forwarded: !!forwarded };
   }
 
   // Torn-down: resolve the job + its local agent, then respawn.
@@ -11980,31 +12005,31 @@ async function pollForJobs(state) {
         if (activeInfo.kind === 'gpu-rental') {
           console.log('[Rental] credentials delivered; jail runs until expiresAt');
           state.emitEvent?.('job.delivered', { jobId, kind: 'gpu-rental', expiresAt: activeInfo.expiresAt });
-        } else {
-          sendToJobAgent(activeInfo, { type: 'job.completed', data: { jobId } });
+          state._lastSentStatus.set(jobId, currentJob.status);
+        } else if (sendToJobAgent(activeInfo, { type: 'job.completed', data: { jobId } })) {
           state.emitEvent?.('job.completed', { jobId, agentId: activeInfo.agentInfo?.id });
+          state._lastSentStatus.set(jobId, currentJob.status);
         }
-        state._lastSentStatus.set(jobId, currentJob.status);
       } else if (currentJob.status === 'disputed') {
-        await queueDisputedJobForRespawn(state, jobId, { agentId: activeInfo.agentInfo?.id, reason: currentJob.dispute?.reason });
-        state._lastSentStatus.set(jobId, currentJob.status);
+        const filed = await queueDisputedJobForRespawn(state, jobId, { agentId: activeInfo.agentInfo?.id, reason: currentJob.dispute?.reason });
+        if (filed && filed.forwarded) state._lastSentStatus.set(jobId, currentJob.status);
       } else if (currentJob.status === 'resolved' || currentJob.status === 'resolved_rejected') {
-        sendToJobAgent(activeInfo, { type: 'dispute.resolved', data: { jobId, action: currentJob.dispute?.action } });
-        state._lastSentStatus.set(jobId, currentJob.status);
+        if (sendToJobAgent(activeInfo, { type: 'dispute.resolved', data: { jobId, action: currentJob.dispute?.action } })) {
+          state._lastSentStatus.set(jobId, currentJob.status);
+        }
       } else if (currentJob.status === 'rework') {
-        sendToJobAgent(activeInfo, { type: 'dispute.rework_accepted', data: { jobId } });
-        state._lastSentStatus.set(jobId, currentJob.status);
+        if (sendToJobAgent(activeInfo, { type: 'dispute.rework_accepted', data: { jobId } })) {
+          state._lastSentStatus.set(jobId, currentJob.status);
+        }
       } else if (currentJob.status === 'delivered' && lastStatus !== 'delivered') {
         if (activeInfo.kind === 'gpu-rental') {
           console.log('[Rental] credentials delivered; jail runs until expiresAt');
           state.emitEvent?.('job.delivered', { jobId, kind: 'gpu-rental', expiresAt: activeInfo.expiresAt });
-        } else {
-          // Auto-deliver detected via poll (pause_ttl_expired)
+        } else if (sendToJobAgent(activeInfo, { type: 'end_session_request', jobId })) {
           console.log(`[Poll] Job ${jobId.substring(0, 8)} auto-delivered`);
-          sendToJobAgent(activeInfo, { type: 'end_session_request', jobId });
           state.emitEvent?.('job.delivered', { jobId, agentId: activeInfo.agentInfo?.id });
+          state._lastSentStatus.set(jobId, currentJob.status);
         }
-        state._lastSentStatus.set(jobId, currentJob.status);
       }
 
       // Poll-mode fallback: detect paused → in_progress (resume happened without webhook)
@@ -12447,7 +12472,9 @@ async function handleWebhookEvent(state, agentId, payload) {
       const reworkJob = state.active.get(jobId);
       // See dispute.resolved above — this one silently never reached a Docker
       // worker, so webhook-mode rework never ran at all.
-      if (reworkJob) sendToJobAgent(reworkJob, { type: 'dispute.rework_accepted', data });
+      if (reworkJob && sendToJobAgent(reworkJob, { type: 'dispute.rework_accepted', data }) && jobId) {
+        state._lastSentStatus.set(jobId, 'rework');
+      }
       break;
     }
 
@@ -12846,10 +12873,18 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
 
   if (!pending || pending.length === 0) return { empty: true };
 
+  // One of each key. Detailing every pending job_record trips the inbox
+  // rate limit and still only one of each key can fit in the identity tx.
+  const { selectInboxWriteSet } = require('./buyer-inbox');
+  const selected = selectInboxWriteSet(pending, (id) => isDeadLettered(state._inboxFailures, id));
+  if (selected.chosen.length === 0) {
+    return { nothingWritable: true, quarantined: selected.quarantined };
+  }
+
   // ── Build the batch ───────────────────────────────────────────────────────
   const batch = [];
-  for (const it of pending) {
-    if (isDeadLettered(state._inboxFailures, it.id)) continue;
+  let rateLimited = false;
+  for (const it of selected.chosen) {
 
     // job_record keeps its dispatcher-side witness gate: it needs getJobWitness +
     // verifyWitness + network policy, which the SDK batch has no business doing.
@@ -12878,14 +12913,20 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
       } catch (e) {
         // Only a real verification failure is the item's fault. A network blip is
         // not — counting it would let 5 API hiccups dead-letter a healthy record.
-        if (classifyInboxFailure(e) === 'hard') noteFailure(it.id, 'job_record', e.message);
+        if (e && (e.statusCode === 429 || /too many requests/i.test(e.message || ''))) {
+          rateLimited = true;
+          console.warn(`[Inbox] job_record ${String(it.id).substring(0, 8)} rate limited — retrying this id only`);
+        } else if (classifyInboxFailure(e) === 'hard') noteFailure(it.id, 'job_record', e.message);
         else console.warn(`[Inbox] job_record ${String(it.id).substring(0, 8)} gate transient (uncounted): ${e.message}`);
         continue;
       }
     }
     batch.push({ id: it.id, type: it.type });
   }
-  if (batch.length === 0) return { empty: true };
+  if (batch.length === 0) {
+    if (rateLimited) return { rateLimited: true, retryIds: selected.chosen.map((it) => it.id) };
+    return { empty: true };
+  }
 
   // ── Legacy fallback: SDK older than the batch API ─────────────────────────
   if (typeof agent.acceptInboxBatch !== 'function') {

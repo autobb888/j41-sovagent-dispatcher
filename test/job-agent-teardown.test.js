@@ -112,7 +112,5 @@ test('idle pause refused on accepted delivers instead of skipping deliverJob', (
   const branch = CODE.slice(accepted, nextElse);
   assert.ok(branch.includes("resolveSession('idle-pause-refused')"), 'accepted branch must end the session so deliver runs');
   assert.equal(branch.includes('_skipDelivery'), false);
-  assert.ok(branch.includes('ACCEPTED_IDLE_NOTE'), 'accepted idle deliver tells the buyer why pause did not happen');
-  assert.ok(branch.indexOf('_idlePauseUnsupported = true') < branch.indexOf('ACCEPTED_IDLE_NOTE'),
-    'the flag is set before the note so a second idle tick cannot send it again');
+  assert.equal(branch.includes('ACCEPTED_IDLE_NOTE'), false, 'do not tell the buyer delivery started before deliverJob');
 });

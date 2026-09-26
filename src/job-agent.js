@@ -1020,6 +1020,9 @@ async function main() {
     });
     result.hash = published.hash;
     log.info('Job delivered', { jobId: JOB_ID, hash: published.hash });
+    try {
+      await agent.sendChatMessage(job.id, 'Uploaded file: delivery.zip');
+    } catch { /* the platform upload line is the buyer-visible proof */ }
   } catch (e) {
     // Safety net (defense-in-depth): a paused / otherwise non-deliverable job
     // returns INVALID_STATUS. NEVER fatal-crash on it — tear down and exit
@@ -1506,7 +1509,6 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
       try { quietStatus = (await agent.client.getJob(job.id))?.status; } catch { /* full idle still runs */ }
       if (quietStatus === 'accepted') {
         _idlePauseUnsupported = true;
-        try { agent.sendChatMessage(job.id, ACCEPTED_IDLE_NOTE); } catch { /* deliver anyway */ }
         log.warn('Accepted job quiet after a reply — delivering', { jobId: job.id, idleSec: Math.round(idleMs / 1000) });
         if (resolveSession) resolveSession('idle-pause-refused');
         return;
@@ -1550,9 +1552,6 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
             // The flag is set before the note so a second idle tick cannot
             // send the line again.
             _idlePauseUnsupported = true;
-            if (curStatus === 'accepted') {
-              try { agent.sendChatMessage(job.id, ACCEPTED_IDLE_NOTE); } catch { /* deliver anyway */ }
-            }
             log.warn('Pause refused on a live job — delivering', { jobId: job.id, status: curStatus });
             if (resolveSession) resolveSession('idle-pause-refused');
           } else {
@@ -2025,6 +2024,12 @@ async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndRes
 
   // Inject the rework context as the next user message via handleMessage()
   console.log(`  Rework instruction: "${reworkContext.substring(0, 100)}${reworkContext.length > 100 ? '...' : ''}"`);
+  try {
+    await ensureChatConnected(agent, job.id);
+    await agent.sendChatMessage(job.id, 'Rework started. The current delivery.zip stays until the new one is accepted.');
+  } catch (e) {
+    console.warn(`  ⚠️  Could not tell the buyer the rework started: ${e.message}`);
+  }
 
   // handleMessage() is the existing Executor method that processes buyer messages.
   // The executor keeps its conversation history from the original job.

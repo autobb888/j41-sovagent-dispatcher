@@ -6,6 +6,7 @@ const assert = require('node:assert');
 const {
   actionableItems,
   preferWatched,
+  selectInboxWriteSet,
   drainMessage,
   drainBuyerInbox,
 } = require('../src/buyer-inbox.js');
@@ -54,6 +55,33 @@ test('preferWatched puts this job ahead of older packets', () => {
     { jobHash: 'new-hash' },
   );
   assert.deepEqual(ordered.map((it) => it.id), ['new', 'rev', 'old']);
+});
+
+test('a write set is one live row of each key', () => {
+  const dead = new Set(['old-job']);
+  const selected = selectInboxWriteSet([
+    job('old-job', 'h0'),
+    job('new-job', 'h1'),
+    review('rev', 'h1'),
+    { id: 'note', type: 'notification' },
+  ], (id) => dead.has(id));
+  assert.deepEqual(selected.chosen.map((it) => it.id), ['new-job', 'rev']);
+  assert.deepEqual(selected.quarantined, ['old-job']);
+});
+
+test('a quarantined inbox stops instead of polling', async () => {
+  const s = scripted({
+    pages: [[job('q1', 'h1')]],
+    batches: [{ nothingWritable: true, quarantined: ['q1'] }],
+  });
+  const result = await drainBuyerInbox({
+    ...s, timeoutMs: 60000, confirmTimeoutMs: 0, buyerId: 'mac',
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'BUYER_INBOX_QUARANTINED');
+  assert.deepEqual(result.quarantined, ['q1']);
+  assert.match(drainMessage(result), /q1/);
+  assert.equal(s.calls.length, 1);
 });
 
 test('empty inbox is success and does not write', async () => {

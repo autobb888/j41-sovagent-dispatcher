@@ -6,6 +6,13 @@
  */
 
 const crypto = require('crypto');
+
+/** The only model text a buyer may see. Reasoning stays on the provider. */
+function buyerVisibleReply(msg) {
+  const content = msg && typeof msg.content === 'string' ? msg.content.trim() : '';
+  if (content) return content;
+  return 'I could not generate a response.';
+}
 const { Executor } = require('./base.js');
 const log = require('../logger.js');
 const { scanUntrusted } = require('../sovguard-context.js');
@@ -503,7 +510,7 @@ async function callLLM(systemPrompt, messages) {
 
   const msg = fetched.data.choices?.[0]?.message;
   return {
-    content: msg?.content || msg?.reasoning_content || msg?.reasoning || 'I could not generate a response.',
+    content: buyerVisibleReply(msg),
     usage: fetched.data.usage || null,
   };
 }
@@ -546,9 +553,10 @@ async function callLLMWithTools(systemPrompt, messages, tools) {
 
   const data = fetched.data;
   const msg = data.choices?.[0]?.message || { content: 'No response generated.' };
-  // Kimi K2.5 via NVIDIA returns content=null with text in reasoning field
-  if (!msg.content && (msg.reasoning_content || msg.reasoning)) {
-    msg.content = msg.reasoning_content || msg.reasoning;
+  // Reasoning is the model's scratch pad. It is not the reply the buyer paid
+  // for, and it can quote the system prompt. Never copy it into content.
+  if (!msg.content || !String(msg.content).trim()) {
+    msg.content = buyerVisibleReply(msg);
   }
   // Kimi K2.5 emits tool calls as raw markup in content instead of tool_calls array
   // Parse <|tool_calls_section_begin|> ... <|tool_calls_section_end|> into proper tool_calls
@@ -613,6 +621,7 @@ function generateTemplateResponse(message, job, soulPrompt) {
 
 module.exports = {
   LocalLLMExecutor, LLM_PRESETS, LLM_CONFIG, resolveLLMConfig, CHAT_ABORT_MS,
+  buyerVisibleReply,
   labourMaxTokens, LABOUR_MAX_TOKENS_DEFAULT, LABOUR_MAX_TOKENS_CEILING,
   chatChunks,
 };

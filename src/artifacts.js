@@ -54,12 +54,23 @@ function planArtifacts(job, files) {
   const notice = job && job.delivery && typeof job.delivery.message === 'string'
     ? job.delivery.message
     : '';
-  if (NOT_READY.has(status) || !status) {
+  if (status === 'rework') {
     return {
       ...base,
       ok: false,
       code: 'ARTIFACTS_NOT_READY',
-      message: `Job status is ${status || 'unknown'}. The package is available after delivery.`,
+      message: 'Job status is rework. The previous zip stays until the new deliver is accepted.',
+    };
+  }
+  if (NOT_READY.has(status) || !status) {
+    const waiting = status === 'accepted' || status === 'in_progress';
+    return {
+      ...base,
+      ok: false,
+      code: 'ARTIFACTS_NOT_READY',
+      message: waiting
+        ? `Job status is ${status}. The seller may have started delivery. The zip is not listed yet.`
+        : `Job status is ${status || 'unknown'}. The package is available after delivery.`,
     };
   }
   const hash = signedHash(job);
@@ -156,6 +167,10 @@ async function fetchArtifacts({ job, files, outDir, downloadFile }) {
     noticeFile = 'notice.txt';
     fs.writeFileSync(path.join(root, noticeFile), plan.notice);
   }
+  const entries = written.filter((file) => file.fromZip).map((file) => file.name);
+  const summary = entries.length
+    ? `sha256 matched delivery.hash. Entries: ${entries.join(', ')}.`
+    : 'sha256 matched delivery.hash.';
   return {
     ok: true,
     artifactsVersion: ARTIFACTS_VERSION,
@@ -166,6 +181,7 @@ async function fetchArtifacts({ job, files, outDir, downloadFile }) {
     deliveryHash: job.delivery && job.delivery.hash ? job.delivery.hash : null,
     files: written,
     noticeFile,
+    summary,
   };
 }
 

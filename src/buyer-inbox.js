@@ -90,6 +90,21 @@ function wroteAny(counts) {
   return counts.job_record + counts.review + counts.attestation > 0;
 }
 
+/** One live row of each content-map key. Dead-lettered ids are not fetched again. */
+function selectInboxWriteSet(pending, isDead) {
+  const picked = {};
+  const quarantined = [];
+  for (const it of pending || []) {
+    if (!it || !BUYER_INBOX_TYPES.includes(it.type)) continue;
+    if (typeof isDead === 'function' && isDead(it.id)) {
+      quarantined.push(it.id);
+      continue;
+    }
+    if (!picked[it.type]) picked[it.type] = it;
+  }
+  return { chosen: Object.values(picked), quarantined };
+}
+
 function drainMessage(result) {
   const id = (result && result.buyerId) || '<buyer>';
   const next = `j41-dispatcher inbox ${id} --yes`;
@@ -112,6 +127,10 @@ function drainMessage(result) {
   }
   if (result.code === 'BUYER_INBOX_PENDING') {
     return `Published ${wrote}. ${result.pending} content-map item(s) still pending. Next: ${next}`;
+  }
+  if (result.code === 'BUYER_INBOX_QUARANTINED') {
+    const ids = (result.quarantined || []).map((id) => String(id).slice(0, 8)).join(', ');
+    return `Published ${wrote}. These inbox items are quarantined until restart: ${ids || 'unknown'}.`;
   }
   const tail = result.pending > 0 ? ` ${result.pending} still pending. Next: ${next}` : '';
   return `Published ${wrote}.${tail}`;
@@ -202,6 +221,23 @@ async function drainBuyerInbox({
         waiting: false,
       });
     }
+    if (res && res.nothingWritable) {
+      return {
+        ok: false,
+        code: 'BUYER_INBOX_QUARANTINED',
+        pending: (res.quarantined || []).length,
+        quarantined: res.quarantined || [],
+        accepted,
+        txids,
+        buyerId,
+      };
+    }
+    if (res && res.rateLimited) {
+      if (typeof onProgress === 'function') onProgress({ waiting: true, pending: pending.length, rateLimited: true });
+      if (singlePass) break;
+      await sleep(intervalMs);
+      continue;
+    }
     if (res && res.stop) {
       const confirmed = await waitConfirmed();
       if (!confirmed) return finish('BUYER_INBOX_UNCONFIRMED', false);
@@ -255,6 +291,7 @@ module.exports = {
   actionableItems,
   preferWatched,
   matchesWatch,
+  selectInboxWriteSet,
   drainMessage,
   drainBuyerInbox,
 };
