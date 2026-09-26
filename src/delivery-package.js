@@ -91,60 +91,206 @@ function buildStoredZip(entries) {
   return Buffer.concat([...locals, cd, eocd]);
 }
 
+function badZip(message) {
+  const err = new Error(message || 'Not a zip package');
+  err.code = 'PACKAGE_BAD_ZIP';
+  return err;
+}
+
+function zipName(buf, start, len) {
+  try {
+    return entryName(buf.slice(start, start + len).toString('utf8'));
+  } catch (e) {
+    if (e.code === 'PACKAGE_BAD_NAME') throw badZip('Zip entry name is not inside the package');
+    throw e;
+  }
+}
+
+/**
+ * Stored zip only. Local headers and the central directory must name the
+ * same bytes. A data descriptor or a deflated entry is rejected: sizes in
+ * those zips are not the bytes that follow the local name.
+ */
 function readStoredZip(buf) {
-  const out = [];
+  if (!Buffer.isBuffer(buf)) buf = Buffer.from(buf);
+  const locals = [];
   let pos = 0;
   while (pos + 4 <= buf.length) {
     const sig = buf.readUInt32LE(pos);
     if (sig === 0x02014b50 || sig === 0x06054b50) break;
-    if (sig !== 0x04034b50) {
-      const err = new Error('Not a zip package');
-      err.code = 'PACKAGE_BAD_ZIP';
-      throw err;
-    }
+    if (sig !== 0x04034b50 || pos + 30 > buf.length) throw badZip();
+    const flags = buf.readUInt16LE(pos + 6);
     const method = buf.readUInt16LE(pos + 8);
     const crc = buf.readUInt32LE(pos + 14);
+    const compSize = buf.readUInt32LE(pos + 18);
     const size = buf.readUInt32LE(pos + 22);
     const nameLen = buf.readUInt16LE(pos + 26);
     const extraLen = buf.readUInt16LE(pos + 28);
+    if ((flags & 0x0008) !== 0) throw badZip('Zip entry uses a data descriptor');
+    if (method !== 0 || compSize !== size) throw badZip('Zip entry is compressed');
     const nameStart = pos + 30;
     const dataStart = nameStart + nameLen + extraLen;
-    const name = entryName(buf.slice(nameStart, nameStart + nameLen).toString('utf8'));
+    if (dataStart + size > buf.length) throw badZip();
+    const name = zipName(buf, nameStart, nameLen);
     const data = Buffer.from(buf.slice(dataStart, dataStart + size));
-    if (method !== 0) {
-      const err = new Error(`Zip entry "${name}" is compressed`);
-      err.code = 'PACKAGE_BAD_ZIP';
-      throw err;
-    }
-    if ((crc32(data) >>> 0) !== crc) {
-      const err = new Error(`Zip entry "${name}" failed CRC`);
-      err.code = 'PACKAGE_BAD_ZIP';
-      throw err;
-    }
-    out.push({ name, data });
+    if ((crc32(data) >>> 0) !== crc) throw badZip(`Zip entry "${name}" failed CRC`);
+    locals.push({ name, data, crc, size, method, offset: pos });
     pos = dataStart + size;
   }
-  return out;
+  if (pos + 4 > buf.length) throw badZip();
+  const next = buf.readUInt32LE(pos);
+  if (next === 0x06054b50) {
+    if (locals.length !== 0) throw badZip();
+    return [];
+  }
+  if (next !== 0x02014b50) throw badZip();
+  let count = 0;
+  while (pos + 4 <= buf.length && buf.readUInt32LE(pos) === 0x02014b50) {
+    if (pos + 46 > buf.length) throw badZip();
+    const flags = buf.readUInt16LE(pos + 8);
+    const method = buf.readUInt16LE(pos + 10);
+    const crc = buf.readUInt32LE(pos + 16);
+    const compSize = buf.readUInt32LE(pos + 20);
+    const size = buf.readUInt32LE(pos + 24);
+    const nameLen = buf.readUInt16LE(pos + 28);
+    const extraLen = buf.readUInt16LE(pos + 30);
+    const commentLen = buf.readUInt16LE(pos + 32);
+    const localOff = buf.readUInt32LE(pos + 42);
+    const nameStart = pos + 46;
+    if (nameStart + nameLen + extraLen + commentLen > buf.length) throw badZip();
+    if ((flags & 0x0008) !== 0 || method !== 0 || compSize !== size) throw badZip('Zip entry is compressed');
+    const name = zipName(buf, nameStart, nameLen);
+    const local = locals[count];
+    if (!local || local.name !== name || local.crc !== crc || local.size !== size
+      || local.method !== method || local.offset !== localOff) {
+      throw badZip(`Zip central directory disagrees with "${name}"`);
+    }
+    count += 1;
+    pos = nameStart + nameLen + extraLen + commentLen;
+  }
+  if (count !== locals.length || pos + 22 > buf.length || buf.readUInt32LE(pos) !== 0x06054b50) throw badZip();
+  if (buf.readUInt16LE(pos + 10) !== locals.length) throw badZip();
+  return locals.map(({ name, data }) => ({ name, data }));
+}
+
+function stripCanary(data, token) {
+  const buf = Buffer.isBuffer(data) ? data : Buffer.from(data == null ? '' : data);
+  if (!token) return buf;
+  const needle = Buffer.from(String(token));
+  if (!needle.length || buf.length < needle.length || buf.indexOf(needle) === -1) return buf;
+  const redacted = Buffer.from('[redacted]');
+  const parts = [];
+  let start = 0;
+  let idx = buf.indexOf(needle, start);
+  while (idx !== -1) {
+    parts.push(buf.subarray(start, idx), redacted);
+    start = idx + needle.length;
+    idx = buf.indexOf(needle, start);
+  }
+  parts.push(buf.subarray(start));
+  return Buffer.concat(parts);
+}
+
+function insideBoundary(rootReal, boundary) {
+  if (!boundary) return true;
+  let boundReal;
+  try { boundReal = fs.realpathSync(boundary); } catch { return false; }
+  const prefix = boundReal.endsWith(path.sep) ? boundReal : boundReal + path.sep;
+  return rootReal.startsWith(prefix);
+}
+
+function readRegularFile(full) {
+  let listed;
+  try { listed = fs.lstatSync(full); } catch { return null; }
+  if (!listed.isFile()) return null;
+  let fd;
+  try { fd = fs.openSync(full, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
+  catch (e) {
+    if (e.code === 'ELOOP' || e.code === 'ENOENT') return null;
+    throw e;
+  }
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) return null;
+    return fs.readFileSync(fd);
+  } finally { fs.closeSync(fd); }
 }
 
 /**
  * Files the worker wrote under the job out/ directory.
- * Buyer inputs live in files/ and are not included. Symlinks are skipped.
+ * Buyer inputs live in files/ and are not included.
+ * A symlink at out/ itself is not a directory: following it packages the
+ * job canary. Symlinks inside the walk are skipped, and each file is
+ * opened with O_NOFOLLOW after a fresh lstat. Sizes are summed before
+ * any read so a huge tree fails closed instead of being loaded.
  */
-function listOutputFiles(root) {
-  if (!root || !fs.existsSync(root)) return [];
-  const acc = [];
+function listOutputFiles(root, opts = {}) {
+  if (!root) return [];
+  let st;
+  try { st = fs.lstatSync(root); } catch { return []; }
+  if (!st.isDirectory()) return [];
+  let rootReal;
+  try { rootReal = fs.realpathSync(root); } catch { return []; }
+  if (!insideBoundary(rootReal, opts.boundary)) return [];
+  const maxBytes = Number.isFinite(opts.maxBytes) ? opts.maxBytes : MAX_PACKAGE_BYTES;
+  const pending = [];
+  let total = 0;
+  let tooBig = false;
   const walk = (dir, prefix) => {
-    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (tooBig) return;
+    let ents;
+    try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const ent of ents) {
+      if (tooBig) return;
       if (ent.isSymbolicLink()) continue;
       const rel = prefix ? `${prefix}/${ent.name}` : ent.name;
       const full = path.join(dir, ent.name);
-      if (ent.isDirectory()) walk(full, rel);
-      else if (ent.isFile()) acc.push({ name: rel, data: fs.readFileSync(full) });
+      if (ent.isDirectory()) {
+        walk(full, rel);
+        continue;
+      }
+      if (!ent.isFile()) continue;
+      if (ent.name === 'canary.token') continue;
+      let listed;
+      try { listed = fs.lstatSync(full); } catch { continue; }
+      if (!listed.isFile()) continue;
+      total += listed.size;
+      if (total > maxBytes) {
+        tooBig = true;
+        return;
+      }
+      pending.push({ name: rel, full });
     }
   };
   walk(root, '');
-  return acc;
+  if (tooBig) {
+    const err = new Error('Delivery is over 25MB');
+    err.code = 'PACKAGE_TOO_LARGE';
+    throw err;
+  }
+  const out = [];
+  for (const file of pending) {
+    const data = readRegularFile(file.full);
+    if (!data) continue;
+    out.push({ name: file.name, data: stripCanary(data, opts.canary) });
+  }
+  return out;
+}
+
+/** Previous delivery.zip uploads to delete after the new one is accepted. */
+function packageIdsToReplace(files, filename, keep) {
+  const name = String(filename || '');
+  const keepId = keep && keep.id ? String(keep.id) : '';
+  const keepHash = keep && (keep.checksum || keep.hash) ? String(keep.checksum || keep.hash).toLowerCase() : '';
+  if (!keepId && !keepHash) return [];
+  const ids = [];
+  for (const file of Array.isArray(files) ? files : []) {
+    if (!file || !file.id || file.filename !== name) continue;
+    if (keepId && String(file.id) === keepId) continue;
+    if (!keepId && keepHash && String(file.checksum || '').toLowerCase() === keepHash) continue;
+    ids.push(String(file.id));
+  }
+  return ids;
 }
 
 /**
@@ -153,12 +299,14 @@ function listOutputFiles(root) {
  * The hash is sha256 of the zip bytes. `sealed` stays false until a buyer
  * z-address exists. The viewing key never leaves the buyer.
  */
-function buildDeliveryPackage(content, files) {
-  const body = typeof content === 'string' ? content : '';
+function buildDeliveryPackage(content, files, opts = {}) {
+  const canary = opts && opts.canary;
+  const bodyBuf = stripCanary(Buffer.from(typeof content === 'string' ? content : '', 'utf8'), canary);
+  const body = bodyBuf.toString('utf8');
   const extras = Array.isArray(files) ? files : [];
   const entries = [];
-  if (body) entries.push({ name: 'answer.txt', data: Buffer.from(body, 'utf8') });
-  for (const file of extras) entries.push({ name: file.name, data: file.data });
+  if (body) entries.push({ name: 'answer.txt', data: bodyBuf });
+  for (const file of extras) entries.push({ name: file.name, data: stripCanary(file.data, canary) });
   if (entries.length === 0) {
     return {
       filename: PACKAGE_FILENAME,
@@ -217,5 +365,7 @@ module.exports = {
   buildStoredZip,
   readStoredZip,
   listOutputFiles,
+  packageIdsToReplace,
+  stripCanary,
   buildDeliveryPackage,
 };

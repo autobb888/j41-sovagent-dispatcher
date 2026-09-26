@@ -4472,7 +4472,7 @@ program
     const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
     const say = (line) => { if (!options.json) console.log(line); };
     if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
-    const { fetchArtifacts } = require('./artifacts');
+    const { fetchArtifacts, classifyArtifactJob } = require('./artifacts');
     const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
     let job;
     try {
@@ -4482,9 +4482,12 @@ program
     }
     if (!job || !job.id) fail('ARTIFACTS_NOT_READY', `Job ${jobId} not found.`, { jobId });
     if (!buyerOwnsJob(keys, job)) fail('ARTIFACTS_NOT_BUYER', 'This identity is not the buyer on that job.', { jobId: job.id });
-    const serviceType = job.serviceType || null;
+    const kind = await classifyArtifactJob(job, agent.client);
+    const view = { ...job };
+    if (kind.gpu) view.serviceType = 'gpu-rental';
+    else if (kind.dataset) view.serviceType = job.serviceType || job.service_type || 'dataset';
     let files = [];
-    if (serviceType !== 'gpu-rental' && serviceType !== 'dataset') {
+    if (!kind.gpu && !kind.dataset) {
       try {
         const listed = await agent.listFiles(job.id);
         files = (listed && listed.data) || [];
@@ -4495,7 +4498,7 @@ program
     let result;
     try {
       result = await fetchArtifacts({
-        job,
+        job: view,
         files,
         outDir: options.out,
         downloadFile: (fileId) => agent.downloadFile(job.id, fileId),

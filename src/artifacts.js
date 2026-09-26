@@ -3,16 +3,38 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { readStoredZip } = require('./delivery-package');
+const { readStoredZip, PACKAGE_FILENAME } = require('./delivery-package');
+const { isDatasetJob } = require('./job-payment');
+const { isGpuRentalJob, jobIsGpuRental } = require('./buyer-extend');
 
 const ARTIFACTS_VERSION = 1;
 const NOT_READY = new Set(['requested', 'accepted', 'paused', 'in_progress', 'rework']);
 
+function signedHash(job) {
+  const hash = job && job.delivery && job.delivery.hash;
+  return typeof hash === 'string' && hash ? hash.toLowerCase() : '';
+}
+
+function selectPackageFile(files, hash) {
+  const matched = (Array.isArray(files) ? files : []).filter((file) => {
+    return file && String(file.checksum || '').toLowerCase() === hash;
+  });
+  const named = matched.filter((file) => String(file.filename || '').toLowerCase() === PACKAGE_FILENAME);
+  const chosen = named.length ? named : matched;
+  return chosen.length ? chosen[chosen.length - 1] : null;
+}
+
+async function classifyArtifactJob(job, client) {
+  const dataset = isDatasetJob(job);
+  let gpu = isGpuRentalJob(job);
+  if (!gpu && client) gpu = await jobIsGpuRental(job, client);
+  return { dataset, gpu };
+}
+
 function planArtifacts(job, files) {
-  const serviceType = (job && (job.serviceType || job.service_type)) || null;
   const status = job && job.status ? String(job.status) : '';
   const base = { status, artifactsVersion: ARTIFACTS_VERSION, sealed: false };
-  if (serviceType === 'gpu-rental') {
+  if (isGpuRentalJob(job)) {
     return {
       ...base,
       ok: false,
@@ -20,7 +42,7 @@ function planArtifacts(job, files) {
       message: 'This rental has no file package. Copy what you need over the lease before complete.',
     };
   }
-  if (serviceType === 'dataset') {
+  if (isDatasetJob(job)) {
     return {
       ...base,
       ok: false,
@@ -32,7 +54,7 @@ function planArtifacts(job, files) {
   const notice = job && job.delivery && typeof job.delivery.message === 'string'
     ? job.delivery.message
     : '';
-  if (list.length === 0 && !notice && (NOT_READY.has(status) || !status)) {
+  if (NOT_READY.has(status) || !status) {
     return {
       ...base,
       ok: false,
@@ -40,7 +62,9 @@ function planArtifacts(job, files) {
       message: `Job status is ${status || 'unknown'}. The package is available after delivery.`,
     };
   }
-  if (list.length === 0 && !notice) {
+  const hash = signedHash(job);
+  const file = hash ? selectPackageFile(list, hash) : null;
+  if (!file && !notice) {
     return {
       ...base,
       ok: false,
@@ -48,7 +72,7 @@ function planArtifacts(job, files) {
       message: 'This job has no package and no delivery notice.',
     };
   }
-  return { ...base, ok: true, notice, files: list };
+  return { ...base, ok: true, notice, files: file ? [file] : [] };
 }
 
 function safeBasename(filename) {
@@ -89,31 +113,41 @@ async function fetchArtifacts({ job, files, outDir, downloadFile }) {
   fs.mkdirSync(outDir, { recursive: true });
   const root = path.resolve(outDir);
   const written = [];
+  const signed = signedHash(job);
   for (const file of plan.files) {
     const downloaded = await downloadFile(file.id);
     const name = safeBasename((downloaded && downloaded.filename) || file.filename || 'file');
-    const dest = path.join(root, name);
     const buf = Buffer.from(downloaded.data);
     const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
-    const expected = (downloaded && downloaded.checksum) || file.checksum;
-    if (expected && sha256 !== expected) {
+    const expected = String((downloaded && downloaded.checksum) || file.checksum || '').toLowerCase();
+    if (!signed || sha256 !== signed || (expected && sha256 !== expected)) {
       const err = new Error(`Checksum mismatch for ${name}`);
       err.code = 'ARTIFACTS_BAD_HASH';
       throw err;
     }
+    let entries = null;
+    if (name.toLowerCase().endsWith('.zip')) {
+      entries = readStoredZip(buf);
+    }
+    const dest = path.join(root, name);
     fs.writeFileSync(dest, buf);
     written.push({ name, bytes: buf.length, sha256 });
-    if (name.toLowerCase().endsWith('.zip')) {
-      for (const entry of readStoredZip(buf)) {
-        const unpacked = safeJoin(root, entry.name);
-        fs.mkdirSync(path.dirname(unpacked), { recursive: true });
-        fs.writeFileSync(unpacked, entry.data);
-        written.push({
-          name: entry.name,
-          bytes: entry.data.length,
-          sha256: crypto.createHash('sha256').update(entry.data).digest('hex'),
-          fromZip: name,
-        });
+    if (entries) {
+      try {
+        for (const entry of entries) {
+          const unpacked = safeJoin(root, entry.name);
+          fs.mkdirSync(path.dirname(unpacked), { recursive: true });
+          fs.writeFileSync(unpacked, entry.data);
+          written.push({
+            name: entry.name,
+            bytes: entry.data.length,
+            sha256: crypto.createHash('sha256').update(entry.data).digest('hex'),
+            fromZip: name,
+          });
+        }
+      } catch (e) {
+        try { fs.unlinkSync(dest); } catch { /* the zip did not validate */ }
+        throw e;
       }
     }
   }
@@ -137,6 +171,7 @@ async function fetchArtifacts({ job, files, outDir, downloadFile }) {
 
 module.exports = {
   ARTIFACTS_VERSION,
+  classifyArtifactJob,
   planArtifacts,
   safeBasename,
   fetchArtifacts,

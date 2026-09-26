@@ -463,6 +463,88 @@ async function withRetry(fn, label, { maxAttempts = 3, baseDelayMs = 1000 } = {}
   }
 }
 
+const OVERSIZE_NOTICE = 'Delivery is over 25MB and was not uploaded.';
+
+async function dropReplacedPackages(agent, jobId, filename, uploaded) {
+  if (typeof agent.listFiles !== 'function' || typeof agent.deleteFile !== 'function') return;
+  const { packageIdsToReplace } = require('./delivery-package');
+  let listed;
+  try { listed = await agent.listFiles(jobId); }
+  catch (e) {
+    console.warn(`[DELIVERY] could not list previous packages: ${e.message}`);
+    return;
+  }
+  const stale = packageIdsToReplace((listed && listed.data) || [], filename, uploaded);
+  for (const id of stale) {
+    try { await agent.deleteFile(jobId, id); }
+    catch (e) { console.warn(`[DELIVERY] previous ${filename} ${id} stayed: ${e.message}`); }
+  }
+}
+
+/**
+ * One path for the first delivery and for rework. The signed hash is sha256
+ * of delivery.zip. The notice is only a pointer. A previous zip is removed
+ * after the new deliver is accepted, so a failed upload leaves the last
+ * package in place.
+ */
+async function publishFinishedJob({ agent, signer, job, fullJob, content, canary }) {
+  const crypto = require('crypto');
+  const {
+    buildDeliveryPackage, listOutputFiles, MAX_PACKAGE_BYTES,
+  } = require('./delivery-package');
+  let text = typeof content === 'string' ? content : '';
+  if (canary && text.includes(canary)) {
+    text = text.split(canary).join('[redacted]');
+    log.info('Canary stripped from deliverable — hash recomputed', { jobId: job.id });
+  }
+  const textBytes = Buffer.byteLength(text);
+  let files = [];
+  let tooBig = textBytes > MAX_PACKAGE_BYTES;
+  if (!tooBig) {
+    try {
+      files = listOutputFiles(path.join(JOB_DIR, 'out'), {
+        boundary: JOB_DIR,
+        canary,
+        maxBytes: MAX_PACKAGE_BYTES - textBytes,
+      });
+    } catch (e) {
+      if (e.code !== 'PACKAGE_TOO_LARGE') throw e;
+      tooBig = true;
+    }
+  }
+  const pkg = tooBig ? null : buildDeliveryPackage(text, files, { canary });
+  if (tooBig || (pkg && pkg.tooBig)) {
+    const hash = crypto.createHash('sha256').update(OVERSIZE_NOTICE).digest('hex');
+    const brokered = await signer.signDeliver({ jobId: job.id, jobHash: fullJob.jobHash, deliveryHash: hash });
+    await withRetry(
+      () => agent.client.deliverJob(job.id, hash, brokered.signature, brokered.timestamp, OVERSIZE_NOTICE),
+      'deliverJob',
+      { maxAttempts: 5, baseDelayMs: 2000 },
+    );
+    return { hash, uploaded: false, tooBig: true };
+  }
+  let deliverHash = pkg.hash;
+  if (!deliverHash) {
+    deliverHash = crypto.createHash('sha256').update(text || 'failed').digest('hex');
+  }
+  let uploaded = null;
+  if (pkg.upload) {
+    uploaded = await withRetry(
+      () => agent.uploadFileData(job.id, pkg.body, pkg.filename, 'application/zip'),
+      'uploadDelivery',
+      { maxAttempts: 5, baseDelayMs: 2000 },
+    );
+  }
+  const brokered = await signer.signDeliver({ jobId: job.id, jobHash: fullJob.jobHash, deliveryHash: deliverHash });
+  await withRetry(
+    () => agent.client.deliverJob(job.id, deliverHash, brokered.signature, brokered.timestamp, pkg.notice || ''),
+    'deliverJob',
+    { maxAttempts: 5, baseDelayMs: 2000 },
+  );
+  if (pkg.upload) await dropReplacedPackages(agent, job.id, pkg.filename, uploaded);
+  return { hash: deliverHash, uploaded: !!pkg.upload, tooBig: false };
+}
+
 // Track agent+executor globally for SIGTERM cleanup
 let _agent = null;
 let _executor = null;
@@ -928,52 +1010,16 @@ async function main() {
     return;
   }
   log.info('Delivering result', { jobId: JOB_ID });
-  // Strip canary token from deliverable content before sending to platform.
-  //
-  // The hash MUST be recomputed after this. finalize() hashed the content that
-  // still contained the canary, so stripping it afterwards left the signed hash
-  // committing to text the buyer never receives — i.e. whenever a canary
-  // appeared in the deliverable, the delivery hash was wrong. It is signed
-  // (signDeliver) and submitted to the platform, so a wrong hash is a broken
-  // integrity claim, not a cosmetic mismatch.
-  if (CANARY_TOKEN && result.content) {
-    const stripped = result.content.split(CANARY_TOKEN).join('[redacted]');
-    if (stripped !== result.content) {
-      result.content = stripped;
-      result.hash = require('crypto').createHash('sha256').update(stripped).digest('hex');
-      log.info('Canary stripped from deliverable — hash recomputed', { jobId: JOB_ID });
-    }
-  }
-  // The finished work is delivery.zip: answer.txt plus anything the worker
-  // wrote under out/. The signed hash is sha256 of that zip. The notice is
-  // only a pointer. sealed stays false until the buyer has a z-address.
-  // The viewing key stays on the buyer.
-  const { buildDeliveryPackage, listOutputFiles } = require('./delivery-package');
-  const pkg = buildDeliveryPackage(result.content, listOutputFiles(path.join(JOB_DIR, 'out')));
-  if (pkg.tooBig) {
-    throw new Error('PACKAGE_TOO_LARGE: delivery is over 25MB');
-  }
-  let deliverHash = pkg.hash || result.hash;
-  if (!deliverHash) {
-    deliverHash = require('crypto').createHash('sha256').update('failed').digest('hex');
-  }
-  if (pkg.hash) result.hash = pkg.hash;
-  if (pkg.upload) {
-    await withRetry(
-      () => agent.uploadFileData(job.id, pkg.body, pkg.filename, 'application/zip'),
-      'uploadDelivery',
-      { maxAttempts: 5, baseDelayMs: 2000 }
-    );
-  }
-  const brokered = await signer.signDeliver({ jobId: job.id, jobHash: fullJob.jobHash, deliveryHash: deliverHash });
-
+  // The hash MUST be of the bytes the buyer receives. finalize() hashed the
+  // text that still contained the canary, and the platform notice is not the
+  // package. publishFinishedJob strips the canary, zips the answer plus out/,
+  // and signs sha256 of that zip.
   try {
-    await withRetry(
-      () => agent.client.deliverJob(job.id, deliverHash, brokered.signature, brokered.timestamp, pkg.notice || ''),
-      'deliverJob',
-      { maxAttempts: 5, baseDelayMs: 2000 }
-    );
-    log.info('Job delivered', { jobId: JOB_ID, hash: deliverHash });
+    const published = await publishFinishedJob({
+      agent, signer, job, fullJob, content: result.content, canary: CANARY_TOKEN,
+    });
+    result.hash = published.hash;
+    log.info('Job delivered', { jobId: JOB_ID, hash: published.hash });
   } catch (e) {
     // Safety net (defense-in-depth): a paused / otherwise non-deliverable job
     // returns INVALID_STATUS. NEVER fatal-crash on it — tear down and exit
@@ -2010,13 +2056,8 @@ async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndRes
     return executor.finalize();
   }
 
-  // Tell the buyer. Without this the rework is invisible to them: the content
-  // goes only into the deliverable, so a buyer who asks "did you redo it?" gets
-  // silence and the job auto-completes.
-  //
-  // Chat is also the only UNCAPPED channel: the platform stores just the first
-  // 200 characters of a deliverable, so for any answer longer than that this post
-  // is the only way the buyer can read the work in full.
+  // Tell the buyer in chat as well. The package they fetch is delivery.zip;
+  // this post is the same answer in the room.
   //
   // Canary-checked like every other outbound reply. The rework instruction is
   // BUYER-authored (it is `dispute.reason`), so this is a prompt-injection path,
@@ -2035,7 +2076,7 @@ async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndRes
       await sendChatChunked(agent, job.id, response);
     }
   } catch (e) {
-    console.warn(`  ⚠️  Could not post the rework to chat: ${e.message} (the deliverable still carries the first ${CHAT_MAX_LEN >= 200 ? 200 : CHAT_MAX_LEN} chars)`);
+    console.warn(`  ⚠️  Could not post the rework to chat: ${e.message} (delivery.zip still carries the full answer)`);
   }
 
   return {
@@ -2289,31 +2330,9 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
 
             const reworkResult = await resumeJob(job, agent, soulPrompt, executor, registerSessionEndResolve, reworkContext, tokenBudget);
             console.log('✅ Rework completed — re-delivering...');
-
-            // Strip canary token from rework deliverable content (same as
-            // main delivery path at STEP 3) before sending to platform.
-            if (CANARY_TOKEN && reworkResult.content) {
-              const strippedRw = reworkResult.content.split(CANARY_TOKEN).join('[redacted]');
-              if (strippedRw !== reworkResult.content) {
-                reworkResult.content = strippedRw;
-                // Recompute — see the delivery path above. A stripped canary
-                // must not leave the signed hash committing to the original.
-                reworkResult.hash = require('crypto').createHash('sha256').update(strippedRw).digest('hex');
-              }
-            }
-
-            // 'rework' is not a hex SHA-256; hash the sentinel so the
-            // broker policy accepts it and both paths agree.
-            let hash = reworkResult.hash;
-            if (!hash) {
-              hash = require('crypto').createHash('sha256').update('rework').digest('hex');
-            }
-            const brokered = await signer.signDeliver({ jobId: job.id, jobHash: fullJob.jobHash, deliveryHash: hash });
-            await withRetry(
-              () => agent.client.deliverJob(job.id, hash, brokered.signature, brokered.timestamp, reworkResult.content?.substring(0, 200)),
-              'deliverJob (rework)',
-              { maxAttempts: 5, baseDelayMs: 2000 }
-            );
+            await publishFinishedJob({
+              agent, signer, job, fullJob, content: reworkResult.content, canary: CANARY_TOKEN,
+            });
             console.log('✅ Rework delivered — new review window started\n');
             resetSafetyTimer();
           } catch (e) {

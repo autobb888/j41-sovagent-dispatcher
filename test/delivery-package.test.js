@@ -8,7 +8,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const {
-  buildDeliveryPackage, readStoredZip, listOutputFiles, LONG_NOTICE, MAX_PACKAGE_BYTES,
+  buildDeliveryPackage, readStoredZip, listOutputFiles, packageIdsToReplace, LONG_NOTICE, MAX_PACKAGE_BYTES,
 } = require('../src/delivery-package');
 
 test('a text answer becomes a zip a normal unzipper can open', () => {
@@ -59,4 +59,67 @@ test('over 25MB is refused instead of truncated', () => {
 
 test('zip entries cannot climb out of the archive', () => {
   assert.throws(() => buildDeliveryPackage('', [{ name: '../secret', data: Buffer.from('x') }]), (err) => err.code === 'PACKAGE_BAD_NAME');
+});
+
+test('a symlink at out/ is not packaged', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-out-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-secret-'));
+  fs.writeFileSync(path.join(outside, 'canary.token'), 'secret-token');
+  const link = path.join(dir, 'out');
+  fs.symlinkSync(outside, link);
+  assert.deepEqual(listOutputFiles(link, { boundary: dir }), []);
+  fs.rmSync(dir, { recursive: true });
+  fs.rmSync(outside, { recursive: true });
+});
+
+test('a symlink inside out/ is skipped and canary bytes are redacted', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-out-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-secret-'));
+  fs.writeFileSync(path.join(outside, 'secret.txt'), 'nope');
+  fs.writeFileSync(path.join(dir, 'note.txt'), 'hello TOKEN world');
+  fs.symlinkSync(path.join(outside, 'secret.txt'), path.join(dir, 'evil.txt'));
+  const names = listOutputFiles(dir, { boundary: path.dirname(dir), canary: 'TOKEN' }).map((file) => file.name);
+  assert.deepEqual(names, ['note.txt']);
+  const note = listOutputFiles(dir, { canary: 'TOKEN' })[0];
+  assert.equal(note.data.toString(), 'hello [redacted] world');
+  fs.rmSync(dir, { recursive: true });
+  fs.rmSync(outside, { recursive: true });
+});
+
+test('an oversized out tree is refused before the files are read', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-out-'));
+  fs.writeFileSync(path.join(dir, 'big.bin'), Buffer.alloc(32));
+  assert.throws(() => listOutputFiles(dir, { maxBytes: 8 }), (err) => err.code === 'PACKAGE_TOO_LARGE');
+  fs.rmSync(dir, { recursive: true });
+});
+
+test('a central-directory lie and a data descriptor are rejected', () => {
+  const pkg = buildDeliveryPackage('hi');
+  const flipped = Buffer.from(pkg.body);
+  const central = flipped.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+  assert.ok(central > 0);
+  flipped.writeUInt16LE(8, central + 10);
+  assert.throws(() => readStoredZip(flipped), (err) => err.code === 'PACKAGE_BAD_ZIP');
+  const described = Buffer.from(pkg.body);
+  described.writeUInt16LE(described.readUInt16LE(6) | 0x0008, 6);
+  assert.throws(() => readStoredZip(described), (err) => err.code === 'PACKAGE_BAD_ZIP');
+});
+
+test('canary bytes in the answer are redacted before the zip is hashed', () => {
+  const pkg = buildDeliveryPackage('see TOKEN', [], { canary: 'TOKEN' });
+  const answer = readStoredZip(pkg.body).find((entry) => entry.name === 'answer.txt');
+  assert.equal(answer.data.toString(), 'see [redacted]');
+  assert.equal(pkg.hash, crypto.createHash('sha256').update(pkg.body).digest('hex'));
+});
+
+test('only a different delivery.zip id is replaced', () => {
+  assert.deepEqual(
+    packageIdsToReplace(
+      [{ id: 'old', filename: 'delivery.zip' }, { id: 'new', filename: 'delivery.zip' }, { id: 'in', filename: 'brief.txt' }],
+      'delivery.zip',
+      { id: 'new' },
+    ),
+    ['old'],
+  );
+  assert.deepEqual(packageIdsToReplace([{ id: 'new', filename: 'delivery.zip' }], 'delivery.zip', {}), []);
 });
