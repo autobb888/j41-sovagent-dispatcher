@@ -14,6 +14,9 @@ test('a real hire answer starts the 90s close; the outage line and a silent exec
   }), false);
   assert.equal(hireAnswerStartsQuiet({ conversationLog: [] }), false);
   assert.equal(hireAnswerStartsQuiet(null), false);
+  assert.equal(hireAnswerStartsQuiet({
+    conversationLog: [{ role: 'assistant', content: 'Hi, I am your assistant. How can I help?', greeting: true }],
+  }), false);
 });
 
 test('the short close runs after the hire answer without a later buyer chat', () => {

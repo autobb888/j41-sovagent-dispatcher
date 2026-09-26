@@ -56,7 +56,8 @@ const ACCEPTED_QUIET_MS = 90_000;
 const ACCEPTED_IDLE_NOTE = 'This job is still accepted, so it cannot be paused. Delivering the work so far.';
 
 function isOutageReply(text) {
-  return /I experienced a temporary issue/i.test(String(text || ''));
+  return /I experienced a temporary issue/i.test(String(text || ''))
+    || /I could not generate a response/i.test(String(text || ''));
 }
 
 function lastAssistantText(executor) {
@@ -64,12 +65,12 @@ function lastAssistantText(executor) {
   if (!Array.isArray(log)) return '';
   for (let i = log.length - 1; i >= 0; i--) {
     const row = log[i];
-    if (row && row.role === 'assistant' && row.content) return String(row.content);
+    if (row && row.role === 'assistant' && row.content && !row.greeting) return String(row.content);
   }
   return '';
 }
 
-/** A real answer to the hire description starts the short close. The outage line does not. */
+/** A real answer to the hire description starts the short close. A greeting or outage line does not. */
 function hireAnswerStartsQuiet(executor) {
   const text = lastAssistantText(executor);
   return text.length > 0 && !isOutageReply(text);
@@ -1270,8 +1271,24 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   // Initialize executor (sends greeting on first connect, skips on reconnect)
   const isReconnect = job.status === 'in_progress';
   await executor.init(job, agent, soulPrompt, { isReconnect });
-  // The hire description is the buyer's message. Answering it starts the
-  // 90s close. Waiting for a later chat message left the job on the 8-minute idle.
+  // The hire description is the whole task. The greeting only introduces
+  // the worker. Answer the description before the 90s close, or the zip
+  // is that introduction.
+  if (!isReconnect && job.description && String(job.description).trim()) {
+    try {
+      const hireReply = await executor.handleMessage(String(job.description), {
+        jobId: job.id,
+        senderVerusId: job.buyer,
+      });
+      if (hireReply && checkCanaryLeak(hireReply)) {
+        await sendChatChunked(agent, job.id, 'I\'m sorry, I can\'t share that information. How else can I help you?');
+      } else if (hireReply && !isOutageReply(hireReply)) {
+        await sendChatChunked(agent, job.id, hireReply);
+      }
+    } catch (e) {
+      console.warn(`[CHAT] Hire answer failed: ${e.message}`);
+    }
+  }
   if (!isReconnect && hireAnswerStartsQuiet(executor)) {
     _lastActivityAt = Date.now();
     hireAnswered = true;
@@ -1603,7 +1620,11 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   // Finalize executor — get deliverable.
   // If handleBudgetDelivery already called finalize() and stored the result,
   // use it directly to avoid a redundant call and to keep the content stable.
-  return _budgetDeliveryResult !== null ? _budgetDeliveryResult : await executor.finalize();
+  if (_budgetDeliveryResult !== null) return _budgetDeliveryResult;
+  const finalized = await executor.finalize();
+  const answer = lastAssistantText(executor);
+  if (answer && !isOutageReply(answer)) finalized.content = answer;
+  return finalized;
 }
 
 let _workspaceConnecting = false;

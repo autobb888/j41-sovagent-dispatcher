@@ -156,7 +156,8 @@ class LocalLLMExecutor extends Executor {
     // The platform rejects one chat message over 4000 characters. A long
     // greeting is sent in order, and every character is kept.
     const sent = await sendWithinChatLimit(agent, job.id, greeting);
-    this.conversationLog.push({ role: 'assistant', content: greeting });
+    // A greeting is not the paid answer. finalize and the 90s close skip it.
+    this.conversationLog.push({ role: 'assistant', content: greeting, greeting: true });
     console.log(`[CHAT] Sent greeting${sent > 1 ? ` in ${sent} parts` : ''}`);
   }
 
