@@ -42,6 +42,8 @@
     "agent"
   ],
   "dependencies": {
+    "@bitgo/blake2b": "3.0.1",
+    "@bitgo/utxo-lib": "1.9.6",
     "@chainvue/verus-sapling": "0.1.1",
     "@grpc/grpc-js": "^1.14.5",
     "@grpc/proto-loader": "^0.8.1",

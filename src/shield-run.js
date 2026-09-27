@@ -205,8 +205,22 @@ async function runOwnNoteProof(req, deps) {
     })),
   });
   if (!signed.ok) return signed;
-  const shielded = await deps.broadcast(signed.hex);
-  if (!shielded || !shielded.txid) return fail('SHIELD_BROADCAST', 'The shield was rejected.');
+  const spentInputs = picked.inputs.map((utxo) => ({
+    txid: utxo.txid,
+    vout: utxo.vout,
+    address: utxo.address,
+  }));
+  let shielded;
+  try {
+    shielded = await deps.broadcast(signed.hex);
+  } catch (error) {
+    return fail('SHIELD_BROADCAST', error && error.message ? error.message : 'The shield was rejected.', {
+      inputs: spentInputs,
+    });
+  }
+  if (!shielded || !shielded.txid) {
+    return fail('SHIELD_BROADCAST', 'The shield was rejected.', { inputs: spentInputs });
+  }
 
   let found = null;
   for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {

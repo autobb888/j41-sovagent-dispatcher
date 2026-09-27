@@ -75,6 +75,11 @@ function harness(overrides) {
     },
     broadcast: async (hex) => {
       calls.broadcast.push(hex);
+      if (overrides.reject) {
+        const error = new Error('Transaction must spend from your registered address');
+        error.code = 'NOT_YOUR_TX';
+        throw error;
+      }
       shielded = true;
       return { txid: calls.broadcast.length === 1 ? '11'.repeat(32) : '22'.repeat(32) };
     },
@@ -138,6 +143,16 @@ test('mainnet and a missing lightwalletd do not create an account', async () => 
   assert.equal(missing.code, 'SHIELD_LIGHTWALLETD');
   assert.equal(offline.calls.wrote, null);
   assert.equal(missing.broadcast, false);
+});
+
+test('a refused broadcast names the inputs and does not include the key', async () => {
+  const { calls, deps, req } = harness({ account: { seedHex: SEED, birthdayHeight: 10 }, reject: true });
+  const result = await runOwnNoteProof(req, deps);
+  assert.equal(result.code, 'SHIELD_BROADCAST');
+  assert.equal(result.broadcast, false);
+  assert.equal(result.inputs[0].txid, 'ab'.repeat(32));
+  assert.equal(JSON.stringify(result).includes(req.wif), false);
+  assert.equal(calls.broadcast.length, 1);
 });
 
 test('without --yes the command does not broadcast', async () => {
