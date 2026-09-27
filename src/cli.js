@@ -8858,6 +8858,61 @@ program
     console.log('\n🔐 Passphrase changed.');
   });
 
+// Phase B proof. Plans a VRSCTEST round trip of this dispatcher's own note
+// back to its own R-address. It does not load a key and it does not broadcast.
+program
+  .command('shield-proof <agent-id>')
+  .description('Plan a VRSCTEST spend of this dispatcher\'s own shielded note back to its own R-address')
+  .option('--amount <coin>', 'Decimal coin amount to shield')
+  .option('--fee <coin>', 'Decimal coin fee (default is the tank fee, 0.0001)')
+  .option('--lightwalletd <url>', 'gRPC URL of a Verus lightwalletd')
+  .option('--json', 'Print the plan as JSON')
+  .action((agentId, options) => {
+    const { planOwnNoteProof, networkForProof } = require('./shield-proof');
+    const { parseVrscAmount } = require('./wallet');
+    const { FEE_SATS } = require('./fee-tank');
+    if (typeof options.amount !== 'string' || !options.amount) {
+      console.error('shield-proof needs --amount as a decimal coin string');
+      process.exit(1);
+    }
+    const amount = parseVrscAmount(options.amount);
+    if (!amount.ok) {
+      console.error(amount.error);
+      process.exit(1);
+    }
+    let feeSats = FEE_SATS;
+    if (typeof options.fee === 'string') {
+      const fee = parseVrscAmount(options.fee);
+      if (!fee.ok) {
+        console.error(fee.error);
+        process.exit(1);
+      }
+      feeSats = fee.sats;
+    }
+    const plan = planOwnNoteProof({
+      network: networkForProof(IS_MAINNET, J41_NETWORK),
+      agentId,
+      coinType: 133,
+      amountSats: amount.sats,
+      feeSats,
+      memo: '',
+      cachedNote: false,
+      hasSeed: false,
+      hasParams: false,
+      lightwalletdUrl: typeof options.lightwalletd === 'string' ? options.lightwalletd : '',
+      outbound: { agentId },
+    });
+    if (options.json) process.stdout.write(`${JSON.stringify(plan, null, 2)}\n`);
+    else {
+      console.log(plan.message);
+      if (Array.isArray(plan.missing) && plan.missing.length) {
+        console.log(`missing: ${plan.missing.join(', ')}`);
+      }
+    }
+    if (plan.ok) process.exit(0);
+    process.exit(plan.code === 'SHIELD_PROOF_NOT_READY' ? 2 : 1);
+  });
+
 // Doctor — mass-use machine diagnosis (single classifier shared with the TUI)
 program
   .command('doctor [agent-id]')
