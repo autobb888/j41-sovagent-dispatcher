@@ -493,27 +493,50 @@ async function publishFinishedJob({ agent, signer, job, fullJob, content, canary
   const {
     buildDeliveryPackage, listOutputFiles, MAX_PACKAGE_BYTES,
   } = require('./delivery-package');
+  const { isDatasetJob } = require('./job-payment');
+  const { isGpuRentalJob } = require('./buyer-extend');
+  const { INNER_CAP, sealOuterZip } = require('./seal-package');
   let text = typeof content === 'string' ? content : '';
   if (canary && text.includes(canary)) {
     text = text.split(canary).join('[redacted]');
     log.info('Canary stripped from deliverable — hash recomputed', { jobId: job.id });
   }
+  let fresh = fullJob;
+  if (agent.client && typeof agent.client.getJob === 'function') {
+    try { fresh = await agent.client.getJob(job.id); } catch { /* the startup copy still has the address if it was already set */ }
+  }
+  const sealAddress = fresh && typeof fresh.buyerSealAddressHex === 'string' ? fresh.buyerSealAddressHex : '';
+  const sealThis = /^[0-9a-fA-F]{86}$/.test(sealAddress) && !isDatasetJob(fresh) && !isGpuRentalJob(fresh);
+  const cap = sealThis ? INNER_CAP : MAX_PACKAGE_BYTES;
   const textBytes = Buffer.byteLength(text);
   let files = [];
-  let tooBig = textBytes > MAX_PACKAGE_BYTES;
+  let tooBig = textBytes > cap;
   if (!tooBig) {
     try {
       files = listOutputFiles(path.join(JOB_DIR, 'out'), {
         boundary: JOB_DIR,
         canary,
-        maxBytes: MAX_PACKAGE_BYTES - textBytes,
+        maxBytes: cap - textBytes,
       });
     } catch (e) {
       if (e.code !== 'PACKAGE_TOO_LARGE') throw e;
       tooBig = true;
     }
   }
-  const pkg = tooBig ? null : buildDeliveryPackage(text, files, { canary });
+  let pkg = null;
+  if (!tooBig && sealThis) {
+    const plain = buildDeliveryPackage(text, files, { canary });
+    if (!plain.upload) {
+      pkg = plain;
+    } else if (plain.body.length > INNER_CAP) {
+      tooBig = true;
+    } else {
+      pkg = await sealOuterZip(plain.body, sealAddress);
+      if (pkg.tooBig) tooBig = true;
+    }
+  } else if (!tooBig) {
+    pkg = buildDeliveryPackage(text, files, { canary });
+  }
   if (tooBig || (pkg && pkg.tooBig)) {
     const hash = crypto.createHash('sha256').update(OVERSIZE_NOTICE).digest('hex');
     const brokered = await signer.signDeliver({ jobId: job.id, jobHash: fullJob.jobHash, deliveryHash: hash });

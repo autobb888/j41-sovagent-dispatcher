@@ -116,7 +116,8 @@ function safeJoin(root, entryName) {
 /**
  * Write the platform's job files and the delivery notice into outDir.
  * `downloadFile(fileId)` returns `{ data, filename, checksum }`.
- * Bytes are written as stored. Decryption waits on a buyer z-address.
+ * Bytes are written as stored. A zip of README.txt and seal.bin is sealed.
+ * This command does not decrypt seal.bin.
  */
 async function fetchArtifacts({ job, files, outDir, downloadFile }) {
   const plan = planArtifacts(job, files);
@@ -168,16 +169,19 @@ async function fetchArtifacts({ job, files, outDir, downloadFile }) {
     fs.writeFileSync(path.join(root, noticeFile), plan.notice);
   }
   const entries = written.filter((file) => file.fromZip).map((file) => file.name);
-  const summary = entries.length
-    ? `sha256 matched delivery.hash. Entries: ${entries.join(', ')}.`
-    : 'sha256 matched delivery.hash.';
+  const sealed = entries.length === 2 && entries.includes('README.txt') && entries.includes('seal.bin');
+  const summary = sealed
+    ? 'sha256 matched delivery.hash. The package is sealed. seal.bin was not decrypted.'
+    : (entries.length
+      ? `sha256 matched delivery.hash. Entries: ${entries.join(', ')}.`
+      : 'sha256 matched delivery.hash.');
   return {
     ok: true,
     artifactsVersion: ARTIFACTS_VERSION,
     jobId: job.id,
     status: plan.status,
     out: root,
-    sealed: false,
+    sealed,
     deliveryHash: job.delivery && job.delivery.hash ? job.delivery.hash : null,
     files: written,
     noticeFile,
