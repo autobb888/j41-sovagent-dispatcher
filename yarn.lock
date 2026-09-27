@@ -47,10 +47,26 @@
     verus-typescript-primitives "git+https://github.com/VerusCoin/verus-typescript-primitives.git"
     wif "2.0.1"
 
+"@chainvue/verus-sapling@0.1.1":
+  version "0.1.1"
+  resolved "https://registry.yarnpkg.com/@chainvue/verus-sapling/-/verus-sapling-0.1.1.tgz#2147dd29146e4f4331466f709de3c8922a5e9c14"
+  integrity sha512-RH84ilmKluvEFsTjxFFn7h+zU3ctsk3f+CmW9CreLb+Bjp8Ln/YbcLfpbPugJ1qHhqFx0ULD91MnQS7j9mofPg==
+  optionalDependencies:
+    "@grpc/grpc-js" "^1.10.0"
+    "@grpc/proto-loader" "^0.8.1"
+
 "@fastify/busboy@^2.0.0":
   version "2.1.1"
   resolved "https://registry.yarnpkg.com/@fastify/busboy/-/busboy-2.1.1.tgz#b9da6a878a371829a0502c9b6c1c143ef6663f4d"
   integrity sha512-vBZP4NlzfOlerQTnba4aqZoMhE/a9HY7HRqoOPaETQcSQuWEIyZMHGfVu6w9wGtGK5fED5qRs2DteVCjOH60sA==
+
+"@grpc/grpc-js@^1.10.0", "@grpc/grpc-js@^1.14.5":
+  version "1.14.5"
+  resolved "https://registry.yarnpkg.com/@grpc/grpc-js/-/grpc-js-1.14.5.tgz#12f97bd9f716358e377ffaa768195d1219eb76a3"
+  integrity sha512-7VZM+SVdEcUUqSQeNI3zM8Qs/BhQKZndPo2h5VkYkAM8Iz0wJIa8mKV5ekQGqG8UUsnkQ0NMxIxwkIHYvj0qOw==
+  dependencies:
+    "@grpc/proto-loader" "^0.8.0"
+    "@js-sdsl/ordered-map" "^4.4.2"
 
 "@grpc/grpc-js@^1.11.1":
   version "1.14.3"
@@ -78,6 +94,16 @@
     lodash.camelcase "^4.3.0"
     long "^5.0.0"
     protobufjs "^7.5.3"
+    yargs "^17.7.2"
+
+"@grpc/proto-loader@^0.8.1":
+  version "0.8.1"
+  resolved "https://registry.yarnpkg.com/@grpc/proto-loader/-/proto-loader-0.8.1.tgz#5a6b290ccbfb1ae2f6775afb74e9898bd8c5d4e8"
+  integrity sha512-wtF6h+DY6M3YaDBPAmvuuA6jV8Sif9MjtOI5euKFWRgCDl5PeDpPsHR9u2l6St5ceY8AZgoNDww5+HvEsXFsGg==
+  dependencies:
+    lodash.camelcase "^4.3.0"
+    long "^5.0.0"
+    protobufjs "^7.5.5"
     yargs "^17.7.2"
 
 "@iarna/toml@^2.2.5":

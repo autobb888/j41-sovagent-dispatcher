@@ -535,7 +535,7 @@ function ensureDirs() {
           if (!st.isDirectory()) continue;
           if ((st.mode & 0o777) !== 0o700) fs.chmodSync(agentDir, 0o700);
           // Sensitive per-agent files: lock to 0600 if present
-          for (const f of ['keys.json', 'agent-config.json', 'finalize-state.json', 'vdxf-update.json', 'vdxf-update.cmd']) {
+          for (const f of ['keys.json', 'agent-config.json', 'finalize-state.json', 'vdxf-update.json', 'vdxf-update.cmd', 'sapling-account.json']) {
             const p = path.join(agentDir, f);
             try {
               if (fs.existsSync(p) && (fs.statSync(p).mode & 0o777) !== 0o600) {
@@ -8858,19 +8858,21 @@ program
     console.log('\n🔐 Passphrase changed.');
   });
 
-// Phase B proof. Plans a VRSCTEST round trip of this dispatcher's own note
-// back to its own R-address. It does not load a key and it does not broadcast.
+// VRSCTEST round trip. --yes broadcasts. The WIF and the shielded seed stay
+// in this process; broadcast receives the finished transaction hex.
 program
   .command('shield-proof <agent-id>')
-  .description('Plan a VRSCTEST spend of this dispatcher\'s own shielded note back to its own R-address')
-  .option('--amount <coin>', 'Decimal coin amount to shield')
+  .description('Shield this agent\'s own coins on VRSCTEST and spend the note back to its R-address')
+  .option('--amount <coin>', 'Decimal coin amount to shield when no note exists yet')
   .option('--fee <coin>', 'Decimal coin fee (default is the tank fee, 0.0001)')
-  .option('--lightwalletd <url>', 'gRPC URL of a Verus lightwalletd')
-  .option('--json', 'Print the plan as JSON')
-  .action((agentId, options) => {
-    const { planOwnNoteProof, networkForProof } = require('./shield-proof');
+  .option('--lightwalletd <host:port>', 'Verus lightwalletd gRPC address')
+  .option('--yes', 'Create the account if needed, fetch parameters if needed, and broadcast')
+  .option('--json', 'Print the result as JSON')
+  .action(async (agentId, options) => {
+    const { networkForProof } = require('./shield-proof');
     const { parseVrscAmount } = require('./wallet');
     const { FEE_SATS } = require('./fee-tank');
+    const { liveShieldProof, outputScriptFor } = require('./shield-live');
     if (typeof options.amount !== 'string' || !options.amount) {
       console.error('shield-proof needs --amount as a decimal coin string');
       process.exit(1);
@@ -8889,28 +8891,57 @@ program
       }
       feeSats = fee.sats;
     }
-    const plan = planOwnNoteProof({
-      network: networkForProof(IS_MAINNET, J41_NETWORK),
-      agentId,
-      coinType: 133,
+    await ensureKeystoreUnlockedIfEncrypted();
+    let keys;
+    try { keys = loadAgentKeys(agentId); }
+    catch (error) {
+      console.error(error.message);
+      process.exit(1);
+    }
+    if (!keys || !keys.wif || !keys.address) {
+      console.error(`shield-proof: ${agentId} has no key`);
+      process.exit(1);
+    }
+    const network = networkForProof(IS_MAINNET, J41_NETWORK);
+    if (network !== 'verustest') {
+      console.error('This proof runs on VRSCTEST.');
+      process.exit(1);
+    }
+    const { wifToAddress } = require('@junction41/sovagent-sdk/dist/index.js');
+    const derived = wifToAddress(keys.wif, network === 'verus' ? 'verus' : 'verustest');
+    const own = resolveOwnRAddress({ derived, platformAddress: keys.address, agentId });
+    if (!own.ok) {
+      console.error(own.error);
+      process.exit(1);
+    }
+    let client = null;
+    if (options.yes) {
+      const state = { agentSessions: new Map() };
+      const agent = await getAgentSession(state, {
+        id: agentId,
+        wif: keys.wif,
+        identity: keys.identity,
+        iAddress: keys.iAddress,
+      });
+      client = agent.client;
+    }
+    const result = await liveShieldProof({
+      network,
       amountSats: amount.sats,
       feeSats,
-      memo: '',
-      cachedNote: false,
-      hasSeed: false,
-      hasParams: false,
-      lightwalletdUrl: typeof options.lightwalletd === 'string' ? options.lightwalletd : '',
-      outbound: { agentId },
+      lightwalletdUrl: options.lightwalletd || process.env.J41_LIGHTWALLETD || '',
+      rAddress: own.rAddress,
+      outputScriptHex: outputScriptFor(own.rAddress, network),
+      wif: keys.wif,
+      yes: options.yes === true,
+      accountFile: path.join(AGENTS_DIR, agentId, 'sapling-account.json'),
+      paramsDir: path.join(J41_DIR, 'sapling'),
+      client,
     });
-    if (options.json) process.stdout.write(`${JSON.stringify(plan, null, 2)}\n`);
-    else {
-      console.log(plan.message);
-      if (Array.isArray(plan.missing) && plan.missing.length) {
-        console.log(`missing: ${plan.missing.join(', ')}`);
-      }
-    }
-    if (plan.ok) process.exit(0);
-    process.exit(plan.code === 'SHIELD_PROOF_NOT_READY' ? 2 : 1);
+    if (options.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    else console.log(result.message || result.code);
+    if (result.ok) process.exit(0);
+    process.exit(result.code === 'SHIELD_NOTE_UNSEEN' ? 2 : 1);
   });
 
 // Doctor — mass-use machine diagnosis (single classifier shared with the TUI)
