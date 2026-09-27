@@ -83,8 +83,24 @@ async function spendNote(req, deps, pub, note, createdNote, shieldTxid) {
     feeSats: req.feeSats,
   });
   if (!hex || typeof hex !== 'string') return fail('SHIELD_SPEND', 'The shielded spend did not produce a transaction.');
-  const sent = await deps.broadcast(hex);
-  if (!sent || !sent.txid) return fail('SHIELD_BROADCAST', 'The spend was rejected.', { createdNote, shieldTxid });
+  const noteRef = { txid: note.txid, output: note.outputIndex, valueSats: note.valueSats };
+  let sent;
+  try {
+    sent = await deps.broadcast(hex);
+  } catch (error) {
+    return fail('SHIELD_BROADCAST', error && error.message ? error.message : 'The spend was rejected.', {
+      createdNote,
+      shieldTxid: shieldTxid || null,
+      note: noteRef,
+    });
+  }
+  if (!sent || !sent.txid) {
+    return fail('SHIELD_BROADCAST', 'The spend was rejected.', {
+      createdNote,
+      shieldTxid: shieldTxid || null,
+      note: noteRef,
+    });
+  }
   return {
     ok: true,
     code: 'SHIELD_PROOF_SPENT',

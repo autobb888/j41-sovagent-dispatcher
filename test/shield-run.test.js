@@ -145,6 +145,20 @@ test('mainnet and a missing lightwalletd do not create an account', async () => 
   assert.equal(missing.broadcast, false);
 });
 
+test('a refused return spend names the note', async () => {
+  const { deps, req } = harness({
+    account: { seedHex: SEED, birthdayHeight: 10 },
+    note: 5_000_000,
+    reject: true,
+  });
+  const result = await runOwnNoteProof(req, deps);
+  assert.equal(result.code, 'SHIELD_BROADCAST');
+  assert.equal(result.note.txid, 'cd'.repeat(32));
+  assert.equal(result.note.output, 0);
+  assert.equal(result.note.valueSats, 5_000_000);
+  assert.equal(JSON.stringify(result).includes(req.wif), false);
+});
+
 test('a refused broadcast names the inputs and does not include the key', async () => {
   const { calls, deps, req } = harness({ account: { seedHex: SEED, birthdayHeight: 10 }, reject: true });
   const result = await runOwnNoteProof(req, deps);
