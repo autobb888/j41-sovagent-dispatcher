@@ -96,7 +96,22 @@ async function sealOuterZip(innerZip, addressHex) {
   };
 }
 
+/** Labour jobs with a real buyer address. GPU rentals and SovData stay plaintext. */
+function shouldSealDelivery(job) {
+  if (!job || typeof job !== 'object') return false;
+  const hex = job.buyerSealAddressHex;
+  if (typeof hex !== 'string' || !/^[0-9a-fA-F]{86}$/.test(hex)) return false;
+  if (job.datasetTerms) return false;
+  const type = job.serviceType || job.service_type
+    || (job.service && (job.service.serviceType || job.service.service_type));
+  if (type === 'dataset' || type === 'gpu-rental') return false;
+  const kind = job.listingKind || job.kind || job.sellerKind;
+  if (kind === 'compute' || kind === 'data') return false;
+  return true;
+}
+
 module.exports = {
   INNER_CAP,
   sealOuterZip,
+  shouldSealDelivery,
 };

@@ -493,9 +493,7 @@ async function publishFinishedJob({ agent, signer, job, fullJob, content, canary
   const {
     buildDeliveryPackage, listOutputFiles, MAX_PACKAGE_BYTES,
   } = require('./delivery-package');
-  const { isDatasetJob } = require('./job-payment');
-  const { isGpuRentalJob } = require('./buyer-extend');
-  const { INNER_CAP, sealOuterZip } = require('./seal-package');
+  const { INNER_CAP, sealOuterZip, shouldSealDelivery } = require('./seal-package');
   let text = typeof content === 'string' ? content : '';
   if (canary && text.includes(canary)) {
     text = text.split(canary).join('[redacted]');
@@ -505,8 +503,8 @@ async function publishFinishedJob({ agent, signer, job, fullJob, content, canary
   if (agent.client && typeof agent.client.getJob === 'function') {
     try { fresh = await agent.client.getJob(job.id); } catch { /* the startup copy still has the address if it was already set */ }
   }
-  const sealAddress = fresh && typeof fresh.buyerSealAddressHex === 'string' ? fresh.buyerSealAddressHex : '';
-  const sealThis = /^[0-9a-fA-F]{86}$/.test(sealAddress) && !isDatasetJob(fresh) && !isGpuRentalJob(fresh);
+  const sealThis = shouldSealDelivery(fresh);
+  const sealAddress = sealThis ? fresh.buyerSealAddressHex : '';
   const cap = sealThis ? INNER_CAP : MAX_PACKAGE_BYTES;
   const textBytes = Buffer.byteLength(text);
   let files = [];

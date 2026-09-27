@@ -11,7 +11,8 @@
     "@junction41/sovagent-sdk": "2.14.1",
     "bn.js": "^5.2.0",
     "json-canonicalize": "2.0.0",
-    "undici": "^5.29.0"
+    "undici": "^5.29.0",
+    "verus-typescript-primitives": "github:VerusCoin/verus-typescript-primitives#27e6c076def4416c20a568e31e4c406b10612807"
   },
   "resolutions": {
     "json-canonicalize": "2.0.0"

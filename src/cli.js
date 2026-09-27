@@ -4243,6 +4243,48 @@ program
   });
 
 program
+  .command('seal-address <buyer-agent-id> <job-id>')
+  .description('Derive a job z-address, keep the viewing key on this machine, and post only the 86-hex address.')
+  .option('--yes', 'Derive, store the viewing key, and post the address')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
+  .action(async (buyerAgentId, jobId, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    if (!/^[0-9a-f-]{36}$/i.test(String(jobId || ''))) fail('SEAL_JOB', 'Job id is not a uuid.');
+    if (IS_MAINNET) fail('SEAL_NETWORK', 'This seal address is derived on VRSCTEST.');
+    const { publishBuyerSealAddress } = require('./seal-address-run');
+    if (!options.yes) {
+      const preview = { ok: true, code: 'SEAL_ADDRESS_PREVIEW', jobId, posted: false };
+      if (options.json) console.log(JSON.stringify(preview, null, 2));
+      else say('Preview only. Pass --yes to derive the address, keep the viewing key here, and post it.');
+      return;
+    }
+    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    const job = await agent.client.getJob(jobId);
+    if (!job || !job.id) fail('SEAL_JOB', `Job ${jobId} not found.`);
+    if (!buyerOwnsJob(keys, job)) fail('SEAL_NOT_BUYER', 'This identity is not the buyer on that job.');
+    const agentDir = path.join(AGENTS_DIR, buyerAgentId);
+    let result;
+    try {
+      result = await publishBuyerSealAddress({
+        agentDir,
+        buyerId: keys.iAddress || keys.identity,
+        jobId,
+        yes: true,
+        post: async (addressHex) => agent.client.request('POST', `/v1/jobs/${jobId}/seal-address`, { addressHex }),
+      });
+    } catch (e) {
+      fail(e.code || 'SEAL_ADDRESS', e.message || String(e));
+    }
+    if (options.json) console.log(JSON.stringify(result, null, 2));
+    else {
+      say(`Posted seal address ${result.addressHex}`);
+      say(`Viewing key stays in ${result.keyFile}`);
+    }
+  });
+
+program
   .command('extend <buyer-agent-id> <job-id>')
   .description('Request a job extension and dual-pay it (labour in_progress/paused; GPU Cat-1 including delivered)')
   .requiredOption('--amount <n>', 'Extension amount in the listing currency')

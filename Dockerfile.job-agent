@@ -39,6 +39,10 @@ COPY src/sovguard-context.js ./
 COPY src/job-agent.js ./
 # Finished-job zip. job-agent.js requires this when it delivers.
 COPY src/delivery-package.js ./
+# Labour seal. seal-package.js loads the vendored encrypt bundle and
+# verus-typescript-primitives (pinned in package.docker.json; not an npm package).
+COPY src/seal-package.js ./
+COPY src/vendor/veruszsupportlib/index.mjs ./vendor/veruszsupportlib/index.mjs
 # Egress-proxy client — required by job-agent.js (installed before the SDK
 # require) to route all fetch through the host egress proxy via undici.
 COPY src/egress-proxy-client.js ./
