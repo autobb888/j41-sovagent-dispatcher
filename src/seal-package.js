@@ -112,6 +112,8 @@ function shouldSealDelivery(job) {
 
 module.exports = {
   INNER_CAP,
+  encryptToAddress,
+  descriptorBytes,
   sealOuterZip,
   shouldSealDelivery,
 };

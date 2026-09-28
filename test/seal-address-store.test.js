@@ -7,6 +7,7 @@ const os = require('os');
 const path = require('path');
 const { ensureSeed, storeJobKey } = require('../src/seal-address-store');
 const { deriveJobAddress, publishBuyerSealAddress, publishSellerSealAddress } = require('../src/seal-address-run');
+const { sealChatArmor, openChatArmor } = require('../src/seal-chat');
 const { shouldSealDelivery } = require('../src/seal-package');
 const { buyerOwnsJob, sellerOwnsJob } = require('../src/hire-pay');
 
@@ -95,6 +96,20 @@ test('buyer and seller derivations for one job differ', async () => {
   assert.notEqual(buyer.addressHex, seller.addressHex);
   buyer.ivk.fill(0);
   seller.ivk.fill(0);
+});
+
+test('chat armor opens only with the recipient viewing key', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-seal-chat-'));
+  const seed = ensureSeed(dir);
+  const jobId = '7f74d5d3-13c2-49c0-9024-a405ad7319b4';
+  const seller = await deriveJobAddress(seed, 'iSeller', jobId, 'seller');
+  const buyer = await deriveJobAddress(seed, 'iBuyer', jobId, 'buyer');
+  const armor = await sealChatArmor(seller.addressHex, 'oak crate pong');
+  assert.equal(armor.includes('oak crate pong'), false);
+  assert.equal(await openChatArmor(armor, seller.ivk), 'oak crate pong');
+  await assert.rejects(() => openChatArmor(armor, buyer.ivk), (err) => err.code === 'CHAT_SEAL_UNREADABLE');
+  seller.ivk.fill(0);
+  buyer.ivk.fill(0);
 });
 
 test('seller ownership follows sellerVerusId', () => {

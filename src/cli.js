@@ -4327,6 +4327,91 @@ program
   });
 
 program
+  .command('seal-chat <agent-id> <job-id>')
+  .description('Send or read a sealed job chat frame. The viewing key stays on this machine.')
+  .option('--message <text>', 'Plaintext to seal to the other party')
+  .option('--read', 'Open sealed messages this machine can read')
+  .option('--yes', 'Send or read')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
+  .action(async (agentId, jobId, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    if (!options.yes) fail('CHAT_SEAL_CONFIRM', 'Pass --yes to send or read sealed chat.');
+    if (!options.message && !options.read) fail('CHAT_SEAL_EMPTY', 'Pass --message to send, or --read to open.');
+    if (!/^[0-9a-f-]{36}$/i.test(String(jobId || ''))) fail('SEAL_JOB', 'Job id is not a uuid.');
+    if (IS_MAINNET) fail('SEAL_NETWORK', 'Sealed chat is derived on VRSCTEST.');
+    const { keys, agent } = await loadBuyerSession(agentId, options);
+    const job = await agent.client.getJob(jobId);
+    if (!job || !job.id) fail('SEAL_JOB', `Job ${jobId} not found.`);
+    const buyer = buyerOwnsJob(keys, job);
+    const seller = sellerOwnsJob(keys, job);
+    if (!buyer && !seller) fail('CHAT_SEAL_PARTY', 'This identity is not the buyer or the seller on that job.');
+    const mine = buyer ? job.buyerSealAddressHex : job.sellerSealAddressHex;
+    const theirs = buyer ? job.sellerSealAddressHex : job.buyerSealAddressHex;
+    const hex86 = /^[0-9a-fA-F]{86}$/;
+    if (!hex86.test(String(mine || '')) || !hex86.test(String(theirs || ''))) {
+      fail('CHAT_SEAL_NOT_READY', 'Both job seal addresses must be posted before chat is sealed.');
+    }
+    const { sealChatArmor, openChatArmor, readJobIvk } = require('./seal-chat');
+    const agentDir = path.join(AGENTS_DIR, agentId);
+    if (options.message) {
+      let armor;
+      try {
+        armor = await sealChatArmor(theirs, options.message);
+      } catch (e) {
+        fail(e.code || 'CHAT_SEAL', e.message || String(e));
+      }
+      let posted;
+      try {
+        posted = await agent.client.request('POST', `/v1/jobs/${jobId}/messages`, {
+          content: armor,
+          contentEncoding: 'j41-seal-v1',
+        });
+      } catch (e) {
+        fail(e.code || 'CHAT_SEAL', e.message || String(e));
+      }
+      const result = { ok: true, code: 'CHAT_SEAL_SENT', jobId, role: buyer ? 'buyer' : 'seller', posted: true };
+      if (options.json) console.log(JSON.stringify(result, null, 2));
+      else say(`Posted a sealed chat message on ${jobId}.`);
+      void posted;
+      return;
+    }
+    let ivk;
+    try {
+      ivk = readJobIvk(agentDir, jobId);
+    } catch (e) {
+      fail(e.code || 'CHAT_SEAL_KEY', e.message || String(e));
+    }
+    let listed;
+    try {
+      listed = await agent.client.request('GET', `/v1/jobs/${jobId}/messages`);
+    } catch (e) {
+      ivk.fill(0);
+      fail('CHAT_SEAL', e.message || String(e));
+    }
+    const rows = (listed && listed.data) || (Array.isArray(listed) ? listed : []);
+    const opened = [];
+    let unread = 0;
+    for (const row of rows) {
+      if (!row || row.contentEncoding !== 'j41-seal-v1') continue;
+      try {
+        const text = await openChatArmor(row.content, ivk);
+        opened.push({ id: row.id, senderVerusId: row.senderVerusId, text });
+      } catch {
+        unread += 1;
+      }
+    }
+    ivk.fill(0);
+    const result = { ok: true, code: 'CHAT_SEAL_READ', jobId, role: buyer ? 'buyer' : 'seller', opened, unread };
+    if (options.json) console.log(JSON.stringify(result, null, 2));
+    else {
+      for (const line of opened) say(`${line.senderVerusId}: ${line.text}`);
+      if (!opened.length) say(unread ? 'No sealed message on this job opened with this key.' : 'No sealed messages on this job.');
+    }
+  });
+
+program
   .command('extend <buyer-agent-id> <job-id>')
   .description('Request a job extension and dual-pay it (labour in_progress/paused; GPU Cat-1 including delivered)')
   .requiredOption('--amount <n>', 'Extension amount in the listing currency')
