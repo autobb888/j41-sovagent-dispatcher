@@ -6,8 +6,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { ensureSeed, storeJobKey } = require('../src/seal-address-store');
-const { publishBuyerSealAddress } = require('../src/seal-address-run');
+const { deriveJobAddress, publishBuyerSealAddress, publishSellerSealAddress } = require('../src/seal-address-run');
 const { shouldSealDelivery } = require('../src/seal-package');
+const { buyerOwnsJob, sellerOwnsJob } = require('../src/hire-pay');
 
 test('a seal key file is created once and the public result has no viewing key', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-seal-'));
@@ -47,6 +48,64 @@ test('the posted result carries the address and not the viewing key', async () =
   assert.equal('ivkHex' in result, false);
   const onDisk = JSON.parse(fs.readFileSync(result.keyFile, 'utf8'));
   assert.equal(JSON.stringify(result).includes(onDisk.ivkHex), false);
+});
+
+test('the seller post carries a different address and not the viewing key', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-seal-seller-'));
+  const jobId = '7f74d5d3-13c2-49c0-9024-a405ad7319b4';
+  const posted = [];
+  const result = await publishSellerSealAddress({
+    agentDir: dir,
+    sellerId: 'iSeller',
+    jobId,
+    yes: true,
+    post: async (addressHex) => {
+      posted.push(addressHex);
+      return { data: { stored: true } };
+    },
+  });
+  assert.equal(result.role, 'seller');
+  assert.equal(result.posted, true);
+  assert.equal(result.addressHex.length, 86);
+  assert.deepEqual(posted, [result.addressHex]);
+  assert.equal('ivk' in result, false);
+  assert.equal('ivkHex' in result, false);
+  assert.equal(fs.statSync(result.keyFile).mode & 0o777, 0o600);
+  const onDisk = JSON.parse(fs.readFileSync(result.keyFile, 'utf8'));
+  assert.equal(JSON.stringify(result).includes(onDisk.ivkHex), false);
+  const again = await publishSellerSealAddress({
+    agentDir: dir,
+    sellerId: 'iSeller',
+    jobId,
+    yes: true,
+    post: async () => ({ data: { stored: true } }),
+  });
+  assert.equal(again.created, false);
+  assert.equal(again.addressHex, result.addressHex);
+});
+
+test('buyer and seller derivations for one job differ', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-seal-role-'));
+  const seed = ensureSeed(dir);
+  const jobId = '7f74d5d3-13c2-49c0-9024-a405ad7319b4';
+  const buyer = await deriveJobAddress(seed, 'iBuyer', jobId, 'buyer');
+  const seller = await deriveJobAddress(seed, 'iSeller', jobId, 'seller');
+  assert.equal(buyer.addressHex.length, 86);
+  assert.equal(seller.addressHex.length, 86);
+  assert.notEqual(buyer.addressHex, seller.addressHex);
+  buyer.ivk.fill(0);
+  seller.ivk.fill(0);
+});
+
+test('seller ownership follows sellerVerusId', () => {
+  const keys = { identity: 'pippinwork.agentplatform@', iAddress: 'iR7vcjyjdA1RpynjzBggBt7fHe2wmA4gyN' };
+  const job = {
+    buyerVerusId: 'iBuyer',
+    sellerVerusId: 'iR7vcjyjdA1RpynjzBggBt7fHe2wmA4gyN',
+  };
+  assert.equal(sellerOwnsJob(keys, job), true);
+  assert.equal(buyerOwnsJob(keys, job), false);
+  assert.equal(sellerOwnsJob(keys, { sellerVerusId: 'iOther' }), false);
 });
 
 test('gpu and data jobs are not sealed', () => {

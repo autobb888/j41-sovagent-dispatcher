@@ -7,13 +7,18 @@ const { ensureSeed, storeJobKey } = require('./seal-address-store');
 
 const LIB_URL = pathToFileURL(path.join(__dirname, 'vendor', 'veruszsupportlib', 'index.mjs')).href;
 
-async function deriveJobAddress(seed, buyerId, jobId) {
+async function deriveJobAddress(seed, partyId, jobId, role = 'buyer') {
+  if (role !== 'buyer' && role !== 'seller') {
+    const err = new Error('Seal role is not buyer or seller');
+    err.code = 'SEAL_ROLE';
+    throw err;
+  }
   const { webcrypto } = require('node:crypto');
   if (!globalThis.crypto) globalThis.crypto = webcrypto;
   const lib = await import(LIB_URL);
-  const fromId = crypto.createHash('sha256').update(String(buyerId)).digest().subarray(0, 20);
+  const fromId = crypto.createHash('sha256').update(String(partyId)).digest().subarray(0, 20);
   const toId = crypto.createHash('sha256').update(String(jobId)).digest().subarray(0, 20);
-  const encryptionIndex = crypto.createHash('sha256').update(`${jobId}:buyer`).digest().readUInt32BE(0);
+  const encryptionIndex = crypto.createHash('sha256').update(`${jobId}:${role}`).digest().readUInt32BE(0);
   const keys = lib.z_getEncryptionAddress({
     seed,
     fromId,
@@ -36,15 +41,15 @@ async function deriveJobAddress(seed, buyerId, jobId) {
 }
 
 /**
- * Derive the buyer's job address, keep the viewing key in agentDir, and post
- * { addressHex } only. The returned object never includes the viewing key.
+ * Derive the job address for this role, keep the viewing key in agentDir, and
+ * post { addressHex } only. The returned object never includes the viewing key.
  */
-async function publishBuyerSealAddress({ agentDir, buyerId, jobId, post, yes }) {
+async function publishRoleSealAddress({ agentDir, partyId, jobId, post, yes, role }) {
   if (!yes) {
-    return { ok: true, code: 'SEAL_ADDRESS_PREVIEW', jobId, posted: false };
+    return { ok: true, code: 'SEAL_ADDRESS_PREVIEW', jobId, role, posted: false };
   }
   const seed = ensureSeed(agentDir);
-  const derived = await deriveJobAddress(seed, buyerId, jobId);
+  const derived = await deriveJobAddress(seed, partyId, jobId, role);
   const stored = storeJobKey(agentDir, jobId, derived.addressHex, derived.ivk);
   derived.ivk.fill(0);
   const body = await post(stored.addressHex);
@@ -52,6 +57,7 @@ async function publishBuyerSealAddress({ agentDir, buyerId, jobId, post, yes }) 
     ok: true,
     code: 'SEAL_ADDRESS_STORED',
     jobId,
+    role,
     addressHex: stored.addressHex,
     keyFile: stored.path,
     created: stored.created,
@@ -60,7 +66,16 @@ async function publishBuyerSealAddress({ agentDir, buyerId, jobId, post, yes }) 
   };
 }
 
+function publishBuyerSealAddress({ agentDir, buyerId, jobId, post, yes }) {
+  return publishRoleSealAddress({ agentDir, partyId: buyerId, jobId, post, yes, role: 'buyer' });
+}
+
+function publishSellerSealAddress({ agentDir, sellerId, jobId, post, yes }) {
+  return publishRoleSealAddress({ agentDir, partyId: sellerId, jobId, post, yes, role: 'seller' });
+}
+
 module.exports = {
   deriveJobAddress,
   publishBuyerSealAddress,
+  publishSellerSealAddress,
 };

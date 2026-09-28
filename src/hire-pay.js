@@ -25,13 +25,23 @@ function planHirePayment({ pending, now, force, backstopMs } = {}) {
   return { ok: true, code: null, reason: null };
 }
 
-function buyerOwnsJob(keys, job) {
-  if (!keys || !job) return false;
-  const buyer = String(job.buyerVerusId || '').replace(/@$/, '').toLowerCase();
+function partyOwns(keys, partyId) {
+  if (!keys || !partyId) return false;
+  const party = String(partyId).replace(/@$/, '').toLowerCase();
   const ids = [keys.identity, keys.iAddress]
     .filter(Boolean)
     .map((s) => String(s).replace(/@$/, '').toLowerCase());
-  return ids.includes(buyer);
+  return ids.includes(party);
+}
+
+function buyerOwnsJob(keys, job) {
+  if (!job) return false;
+  return partyOwns(keys, job.buyerVerusId);
+}
+
+function sellerOwnsJob(keys, job) {
+  if (!job) return false;
+  return partyOwns(keys, job.sellerVerusId);
 }
 
 function jobAlreadyPaid(job) {
@@ -55,4 +65,4 @@ function dualPayTxids(outputs, txid) {
   return { agentTxid: id, feeTxid: undefined };
 }
 
-module.exports = { planHirePayment, buyerOwnsJob, jobAlreadyPaid, dualPayTxids };
+module.exports = { planHirePayment, buyerOwnsJob, sellerOwnsJob, jobAlreadyPaid, dualPayTxids };

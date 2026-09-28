@@ -56,7 +56,7 @@ async function deliverDatasetNotice(agent, agentInfo, job) {
   console.log(`[Data] delivered ${job.id} (no rows, no token)`);
   return 'delivered';
 }
-const { planHirePayment, buyerOwnsJob, jobAlreadyPaid } = require('./hire-pay');
+const { planHirePayment, buyerOwnsJob, sellerOwnsJob, jobAlreadyPaid } = require('./hire-pay');
 const rq = require('./reactivation-queue.js');
 const {
   isDeadLettered,
@@ -4280,6 +4280,48 @@ program
     if (options.json) console.log(JSON.stringify(result, null, 2));
     else {
       say(`Posted seal address ${result.addressHex}`);
+      say(`Viewing key stays in ${result.keyFile}`);
+    }
+  });
+
+program
+  .command('seller-seal-address <seller-agent-id> <job-id>')
+  .description('Derive the seller job z-address, keep the viewing key on this machine, and post only the 86-hex address.')
+  .option('--yes', 'Derive, store the viewing key, and post the address')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
+  .action(async (sellerAgentId, jobId, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    if (!/^[0-9a-f-]{36}$/i.test(String(jobId || ''))) fail('SEAL_JOB', 'Job id is not a uuid.');
+    if (IS_MAINNET) fail('SEAL_NETWORK', 'This seal address is derived on VRSCTEST.');
+    const { publishSellerSealAddress } = require('./seal-address-run');
+    if (!options.yes) {
+      const preview = { ok: true, code: 'SEAL_ADDRESS_PREVIEW', jobId, role: 'seller', posted: false };
+      if (options.json) console.log(JSON.stringify(preview, null, 2));
+      else say('Preview only. Pass --yes to derive the seller address, keep the viewing key here, and post it.');
+      return;
+    }
+    const { keys, agent } = await loadBuyerSession(sellerAgentId, options);
+    const job = await agent.client.getJob(jobId);
+    if (!job || !job.id) fail('SEAL_JOB', `Job ${jobId} not found.`);
+    if (!sellerOwnsJob(keys, job)) fail('SEAL_NOT_SELLER', 'This identity is not the seller on that job.');
+    const agentDir = path.join(AGENTS_DIR, sellerAgentId);
+    let result;
+    try {
+      result = await publishSellerSealAddress({
+        agentDir,
+        sellerId: keys.iAddress || keys.identity,
+        jobId,
+        yes: true,
+        post: async (addressHex) => agent.client.request('POST', `/v1/jobs/${jobId}/seal-address`, { addressHex }),
+      });
+    } catch (e) {
+      fail(e.code || 'SEAL_ADDRESS', e.message || String(e));
+    }
+    if (options.json) console.log(JSON.stringify(result, null, 2));
+    else {
+      say(`Posted seller seal address ${result.addressHex}`);
       say(`Viewing key stays in ${result.keyFile}`);
     }
   });
