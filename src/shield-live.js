@@ -292,12 +292,40 @@ async function liveShieldProof(opts) {
   }
 }
 
+/** Notes this account can see, from its birthday. The viewing key is not returned. */
+async function scanNotes(opts) {
+  const deps = makeDeps({
+    accountFile: opts.accountFile,
+    paramsDir: opts.paramsDir,
+    lightwalletdUrl: opts.lightwalletdUrl,
+    client: opts.client || null,
+  });
+  const account = await deps.readAccount();
+  if (!account) {
+    const error = new Error('This identity has no shielded account yet.');
+    error.code = 'Z_ADDRESS_NOT_SET';
+    throw error;
+  }
+  const prepared = await deps.prepare(account);
+  const fromHeight = opts.fromHeight != null ? opts.fromHeight : (account.birthdayHeight || 1);
+  const notes = await deps.scan(fromHeight);
+  return {
+    notes,
+    addressHex: prepared.addressHex,
+    changeAddress: prepared.address,
+  };
+}
+
 module.exports = {
   outputScriptFor,
   accountFile,
   readStoredAccount,
   writeStoredAccount,
   paramsMatch,
+  ensureParams,
+  readParams,
+  loadLibrary,
   liveShieldProof,
   lightwalletdTarget,
+  scanNotes,
 };

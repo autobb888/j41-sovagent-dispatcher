@@ -9199,6 +9199,171 @@ program
     process.exit(safe.ok ? 0 : 1);
   });
 
+// One note to the seller, the platform fee, and the job tag. Off unless the API
+// advertises jobs.shielded-hire-v1. Broadcast is lightwalletd, not /v1/tx/broadcast.
+program
+  .command('pay-shielded <agent-id> <job-id>')
+  .description('Pay an accepted hire from one shielded note when the API allows it')
+  .option('--yes', 'Prove and broadcast')
+  .option('--lightwalletd <host:port>', 'Verus lightwalletd gRPC address')
+  .option('--json', 'Print the result as JSON')
+  .action(async (agentId, jobId, options) => {
+    const { networkForProof } = require('./shield-proof');
+    const { readStoredAccount, accountFile, scanNotes, ensureParams } = require('./shield-live');
+    const { readLocalZAddress, deriveIdentityAddress } = require('./z-address-run');
+    const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
+    const {
+      prepareShieldedHire,
+      spendPreparedHire,
+      proveHireSpend,
+      broadcastShieldedHex,
+      versionFeatures,
+      shieldedPayLine,
+    } = require('./hire-shield-run');
+    const hidden = new Set(['seed', 'seedhex', 'extskhex', 'dfvkhex', 'ivk', 'wif', 'spendingkey']);
+    const finish = (result, seedHex) => {
+      const safe = {};
+      for (const [key, value] of Object.entries(result || {})) {
+        if (hidden.has(String(key).toLowerCase())) continue;
+        if (key === 'message') {
+          let message = String(value || '');
+          const seed = String(seedHex || '').toLowerCase();
+          if ((seed && message.toLowerCase().includes(seed)) || /[0-9a-f]{64,}/i.test(message)) {
+            message = 'The shielded hire failed.';
+          }
+          safe.message = message;
+          continue;
+        }
+        safe[key] = value;
+      }
+      if (options.json) process.stdout.write(`${JSON.stringify(safe)}\n`);
+      else console.log(safe.code || (safe.ok ? 'ok' : 'SHIELDED_HIRE_FAILED'));
+      process.exit(safe.ok ? 0 : 1);
+    };
+    const network = networkForProof(IS_MAINNET, J41_NETWORK);
+    if (network !== 'verustest') {
+      console.error('This payment runs on VRSCTEST.');
+      process.exit(1);
+    }
+    await ensureKeystoreUnlockedIfEncrypted();
+    let keys;
+    try { keys = loadAgentKeys(agentId); }
+    catch (error) {
+      console.error(error.message);
+      process.exit(1);
+    }
+    if (!keys || !keys.wif || !keys.address) {
+      console.error(`pay-shielded: ${agentId} has no key`);
+      process.exit(1);
+    }
+    const lightwalletdUrl = options.lightwalletd || process.env.J41_LIGHTWALLETD || '';
+    const paramsDir = path.join(J41_DIR, 'sapling');
+    let agent;
+    try {
+      const state = { agentSessions: new Map() };
+      agent = await getAgentSession(state, {
+        id: agentId,
+        wif: keys.wif,
+        identity: keys.identity,
+        iAddress: keys.iAddress,
+      });
+      const version = await agent.client.request('GET', '/v1/version');
+      const features = versionFeatures(version);
+      if (!features.includes('jobs.shielded-hire-v1')) finish({ ok: false, code: 'SHIELDED_HIRE_OFF' });
+      let registeredHex = '';
+      try {
+        const row = await agent.client.request('GET', '/v1/me/z-address');
+        const data = row && row.data ? row.data : row;
+        registeredHex = data && data.addressHex ? String(data.addressHex) : '';
+      } catch (error) {
+        if (!(error && (error.statusCode === 404 || error.code === 'Z_ADDRESS_NOT_SET'))) throw error;
+      }
+      const job = await agent.client.getJob(jobId);
+      const qrBody = await agent.client.request('GET', `/v1/jobs/${encodeURIComponent(jobId)}/payment-qr?type=combined`);
+      const qr = qrBody && qrBody.data ? qrBody.data : qrBody;
+      const local = await readLocalZAddress({
+        agentsDir: AGENTS_DIR,
+        agentId,
+        derive: deriveIdentityAddress,
+      });
+      if (!local.ok) finish(local);
+      const { payShieldedGate } = require('./hire-shield');
+      const gate = payShieldedGate({
+        features,
+        registeredHex,
+        localHex: local.addressHex,
+        status: job && job.status,
+        paymentVerified: !!(job && job.payment && job.payment.verified === true),
+      });
+      if (!gate.ok) finish(gate);
+      const scanned = await scanNotes({
+        accountFile: accountFile(AGENTS_DIR, agentId),
+        paramsDir,
+        lightwalletdUrl,
+        fromHeight: local.birthdayHeight || 1,
+      });
+      const prepared = prepareShieldedHire({
+        features,
+        registeredHex,
+        localHex: local.addressHex,
+        job,
+        qr,
+        notes: scanned.notes,
+        changeAddress: local.changeAddress,
+        networkName: network,
+      });
+      if (!prepared.ok) finish(prepared);
+      if (options.yes !== true) {
+        const change = prepared.plan.shieldedOutputs[0];
+        finish({
+          ok: true,
+          code: 'SHIELDED_HIRE_READY',
+          note: prepared.note,
+          minerFeeSats: Number(prepared.plan.feeSats),
+          changeSats: change ? Number(change.valueSats) : 0,
+        });
+      }
+      if (!job || !job.jobHash || !job.sellerVerusId) finish({ ok: false, code: 'JOB_NOT_ACCEPTED' });
+      const ready = await ensureParams(paramsDir);
+      if (!ready.ok) finish(ready);
+      const stored = readStoredAccount(accountFile(AGENTS_DIR, agentId));
+      const spent = await spendPreparedHire({
+        seedHex: stored.seedHex,
+        plan: prepared.plan,
+        note: prepared.note,
+        buildSpend: () => proveHireSpend({
+          seedHex: stored.seedHex,
+          paramsDir,
+          lightwalletdUrl,
+          plan: prepared.plan,
+          note: prepared.note,
+        }),
+        broadcast: (hex) => broadcastShieldedHex({ lightwalletdUrl, hex }),
+        sign: (line) => signMessage(keys.wif, line, 'verustest'),
+        post: async (body) => {
+          if (!body || Object.keys(body).length !== 2 || !body.txid || !body.signature) {
+            throw new Error('Refusing to post a shielded payment that is not { txid, signature }.');
+          }
+          return agent.client.request('POST', `/v1/jobs/${encodeURIComponent(jobId)}/payment-shielded`, {
+            txid: body.txid,
+            signature: body.signature,
+          });
+        },
+        line: (txid) => shieldedPayLine({
+          jobHash: job.jobHash,
+          txid,
+          sellerIAddress: job.sellerVerusId,
+          labourSats: Number(prepared.plan.transparentOutputs[0].valueSats),
+          feeSats: Number(prepared.plan.transparentOutputs[1].valueSats),
+        }),
+      });
+      finish(spent, stored.seedHex);
+    } catch (error) {
+      const code = (error && error.code) || 'SHIELDED_HIRE_FAILED';
+      finish({ ok: false, code, message: error && error.message ? error.message : '' });
+    }
+  });
+
 // Doctor — mass-use machine diagnosis (single classifier shared with the TUI)
 program
   .command('doctor [agent-id]')
