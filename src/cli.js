@@ -9243,7 +9243,10 @@ program
         safe[key] = value;
       }
       if (options.json) process.stdout.write(`${JSON.stringify(safe)}\n`);
-      else console.log(safe.code || (safe.ok ? 'ok' : 'SHIELDED_HIRE_FAILED'));
+      else {
+        if (typeof safe.txid === 'string' && /^[0-9a-fA-F]{64}$/.test(safe.txid)) console.log(safe.txid);
+        console.log(safe.code || (safe.ok ? 'ok' : 'SHIELDED_HIRE_FAILED'));
+      }
       process.exit(safe.ok ? 0 : 1);
     };
     const network = networkForProof(IS_MAINNET, J41_NETWORK);

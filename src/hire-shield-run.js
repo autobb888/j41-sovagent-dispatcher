@@ -108,15 +108,18 @@ async function spendPreparedHire({ buildSpend, broadcast, sign, post, seedHex, p
   const txid = sent && typeof sent === 'object' && typeof sent.txid === 'string' && /^[0-9a-fA-F]{64}$/.test(sent.txid)
     ? sent.txid.toLowerCase()
     : txidOfRawHex(hex);
-  const payLine = typeof line === 'function' ? line(txid) : line;
-  const signature = await sign(payLine);
-  if (typeof signature !== 'string' || !signature) {
-    const error = new Error('The payment line was not signed.');
-    error.code = 'SHIELD_SIGN';
-    throw error;
+  try {
+    const payLine = typeof line === 'function' ? line(txid) : line;
+    const signature = await sign(payLine);
+    if (typeof signature !== 'string' || !signature) {
+      const error = new Error('The payment line was not signed.');
+      error.code = 'SHIELD_SIGN';
+      throw error;
+    }
+    await post({ txid, signature });
+  } catch {
+    return { ok: false, code: 'SHIELDED_HIRE_UNRECORDED', txid };
   }
-  const body = { txid, signature };
-  await post(body);
   return { ok: true, code: 'SHIELDED_HIRE_SUBMITTED', txid };
 }
 

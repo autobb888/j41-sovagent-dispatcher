@@ -138,3 +138,39 @@ test('a clean hex is signed on the pay line and posted as txid plus signature', 
   assert.equal('seedHex' in result, false);
   assert.equal('extskHex' in result, false);
 });
+
+test('a post failure after broadcast keeps the txid and drops the seed', async () => {
+  const txid = 'ab'.repeat(32);
+  const result = await spendPreparedHire({
+    seedHex: 'cd'.repeat(64),
+    plan: {},
+    note: { txid: '11'.repeat(32), outputIndex: 0, valueSats: 6_000_000 },
+    line: 'line',
+    buildSpend: async () => ({ hex: '010203' }),
+    broadcast: async () => ({ txid }),
+    sign: async () => 'sig',
+    post: async () => { throw new Error('post failed'); },
+  });
+  assert.deepEqual(result, { ok: false, code: 'SHIELDED_HIRE_UNRECORDED', txid });
+  assert.equal('seedHex' in result, false);
+  assert.equal('extskHex' in result, false);
+  assert.equal('hex' in result, false);
+});
+
+test('a broadcast failure is thrown and post is not called', async () => {
+  let posted = 0;
+  await assert.rejects(
+    () => spendPreparedHire({
+      seedHex: 'cd'.repeat(64),
+      plan: {},
+      note: { txid: '11'.repeat(32), outputIndex: 0, valueSats: 6_000_000 },
+      line: 'line',
+      buildSpend: async () => ({ hex: '010203' }),
+      broadcast: async () => { throw new Error('broadcast rejected'); },
+      sign: async () => 'sig',
+      post: async () => { posted += 1; },
+    }),
+    /broadcast rejected/,
+  );
+  assert.equal(posted, 0);
+});
