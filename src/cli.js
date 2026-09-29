@@ -9246,6 +9246,10 @@ program
       if (options.json) process.stdout.write(`${JSON.stringify(safe)}\n`);
       else {
         if (typeof safe.txid === 'string' && /^[0-9a-fA-F]{64}$/.test(safe.txid)) console.log(safe.txid);
+        if (typeof safe.labourAddress === 'string') console.log(safe.labourAddress);
+        if (safe.note && Number.isSafeInteger(safe.note.valueSats)) console.log(`note ${safe.note.valueSats}`);
+        if (Number.isSafeInteger(safe.minerFeeSats)) console.log(`miner ${safe.minerFeeSats}`);
+        if (Number.isSafeInteger(safe.changeSats)) console.log(`change ${safe.changeSats}`);
         console.log(safe.code || (safe.ok ? 'ok' : 'SHIELDED_HIRE_FAILED'));
       }
       process.exit(safe.ok ? 0 : 1);
@@ -9339,12 +9343,13 @@ program
         changeAddress: local.changeAddress,
         networkName: network,
       });
-      if (!prepared.ok) finish(prepared);
+      if (!prepared.ok) finish(Object.assign({ labourAddress: sellerAddress }, prepared));
       if (options.yes !== true) {
         const change = prepared.plan.shieldedOutputs[0];
         finish({
           ok: true,
           code: 'SHIELDED_HIRE_READY',
+          labourAddress: sellerAddress,
           note: prepared.note,
           minerFeeSats: Number(prepared.plan.feeSats),
           changeSats: change ? Number(change.valueSats) : 0,
