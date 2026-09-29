@@ -9113,6 +9113,92 @@ program
     process.exit(result.code === 'SHIELD_NOTE_UNSEEN' ? 2 : 1);
   });
 
+// One Sapling address per identity. The seed stays in the agent directory.
+// The POST body is { addressHex } only.
+program
+  .command('z-address <agent-id>')
+  .description('Register this identity\'s Sapling address. The seed stays in the agent directory.')
+  .option('--yes', 'Create the account file if needed and POST the address')
+  .option('--json', 'Print the result as JSON')
+  .action(async (agentId, options) => {
+    const { networkForProof } = require('./shield-proof');
+    const { publishIdentityZAddress, deriveIdentityAddress } = require('./z-address-run');
+    const network = networkForProof(IS_MAINNET, J41_NETWORK);
+    if (network !== 'verustest') {
+      console.error('This registration runs on VRSCTEST.');
+      process.exit(1);
+    }
+    await ensureKeystoreUnlockedIfEncrypted();
+    let keys;
+    try { keys = loadAgentKeys(agentId); }
+    catch (error) {
+      console.error(error.message);
+      process.exit(1);
+    }
+    if (!keys || !keys.wif || !keys.address) {
+      console.error(`z-address: ${agentId} has no key`);
+      process.exit(1);
+    }
+    let post = async () => {
+      throw new Error('z-address post was not opened');
+    };
+    let birthdayHeight = null;
+    if (options.yes === true) {
+      const state = { agentSessions: new Map() };
+      const agent = await getAgentSession(state, {
+        id: agentId,
+        wif: keys.wif,
+        identity: keys.identity,
+        iAddress: keys.iAddress,
+      });
+      try {
+        const info = await agent.client.getChainInfo();
+        const tip = Number(info && (info.blockHeight != null ? info.blockHeight : info.blocks));
+        if (Number.isInteger(tip) && tip >= 0) birthdayHeight = tip;
+      } catch {
+        birthdayHeight = null;
+      }
+      post = async (body) => {
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          throw new Error('Refusing to post a z-address body that is not { addressHex }.');
+        }
+        const names = Object.keys(body);
+        if (names.length !== 1 || names[0] !== 'addressHex' || typeof body.addressHex !== 'string') {
+          throw new Error('Refusing to post a z-address body that is not { addressHex }.');
+        }
+        return agent.client.request('POST', '/v1/me/z-address', { addressHex: body.addressHex });
+      };
+    }
+    let result;
+    try {
+      result = await publishIdentityZAddress({
+        agentsDir: AGENTS_DIR,
+        agentId,
+        yes: options.yes === true,
+        derive: deriveIdentityAddress,
+        post,
+        birthdayHeight,
+      });
+    } catch (error) {
+      const code = (error && error.code) || 'Z_ADDRESS_DERIVE';
+      if (options.json) process.stdout.write(`${JSON.stringify({ ok: false, code })}\n`);
+      else console.error(code);
+      process.exit(1);
+    }
+    const hidden = new Set(['seed', 'seedhex', 'extskhex', 'dfvkhex', 'ivk', 'wif', 'spendingkey']);
+    const safe = {};
+    for (const [key, value] of Object.entries(result || {})) {
+      if (hidden.has(String(key).toLowerCase())) continue;
+      safe[key] = value;
+    }
+    if (options.json) process.stdout.write(`${JSON.stringify(safe)}\n`);
+    else {
+      if (safe.addressHex) console.log(safe.addressHex);
+      console.log(safe.code);
+    }
+    process.exit(safe.ok ? 0 : 1);
+  });
+
 // Doctor — mass-use machine diagnosis (single classifier shared with the TUI)
 program
   .command('doctor [agent-id]')
