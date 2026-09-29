@@ -125,6 +125,7 @@ const { loadDispatcherConfig, fileConfiguredNetwork } = require('./config-loader
 const { SignChannelHost } = require('./sign-channel-host.js');
 const { EgressProxyHost, deriveAllowedHosts, isolatedGatewayIp, EGRESS_PROXY_PORT } = require('./egress-proxy.js');
 const { defaultExecutors, expiryForIdentity } = require('./broker-executors.js');
+const { isShieldedHire } = require('./shielded-hire-skip');
 const { findMainnetSecurityViolations, resolveIsMainnet } = require('./mainnet-guard.js');
 const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, liveLogPath, archiveLogPath } = require('./job-log.js');
 const { shouldRefundOrphan, isRefundAlreadyHandled, buildAbandonedJobRefund, classifyCrashOrphan, promoteNeedsReview } = require('./refund.js');
@@ -3973,6 +3974,7 @@ async function runBuyerComplete(keys, agent, jobId, options, buyerAgentId) {
     const ok = await confirmHire({ amountText: `complete ${job.id}`, pay: false });
     if (!ok) { console.log('Cancelled.'); process.exit(0); }
   }
+  const shieldedHire = isShieldedHire(job);
   const done = await agent.completeJob(job.id);
   // Observe rental the way the buyer can: try getRentalAccess. ssh.host →
   // honesty (LAN leftover must not print the success checkmark). 404 / no host
@@ -3983,10 +3985,12 @@ async function runBuyerComplete(keys, agent, jobId, options, buyerAgentId) {
   );
   const warning = honesty && honesty.warning;
   let witness = null;
-  try {
-    witness = await agent.client.getJobWitness(job.id);
-  } catch (e) {
-    if (!warning) say(`   Witness not ready yet (${e.message}). Retry inspect later.`);
+  if (!shieldedHire) {
+    try {
+      witness = await agent.client.getJobWitness(job.id);
+    } catch (e) {
+      if (!warning) say(`   Witness not ready yet (${e.message}). Retry inspect later.`);
+    }
   }
   const out = formatBuyerCompleteOutput({
     jobId: job.id,
@@ -4025,7 +4029,9 @@ program
     const review = await offerBuyerReview({
       options, say, keys, agent, buyerAgentId, mode: 'job', jobId, seller,
     });
-    if (!(review && review.buyerInbox)) {
+    const finished = await agent.client.getJob(jobId);
+    const shieldedHire = isShieldedHire(finished);
+    if (!(review && review.buyerInbox) && !shieldedHire) {
       await publishBuyerContentMaps({
         agent, buyerAgentId, options, say,
         watch: await jobContentWatch(agent, jobId, ['job_record']),

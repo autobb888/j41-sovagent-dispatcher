@@ -28,6 +28,7 @@ const {
 const {
   verifyWitness,
 } = require('@junction41/sovagent-sdk/dist/index.js');
+const { isShieldedHire } = require('./shielded-hire-skip');
 
 /**
  * Maximum JSON byte size allowed for a container-supplied on-chain record.
@@ -187,6 +188,10 @@ function jobCompletionUpdateExecutor({ getClient }) {
     const network = ctx.network;
     if (network !== 'verus' && network !== 'verustest') {
       throw new Error(`jobCompletionUpdate: invalid/absent network '${network}' — refusing record.job write`);
+    }
+
+    if (isShieldedHire(authoritativeJob)) {
+      return { skipped: true, reason: 'shielded-hire' };
     }
 
     const { record, witness } = await client.getJobWitness(jobId);

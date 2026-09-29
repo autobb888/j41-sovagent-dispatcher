@@ -59,6 +59,9 @@ COPY src/job-signer.js ./
 # broker executor surface). Missing these crashes the worker at module load
 # when those code paths run (after auth, before chat).
 COPY src/token-budget.js ./
+# Shielded hires skip the public job record. job-agent.js requires this at
+# module load; omitting it crashes every container at startup.
+COPY src/shielded-hire-skip.js ./
 COPY src/broker-executors.js ./
 # Message reliability — required by job-agent.js at module load (require at top):
 # id-dedup for the WS+poll paths and the poll-fallback selector. Missing these

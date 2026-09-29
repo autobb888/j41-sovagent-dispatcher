@@ -21,6 +21,7 @@ const {
   resolveCanaryId,
   purgeStaleCanaries,
 } = require('./job-agent-teardown.js');
+const { isShieldedHire } = require('./shielded-hire-skip');
 
 /** SovGuard canary id for this job, resolved after registration. */
 let _canaryId = null;
@@ -2530,6 +2531,8 @@ async function performCleanup(agent, keys, fullJob, postDeliveryResult, signer) 
       // for callers that still want a container-driven path (e.g., timeout
       // resolution where no buyer completion exists to queue an inbox item).
       log.info('On-chain identity update deferred to host Inbox processor (broker mode)', { jobId: JOB_ID });
+    } else if (isShieldedHire(fullJob)) {
+      log.info('Shielded hire skips the local job record write', { jobId: JOB_ID });
     } else {
       // Legacy local-WIF path — unchanged from pre-broker behavior.
       const { buildJobCompletionAdditions } = require('@junction41/sovagent-sdk/dist/onboarding/vdxf.js');
