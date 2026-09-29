@@ -18,6 +18,16 @@ const {
 const { outputScriptFor, loadLibrary, readParams, lightwalletdTarget } = require('./shield-live');
 const { COIN_TYPE } = require('./shield-proof');
 
+function transparentPayAddress(qrAddress, resolved) {
+  const address = typeof qrAddress === 'string' ? qrAddress : '';
+  if (address.startsWith('R')) return address;
+  if (address.startsWith('i')) {
+    const primary = resolved && typeof resolved.address === 'string' ? resolved.address : '';
+    if (primary.startsWith('R')) return primary;
+  }
+  return address;
+}
+
 function satsFromCoins(amount) {
   const n = Number(amount);
   if (!Number.isFinite(n)) return null;
@@ -200,6 +210,7 @@ function versionFeatures(version) {
 }
 
 module.exports = {
+  transparentPayAddress,
   prepareShieldedHire,
   spendPreparedHire,
   proveHireSpend,

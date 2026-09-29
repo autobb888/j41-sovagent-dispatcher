@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { outputScriptFor } = require('../src/shield-live');
 const { shieldedPayLine, MINER_FEE_SATS } = require('../src/hire-shield');
-const { prepareShieldedHire, spendPreparedHire } = require('../src/hire-shield-run');
+const { transparentPayAddress, prepareShieldedHire, spendPreparedHire } = require('../src/hire-shield-run');
 
 const TAG = '00112233445566778899aabbccddeeff';
 const SELLER = 'RFzAZGqmJRwYQz3Y7FwYJVD5mnNGZXRDY6';
@@ -33,6 +33,24 @@ function input(overrides = {}) {
     ...overrides,
   };
 }
+
+test('an identity payment address uses the primary R-address', () => {
+  const identity = 'iR7vcjyjdA1RpynjzBggBt7fHe2wmA4gyN';
+  assert.equal(transparentPayAddress(identity, { address: SELLER, iAddress: identity }), SELLER);
+  assert.equal(transparentPayAddress(SELLER, { address: 'R9other' }), SELLER);
+  assert.equal(transparentPayAddress(identity, { address: identity }), identity);
+});
+
+test('an identity address is not a transparent script', () => {
+  const result = prepareShieldedHire(input({
+    qr: {
+      shieldPayTag: TAG,
+      agentPayment: { address: 'iR7vcjyjdA1RpynjzBggBt7fHe2wmA4gyN', amount: '0.05' },
+      feePayment: { address: FEE, amount: '0.0025' },
+    },
+  }));
+  assert.deepEqual(result, { ok: false, code: 'BAD_SCRIPT' });
+});
 
 test('a missing feature refuses before any script is built', () => {
   const result = prepareShieldedHire(input({

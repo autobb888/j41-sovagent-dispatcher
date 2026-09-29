@@ -9219,6 +9219,7 @@ program
     const { readLocalZAddress, deriveIdentityAddress } = require('./z-address-run');
     const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
     const {
+      transparentPayAddress,
       prepareShieldedHire,
       spendPreparedHire,
       proveHireSpend,
@@ -9290,6 +9291,23 @@ program
       const job = await agent.client.getJob(jobId);
       const qrBody = await agent.client.request('GET', `/v1/jobs/${encodeURIComponent(jobId)}/payment-qr?type=combined`);
       const qr = qrBody && qrBody.data ? qrBody.data : qrBody;
+      let sellerAddress = qr && qr.agentPayment && qr.agentPayment.address;
+      if (typeof sellerAddress === 'string' && sellerAddress.startsWith('i')) {
+        let looked = null;
+        try {
+          const body = await agent.client.request('GET', `/v1/agents/${encodeURIComponent(sellerAddress)}/payment-address`);
+          looked = body && body.data ? body.data : body;
+        } catch {
+          finish({ ok: false, code: 'BAD_SCRIPT' });
+        }
+        sellerAddress = transparentPayAddress(sellerAddress, looked);
+      }
+      if (typeof sellerAddress !== 'string' || !sellerAddress.startsWith('R')) {
+        finish({ ok: false, code: 'BAD_SCRIPT' });
+      }
+      const qrForSpend = qr && qr.agentPayment
+        ? { ...qr, agentPayment: { ...qr.agentPayment, address: sellerAddress } }
+        : qr;
       const local = await readLocalZAddress({
         agentsDir: AGENTS_DIR,
         agentId,
@@ -9316,7 +9334,7 @@ program
         registeredHex,
         localHex: local.addressHex,
         job,
-        qr,
+        qr: qrForSpend,
         notes: scanned.notes,
         changeAddress: local.changeAddress,
         networkName: network,
