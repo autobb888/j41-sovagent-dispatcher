@@ -66,6 +66,9 @@ cp "$DISPATCHER_DIR/src/egress-proxy-client.js" .build-temp/src/
 # Token-budget math + broker executors — required by job-agent.js at runtime
 # (lazy require). Missing these crashes the worker at module load.
 cp "$DISPATCHER_DIR/src/token-budget.js" .build-temp/src/
+# Shielded hires skip the public job record. job-agent.js requires this at
+# module load. Omitting it crashes every container at startup.
+cp "$DISPATCHER_DIR/src/shielded-hire-skip.js" .build-temp/src/
 cp "$DISPATCHER_DIR/src/broker-executors.js" .build-temp/src/
 # Message reliability — required by job-agent.js at module load (top-level require).
 cp "$DISPATCHER_DIR/src/message-dedup.js" .build-temp/src/
