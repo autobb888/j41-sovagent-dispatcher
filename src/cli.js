@@ -9208,6 +9208,30 @@ program
 // One note to the seller, the platform fee, and the job tag. Off unless the API
 // advertises jobs.shielded-hire-v1. Broadcast is lightwalletd, not /v1/tx/broadcast.
 program
+  .command('reactivate <buyer-agent-id> <job-id>')
+  .description('Buyer resumes a paused hire. A zero reactivation fee sends no payment.')
+  .option('--json', 'Print the API result as JSON')
+  .action(async (buyerAgentId, jobId, options) => {
+    if (!/^[0-9a-f-]{36}$/i.test(String(jobId || ''))) {
+      console.error('REACTIVATE_JOB');
+      process.exit(1);
+    }
+    await ensureKeystoreUnlockedIfEncrypted();
+    const { agent } = await loadBuyerSession(buyerAgentId, options);
+    try {
+      const body = await agent.client.request('POST', `/v1/jobs/${encodeURIComponent(jobId)}/reactivate`, {});
+      const data = body && body.data ? body.data : body;
+      if (options.json) process.stdout.write(`${JSON.stringify(data)}\n`);
+      else console.log(data && data.status ? data.status : 'in_progress');
+      process.exit(0);
+    } catch (error) {
+      console.error(error && error.code ? error.code : 'REACTIVATE_FAILED');
+      if (error && error.message) console.error(error.message);
+      process.exit(1);
+    }
+  });
+
+program
   .command('pay-shielded <agent-id> <job-id>')
   .description('Pay an accepted hire from one shielded note when the API allows it')
   .option('--yes', 'Prove and broadcast')
