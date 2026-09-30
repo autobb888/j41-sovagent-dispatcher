@@ -161,3 +161,17 @@ test('the review command stores a shielded hire without finishReviewWrite', () =
   assert.match(offer, /isShieldedHire/);
   assert.match(offer, /shieldedReviewStoredMessage/);
 });
+
+test('a shielded hire is not treated as already public', () => {
+  const cli = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
+  const fn = cli.slice(cli.indexOf('async function reviewAlreadyPublic'), cli.indexOf('function reviewNextLine'));
+  const shieldAt = fn.indexOf('isShieldedHire');
+  const lookupAt = fn.indexOf('getJobReview');
+  assert.ok(shieldAt > -1 && lookupAt > shieldAt, 'shielded check must run before getJobReview');
+});
+
+test('review --json omits the empty-inbox warning for a shielded hire', () => {
+  const cli = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
+  const review = cli.slice(cli.indexOf(".command('review "), cli.indexOf(".command('review-session"));
+  assert.match(review, /!shieldedHire && result\.inboxWarning/);
+});

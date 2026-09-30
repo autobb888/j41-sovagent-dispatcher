@@ -3679,7 +3679,9 @@ async function reviewAlreadyPublic({ agent, mode, jobId, seller, buyerAgentId, p
       return !!publishedReview(await agent.client.getAgentReviews(seller, { limit: 20 }), { sessionId });
     }
     const job = await agent.client.getJob(jobId);
-    if (!job || !job.jobHash || typeof agent.client.getJobReview !== 'function') return false;
+    if (!job || !job.jobHash) return false;
+    if (isShieldedHire(job)) return false;
+    if (typeof agent.client.getJobReview !== 'function') return false;
     return !!publishedReview(await agent.client.getJobReview(job.jobHash), { jobHash: job.jobHash });
   } catch {
     return false;
@@ -4150,7 +4152,7 @@ program
         chainReviewCount: written.count,
         result: result.result,
         inboxCount: result.inboxCount,
-        ...(result.inboxWarning ? { inboxWarning: result.inboxWarning } : {}),
+        ...(!shieldedHire && result.inboxWarning ? { inboxWarning: result.inboxWarning } : {}),
         buyerInbox: {
           ok: !!buyerInbox.ok,
           code: buyerInbox.code,
