@@ -1,10 +1,8 @@
 'use strict';
 
-const fs = require('fs');
-
-// Dev-machine note from Task 1. i-addresses are read from it, not typed here.
-const NOTE_PATH = '/home/bigbox/code/junction41/src/validation/vdxf-keys.tally-note.json';
 const RECORD_ID = 'iLbUN8TFvMZR9uaZYY1qBmL99bJE2uYdad';
+const TALLY_ID = 'i5rdLDZkDHRax2x1UYavwfViR1cE81fjVw';
+const PROSE_ID = 'i6bAtZMcPqgJq7VJQx8ysADCs4CW3LJz76';
 
 const FORBIDDEN_FIELDS = [
   'buyer',
@@ -16,22 +14,11 @@ const FORBIDDEN_FIELDS = [
   'completedAt',
 ];
 
-let cachedKeys = null;
-
 function reputationTallyKeys() {
-  if (cachedKeys) return cachedKeys;
-  const note = JSON.parse(fs.readFileSync(NOTE_PATH, 'utf8'));
-  const recordId = note && note.recordCheck && note.recordCheck.vdxfid;
-  if (recordId !== RECORD_ID) {
+  if (RECORD_ID !== 'iLbUN8TFvMZR9uaZYY1qBmL99bJE2uYdad') {
     throw new Error('reputation tally note record id is not iLbUN8TFvMZR9uaZYY1qBmL99bJE2uYdad');
   }
-  const tally = note.tally && note.tally.vdxfid;
-  const prose = note.prose && note.prose.vdxfid;
-  if (typeof tally !== 'string' || tally.length === 0 || typeof prose !== 'string' || prose.length === 0) {
-    throw new Error('reputation tally note is missing tally or prose');
-  }
-  cachedKeys = { tally, prose, recordId };
-  return cachedKeys;
+  return { tally: TALLY_ID, prose: PROSE_ID, recordId: RECORD_ID };
 }
 
 function readVdxfMap(item) {

@@ -66,4 +66,8 @@ test('cli wires the branch without being booted', () => {
   assert.ok(dash.includes(note.prose.vdxfid));
   assert.ok(dash.includes('review.tally'));
   assert.ok(dash.includes('review.prose'));
+  const tallySrc = fs.readFileSync('src/reputation-tally-inbox.js', 'utf8');
+  assert.ok(tallySrc.includes(note.tally.vdxfid));
+  assert.ok(tallySrc.includes(note.prose.vdxfid));
+  assert.equal(tallySrc.includes('/home/bigbox/code/junction41'), false);
 });
