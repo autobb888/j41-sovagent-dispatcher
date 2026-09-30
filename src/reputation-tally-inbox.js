@@ -80,12 +80,14 @@ function planReputationTallyAdditions(item, keys) {
 }
 
 async function acceptReputationTallyItem(item, deps) {
-  const additions = planReputationTallyAdditions(item, deps && deps.keys);
-  if (deps && typeof deps.writeIdentityAdditions === 'function') {
-    await deps.writeIdentityAdditions(additions);
-    return { accepted: true };
+  // Legacy dispatchInboxAccept has no writer. Throw before planning so a
+  // { id, type } ref, which has no hex, still surfaces this error.
+  if (!deps || typeof deps.writeIdentityAdditions !== 'function') {
+    throw new Error('reputation_tally write is not wired');
   }
-  throw new Error('reputation_tally write is not wired');
+  const additions = planReputationTallyAdditions(item, deps.keys);
+  await deps.writeIdentityAdditions(additions);
+  return { accepted: true };
 }
 
 module.exports = {

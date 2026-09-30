@@ -13408,7 +13408,7 @@ async function dispatchInboxAccept(agent, item, deps) {
     if (!deps || typeof deps !== 'object') {
       throw new Error('reputation_tally write is not wired');
     }
-    deps.keys = { tally: loaded.tally, prose: loaded.prose };
+    if (!deps.keys) deps.keys = { tally: loaded.tally, prose: loaded.prose };
     console.log(`[Inbox] Processing reputation tally ${item.id}`);
     const accepted = await acceptReputationTallyItem(item, deps);
     console.log(`[Inbox] ✅ Reputation tally accepted`);
