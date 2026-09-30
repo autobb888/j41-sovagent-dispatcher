@@ -1,5 +1,7 @@
 'use strict';
 
+const { isShieldedHire } = require('./shielded-hire-skip');
+
 /**
  * Publish buyer content maps from the buyer's own inbox.
  *
@@ -105,6 +107,21 @@ function selectInboxWriteSet(pending, isDead) {
   return { chosen: Object.values(picked), quarantined };
 }
 
+function buyerInboxWatch(job, types) {
+  const id = job && (job.id || job.jobId) || null;
+  const jobHash = job && (job.jobHash || null);
+  if (isShieldedHire(job)) {
+    return { jobId: id, jobHash, types: [], required: false, shielded: true };
+  }
+  return {
+    jobId: id,
+    jobHash,
+    types: types && types.length ? types : BUYER_INBOX_TYPES,
+    required: true,
+    shielded: false,
+  };
+}
+
 function drainMessage(result) {
   const id = (result && result.buyerId) || '<buyer>';
   const next = `j41-dispatcher inbox ${id} --yes`;
@@ -121,6 +138,9 @@ function drainMessage(result) {
   }
   if (result.code === 'BUYER_INBOX_EMPTY') {
     return 'Buyer inbox has no pending job_record, review, or attestation.';
+  }
+  if (result.code === 'BUYER_INBOX_SHIELDED') {
+    return 'This hire was paid from a shielded note. No job record, review, or attestation is copied to the buyer inbox.';
   }
   if (result.code === 'BUYER_INBOX_WAITING') {
     return `Published ${wrote}. This job's copy is not in the buyer inbox yet. The seller accept copies the review. Next: ${next}`;
@@ -161,7 +181,8 @@ async function drainBuyerInbox({
   let sawWatch = false;
   const started = now();
   const singlePass = timeoutMs <= 0 || once;
-  const needWatch = !!(watch && (watch.jobHash || watch.jobId));
+  const shieldedWatch = !!(watch && watch.shielded);
+  const needWatch = !shieldedWatch && !!(watch && (watch.jobHash || watch.jobId));
   const timedOut = () => timeoutMs > 0 && (now() - started) >= timeoutMs;
 
   const finish = (code, ok) => ({
@@ -198,6 +219,9 @@ async function drainBuyerInbox({
     if (needWatch && watchedStillPending(pending, watch)) sawWatch = true;
 
     if (pending.length === 0) {
+      if (shieldedWatch && !wroteAny(accepted)) {
+        return finishConfirmed('BUYER_INBOX_SHIELDED', true);
+      }
       if (!needWatch || sawWatch) {
         return finishConfirmed(wroteAny(accepted) ? 'BUYER_INBOX_PUBLISHED' : 'BUYER_INBOX_EMPTY', true);
       }
@@ -257,6 +281,9 @@ async function drainBuyerInbox({
     if (needWatch && watchedStillPending(pending, watch)) sawWatch = true;
     const watchClear = !needWatch || !watchedStillPending(pending, watch);
     if (watchClear && (pending.length === 0 || needWatch)) {
+      if (shieldedWatch && !wroteAny(accepted)) {
+        return finishConfirmed('BUYER_INBOX_SHIELDED', true);
+      }
       return finishConfirmed(
         pending.length === 0 && !wroteAny(accepted) ? 'BUYER_INBOX_EMPTY' : 'BUYER_INBOX_PUBLISHED',
         true,
@@ -269,6 +296,9 @@ async function drainBuyerInbox({
   pending = actionableItems(await fetchPending());
   if (needWatch && watchedStillPending(pending, watch)) sawWatch = true;
   if (pending.length === 0 && (!needWatch || sawWatch)) {
+    if (shieldedWatch && !wroteAny(accepted)) {
+      return finishConfirmed('BUYER_INBOX_SHIELDED', true);
+    }
     return finishConfirmed(wroteAny(accepted) ? 'BUYER_INBOX_PUBLISHED' : 'BUYER_INBOX_EMPTY', true);
   }
   if (needWatch && !watchedStillPending(pending, watch) && (sawWatch || wroteAny(accepted))) {
@@ -294,4 +324,5 @@ module.exports = {
   selectInboxWriteSet,
   drainMessage,
   drainBuyerInbox,
+  buyerInboxWatch,
 };

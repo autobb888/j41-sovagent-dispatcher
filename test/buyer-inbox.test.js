@@ -9,6 +9,7 @@ const {
   selectInboxWriteSet,
   drainMessage,
   drainBuyerInbox,
+  buyerInboxWatch,
 } = require('../src/buyer-inbox.js');
 
 const job = (id, hash) => ({ id, type: 'job_record', jobHash: hash, status: 'pending' });
@@ -240,4 +241,49 @@ test('timeout with rows still pending is not success', async () => {
   });
   assert.equal(result.ok, false);
   assert.equal(result.code, 'BUYER_INBOX_PENDING');
+});
+
+test('a shielded hire does not wait for a buyer copy', async () => {
+  const watched = buyerInboxWatch(
+    { id: 'job-1', jobHash: 'h-shield', payment: { kind: 'shielded' } },
+    ['job_record', 'review', 'attestation'],
+  );
+  assert.equal(watched.shielded, true);
+  assert.deepEqual(watched.types, []);
+  assert.equal(watched.required, false);
+
+  const s = scripted({ pages: [[]], batches: [] });
+  const result = await drainBuyerInbox({
+    ...s,
+    timeoutMs: 0,
+    confirmTimeoutMs: 0,
+    watch: watched,
+    buyerId: 'mac',
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.code, 'BUYER_INBOX_SHIELDED');
+  assert.equal(s.calls.length, 0);
+  const line = drainMessage(result);
+  assert.doesNotMatch(line, /not in the buyer inbox yet/);
+  assert.doesNotMatch(line, /seller accept copies the review/);
+  assert.doesNotMatch(line, /BUYER_INBOX_WAITING/);
+});
+
+test('a transparent watch still reports a missing copy', async () => {
+  const watched = buyerInboxWatch(
+    { id: 'job-1', jobHash: 'missing', payment: { kind: 'transparent' } },
+    ['review', 'attestation'],
+  );
+  assert.equal(watched.shielded, false);
+  assert.equal(watched.required, true);
+  const s = scripted({ pages: [[]], batches: [] });
+  const result = await drainBuyerInbox({
+    ...s,
+    timeoutMs: 0,
+    confirmTimeoutMs: 0,
+    watch: { jobHash: 'missing', types: ['review', 'attestation'], required: true },
+    buyerId: 'mac',
+  });
+  assert.equal(result.code, 'BUYER_INBOX_WAITING');
+  assert.match(drainMessage(result), /seller accept copies the review/);
 });

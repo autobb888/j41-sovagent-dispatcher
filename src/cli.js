@@ -3703,13 +3703,16 @@ function buyerInboxTimeoutMs() {
 async function jobContentWatch(agent, jobId, types) {
   let jobHash = null;
   let id = jobId;
+  let job = null;
   try {
-    const job = await agent.client.getJob(jobId);
+    job = await agent.client.getJob(jobId);
     if (job) {
       jobHash = job.jobHash || null;
       id = job.id || jobId;
     }
   } catch { /* id alone still matches vdxfData.jobId */ }
+  const { buyerInboxWatch } = require('./buyer-inbox');
+  if (isShieldedHire(job)) return buyerInboxWatch(job, types);
   return { jobId: id, jobHash, types, required: true };
 }
 
@@ -3891,6 +3894,7 @@ async function offerBuyerReview({
   let submitted;
   let sessionId = null;
   let jobHash = null;
+  let job = null;
   if (mode === 'session') {
     const { submitBuyerApiSessionReview } = require('./buyer-review-session');
     const { loadAccessGrant } = require('./buyer-access');
@@ -3910,7 +3914,7 @@ async function offerBuyerReview({
   } else {
     const { submitBuyerJobReview } = require('./buyer-review');
     try {
-      const job = await agent.client.getJob(jobId);
+      job = await agent.client.getJob(jobId);
       jobHash = job && job.jobHash;
     } catch { /* submit reports the same failure */ }
     submitted = await submitBuyerJobReview({
@@ -3923,23 +3927,39 @@ async function offerBuyerReview({
     });
   }
   if (!submitted.ok) return submitted;
+  const shieldedHire = isShieldedHire(job);
   if (!(options && options.json)) {
     say(`✅ Review submitted (${submitted.result && (submitted.result.inboxId || submitted.result.id) || 'ok'})`);
-    if (submitted.inboxWarning) say(`   ${submitted.inboxWarning}`);
+    if (submitted.inboxWarning && !shieldedHire) say(`   ${submitted.inboxWarning}`);
   }
-  const written = await finishReviewWrite({
-    client: agent.client,
-    seller,
-    jobHash,
-    sessionId,
-    baselineCount: baseline,
-    timeoutMs: process.env.NODE_ENV === 'test' ? 0 : (mode === 'session' ? 15000 : REVIEW_COUNT_TIMEOUT_MS),
-    intervalMs: process.env.NODE_ENV === 'test' ? 0 : REVIEW_COUNT_INTERVAL_MS,
-    onProgress: reviewCountProgress(say),
-  });
-  const line = reviewWriteMessage(written);
-  if (written.ok) {
+  let written;
+  let line;
+  if (shieldedHire) {
+    const { shieldedReviewStoredMessage } = require('./review-close');
+    line = shieldedReviewStoredMessage();
+    written = {
+      ok: true,
+      code: 'REVIEW_STORED_PRIVATE',
+      count: baseline,
+      baseline: baseline,
+      message: line,
+    };
     if (!(options && options.json)) say(`✅ ${line}`);
+  } else {
+    written = await finishReviewWrite({
+      client: agent.client,
+      seller,
+      jobHash,
+      sessionId,
+      baselineCount: baseline,
+      timeoutMs: process.env.NODE_ENV === 'test' ? 0 : (mode === 'session' ? 15000 : REVIEW_COUNT_TIMEOUT_MS),
+      intervalMs: process.env.NODE_ENV === 'test' ? 0 : REVIEW_COUNT_INTERVAL_MS,
+      onProgress: reviewCountProgress(say),
+    });
+    line = reviewWriteMessage(written);
+    if (written.ok) {
+      if (!(options && options.json)) say(`✅ ${line}`);
+    }
   }
   let buyerInbox = null;
   if (mode === 'job' && jobId) {
@@ -4089,20 +4109,34 @@ program
     });
     if (!result.ok) fail(result.code, result.message, { jobId: result.jobId, status: result.status });
     say(`✅ Review submitted (${result.result && (result.result.inboxId || result.result.id) || 'ok'})`);
-    if (result.inboxWarning) say(`   ${result.inboxWarning}`);
-    const written = await finishReviewWrite({
-      client: agent.client,
-      seller,
-      jobHash: job.jobHash,
-      baselineCount: baseline,
-      timeoutMs: process.env.NODE_ENV === 'test' ? 0 : REVIEW_COUNT_TIMEOUT_MS,
-      intervalMs: process.env.NODE_ENV === 'test' ? 0 : REVIEW_COUNT_INTERVAL_MS,
-      onProgress: reviewCountProgress(say),
-    });
-    const line = reviewWriteMessage(written);
-    if (written.ok) say(`✅ ${line}`);
-    else console.error(`❌ ${line}`);
-    if (!written.ok) process.exitCode = 1;
+    const shieldedHire = isShieldedHire(job);
+    if (result.inboxWarning && !shieldedHire) say(`   ${result.inboxWarning}`);
+    let written;
+    if (shieldedHire) {
+      const { shieldedReviewStoredMessage } = require('./review-close');
+      written = {
+        ok: true,
+        code: 'REVIEW_STORED_PRIVATE',
+        count: baseline,
+        baseline: baseline,
+        message: shieldedReviewStoredMessage(),
+      };
+      say(`✅ ${written.message}`);
+    } else {
+      written = await finishReviewWrite({
+        client: agent.client,
+        seller,
+        jobHash: job.jobHash,
+        baselineCount: baseline,
+        timeoutMs: process.env.NODE_ENV === 'test' ? 0 : REVIEW_COUNT_TIMEOUT_MS,
+        intervalMs: process.env.NODE_ENV === 'test' ? 0 : REVIEW_COUNT_INTERVAL_MS,
+        onProgress: reviewCountProgress(say),
+      });
+      const line = reviewWriteMessage(written);
+      if (written.ok) say(`✅ ${line}`);
+      else console.error(`❌ ${line}`);
+      if (!written.ok) process.exitCode = 1;
+    }
     const buyerInbox = await publishBuyerContentMaps({
       agent, buyerAgentId, options, say,
       watch: await jobContentWatch(agent, job.id, ['job_record', 'review', 'attestation']),

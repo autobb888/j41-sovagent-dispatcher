@@ -127,6 +127,10 @@ async function waitForWrittenReview({
   }
 }
 
+function shieldedReviewStoredMessage() {
+  return 'Review stored. It stays off the public list, and chainReviewCount does not move.';
+}
+
 function reviewWriteMessage(result) {
   if (!result) return 'Review was not checked.';
   if (result.skipped) return 'Review skipped.';
@@ -193,6 +197,7 @@ module.exports = {
   readReviewBaseline,
   waitForWrittenReview,
   reviewWriteMessage,
+  shieldedReviewStoredMessage,
   finishReviewWrite,
   REVIEW_COUNT_TIMEOUT_MS,
   REVIEW_COUNT_INTERVAL_MS,
