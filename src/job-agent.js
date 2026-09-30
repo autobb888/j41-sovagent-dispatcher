@@ -51,8 +51,11 @@ const IDENTITY = process.env.J41_IDENTITY;
 const JOB_ID = process.env.J41_JOB_ID;
 const TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS || '3600000');
 const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '480000'); // idle → pause (8 min, before backend's 10-min auto-deliver)
-// A job that stays `accepted` cannot be paused. After the buyer has been
-// answered, deliver on a short quiet period instead of the full pause TTL.
+// After this container answers the hire, deliver on a short quiet period.
+// A verified payment is already in_progress before the first container
+// starts, so that close covers in_progress as well as accepted. A later
+// resume that already has a real seller answer does not set hireAnswered,
+// and the long idle still pauses that chat.
 const ACCEPTED_QUIET_MS = 90_000;
 const ACCEPTED_IDLE_NOTE = 'This job is still accepted, so it cannot be paused. Delivering the work so far.';
 
@@ -88,6 +91,53 @@ function quietDeliverReady({
   if (checked) return false;
   if (!(messageCount > 0 || hireAnswered)) return false;
   return idleMs >= quietMs && idleMs < idleLimit;
+}
+
+// The idle notice, a greeting, a file line, and a dispute note are not the
+// hire answer. A paused job whose only seller line is one of these still
+// has the first work ahead of it.
+function isCannedWorkerLine(text) {
+  const s = String(text || '').trim();
+  if (!s) return true;
+  if (/^Session going idle\b/.test(s)) return true;
+  if (/^📎 Uploaded file:/.test(s) || /^Uploaded file:/.test(s)) return true;
+  if (s.startsWith('⚠️')) return true;
+  if (/^\[DISPUTE\b/.test(s)) return true;
+  if (/^Resuming this job\b/.test(s)) return true;
+  if (/^I experienced an issue processing your message\./.test(s)) return true;
+  if (/^I'm sorry, I can't share that information\./.test(s)) return true;
+  if (/^Hello! I'm your Verus agent\./.test(s)) return true;
+  if (/^Hello! I've accepted your job:/.test(s)) return true;
+  if (/^Hi, I'm your J41 assistant/.test(s) && s.length <= 180) return true;
+  return false;
+}
+
+function priorSellerWork(messages, speakerIds) {
+  const ids = new Set((speakerIds || []).filter((s) => typeof s === 'string' && s.length > 0));
+  if (ids.size === 0) return false;
+  for (const m of messages || []) {
+    if (!m || typeof m !== 'object') continue;
+    if (m.type === 'system' || m.type === 'file') continue;
+    const sender = m.senderVerusId || m.sender_verus_id;
+    if (!ids.has(sender)) continue;
+    const text = String(m.content || '');
+    if (isOutageReply(text) || isCannedWorkerLine(text)) continue;
+    return true;
+  }
+  return false;
+}
+
+// Payment sets in_progress before the first container. That status is not
+// a reconnect. Skip the hire answer only when this seller already did the
+// work, or a delivery is already stored.
+function skipsFirstWork({ status, messages, speakerIds, hasDelivery = false } = {}) {
+  if (status !== 'in_progress') return false;
+  if (hasDelivery) return true;
+  return priorSellerWork(messages, speakerIds);
+}
+
+function answeredHireCanClose(status) {
+  return status === 'accepted' || status === 'in_progress';
 }
 
 function labourExtensionClosed(status) {
@@ -1002,6 +1052,8 @@ async function main() {
   let result;
   try {
     job.status = fullJob.status; // pass current status so processJob knows if this is a reconnect
+    job.deliveryHash = fullJob && fullJob.delivery && fullJob.delivery.hash ? fullJob.delivery.hash : null;
+    job.sellerVerusId = fullJob && fullJob.sellerVerusId ? fullJob.sellerVerusId : null;
     result = await processJob(job, agent, soulPrompt, executor, (resolve) => { setSessionEndResolve(resolve); });
     log.info('Work completed', { jobId: JOB_ID });
 
@@ -1290,8 +1342,27 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
     }
   }
 
-  // Initialize executor (sends greeting on first connect, skips on reconnect)
-  const isReconnect = job.status === 'in_progress';
+  // Initialize executor (sends greeting on first connect, skips on reconnect).
+  // in_progress alone is the paid state, not proof a previous container spoke.
+  let priorMessages = [];
+  if (agent && agent.client && typeof agent.client.getChatMessages === 'function') {
+    try {
+      const histRes = await agent.client.getChatMessages(job.id, { limit: 100 });
+      priorMessages = histRes && Array.isArray(histRes.data) ? histRes.data
+        : (Array.isArray(histRes) ? histRes : []);
+    } catch (e) {
+      console.warn(`[CHAT] Could not read prior messages (${e && e.message ? e.message : e}) — this start will answer the hire`);
+    }
+  }
+  const isReconnect = skipsFirstWork({
+    status: job.status,
+    messages: priorMessages,
+    speakerIds: [agent && agent.iAddress, agent && agent.identityName, job.sellerVerusId],
+    hasDelivery: !!(job.deliveryHash || (job.delivery && job.delivery.hash)),
+  });
+  if (job.status === 'in_progress' && !isReconnect) {
+    console.log('[CHAT] No seller answer on this hire yet — doing the first work');
+  }
   await executor.init(job, agent, soulPrompt, { isReconnect });
   // The hire description is the whole task. The greeting only introduces
   // the worker. Answer the description before the 90s close, or the zip
@@ -1546,9 +1617,9 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
       _acceptedQuietChecked = true;
       let quietStatus = null;
       try { quietStatus = (await agent.client.getJob(job.id))?.status; } catch { /* full idle still runs */ }
-      if (quietStatus === 'accepted') {
+      if (answeredHireCanClose(quietStatus)) {
         _idlePauseUnsupported = true;
-        log.warn('Accepted job quiet after a reply — delivering', { jobId: job.id, idleSec: Math.round(idleMs / 1000) });
+        log.warn('Answered hire is quiet — delivering', { jobId: job.id, status: quietStatus, idleSec: Math.round(idleMs / 1000) });
         if (resolveSession) resolveSession('idle-pause-refused');
         return;
       }
@@ -2600,5 +2671,5 @@ if (require.main === module) {
 // Export testable helpers when running under NODE_ENV=test.
 // Avoids shipping a test seam in production while keeping coverage honest.
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach, isTerminalAttachError, ATTACH_CONFIRM_BACKOFF_MS, resumeJob, ensureChatConnected, containDownload, labourExtensionClosed, requestBudgetExtension, ACCEPTED_IDLE_NOTE, hireAnswerStartsQuiet, quietDeliverReady, ACCEPTED_QUIET_MS };
+  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach, isTerminalAttachError, ATTACH_CONFIRM_BACKOFF_MS, resumeJob, ensureChatConnected, containDownload, labourExtensionClosed, requestBudgetExtension, ACCEPTED_IDLE_NOTE, hireAnswerStartsQuiet, quietDeliverReady, skipsFirstWork, answeredHireCanClose, ACCEPTED_QUIET_MS };
 }
