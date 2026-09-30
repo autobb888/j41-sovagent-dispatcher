@@ -93,11 +93,11 @@ function wroteAny(counts) {
 }
 
 /** One live row of each content-map key. Dead-lettered ids are not fetched again. */
-function selectInboxWriteSet(pending, isDead) {
+function selectInboxWriteSet(pending, isDead, types = BUYER_INBOX_TYPES) {
   const picked = {};
   const quarantined = [];
   for (const it of pending || []) {
-    if (!it || !BUYER_INBOX_TYPES.includes(it.type)) continue;
+    if (!it || !types.includes(it.type)) continue;
     if (typeof isDead === 'function' && isDead(it.id)) {
       quarantined.push(it.id);
       continue;

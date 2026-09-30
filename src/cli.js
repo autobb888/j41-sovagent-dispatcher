@@ -13399,6 +13399,21 @@ async function dispatchInboxAccept(agent, item, deps) {
     console.log(`[Inbox] ✅ Job record written on-chain`);
     return { accepted: true };
   }
+  if (item.type === 'reputation_tally') {
+    const { acceptReputationTallyItem, reputationTallyKeys } = require('./reputation-tally-inbox');
+    const loaded = reputationTallyKeys();
+    if (!loaded || loaded.recordId !== 'iLbUN8TFvMZR9uaZYY1qBmL99bJE2uYdad') {
+      throw new Error('reputation tally note record id is not iLbUN8TFvMZR9uaZYY1qBmL99bJE2uYdad');
+    }
+    if (!deps || typeof deps !== 'object') {
+      throw new Error('reputation_tally write is not wired');
+    }
+    deps.keys = { tally: loaded.tally, prose: loaded.prose };
+    console.log(`[Inbox] Processing reputation tally ${item.id}`);
+    const accepted = await acceptReputationTallyItem(item, deps);
+    console.log(`[Inbox] ✅ Reputation tally accepted`);
+    return accepted;
+  }
   return { accepted: false };
 }
 
@@ -13420,7 +13435,7 @@ async function dispatchInboxAccept(agent, item, deps) {
  * `deps` is injected so the whole function is testable with no daemon or chain.
  */
 /** The only inbox types that result in an on-chain write. */
-const INBOX_ACTIONABLE_TYPES = ['review', 'attestation', 'job_record'];
+const INBOX_ACTIONABLE_TYPES = ['review', 'attestation', 'job_record', 'reputation_tally'];
 
 async function processInboxForAgent(agent, agentInfo, pending, state, deps = {}) {
   const now = deps.now || Date.now;
@@ -13476,7 +13491,7 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
   // One of each key. Detailing every pending job_record trips the inbox
   // rate limit and still only one of each key can fit in the identity tx.
   const { selectInboxWriteSet } = require('./buyer-inbox');
-  const selected = selectInboxWriteSet(pending, (id) => isDeadLettered(state._inboxFailures, id));
+  const selected = selectInboxWriteSet(pending, (id) => isDeadLettered(state._inboxFailures, id), INBOX_ACTIONABLE_TYPES);
   if (selected.chosen.length === 0) {
     return { nothingWritable: true, quarantined: selected.quarantined };
   }
@@ -13521,6 +13536,26 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
         continue;
       }
     }
+    // The SDK copies inbox hex and does not know these fields. Refuse here so
+    // a buyer, address, job, or amount never enters the one identity update.
+    if (it.type === 'reputation_tally') {
+      try {
+        const { planReputationTallyAdditions, reputationTallyKeys } = require('./reputation-tally-inbox');
+        let detail = it;
+        if (agent.client && typeof agent.client.getInboxItem === 'function') {
+          const res = await agent.client.getInboxItem(it.id);
+          detail = (res && res.data) || it;
+        }
+        planReputationTallyAdditions(detail, reputationTallyKeys());
+      } catch (e) {
+        if (e && (e.statusCode === 429 || /too many requests/i.test(e.message || ''))) {
+          rateLimited = true;
+          console.warn(`[Inbox] reputation_tally ${String(it.id).substring(0, 8)} rate limited — retrying this id only`);
+        } else if (classifyInboxFailure(e) === 'hard') noteFailure(it.id, 'reputation_tally', e.message);
+        else console.warn(`[Inbox] reputation_tally ${String(it.id).substring(0, 8)} gate transient (uncounted): ${e.message}`);
+        continue;
+      }
+    }
     batch.push({ id: it.id, type: it.type });
   }
   if (batch.length === 0) {
@@ -13532,9 +13567,15 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
   if (typeof agent.acceptInboxBatch !== 'function') {
     for (const ref of batch) {
       try {
-        const r = await dispatchInboxAccept(agent, ref, {
+        const acceptDeps = {
           verifyInboxJobRecord: deps.verifyInboxJobRecord, verifyWitness: deps.verifyWitness, network: deps.network,
-        });
+        };
+        // No acceptInboxBatch on this path, so do not invent a second identity
+        // update. A caller-supplied writer is the only reputation_tally write.
+        if (ref.type === 'reputation_tally' && typeof deps.writeIdentityAdditions === 'function') {
+          acceptDeps.writeIdentityAdditions = deps.writeIdentityAdditions;
+        }
+        const r = await dispatchInboxAccept(agent, ref, acceptDeps);
         // Preserve the original contract: a transient skip is neither counted NOR
         // cleared. Clearing would wipe accumulated attempts, so a flapping item
         // could never reach the dead-letter threshold.
@@ -13643,6 +13684,7 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
       if (type === 'review') console.log(`[Inbox] ✅ Review accepted ${id}`);
       else if (type === 'attestation') console.log(`[Inbox] ✅ Attestation accepted ${id}`);
       else if (type === 'job_record') console.log(`[Inbox] ✅ Job record accepted ${id}`);
+      else if (type === 'reputation_tally') console.log(`[Inbox] ✅ Reputation tally accepted ${id}`);
     }
     console.log(`[Inbox] ✅ ${agentInfo.id}: ${res.acked.length} item(s) accepted${res.txid ? ` in tx ${String(res.txid).slice(0, 8)}` : ' (already on-chain)'}`);
   }
@@ -13881,7 +13923,7 @@ async function runInboxSweep(state) {
       // and a `const` referenced above its declaration is a TDZ ReferenceError,
       // not a hoisted undefined.
       const { verifyWitness } = require('@junction41/sovagent-sdk/dist/index.js');
-      // Filter server-side to the three types that cause chain writes. Informational
+      // Filter server-side to the types that cause chain writes. Informational
       // items (job_accepted / job_delivered / notification) are never consumed and
       // accumulate — the platform returns newest-first, so a large informational
       // backlog would push a genuine review past the 20-row window and make it
@@ -13889,7 +13931,7 @@ async function runInboxSweep(state) {
       // param, so this is safe to ship ahead of it.
       const inbox = await agent.client.getInbox('pending', 20, INBOX_ACTIONABLE_TYPES);
       const pending = (inbox?.data || []).filter(
-        item => item.type === 'review' || item.type === 'job_record' || item.type === 'attestation'
+        item => INBOX_ACTIONABLE_TYPES.includes(item.type)
       );
       if (pending.length === 0) {
         // Still evaluate the pending-write gate: it is what clears a confirmed

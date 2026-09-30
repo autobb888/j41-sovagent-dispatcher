@@ -78,6 +78,8 @@ const VDXF_KEY_NAMES = {
   'iD3quozCGbzJyZ29uvRCeecr12np2dMsvN': 'agent.profileCategory',
   'iFxerhcrMr2e5eWyvHiXuWHXj2dnhEZF8p': 'agent.disputePolicy',
   'iLbUN8TFvMZR9uaZYY1qBmL99bJE2uYdad': 'review.record',
+  'i5rdLDZkDHRax2x1UYavwfViR1cE81fjVw': 'review.tally',
+  'i6bAtZMcPqgJq7VJQx8ysADCs4CW3LJz76': 'review.prose',
   'i6PC1B9vgVf8bLtHcdsNunLtr6ibtnL7ZC': 'bounty.record',
   'iE8Z7gZmAs4NU8AqEJzV9MWHUCoUBQqfum': 'bounty.application',
   'iMs3n1aCWQh5rmkXCNLRi8WqbzZrq3F7Ye': 'platform.config',
@@ -539,6 +541,8 @@ const ALL_VDXF_KEYS = [
   { iAddr: 'i8xp9AgvueoAHyYXbxNACMgRQfEXF82V5D', name: 'workspace.attestation' },
   // Records
   { iAddr: 'iLbUN8TFvMZR9uaZYY1qBmL99bJE2uYdad', name: 'review.record' },
+  { iAddr: 'i5rdLDZkDHRax2x1UYavwfViR1cE81fjVw', name: 'review.tally' },
+  { iAddr: 'i6bAtZMcPqgJq7VJQx8ysADCs4CW3LJz76', name: 'review.prose' },
   { iAddr: 'iPsXc7vcBzAxyjFYfPAs9PUtMLh1EJPHSn', name: 'job.record' },
   { iAddr: 'i6PC1B9vgVf8bLtHcdsNunLtr6ibtnL7ZC', name: 'bounty.record' },
   { iAddr: 'iE8Z7gZmAs4NU8AqEJzV9MWHUCoUBQqfum', name: 'bounty.application' },
