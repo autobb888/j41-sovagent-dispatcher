@@ -268,7 +268,21 @@ function buildAgents(state) {
   return { agents };
 }
 
+const EARNINGS_TTL_MS = 60000;
+
+function shouldRefreshEarnings(cachedAt, now, ttlMs) {
+  return cachedAt == null || now - cachedAt >= ttlMs;
+}
+
+// Last earnings summary, reused for 60 seconds.
+const earningsCache = { at: null, body: null };
+
 async function buildEarnings(state, getAgentSession) {
+  const now = Date.now();
+  if (!shouldRefreshEarnings(earningsCache.at, now, EARNINGS_TTL_MS)) {
+    return earningsCache.body;
+  }
+
   const earnings = { agents: [], total: { jobs: 0, earned: 0, tokenCost: 0 } };
   for (const agentInfo of state.agents) {
     try {
@@ -292,6 +306,8 @@ async function buildEarnings(state, getAgentSession) {
     }
   }
   earnings.total.earned = Math.round(earnings.total.earned * 1000) / 1000;
+  earningsCache.at = Date.now();
+  earningsCache.body = earnings;
   return earnings;
 }
 
@@ -881,6 +897,8 @@ module.exports = {
   buildAgents,
   buildUpstreamHealth,
   buildEarnings,
+  shouldRefreshEarnings,
+  EARNINGS_TTL_MS,
   buildHealthDocument,
   buildInboxSurface,
   buildDepositSurface,
