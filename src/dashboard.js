@@ -1432,7 +1432,31 @@ async function addAgentScreen(inquirer) {
   }
 
   if (signupStopsAtIdentity(purpose)) {
-    await hireScreen(inquirer);
+    console.log(`\n  ─── Creating listing ───`);
+    console.log(`  Kind:     ${kind}`);
+    console.log(`  ID:       ${agentId}`);
+    console.log(`  Identity: ${preview}`);
+    console.log('');
+
+    const { confirm } = await promptWithEsc(inquirer, [{ type: 'confirm', name: 'confirm', message: 'Proceed with setup?', default: false }]);
+    if (!confirm) return;
+
+    try {
+      console.log('');
+      console.log('  ℹ️  Registration waits for block confirmations (can take 5-20 min).');
+      console.log('  Press Ctrl+C to return to menu — registration continues on the platform.\n');
+      const setupArgs = [process.argv[1], 'setup', agentId, name, '--kind', 'agent', '--profile-name', name, '--profile-description', 'Buyer identity'];
+      const exitCode = await runCommandAsync(process.execPath, setupArgs);
+      if (exitCode === 0) {
+        await hireScreen(inquirer);
+        return;
+      }
+      console.log(`\n  ❌ Setup failed (exit code ${exitCode}).`);
+      console.log('     If registration was in progress, use "Retry Registration" from the agent detail screen.\n');
+    } catch (e) {
+      console.log(`\n  ❌ Setup failed: ${e.message}\n`);
+    }
+    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
     return;
   }
 
