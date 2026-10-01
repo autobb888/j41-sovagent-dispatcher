@@ -302,6 +302,11 @@ async function connectWithHello({ host, port, token, connect }) {
 
 // The hello is the first line on the outbound socket. Call immediately after attach 200.
 async function attachAndDial(opts = {}) {
+  const localPort = Number(opts.localPort);
+  const localHost = opts.localHost || '127.0.0.1';
+  if (!Number.isInteger(localPort) || localPort < 1) {
+    throw Object.assign(new Error('COMPUTE_EDGE_NO_LOCAL: local SSH port required'), { code: 'COMPUTE_EDGE_NO_LOCAL' });
+  }
   const attached = await challengeAndAttach(opts);
   const connect = typeof opts.connect === 'function' ? opts.connect : defaultConnect;
   const remote = await connectWithHello({
@@ -310,12 +315,6 @@ async function attachAndDial(opts = {}) {
     token: attached.token,
     connect,
   });
-  const localPort = Number(opts.localPort);
-  const localHost = opts.localHost || '127.0.0.1';
-  if (!Number.isInteger(localPort) || localPort < 1) {
-    try { remote.destroy(); } catch { /* ignore */ }
-    throw Object.assign(new Error('COMPUTE_EDGE_NO_LOCAL: local SSH port required'), { code: 'COMPUTE_EDGE_NO_LOCAL' });
-  }
   const held = holdRemoteToLocal(remote, { localHost, localPort, connect });
   return { ...attached, remote, get local() { return held.local; }, stopHold: held.stop };
 }

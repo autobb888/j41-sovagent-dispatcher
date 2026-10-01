@@ -147,6 +147,27 @@ test('attachAndDial writes the hello as the first bytes on the seller dial', asy
   assert.equal(prefixOf(writes), `${HELLO}\n`);
 });
 
+test('attachAndDial does not attach when the local port is missing', async () => {
+  let requests = 0;
+  const client = {
+    async request() {
+      requests += 1;
+      return {};
+    },
+  };
+  await assert.rejects(
+    () => attachAndDial({
+      client,
+      jobId: 'job-1',
+      signMessage: async () => 'sig',
+      localPort: 0,
+      connect: () => { throw new Error('should not connect'); },
+    }),
+    (err) => err && err.code === 'COMPUTE_EDGE_NO_LOCAL',
+  );
+  assert.equal(requests, 0);
+});
+
 test('attachAndDial does not connect when the hello is missing', async () => {
   let connects = 0;
   const client = {
