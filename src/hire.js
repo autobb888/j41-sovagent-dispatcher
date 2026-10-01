@@ -91,6 +91,71 @@ function paymentOutputs(job, amount) {
   return outputs;
 }
 
+/**
+ * The seller output must be the address stored on the job. Do not swap an
+ * i-address for the primary R-address before sendMultiPayment.
+ */
+function assertPaysJobAddress(outputs, job) {
+  const expected = job && job.payment && job.payment.address;
+  const seller = outputs && outputs[0] && outputs[0].address;
+  if (typeof expected !== 'string' || expected.length === 0 || seller !== expected) {
+    throw new Error('PAY_ADDRESS_MISMATCH: seller output is not job.payment.address');
+  }
+  return outputs;
+}
+
+/**
+ * Transparent addresses controlled by one identity: the i-address and every
+ * primary R-address, plus any extra already resolved. A z-address is not a
+ * transparent recipient. Accepts getIdentityKeys ({ iaddress, primaryAddresses })
+ * or a getidentity body ({ identityaddress, primaryaddresses }).
+ */
+function identityReceivingAddresses(identity, extras) {
+  const out = [];
+  const seen = new Set();
+  const add = (addr) => {
+    if (typeof addr !== 'string') return;
+    const trimmed = addr.trim();
+    if (!trimmed || trimmed.startsWith('z')) return;
+    if (seen.has(trimmed)) return;
+    seen.add(trimmed);
+    out.push(trimmed);
+  };
+  const id = identity && typeof identity === 'object'
+    ? (identity.identity && typeof identity.identity === 'object' ? identity.identity : identity)
+    : null;
+  if (id) {
+    add(id.identityaddress || id.iaddress || id.iAddress);
+    const primaries = id.primaryaddresses || id.primaryAddresses;
+    if (Array.isArray(primaries)) {
+      for (const addr of primaries) add(addr);
+    }
+  }
+  if (Array.isArray(extras)) {
+    for (const addr of extras) add(addr);
+  }
+  return out;
+}
+
+/**
+ * Spend-gate recipient list for a seller. getIdentityKeys(sellerId) is the
+ * seller; getIdentityRaw() is the logged-in agent and must not be used here.
+ * A failed lookup keeps the addresses already resolved.
+ */
+async function loadSellerRecipientSet(client, sellerId, fallback) {
+  const base = identityReceivingAddresses(null, fallback);
+  if (!client || typeof client.getIdentityKeys !== 'function' || typeof sellerId !== 'string' || !sellerId) {
+    return base;
+  }
+  try {
+    const keys = await client.getIdentityKeys(sellerId);
+    const widened = identityReceivingAddresses(keys, base);
+    return widened.length ? widened : base;
+  } catch {
+    return base;
+  }
+}
+
 function localBuyers(ids, loadKeys) {
   const out = [];
   for (const id of ids || []) {
@@ -251,6 +316,9 @@ module.exports = {
   assertHireAllowed,
   assertAccessAllowed,
   paymentOutputs,
+  assertPaysJobAddress,
+  identityReceivingAddresses,
+  loadSellerRecipientSet,
   isVerusAddr,
   localBuyers,
   defaultServiceTypeForKind,

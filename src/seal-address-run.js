@@ -7,6 +7,20 @@ const { ensureSeed, storeJobKey } = require('./seal-address-store');
 
 const LIB_URL = pathToFileURL(path.join(__dirname, 'vendor', 'veruszsupportlib', 'index.mjs')).href;
 
+// zip32 rejects an index >= 2^31 ("unreachable"). Clearing the high bit keeps
+// an already-posted index below 2^31 unchanged.
+const ZIP32_INDEX_MASK = 0x7fffffff;
+
+function maskEncryptionIndex(index) {
+  return (Number(index) >>> 0) & ZIP32_INDEX_MASK;
+}
+
+function sealIndexError() {
+  const err = new Error('Seal address derivation was rejected by the zip32 library');
+  err.code = 'SEAL_INDEX';
+  return err;
+}
+
 async function deriveJobAddress(seed, partyId, jobId, role = 'buyer') {
   if (role !== 'buyer' && role !== 'seller') {
     const err = new Error('Seal role is not buyer or seller');
@@ -18,14 +32,21 @@ async function deriveJobAddress(seed, partyId, jobId, role = 'buyer') {
   const lib = await import(LIB_URL);
   const fromId = crypto.createHash('sha256').update(String(partyId)).digest().subarray(0, 20);
   const toId = crypto.createHash('sha256').update(String(jobId)).digest().subarray(0, 20);
-  const encryptionIndex = crypto.createHash('sha256').update(`${jobId}:${role}`).digest().readUInt32BE(0);
-  const keys = lib.z_getEncryptionAddress({
-    seed,
-    fromId,
-    toId,
-    encryptionIndex,
-    returnSecret: false,
-  });
+  const encryptionIndex = maskEncryptionIndex(
+    crypto.createHash('sha256').update(`${jobId}:${role}`).digest().readUInt32BE(0),
+  );
+  let keys;
+  try {
+    keys = lib.z_getEncryptionAddress({
+      seed,
+      fromId,
+      toId,
+      encryptionIndex,
+      returnSecret: false,
+    });
+  } catch {
+    throw sealIndexError();
+  }
   if (keys.spendingKey) {
     const err = new Error('Derivation returned a spend key');
     err.code = 'SEAL_SPEND';
@@ -76,6 +97,8 @@ function publishSellerSealAddress({ agentDir, sellerId, jobId, post, yes }) {
 
 module.exports = {
   deriveJobAddress,
+  maskEncryptionIndex,
+  sealIndexError,
   publishBuyerSealAddress,
   publishSellerSealAddress,
 };

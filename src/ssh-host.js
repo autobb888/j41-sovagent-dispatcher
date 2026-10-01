@@ -128,6 +128,33 @@ function probeSshHost({ host, port } = {}, opts = {}) {
   });
 }
 
+function rentalAccessBody(access) {
+  if (!access || typeof access !== 'object') return {};
+  if (access.data && typeof access.data === 'object' && !access.ssh) return access.data;
+  return access;
+}
+
+function rentalAccessView(access) {
+  const { host, port } = rentalSshFromAccess(access);
+  const ssh = rentalAccessBody(access).ssh;
+  const row = ssh && typeof ssh === 'object' ? ssh : {};
+  return {
+    host,
+    port,
+    user: row.user,
+    privateKey: typeof row.privateKey === 'string' ? row.privateKey : '',
+  };
+}
+
+function rentalAccessPrintLines(view) {
+  const v = view || {};
+  return [
+    `Host: ${v.host == null ? '' : v.host}`,
+    `Port: ${v.port == null ? '' : v.port}`,
+    `User: ${v.user == null ? '' : v.user}`,
+  ];
+}
+
 function rentalSshFromAccess(access) {
   if (!access || typeof access !== 'object') return { host: undefined, port: undefined };
   const body = (access.data && typeof access.data === 'object' && !access.ssh)
@@ -215,6 +242,8 @@ module.exports = {
   sshHostnameForAgent,
   probeSshHost,
   rentalSshFromAccess,
+  rentalAccessView,
+  rentalAccessPrintLines,
   leftoverCompleteHonesty,
   completeRentalHonesty,
   formatBuyerCompleteOutput,

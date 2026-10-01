@@ -1,7 +1,11 @@
 'use strict';
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { selectRefundableDisputes, buildDisputeRefundEntry, hasPositiveTokens } = require('../src/dispute-sweep.js');
+const {
+  selectRefundableDisputes, buildDisputeRefundEntry, hasPositiveTokens,
+  unwrapDispute, agreedRefundPercent, alreadyPaid, logUnselectedDisputes,
+  listSellerDisputedJobs, fetchSellerDisputedJobs,
+} = require('../src/dispute-sweep.js');
 
 const disp = { id: 'd1', action: 'pending', raised_by: 'iBUY' };
 const undelivered = { id: 'j1', status: 'disputed', delivery: null, tokenUsage: null, amount: 0.5, currency: 'VRSCTEST', buyerVerusId: 'iBUY' };
@@ -162,6 +166,95 @@ test('M5: an out-of-range agreed percentage is not queued, and says so', () => {
   assert.ok(logged.length >= 6, 'every dropped refund must produce an operator-visible line');
   assert.ok(logged.some(l => /respond-dispute/.test(l)),
     'the message must name the command that fixes it');
+});
+
+test('flat and wrapped refund rows are both selected', () => {
+  const flat = { action: 'refund', refund_percent: 100 };
+  const wrapped = { dispute: { action: 'refund', refund_percent: 100 }, deadline_passed: false };
+  assert.equal(selectRefundableDisputes([job()], { j1: flat }).length, 1);
+  assert.equal(selectRefundableDisputes([job({ id: 'j-wrap' })], { 'j-wrap': wrapped }).length, 1);
+  assert.equal(unwrapDispute(wrapped).action, 'refund');
+  assert.equal(unwrapDispute(wrapped).refund_percent, 100);
+  assert.equal(unwrapDispute(flat), flat);
+  const entry = buildDisputeRefundEntry(job(), wrapped, 'agent-7', target, 'now');
+  assert.equal(entry.refundPercent, 100);
+  assert.match(entry.reason, /SELLER AGREED/);
+});
+
+test('camelCase refund percent and txid are read', () => {
+  assert.equal(agreedRefundPercent({ refundPercent: 40 }), 40);
+  assert.equal(alreadyPaid({ refundTxid: 'abc' }), true);
+  const sel = selectRefundableDisputes([job()], {
+    j1: { action: 'refund', refundPercent: 100, refundTxid: 'paid' },
+  });
+  assert.equal(sel.length, 0);
+  const queued = selectRefundableDisputes([job()], {
+    j1: { action: 'refund', refundPercent: 25 },
+  });
+  assert.equal(queued.length, 1);
+});
+
+test('a fetched dispute that is not selected logs the job prefix and action', () => {
+  const lines = [];
+  logUnselectedDisputes(
+    [{ id: 'abcdef012345', status: 'disputed' }],
+    { abcdef012345: { dispute: { action: 'rework' } } },
+    [],
+    (msg) => lines.push(msg),
+  );
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /abcdef01/);
+  assert.match(lines[0], /action=rework/);
+});
+
+test('seller disputed pages stop on a short page and cap a full scan', async () => {
+  const calls = [];
+  const short = await listSellerDisputedJobs(async ({ limit, offset }) => {
+    calls.push({ limit, offset });
+    if (offset === 0) return Array.from({ length: 20 }, (_, i) => ({ id: `p0-${i}` }));
+    return [{ id: 'p1-0' }];
+  }, { pageSize: 20, maxPages: 10, log: () => { throw new Error('short page must not hit the cap'); } });
+  assert.equal(short.truncated, false);
+  assert.equal(short.jobs.length, 21);
+  assert.deepEqual(calls, [{ limit: 20, offset: 0 }, { limit: 20, offset: 20 }]);
+
+  const logs = [];
+  let n = 0;
+  const capped = await listSellerDisputedJobs(async () => {
+    const page = [];
+    for (let i = 0; i < 20; i++) page.push({ id: `c-${n++}` });
+    return page;
+  }, { pageSize: 20, maxPages: 10, log: (msg) => logs.push(msg) });
+  assert.equal(capped.truncated, true);
+  assert.equal(capped.jobs.length, 200);
+  assert.match(logs[0], /stopped after 10 pages/);
+});
+
+test('fetch paginates with request and falls back to getMyJobs', async () => {
+  const seen = [];
+  const viaRequest = await fetchSellerDisputedJobs({
+    request: async (_method, url) => {
+      seen.push(url);
+      return { data: url.includes('offset=0') ? [{ id: 'only' }] : [] };
+    },
+  }, { pageSize: 20, maxPages: 3 });
+  assert.equal(viaRequest.jobs.length, 1);
+  assert.equal(viaRequest.jobs[0].id, 'only');
+  assert.match(seen[0], /\/v1\/me\/jobs\?/);
+  assert.match(seen[0], /role=seller/);
+  assert.match(seen[0], /status=disputed/);
+  assert.match(seen[0], /limit=20/);
+  assert.match(seen[0], /offset=0/);
+
+  const viaJobs = await fetchSellerDisputedJobs({
+    getMyJobs: async (q) => {
+      assert.equal(q.role, 'seller');
+      assert.equal(q.status, 'disputed');
+      return { data: [{ id: 'legacy' }] };
+    },
+  });
+  assert.equal(viaJobs.jobs[0].id, 'legacy');
+  assert.equal(viaJobs.truncated, false);
 });
 
 test('M5: a valid agreed percentage is still queued silently', () => {

@@ -3213,7 +3213,7 @@ program
       fail('BUYER_NOT_REGISTERED', `Agent ${buyerAgentId} is not registered — hire is a buyer identity, not a local folder.`);
     }
 
-    const { assertHireAllowed, paymentOutputs } = require('./hire.js');
+    const { assertHireAllowed, paymentOutputs, assertPaysJobAddress, loadSellerRecipientSet } = require('./hire.js');
     const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
     const agent = new J41Agent({
       apiUrl: J41_API_URL,
@@ -3375,8 +3375,8 @@ program
               `Cannot resolve the seller's on-chain address to authorise payment: ${e.message}`,
               { jobId: job.id });
           }
-          const expected = [payInfo && payInfo.address, payInfo && payInfo.iAddress, listing.payaddress]
-            .filter((a) => typeof a === 'string' && a.length > 0);
+          const fallback = [payInfo && payInfo.address, payInfo && payInfo.iAddress, listing.payaddress];
+          const expected = await loadSellerRecipientSet(agent.client, sellerId, fallback);
           if (!expected.length) {
             fail('RECIPIENT_UNRESOLVED',
               'No on-chain address for the seller — refusing to pay an unverifiable recipient.',
@@ -3395,6 +3395,7 @@ program
           }
         }
 
+        assertPaysJobAddress(outputs, job);
         txid = await agent.sendMultiPayment(outputs);
         saveWalletPending(buyerAgentId, { txid, at: Date.now(), kind: 'hire-pay', amount });
         await agent.client.recordPaymentCombined(job.id, txid);
@@ -3611,7 +3612,7 @@ program
     const pendingPlan = planHirePayment({ pending: loadWalletPending(buyerAgentId), now: Date.now(), force: !!options.force });
     if (!pendingPlan.ok) fail(pendingPlan.code, pendingPlan.reason, { jobId: job.id });
     const amount = job.amount;
-    const { paymentOutputs } = require('./hire.js');
+    const { paymentOutputs, assertPaysJobAddress, loadSellerRecipientSet } = require('./hire.js');
     const outputs = paymentOutputs(job, amount);
     if (!options.yes) {
       const ok = await confirmHire({ amountText: String(amount), pay: true });
@@ -3623,14 +3624,19 @@ program
       let payInfo = null;
       try { payInfo = await agent.client.getAgentPaymentAddress(sellerId); }
       catch (e) { fail('RECIPIENT_UNRESOLVED', `Cannot resolve seller address: ${e.message}`, { jobId: job.id }); }
-      const expected = [payInfo && payInfo.address, payInfo && payInfo.iAddress]
-        .filter((a) => typeof a === 'string' && a.length > 0);
+      const fallback = [payInfo && payInfo.address, payInfo && payInfo.iAddress];
+      const expected = await loadSellerRecipientSet(agent.client, sellerId, fallback);
       if (!expected.length) fail('RECIPIENT_UNRESOLVED', 'No on-chain address for the seller.', { jobId: job.id });
       const g = gateExternalSend({
         jobId: job.id, toAddress: job.payment && job.payment.address, amount, jobPrice: amount,
         kind: 'payment', expectedRecipients: expected,
       });
       if (!g.allowed) fail('SPEND_DENIED', g.reason, { jobId: job.id, retryable: !!g.retryable });
+    }
+    try {
+      assertPaysJobAddress(outputs, job);
+    } catch (e) {
+      fail('PAY_ADDRESS_MISMATCH', e.message || String(e), { jobId: job.id });
     }
     const txid = await agent.sendMultiPayment(outputs);
     saveWalletPending(buyerAgentId, { txid, at: Date.now(), kind: 'hire-pay', amount });
@@ -4027,6 +4033,46 @@ async function runBuyerComplete(keys, agent, jobId, options, buyerAgentId) {
   }
   if (options.json) console.log(JSON.stringify(out.json, null, 2));
 }
+
+program
+  .command('rental-access <buyer-agent-id> <job-id>')
+  .description('Print host, port, and user from GET /v1/jobs/:id/rental-access. The private key is written only to --out.')
+  .requiredOption('--out <file>', 'File that receives the private key when --yes is set')
+  .option('--yes', 'Write the private key to --out')
+  .option('--json', 'One JSON object on stdout. Requires --yes. The key is not included.')
+  .action(async (buyerAgentId, jobId, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    if (!/^[0-9a-f-]{36}$/i.test(String(jobId || ''))) fail('RENTAL_JOB', 'Job id is not a uuid.');
+    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
+    const job = await agent.client.getJob(jobId);
+    if (!job || !job.id) fail('RENTAL_JOB', `Job ${jobId} not found.`);
+    if (!buyerOwnsJob(keys, job)) fail('RENTAL_NOT_BUYER', 'This identity is not the buyer on that job.');
+    let access;
+    try {
+      access = await agent.client.getRentalAccess(jobId);
+    } catch (e) {
+      fail(e.code || 'RENTAL_ACCESS', e.message || String(e), { jobId });
+    }
+    const { rentalAccessView, rentalAccessPrintLines } = require('./ssh-host');
+    const view = rentalAccessView(access);
+    const pub = { host: view.host, port: view.port, user: view.user };
+    for (const line of rentalAccessPrintLines(view)) say(line);
+    if (!options.yes) {
+      say('Preview only. Pass --yes to write the private key to --out. The key is not printed.');
+      if (options.json) {
+        console.log(JSON.stringify({ ok: true, code: 'RENTAL_ACCESS_PREVIEW', jobId, ...pub, wrote: false }, null, 2));
+      }
+      return;
+    }
+    if (!view.privateKey) fail('RENTAL_NO_KEY', 'Rental access has no private key to write.', { jobId });
+    fs.writeFileSync(options.out, view.privateKey, { mode: 0o600 });
+    say(`Wrote the private key to ${options.out}`);
+    if (options.json) {
+      console.log(JSON.stringify({ ok: true, code: 'RENTAL_ACCESS', jobId, ...pub, wrote: true, out: options.out }, null, 2));
+    }
+  });
 
 program
   .command('complete <buyer-agent-id> <job-id>')
@@ -4450,6 +4496,51 @@ program
     else {
       for (const line of opened) say(`${line.senderVerusId}: ${line.text}`);
       if (!opened.length) say(unread ? 'No sealed message on this job opened with this key.' : 'No sealed messages on this job.');
+    }
+  });
+
+program
+  .command('seal-open <agent-id> <job-id>')
+  .description('Open a sealed delivery zip with the viewing key stored on this machine.')
+  .requiredOption('--out <dir>', 'Directory that contains seal.bin and receives the opened files')
+  .option('--yes', 'Write the opened files')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
+  .action(async (agentId, jobId, options) => {
+    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
+    const say = (line) => { if (!options.json) console.log(line); };
+    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
+    if (!/^[0-9a-f-]{36}$/i.test(String(jobId || ''))) fail('SEAL_JOB', 'Job id is not a uuid.');
+    if (IS_MAINNET) fail('SEAL_NETWORK', 'Sealed delivery is derived on VRSCTEST.');
+    if (!options.yes) {
+      say('Preview only. Pass --yes to open seal.bin and write the files into --out.');
+      return;
+    }
+    const { keys, agent } = await loadBuyerSession(agentId, options);
+    const job = await agent.client.getJob(jobId);
+    if (!job || !job.id) fail('SEAL_JOB', `Job ${jobId} not found.`);
+    const buyer = buyerOwnsJob(keys, job);
+    const seller = sellerOwnsJob(keys, job);
+    if (!buyer && !seller) fail('SEAL_PARTY', 'This identity is not the buyer or the seller on that job.');
+    const { openSealedPackage } = require('./seal-open');
+    const agentDir = path.join(AGENTS_DIR, agentId);
+    let result;
+    try {
+      result = await openSealedPackage({ agentDir, jobId, outDir: options.out });
+    } catch (e) {
+      fail(e.code || 'SEAL_OPEN', e.message || String(e));
+    }
+    const safe = {
+      ok: true,
+      code: result.code,
+      jobId: result.jobId,
+      out: result.out,
+      innerZip: result.innerZip,
+      files: result.files,
+    };
+    if (options.json) console.log(JSON.stringify(safe, null, 2));
+    else {
+      say(`Opened ${result.jobId} into ${result.out}`);
+      for (const name of result.files || []) say(name);
     }
   });
 
@@ -6279,6 +6370,49 @@ program
     } catch (e) {
       console.error(`✗ Platform registration failed: ${e.message}`);
       console.error('  Config was still written — rerun with --no-register to skip this step, or fix auth and retry.');
+      process.exit(1);
+    } finally {
+      try { agent.stop?.(); } catch {}
+    }
+  });
+
+program
+  .command('service-price <agent-id> <service-id>')
+  .description('Set one service price via PUT /v1/me/services/:id. Refuses a price below 0.0001.')
+  .requiredOption('--price <amount>', 'Price in the service currency')
+  .option('--yes', 'Send the update')
+  .action(async (agentId, serviceId, options) => {
+    const { assertServicePrice } = require('./service-price');
+    let price;
+    try {
+      price = assertServicePrice(options.price);
+    } catch (e) {
+      console.error(`❌ ${e.message}`);
+      process.exit(1);
+    }
+    if (!options.yes) {
+      console.log(`Preview only. Pass --yes to set service ${serviceId} price to ${price}.`);
+      return;
+    }
+    await ensureKeystoreUnlockedIfEncrypted();
+    const keys = loadAgentKeys(agentId);
+    if (!keys || !keys.identity || !keys.wif) {
+      console.error(`❌ Agent ${agentId} is not registered.`);
+      process.exit(1);
+    }
+    const { J41Agent } = require('@junction41/sovagent-sdk/dist/index.js');
+    const agent = new J41Agent({
+      apiUrl: J41_API_URL,
+      wif: keys.wif,
+      identityName: keys.identity,
+      iAddress: keys.iAddress,
+    });
+    try {
+      await agent.authenticate();
+      await agent.client.updateService(serviceId, { price });
+      console.log(`✅ Service ${serviceId} price set to ${price}`);
+    } catch (e) {
+      console.error(`❌ ${e.message}`);
       process.exit(1);
     } finally {
       try { agent.stop?.(); } catch {}
@@ -11420,7 +11554,10 @@ const OUTAGE_APOLOGY =
  * Per-agent failures do not abort the rest of the sweep.
  */
 async function sweepDisputesForRefund(state) {
-  const { selectRefundableDisputes, buildDisputeRefundEntry } = require('./dispute-sweep.js');
+  const {
+    selectRefundableDisputes, buildDisputeRefundEntry, unwrapDispute,
+    fetchSellerDisputedJobs, logUnselectedDisputes,
+  } = require('./dispute-sweep.js');
   const { resolveRefundTarget } = require('./refund-target.js');
 
   const selfAddresses = new Set();
@@ -11435,8 +11572,10 @@ async function sweepDisputesForRefund(state) {
 
       let jobs;
       try {
-        const res = await agent.client.getMyJobs({ role: 'seller', status: 'disputed' });
-        jobs = res && res.data ? res.data : (Array.isArray(res) ? res : []);
+        const listed = await fetchSellerDisputedJobs(agent.client, {
+          log: (msg) => console.error(`[DisputeSweep] ${agentInfo.id}: ${msg}`),
+        });
+        jobs = listed.jobs;
       } catch (e) {
         console.error(`[DisputeSweep] ${agentInfo.id}: failed to fetch jobs — ${e.message}`);
         continue;
@@ -11446,7 +11585,7 @@ async function sweepDisputesForRefund(state) {
       for (const job of jobs) {
         if (!job || !job.id) continue;
         try {
-          const dispute = await agent.client.getDispute(job.id);
+          const dispute = unwrapDispute(await agent.client.getDispute(job.id));
           if (dispute) disputeByJobId[job.id] = dispute;
         } catch (_) {
           // 404 / no dispute — skip
@@ -11454,6 +11593,7 @@ async function sweepDisputesForRefund(state) {
       }
 
       const refundable = selectRefundableDisputes(jobs, disputeByJobId);
+      logUnselectedDisputes(jobs, disputeByJobId, refundable);
       if (refundable.length === 0) continue;
 
       const ledger = loadPendingRefunds();
@@ -12085,7 +12225,10 @@ async function handleCrashRecovery(state) {
       } else {
         applyCrashDecision(jobId, orphan, decision);
       }
-      if (decision.action === 'refund') await killOrphanContainer(jobId);
+      if (decision.action === 'refund') {
+        await killOrphanContainer(jobId);
+        await releaseTrackedCanary(state, { agentInfo }, jobId);
+      }
     } catch (e) {
       console.error(`  ❌ Recovery failed for ${jobId.substring(0, 8)}: ${e.message}`);
       if (!pendingRefunds[jobId]) keep.set(jobId, orphan);
@@ -13499,7 +13642,8 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
   }
 
   // ── Build the batch ───────────────────────────────────────────────────────
-  const batch = [];
+  let batch = [];
+  const tallyPlanned = [];
   let rateLimited = false;
   for (const it of selected.chosen) {
 
@@ -13538,31 +13682,90 @@ async function processInboxForAgent(agent, agentInfo, pending, state, deps = {})
         continue;
       }
     }
-    // The SDK copies inbox hex and does not know these fields. Refuse here so
-    // a buyer, address, job, or amount never enters the one identity update.
+    // The installed SDK acceptInboxBatch allowlist throws on reputation_tally.
+    // Plan the two tally keys here and do not put the item in that call.
+    // A buyer, address, job, or amount still never enters the identity update.
     if (it.type === 'reputation_tally') {
       try {
         const { planReputationTallyAdditions, reputationTallyKeys } = require('./reputation-tally-inbox');
+        const loaded = reputationTallyKeys();
+        if (!loaded || loaded.recordId !== 'iLbUN8TFvMZR9uaZYY1qBmL99bJE2uYdad') {
+          throw new Error('reputation tally note record id is not iLbUN8TFvMZR9uaZYY1qBmL99bJE2uYdad');
+        }
         let detail = it;
         if (agent.client && typeof agent.client.getInboxItem === 'function') {
           const res = await agent.client.getInboxItem(it.id);
           detail = (res && res.data) || it;
         }
-        planReputationTallyAdditions(detail, reputationTallyKeys());
+        const additions = planReputationTallyAdditions(detail, loaded);
+        tallyPlanned.push({
+          id: it.id,
+          type: 'reputation_tally',
+          additions,
+          item: { id: (detail && detail.id) || it.id, type: 'reputation_tally' },
+        });
       } catch (e) {
         if (e && (e.statusCode === 429 || /too many requests/i.test(e.message || ''))) {
           rateLimited = true;
           console.warn(`[Inbox] reputation_tally ${String(it.id).substring(0, 8)} rate limited — retrying this id only`);
         } else if (classifyInboxFailure(e) === 'hard') noteFailure(it.id, 'reputation_tally', e.message);
         else console.warn(`[Inbox] reputation_tally ${String(it.id).substring(0, 8)} gate transient (uncounted): ${e.message}`);
-        continue;
       }
+      continue;
     }
     batch.push({ id: it.id, type: it.type });
   }
+  const { splitInboxBatch, tallyWriteShouldCountItem } = require('./reputation-tally-inbox');
+  const split = splitInboxBatch(batch);
+  for (const leftover of split.tally) {
+    console.warn(`[Inbox] reputation_tally ${String(leftover.id).substring(0, 8)} withheld from acceptInboxBatch`);
+  }
+  batch = split.chain;
+  if (!state._inboxBatchFailures) state._inboxBatchFailures = new Map();
+  if (tallyPlanned.length) {
+    const deferBroadcast = batch.length > 0;
+    for (const row of tallyPlanned) {
+      try {
+        if (typeof deps.writeIdentityAdditions !== 'function') {
+          throw new Error('reputation_tally write is not wired');
+        }
+        const result = await deps.writeIdentityAdditions(row.additions, row.item, { deferBroadcast });
+        if (result && result.deferred) {
+          console.log(`[Inbox] ⏭ reputation_tally ${String(row.id).substring(0, 8)} deferred (uncounted): ${result.reason}`);
+          continue;
+        }
+        if (result && result.txid) {
+          state._inboxLastWrite.set(agentInfo.id, {
+            txid: result.txid,
+            at: now(),
+            expiryHeight: result.expiryHeight ?? deps.expiryHeight ?? null,
+          });
+        }
+        if (result && result.ackFailed) {
+          console.warn(`[Inbox] ${String(row.id).substring(0, 8)} reputation tally written but ack failed (uncounted): ${result.error}`);
+          continue;
+        }
+        clearInboxFailure(state._inboxFailures, row.id);
+        console.log(`[Inbox] ✅ Reputation tally accepted ${row.id}`);
+      } catch (e) {
+        const cls = classifyInboxFailure(e);
+        const bf = recordBatchFailure(state._inboxBatchFailures, agentInfo.id, [row.id], cls);
+        if (isFundingFailure(e)) {
+          console.error(`[Inbox] 💸 ${agentInfo.id}: ${FEE_TANK_ERROR_PREFIX} (${bf.consecutive}x) — reputation_tally ${String(row.id).substring(0, 8)} stalled, not struck. ${e.message}`);
+        } else if (cls === 'contention') {
+          console.warn(`[Inbox] reputation_tally ${String(row.id).substring(0, 8)}: contention (uncounted) — ${e.message}`);
+        } else if (cls !== 'hard') {
+          console.warn(`[Inbox] reputation_tally ${String(row.id).substring(0, 8)}: ${cls} (uncounted) — ${e.message}`);
+        } else {
+          console.error(`[Inbox] reputation_tally ${String(row.id).substring(0, 8)}: ${cls} (${bf.hardConsecutive}x) — ${e.message}`);
+        }
+        if (tallyWriteShouldCountItem(cls, bf)) noteFailure(row.id, 'reputation_tally', e.message);
+      }
+    }
+  }
   if (batch.length === 0) {
     if (rateLimited) return { rateLimited: true, retryIds: selected.chosen.map((it) => it.id) };
-    return { empty: true };
+    return tallyPlanned.length ? { tallyOnly: true } : { empty: true };
   }
 
   // ── Legacy fallback: SDK older than the batch API ─────────────────────────
@@ -13906,6 +14109,16 @@ async function checkPendingInbox(state) {
   }
 }
 
+function reputationTallyWriter(agent, agentInfo) {
+  const { writeReputationTallyAdditions } = require('./reputation-tally-inbox');
+  return (additions, item, opts) => writeReputationTallyAdditions(additions, item, {
+    client: agent.client,
+    wif: agentInfo.wif,
+    network: J41_NETWORK,
+    deferBroadcast: !!(opts && opts.deferBroadcast),
+  });
+}
+
 async function runInboxSweep(state) {
   if (!state._inboxFailures) state._inboxFailures = new Map(); // defensive: older state objects
   if (!state._inboxLastWrite) state._inboxLastWrite = new Map();
@@ -13941,6 +14154,7 @@ async function runInboxSweep(state) {
         // would leave a permanently stale entry once an inbox empties.
         await processInboxForAgent(agent, agentInfo, [], state, {
           verifyInboxJobRecord, verifyWitness, network: J41_NETWORK,
+          writeIdentityAdditions: reputationTallyWriter(agent, agentInfo),
         });
         continue;
       }
@@ -13949,6 +14163,7 @@ async function runInboxSweep(state) {
       for (const item of pending) seenInboxIds.add(item.id);
       await processInboxForAgent(agent, agentInfo, pending, state, {
         verifyInboxJobRecord, verifyWitness, network: J41_NETWORK,
+        writeIdentityAdditions: reputationTallyWriter(agent, agentInfo),
       });
     } catch (e) {
       completeView = false; // this agent's pending set is unknown → don't prune its items
@@ -14355,6 +14570,7 @@ async function startJobContainer(state, job, agentInfo) {
   const canaryToken = require('crypto').randomBytes(32).toString('hex');
   writeJobFileNoFollow(path.join(jobDir, 'canary.token'), canaryToken);
   try { fs.chmodSync(path.join(jobDir, 'canary.token'), 0o600); } catch {}
+  await rememberJobCanary(state, agentInfo, job.id, canaryToken);
 
   const agentDir = path.join(AGENTS_DIR, agentInfo.id);
   const keysPath = path.join(agentDir, 'keys.json');
@@ -14569,6 +14785,7 @@ async function startJobContainer(state, job, agentInfo) {
       _signerChannelDir: signerChannelDir,
       _signerTeardown: signerTeardown,
       _egressToken: egressToken,
+      _canaryToken: canaryToken,
     });
 
     // Deliver the dispute policy + markup to the container.
@@ -14704,6 +14921,10 @@ async function startJobContainer(state, job, agentInfo) {
     try { if (signerHost) await signerHost.destroy(); } catch {}
     try { if (signerTeardown) await signerTeardown(); } catch {}
     try { if (state.egressProxy && egressToken) state.egressProxy.revoke(egressToken); } catch {}
+    // The container never registered if we never recorded it as active.
+    if (!state.active.has(job.id)) {
+      try { require('./job-agent-teardown.js').removeHostCanary(JOBS_DIR, job.id); } catch {}
+    }
     // Return agent to pool
     returnAgentToPool(state, agentInfo);
   }
@@ -14751,6 +14972,61 @@ function pruneExtensionChecks(state, jobId) {
   }
 }
 
+/**
+ * The container registers its canary. A kill never runs the in-container
+ * release, and the 25h purge will not free a same-day token. Release only the
+ * token this host minted, and only from a stop path (the container is already
+ * gone or this call just stopped it).
+ */
+async function rememberJobCanary(state, agentInfo, jobId, canaryToken) {
+  const { claimHostCanary } = require('./job-agent-teardown.js');
+  let client = null;
+  try {
+    const session = await getAgentSession(state, agentInfo);
+    client = session && (session.client || session._client);
+  } catch (e) {
+    console.warn(`[CANARY] ${String(jobId).substring(0, 8)}: could not check a previous token (${e.message})`);
+  }
+  try {
+    const claimed = await claimHostCanary({ client, jobsDir: JOBS_DIR, jobId, token: canaryToken });
+    if (claimed.prior && claimed.prior.released === false) {
+      console.warn(`[CANARY] ${String(jobId).substring(0, 8)}: previous token not released — ${claimed.prior.reason}`);
+    }
+  } catch (e) {
+    console.warn(`[CANARY] ${String(jobId).substring(0, 8)}: host canary not saved (${e.message})`);
+  }
+}
+
+async function releaseTrackedCanary(state, active, jobId) {
+  const { releaseParentJobCanary } = require('./job-agent-teardown.js');
+  let client = null;
+  try {
+    if (active && active.agentInfo) {
+      const session = await getAgentSession(state, active.agentInfo);
+      client = session && (session.client || session._client);
+    }
+  } catch (e) {
+    console.warn(`[CANARY] ${String(jobId).substring(0, 8)}: session unavailable (${e.message})`);
+  }
+  if (!client) {
+    console.warn(`[CANARY] ${String(jobId).substring(0, 8)}: not released — no seller session`);
+    return;
+  }
+  try {
+    const cr = await releaseParentJobCanary({
+      client,
+      jobsDir: JOBS_DIR,
+      jobId,
+      token: active && active._canaryToken,
+    });
+    const short = String(jobId).substring(0, 8);
+    if (cr.released) console.log(`[CANARY] ${short}: ${cr.reason}`);
+    else console.warn(`[CANARY] ${short}: not released — ${cr.reason}`);
+  } catch (e) {
+    console.warn(`[CANARY] ${String(jobId).substring(0, 8)}: not released — ${e.message}`);
+  }
+}
+
 // Stop a job container
 async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   const active = state.active.get(jobId);
@@ -14763,16 +15039,24 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   if (active._stopping) return;
   active._stopping = true;
 
+  let containerGone = false;
   try {
     await active.container.stop();
+    containerGone = true;
     // AutoRemove will delete it
   } catch (e) {
-    if (String(e.message || '').includes('404') || String(e.message || '').includes('No such container')) {
-      // already gone; ignore noisy Docker cleanup errors
+    const msg = String(e && e.message || '');
+    // 304 is dockerode's "container already stopped" — the OOM / kill case.
+    // 404 is already removed. Neither is a live container.
+    if ((e && (e.statusCode === 304 || e.statusCode === 404))
+        || /404|no such container|already stopped/i.test(msg)) {
+      containerGone = true;
     } else {
       console.error(`[Cleanup] Error stopping ${jobId}:`, e.message);
     }
   }
+  // A stop that did not land leaves the container running. Do not free its token.
+  if (containerGone) await releaseTrackedCanary(state, active, jobId);
 
   // Tear down the signing broker (broker mode): stop the watcher, run the
   // executor teardown (closes the cached J41Agent inside the executors), and
@@ -14884,6 +15168,7 @@ async function startJobLocal(state, job, agentInfo) {
   const canaryToken = require('crypto').randomBytes(32).toString('hex');
   writeJobFileNoFollow(path.join(jobDir, 'canary.token'), canaryToken);
   try { fs.chmodSync(path.join(jobDir, 'canary.token'), 0o600); } catch {}
+  await rememberJobCanary(state, agentInfo, job.id, canaryToken);
 
   const agentDir = path.join(AGENTS_DIR, agentInfo.id);
   const keysPath = path.join(agentDir, 'keys.json');
@@ -15028,6 +15313,7 @@ async function startJobLocal(state, job, agentInfo) {
       agentInfoId: agentInfo.id,
       reworkCount: 0,
       _logStream: logStream,
+      _canaryToken: canaryToken,
     });
 
     state.emitEvent?.('container.started', {
@@ -15058,6 +15344,9 @@ async function startJobLocal(state, job, agentInfo) {
   } catch (e) {
     console.error(`❌ Failed to start local process for ${job.id}:`, e.message);
     await reportSpawnAttachFailed(state, agentInfo, job, 'spawn-error: ' + e.message);
+    if (!state.active.has(job.id)) {
+      try { require('./job-agent-teardown.js').removeHostCanary(JOBS_DIR, job.id); } catch {}
+    }
     returnAgentToPool(state, agentInfo);
   }
 }
@@ -15073,22 +15362,31 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
   if (active._stopping) return;
   active._stopping = true;
 
-  // Kill the child process
+  // Kill the child process. Release the canary only after it has exited:
+  // SIGTERM's .killed flag is set even when the process ignores the signal,
+  // and freeing the token then would turn detection off on a job that is
+  // still running.
+  let processGone = !active.process;
   try {
-    if (active.process && !active.process.killed) {
-      active.process.kill('SIGTERM');
-      // Give 5s for graceful shutdown, then SIGKILL
+    if (active.process && active.process.exitCode == null && active.process.signalCode == null) {
+      try { active.process.kill('SIGTERM'); } catch { /* already dead */ }
       await new Promise(resolve => {
+        let settled = false;
+        const done = () => { if (!settled) { settled = true; resolve(); } };
         const forceTimer = setTimeout(() => {
-          try { if (!active.process.killed) active.process.kill('SIGKILL'); } catch {}
-          resolve();
+          try { active.process.kill('SIGKILL'); } catch { /* already dead */ }
+          setTimeout(done, 1000);
         }, 5000);
-        active.process.on('exit', () => { clearTimeout(forceTimer); resolve(); });
+        active.process.once('exit', () => { clearTimeout(forceTimer); done(); });
       });
     }
+    processGone = !active.process
+      || active.process.exitCode != null
+      || active.process.signalCode != null;
   } catch {
-    // already dead
+    processGone = true;
   }
+  if (processGone) await releaseTrackedCanary(state, active, jobId);
 
   // Drain the per-job log stream before archiving. The child's exit handler
   // calls logStream.end() but that flush is async; await 'finish' so the

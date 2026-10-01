@@ -35,6 +35,19 @@ function alreadyPaid(d) {
 }
 
 /**
+ * GET /v1/jobs/:id/dispute is `{ dispute, deadline_at, ... }`. The SDK usually
+ * returns the inner row. A body with no action and a `.dispute` object is that
+ * wrapper — use the inner row.
+ */
+function unwrapDispute(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw || null;
+  if (raw.action == null && raw.dispute && typeof raw.dispute === 'object' && !Array.isArray(raw.dispute)) {
+    return raw.dispute;
+  }
+  return raw;
+}
+
+/**
  * The percentage the seller actually agreed to.
  *
  * Load-bearing: the entry builder used to hardcode 100. A seller who agreed to
@@ -52,7 +65,7 @@ function agreedRefundPercent(d) {
 function selectRefundableDisputes(jobs, disputeByJobId) {
   return (jobs || []).filter(j => {
     if (!j || j.status !== 'disputed') return false;
-    const d = disputeByJobId[j.id];
+    const d = unwrapDispute(disputeByJobId[j.id]);
     if (!d) return false;
     if (alreadyPaid(d)) return false; // never re-queue something already sent
 
@@ -83,6 +96,7 @@ function selectRefundableDisputes(jobs, disputeByJobId) {
 }
 
 function buildDisputeRefundEntry(job, dispute, agentInfoId, target, nowIso) {
+  dispute = unwrapDispute(dispute);
   const amount = Number(job.amount) || 0;
   const currency = job.currency || 'VRSCTEST';
   const failing = Object.entries(target.checks || {}).filter(([, v]) => v === false).map(([k]) => k);
@@ -110,7 +124,71 @@ function buildDisputeRefundEntry(job, dispute, agentInfoId, target, nowIso) {
   };
 }
 
+function logUnselectedDisputes(jobs, disputeByJobId, selectedJobs, log = console.log) {
+  const selected = new Set((selectedJobs || []).map((j) => j && j.id).filter(Boolean));
+  for (const job of jobs || []) {
+    if (!job || !job.id || selected.has(job.id)) continue;
+    const d = unwrapDispute(disputeByJobId && disputeByJobId[job.id]);
+    if (!d) continue;
+    const action = d.action == null ? 'none' : d.action;
+    log(`[DisputeSweep] ${String(job.id).substring(0, 8)} not selected (action=${action})`);
+  }
+}
+
+/**
+ * Page GET /v1/me/jobs until a short page. `fetchPage` returns one page of rows.
+ * Stops after `maxPages` and logs when a full last page means later jobs were skipped.
+ */
+async function listSellerDisputedJobs(fetchPage, opts = {}) {
+  const pageSize = opts.pageSize || 20;
+  const maxPages = opts.maxPages || 10;
+  const log = opts.log || console.error;
+  const jobs = [];
+  const seen = new Set();
+  let truncated = false;
+  for (let page = 0; page < maxPages; page++) {
+    const offset = page * pageSize;
+    const list = await fetchPage({ limit: pageSize, offset });
+    const rows = Array.isArray(list) ? list : [];
+    let added = 0;
+    for (const row of rows) {
+      if (!row || !row.id || seen.has(row.id)) continue;
+      seen.add(row.id);
+      jobs.push(row);
+      added += 1;
+    }
+    if (rows.length < pageSize || added === 0) return { jobs, truncated: false };
+    if (page === maxPages - 1) {
+      truncated = true;
+      log(`stopped after ${maxPages} pages of disputed seller jobs — later pages were not scanned`);
+    }
+  }
+  return { jobs, truncated };
+}
+
+async function fetchSellerDisputedJobs(client, opts = {}) {
+  if (!client || typeof client.request !== 'function') {
+    if (!client || typeof client.getMyJobs !== 'function') return { jobs: [], truncated: false };
+    const res = await client.getMyJobs({ role: 'seller', status: 'disputed' });
+    const rows = res && res.data ? res.data : (Array.isArray(res) ? res : []);
+    return { jobs: rows, truncated: false };
+  }
+  return listSellerDisputedJobs(async ({ limit, offset }) => {
+    const query = new URLSearchParams({
+      role: 'seller',
+      status: 'disputed',
+      limit: String(limit),
+      offset: String(offset),
+    });
+    const res = await client.request('GET', `/v1/me/jobs?${query}`);
+    if (res && Array.isArray(res.data)) return res.data;
+    if (Array.isArray(res)) return res;
+    return [];
+  }, opts);
+}
+
 module.exports = {
-  hasPositiveTokens, alreadyPaid, agreedRefundPercent,
-  selectRefundableDisputes, buildDisputeRefundEntry,
+  hasPositiveTokens, alreadyPaid, agreedRefundPercent, unwrapDispute,
+  selectRefundableDisputes, buildDisputeRefundEntry, logUnselectedDisputes,
+  listSellerDisputedJobs, fetchSellerDisputedJobs,
 };

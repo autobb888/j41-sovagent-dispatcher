@@ -3,7 +3,11 @@
 process.env.NODE_ENV = 'test';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { hireAnswerStartsQuiet, quietDeliverReady, skipsFirstWork, answeredHireCanClose, ACCEPTED_QUIET_MS } = require('../src/job-agent.js');
+const fs = require('node:fs');
+const {
+  hireAnswerStartsQuiet, quietDeliverReady, skipsFirstWork, answeredHireCanClose,
+  priorSellerWork, jobHasBothSealAddresses, ACCEPTED_QUIET_MS,
+} = require('../src/job-agent.js');
 
 test('a real hire answer starts the 90s close; the outage line and a silent executor do not', () => {
   assert.equal(hireAnswerStartsQuiet({
@@ -81,6 +85,35 @@ test('a paid hire that already has a seller answer is a reconnect', () => {
     messages: [{ sender_verus_id: SELLER, content: 'done' }],
     speakerIds: [],
   }), false);
+});
+
+test('a sealed seller line is not finished work', () => {
+  const armor = {
+    senderVerusId: SELLER,
+    content: 'armor-frame',
+    contentEncoding: 'j41-seal-v1',
+  };
+  assert.equal(priorSellerWork([armor], [SELLER]), false);
+  assert.equal(priorSellerWork([{
+    senderVerusId: SELLER,
+    content: 'armor-frame',
+    content_encoding: 'j41-seal-v1',
+  }], [SELLER]), false);
+  assert.equal(priorSellerWork([{
+    senderVerusId: SELLER,
+    content: 'The crate name is FujiKeeper. pong',
+  }], [SELLER]), true);
+  const hex = 'ab'.repeat(43);
+  assert.equal(jobHasBothSealAddresses({
+    buyerSealAddressHex: hex, sellerSealAddressHex: hex,
+  }), true);
+  assert.equal(jobHasBothSealAddresses({
+    buyerSealAddressHex: hex, sellerSealAddressHex: 'zz',
+  }), false);
+  const src = fs.readFileSync('src/job-agent.js', 'utf8');
+  const at = src.indexOf("await agent.sendChatMessage(job.id, 'Uploaded file: delivery.zip')");
+  assert.ok(at > 0);
+  assert.match(src.slice(at - 220, at), /if \(!published\.bothSeals\)/);
 });
 
 test('an answered hire can close while accepted or in progress', () => {

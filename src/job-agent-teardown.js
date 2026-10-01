@@ -15,6 +15,10 @@
 
 const fs = require('fs');
 const path = require('path');
+const { isValidJobId } = require('./job-id');
+
+/** The parent writes this. randomBytes(32).hex. Anything else is not our token. */
+const CANARY_TOKEN_RE = /^[0-9a-f]{64}$/;
 
 /**
  * Sign and submit a deletion attestation — the ONE way this codebase does it.
@@ -113,10 +117,12 @@ async function resolveCanaryId(client, token) {
 /**
  * Release this job's canary registration.
  *
- * Registrations are capped at 5 per agent and nothing ever released them, so
- * slots were consumed permanently — one agent still held a slot from
- * 2026-03-15, and every agent past its 5th job ever ran with SovGuard-side leak
- * detection silently off.
+ * Registrations are capped at 32 per agent (CANARY_MAX_PER_AGENT). Nothing
+ * released them, so slots were consumed permanently — one agent still held a
+ * slot from 2026-03-15, and once the cap was full every later job ran with
+ * SovGuard-side leak detection off. The parent dispatcher releases this job's
+ * own token when the container exits. This in-container call still runs when
+ * the process itself reaches teardown.
  *
  * Best-effort: never let cleanup affect the job. Call this AFTER the attestation
  * — the privacy proof is worth more than canary hygiene, and container kill
@@ -179,14 +185,15 @@ function parseCanaryTimestamp(value) {
 /**
  * Free ABANDONED canary slots so registration can succeed.
  *
- * Without this the fix cannot bootstrap: every existing agent is already at the
- * 5-token cap, so registration fails, no id is recorded, the release path
- * no-ops, and the slots are never freed — inert forever.
+ * Without this the fix cannot bootstrap: an agent already at the 32-token cap
+ * fails registration, no id is recorded, the release path no-ops, and the slots
+ * are never freed — inert forever.
  *
  * ⚠️ SELECTION RULE IS AGE, NOT TOKEN IDENTITY. An earlier version deleted every
  * registration whose token was not the current job's, reasoning "one canary per
  * job, so the rest are finished". That is FALSE under concurrency: the cap is
- * per AGENT, and round 3 ran 10 concurrent jobs on one agent against a cap of 5.
+ * per AGENT. Round 3 ran 10 concurrent jobs on one agent against a cap of 5.
+ * The cap is 32 now. Age is still the only selection rule.
  * Job 6 would have purged jobs 1-5's LIVE canaries, silently disabling
  * SovGuard-side leak detection on running jobs — strictly worse than the bug it
  * was fixing. Only delete registrations older than any job could possibly be.
@@ -218,6 +225,117 @@ async function purgeStaleCanaries({ client, keepToken, now = Date.now(), maxAgeM
   return deleted;
 }
 
+/**
+ * Host-only copy of the token this dispatcher minted for one job.
+ * The job directory is bind-mounted into the container, so the copy inside it
+ * can be replaced. This file sits beside that directory and is not mounted.
+ * A restart can still release the token after the in-memory handle is gone.
+ */
+function hostCanaryPath(jobsDir, jobId) {
+  if (!isValidJobId(jobId)) {
+    const err = new Error('invalid job id');
+    err.code = 'CANARY_JOB_ID';
+    throw err;
+  }
+  return path.join(jobsDir, '_canaries', jobId);
+}
+
+function writeHostCanary(jobsDir, jobId, token, fsImpl = fs) {
+  if (!CANARY_TOKEN_RE.test(token)) {
+    const err = new Error('invalid canary token');
+    err.code = 'CANARY_TOKEN';
+    throw err;
+  }
+  const file = hostCanaryPath(jobsDir, jobId);
+  fsImpl.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const fd = fsImpl.openSync(
+    file,
+    fsImpl.constants.O_WRONLY | fsImpl.constants.O_CREAT | fsImpl.constants.O_TRUNC | fsImpl.constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    fsImpl.writeFileSync(fd, token);
+  } finally {
+    fsImpl.closeSync(fd);
+  }
+  try { fsImpl.chmodSync(file, 0o600); } catch { /* umask already restricts it */ }
+}
+
+function readHostCanary(jobsDir, jobId, fsImpl = fs) {
+  let file;
+  try { file = hostCanaryPath(jobsDir, jobId); } catch { return null; }
+  let fd;
+  try {
+    fd = fsImpl.openSync(file, fsImpl.constants.O_RDONLY | fsImpl.constants.O_NOFOLLOW);
+  } catch (e) {
+    if (e.code === 'ENOENT' || e.code === 'ELOOP') return null;
+    throw e;
+  }
+  try {
+    const text = fsImpl.readFileSync(fd, 'utf8').trim();
+    return CANARY_TOKEN_RE.test(text) ? text : null;
+  } finally {
+    fsImpl.closeSync(fd);
+  }
+}
+
+function removeHostCanary(jobsDir, jobId, fsImpl = fs) {
+  let file;
+  try { file = hostCanaryPath(jobsDir, jobId); } catch { return; }
+  try { fsImpl.rmSync(file, { force: true }); } catch { /* best-effort */ }
+}
+
+/** A second delete, or a token that was never registered, means the slot is free. */
+function parentReleaseSucceeded(result) {
+  if (!result) return false;
+  if (result.released) return true;
+  if (result.reason === 'no registration found for this token') return true;
+  return /^delete failed:/i.test(result.reason || '') && /not found|404/i.test(result.reason);
+}
+
+/**
+ * Remember the token the new container will register.
+ * If this host still has a different token from an earlier container for the
+ * same job, release that one first. The new token is what we track either way:
+ * the live container's token must not be forgotten because an old delete failed.
+ */
+async function claimHostCanary({ client, jobsDir, jobId, token, release = releaseCanary }) {
+  const previous = readHostCanary(jobsDir, jobId);
+  let prior = { released: true, reason: 'no previous host canary' };
+  if (previous && previous !== token) {
+    if (!client) prior = { released: false, reason: 'no client' };
+    else prior = await release({ client, token: previous });
+  }
+  writeHostCanary(jobsDir, jobId, token);
+  return { claimed: true, prior };
+}
+
+/**
+ * Release the token this host minted, once the container is gone.
+ * Deletes only registrations whose token equals that value. A different job's
+ * token is never selected. A network failure keeps the host file so a later
+ * stop can retry. Success, or "already gone", removes the host file.
+ */
+async function releaseParentJobCanary({ client, jobsDir, jobId, token = null, release = releaseCanary }) {
+  const fromMemory = token && CANARY_TOKEN_RE.test(token) ? token : null;
+  const fromFile = readHostCanary(jobsDir, jobId);
+  const tokens = [];
+  if (fromMemory) tokens.push(fromMemory);
+  if (fromFile && fromFile !== fromMemory) tokens.push(fromFile);
+  if (tokens.length === 0) return { released: false, reason: 'no host canary for this job' };
+
+  let freed = false;
+  let stuck = null;
+  for (const tok of tokens) {
+    const result = await release({ client, token: tok });
+    if (parentReleaseSucceeded(result)) freed = true;
+    else stuck = result && result.reason ? result.reason : 'not released';
+  }
+  if (!stuck) removeHostCanary(jobsDir, jobId);
+  if (stuck) return { released: false, reason: stuck };
+  return { released: freed, reason: freed ? 'released' : 'no host canary for this job' };
+}
+
 module.exports = {
   signAndSubmitDeletionAttestation,
   releaseCanary,
@@ -225,4 +343,12 @@ module.exports = {
   purgeStaleCanaries,
   parseCanaryTimestamp,
   STALE_CANARY_MS,
+  CANARY_TOKEN_RE,
+  hostCanaryPath,
+  writeHostCanary,
+  readHostCanary,
+  removeHostCanary,
+  claimHostCanary,
+  releaseParentJobCanary,
+  parentReleaseSucceeded,
 };

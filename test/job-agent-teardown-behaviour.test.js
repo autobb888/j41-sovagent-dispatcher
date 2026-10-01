@@ -11,6 +11,10 @@ const {
   resolveCanaryId,
   purgeStaleCanaries,
   parseCanaryTimestamp,
+  writeHostCanary,
+  readHostCanary,
+  claimHostCanary,
+  releaseParentJobCanary,
 } = require('../src/job-agent-teardown.js');
 
 /**
@@ -218,6 +222,104 @@ test('canary: purge tolerates individual delete failures', async () => {
     deleteCanary: async (id) => { if (id === 'a') throw new Error('nope'); },
   };
   assert.strictEqual(await purgeStaleCanaries({ client, keepToken: 'x' }), 1);
+});
+
+function hexToken(byte) {
+  return Buffer.alloc(32, byte).toString('hex');
+}
+
+test('parent canary: releases only this job token and removes the host file', async () => {
+  const dir = tmpdir();
+  const jobId = 'job-parent-1';
+  const mine = hexToken(1);
+  const other = hexToken(2);
+  writeHostCanary(dir, jobId, mine);
+  const deleted = [];
+  const client = {
+    getCanaries: async () => ([
+      { id: 'mine', token: mine },
+      { id: 'other-live', token: other },
+    ]),
+    deleteCanary: async (id) => { deleted.push(id); },
+  };
+  const result = await releaseParentJobCanary({ client, jobsDir: dir, jobId, token: mine });
+  assert.strictEqual(result.released, true);
+  assert.deepStrictEqual(deleted, ['mine']);
+  assert.strictEqual(readHostCanary(dir, jobId), null);
+});
+
+test('parent canary: a second delete counts as already free', async () => {
+  const dir = tmpdir();
+  const jobId = 'job-parent-2';
+  const mine = hexToken(3);
+  writeHostCanary(dir, jobId, mine);
+  const client = {
+    getCanaries: async () => ([{ id: 'mine', token: mine }]),
+    deleteCanary: async () => { throw new Error('Canary not found'); },
+  };
+  const result = await releaseParentJobCanary({ client, jobsDir: dir, jobId });
+  assert.strictEqual(result.released, true);
+  assert.strictEqual(readHostCanary(dir, jobId), null);
+});
+
+test('parent canary: a network failure keeps the host file and says so', async () => {
+  const dir = tmpdir();
+  const jobId = 'job-parent-3';
+  const mine = hexToken(4);
+  writeHostCanary(dir, jobId, mine);
+  const client = {
+    getCanaries: async () => ([{ id: 'mine', token: mine }]),
+    deleteCanary: async () => { throw new Error('socket hang up'); },
+  };
+  const result = await releaseParentJobCanary({ client, jobsDir: dir, jobId, token: mine });
+  assert.strictEqual(result.released, false);
+  assert.match(result.reason, /socket hang up/);
+  assert.strictEqual(readHostCanary(dir, jobId), mine);
+});
+
+test('parent canary: does not follow a symlink over the host file', async () => {
+  const dir = tmpdir();
+  const jobId = 'job-parent-4';
+  const secret = path.join(dir, 'secret.txt');
+  fs.mkdirSync(path.join(dir, '_canaries'), { recursive: true });
+  fs.writeFileSync(secret, 'do-not-read');
+  fs.symlinkSync(secret, path.join(dir, '_canaries', jobId));
+  assert.strictEqual(readHostCanary(dir, jobId), null);
+  assert.throws(() => writeHostCanary(dir, jobId, hexToken(5)));
+  assert.strictEqual(fs.readFileSync(secret, 'utf8'), 'do-not-read');
+});
+
+test('parent canary: claim releases the previous token and tracks the new one', async () => {
+  const dir = tmpdir();
+  const jobId = 'job-parent-5';
+  const previous = hexToken(6);
+  const next = hexToken(7);
+  writeHostCanary(dir, jobId, previous);
+  const released = [];
+  const claimed = await claimHostCanary({
+    client: {},
+    jobsDir: dir,
+    jobId,
+    token: next,
+    release: async ({ token }) => {
+      released.push(token);
+      return { released: true, reason: 'released id' };
+    },
+  });
+  assert.strictEqual(claimed.claimed, true);
+  assert.deepStrictEqual(released, [previous]);
+  assert.strictEqual(readHostCanary(dir, jobId), next);
+});
+
+test('parent canary: a missing host file is not a silent success', async () => {
+  const dir = tmpdir();
+  const result = await releaseParentJobCanary({
+    client: { getCanaries: async () => [], deleteCanary: async () => {} },
+    jobsDir: dir,
+    jobId: 'job-parent-6',
+  });
+  assert.strictEqual(result.released, false);
+  assert.match(result.reason, /no host canary/);
 });
 
 // ---------------------------------------------------------------------------

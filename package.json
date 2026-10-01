@@ -53,7 +53,8 @@
     "dockerode": "5",
     "inquirer": "^9",
     "json-canonicalize": "2.0.0",
-    "undici": "5"
+    "undici": "5",
+    "verus-typescript-primitives": "github:VerusCoin/verus-typescript-primitives#27e6c076def4416c20a568e31e4c406b10612807"
   },
   "optionalDependencies": {
     "@junction41/secure-setup": "0.3.0"

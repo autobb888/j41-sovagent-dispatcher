@@ -112,12 +112,27 @@ function isCannedWorkerLine(text) {
   return false;
 }
 
+// A j41-seal-v1 frame is armor, not the hire answer.
+function isSealArmorMessage(message) {
+  if (!message || typeof message !== 'object') return false;
+  const enc = message.contentEncoding || message.content_encoding;
+  return enc === 'j41-seal-v1';
+}
+
+function jobHasBothSealAddresses(job) {
+  const hex86 = /^[0-9a-fA-F]{86}$/;
+  if (!job || typeof job !== 'object') return false;
+  return hex86.test(String(job.buyerSealAddressHex || ''))
+    && hex86.test(String(job.sellerSealAddressHex || ''));
+}
+
 function priorSellerWork(messages, speakerIds) {
   const ids = new Set((speakerIds || []).filter((s) => typeof s === 'string' && s.length > 0));
   if (ids.size === 0) return false;
   for (const m of messages || []) {
     if (!m || typeof m !== 'object') continue;
     if (m.type === 'system' || m.type === 'file') continue;
+    if (isSealArmorMessage(m)) continue;
     const sender = m.senderVerusId || m.sender_verus_id;
     if (!ids.has(sender)) continue;
     const text = String(m.content || '');
@@ -555,6 +570,7 @@ async function publishFinishedJob({ agent, signer, job, fullJob, content, canary
     try { fresh = await agent.client.getJob(job.id); } catch { /* the startup copy still has the address if it was already set */ }
   }
   const sealThis = shouldSealDelivery(fresh);
+  const bothSeals = jobHasBothSealAddresses(fresh);
   const sealAddress = sealThis ? fresh.buyerSealAddressHex : '';
   const cap = sealThis ? INNER_CAP : MAX_PACKAGE_BYTES;
   const textBytes = Buffer.byteLength(text);
@@ -594,7 +610,7 @@ async function publishFinishedJob({ agent, signer, job, fullJob, content, canary
       'deliverJob',
       { maxAttempts: 5, baseDelayMs: 2000 },
     );
-    return { hash, uploaded: false, tooBig: true };
+    return { hash, uploaded: false, tooBig: true, bothSeals };
   }
   let deliverHash = pkg.hash;
   if (!deliverHash) {
@@ -615,7 +631,7 @@ async function publishFinishedJob({ agent, signer, job, fullJob, content, canary
     { maxAttempts: 5, baseDelayMs: 2000 },
   );
   if (pkg.upload) await dropReplacedPackages(agent, job.id, pkg.filename, uploaded);
-  return { hash: deliverHash, uploaded: !!pkg.upload, tooBig: false };
+  return { hash: deliverHash, uploaded: !!pkg.upload, tooBig: false, bothSeals };
 }
 
 // Track agent+executor globally for SIGTERM cleanup
@@ -816,8 +832,9 @@ async function main() {
       // "non-fatal" is true for job EXECUTION and misleading for security posture:
       // SovGuard-side leak detection is off for this job. The in-process
       // checkForCanaryLeak guard still runs. Registrations were leaking slots
-      // (nothing ever released them), so every agent hit the 5-token cap and
-      // every job past its 5th ran unwatched — see releaseCanary() below.
+      // (nothing ever released them), so an agent at the 32-token cap runs the
+      // next job unwatched — see releaseCanary() below. The parent releases the
+      // token when the container exits, including a kill that never gets here.
       console.warn(`[CANARY] ⚠️  SovGuard registration failed — SovGuard-side leak detection is DISABLED for this job (local check still active): ${e.message}`);
     }
   }
@@ -1095,9 +1112,12 @@ async function main() {
     });
     result.hash = published.hash;
     log.info('Job delivered', { jobId: JOB_ID, hash: published.hash });
-    try {
-      await agent.sendChatMessage(job.id, 'Uploaded file: delivery.zip');
-    } catch { /* the platform upload line is the buyer-visible proof */ }
+    // Both 86-hex seals: the zip is the delivery. Do not add a plaintext upload line.
+    if (!published.bothSeals) {
+      try {
+        await agent.sendChatMessage(job.id, 'Uploaded file: delivery.zip');
+      } catch { /* the platform upload line is the buyer-visible proof */ }
+    }
   } catch (e) {
     // Safety net (defense-in-depth): a paused / otherwise non-deliverable job
     // returns INVALID_STATUS. NEVER fatal-crash on it — tear down and exit
@@ -2671,5 +2691,5 @@ if (require.main === module) {
 // Export testable helpers when running under NODE_ENV=test.
 // Avoids shipping a test seam in production while keeping coverage honest.
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach, isTerminalAttachError, ATTACH_CONFIRM_BACKOFF_MS, resumeJob, ensureChatConnected, containDownload, labourExtensionClosed, requestBudgetExtension, ACCEPTED_IDLE_NOTE, hireAnswerStartsQuiet, quietDeliverReady, skipsFirstWork, answeredHireCanClose, ACCEPTED_QUIET_MS };
+  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach, isTerminalAttachError, ATTACH_CONFIRM_BACKOFF_MS, resumeJob, ensureChatConnected, containDownload, labourExtensionClosed, requestBudgetExtension, ACCEPTED_IDLE_NOTE, hireAnswerStartsQuiet, quietDeliverReady, skipsFirstWork, priorSellerWork, jobHasBothSealAddresses, answeredHireCanClose, ACCEPTED_QUIET_MS };
 }

@@ -5,7 +5,7 @@
  * grows the lease; the buyer does not need the seller process online.
  */
 const { planHirePayment, buyerOwnsJob, dualPayTxids } = require('./hire-pay');
-const { paymentOutputs } = require('./hire');
+const { paymentOutputs, loadSellerRecipientSet } = require('./hire');
 
 const LABOUR_OPEN = new Set(['in_progress', 'paused']);
 const GPU_OPEN = new Set(['in_progress', 'paused', 'delivered']);
@@ -245,8 +245,8 @@ async function runBuyerExtend({
         });
       }
     }
-    const expected = [payInfo && payInfo.address, payInfo && payInfo.iAddress]
-      .filter((a) => typeof a === 'string' && a.length > 0);
+    const fallback = [payInfo && payInfo.address, payInfo && payInfo.iAddress];
+    const expected = await loadSellerRecipientSet(client, sellerId, fallback);
     if (!expected.length) {
       return fail('RECIPIENT_UNRESOLVED', 'No on-chain address for the seller.', {
         jobId: job.id, extensionId: extension.id,
