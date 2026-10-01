@@ -42,16 +42,21 @@ function buyerMatches(job, ...buyers) {
   return buyers.some((buyer) => idKey(buyer) && idKey(buyer) === have);
 }
 
+// One paid open returns at most this many rows.
+const MAX_DATASET_ROWS = 100;
+
 function createOrchardDoor({ getJob, secret, verifyMessage, docPath }) {
   const file = docPath || path.join(__dirname, '..', 'templates', 'orchard-apples.json');
+  let cached;
 
   function readDoc() {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (cached === undefined) cached = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return cached;
   }
 
   function rowsForTerms(terms) {
     const doc = readDoc();
-    const items = (Array.isArray(doc.items) ? doc.items : []).filter((row) => {
+    const filtered = (Array.isArray(doc.items) ? doc.items : []).filter((row) => {
       if (!row || typeof row !== 'object') return false;
       for (const key of ['color', 'kind', 'taste']) {
         if (terms[key] && String(row[key] || '') !== terms[key]) return false;
@@ -62,7 +67,8 @@ function createOrchardDoor({ getJob, secret, verifyMessage, docPath }) {
       }
       return true;
     });
-    return { count: items.length, items };
+    const items = filtered.slice(0, MAX_DATASET_ROWS);
+    return { count: filtered.length, items, truncated: filtered.length > MAX_DATASET_ROWS };
   }
 
   async function paidJob(jobId) {
@@ -111,9 +117,9 @@ function createOrchardDoor({ getJob, secret, verifyMessage, docPath }) {
         }
       }
       const rows = rowsForTerms(paid.terms.normalized);
-      return { dataset: 'orchardapples', count: rows.count, items: rows.items };
+      return { dataset: 'orchardapples', count: rows.count, items: rows.items, truncated: rows.truncated };
     },
   };
 }
 
-module.exports = { createOrchardDoor, windowExpiresMs };
+module.exports = { createOrchardDoor, windowExpiresMs, MAX_DATASET_ROWS };
