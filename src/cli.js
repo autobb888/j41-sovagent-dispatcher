@@ -6359,7 +6359,9 @@ program
 program
   .command('dashboard')
   .description('Launch the interactive TUI menu')
-  .action(() => { require('./dashboard.js'); });
+  .action(() => {
+    require('./dashboard.js').main().catch((e) => { console.error(e); process.exit(1); });
+  });
 
 // ── The job-agent image ─────────────────────────────────────────────────────
 
@@ -17057,8 +17059,9 @@ if (process.env.NODE_ENV === 'test') {
     program, __getState: () => _liveState,
     pollForJobs, startRentalJobWired, runBuyerComplete };
 } else if (process.argv.length <= 2) {
-  // No command — launch interactive dashboard
-  require('./dashboard.js');
+  // No command — launch interactive dashboard.
+  // dashboard.js no longer starts main() on require (tests import the menu).
+  require('./dashboard.js').main().catch((e) => { console.error(e); process.exit(1); });
 } else {
   program.parse();
 }

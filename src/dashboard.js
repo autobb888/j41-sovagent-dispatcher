@@ -279,6 +279,54 @@ async function withBack(fn) {
 
 // ── Screens ──
 
+// Plain objects so a test can call this with no TTY and no inquirer.
+// Separators stay `{ separator }` here; mainMenu maps them to inquirer.Separator.
+function mainMenuChoices(status = {}, money = {}, identityRows = []) {
+  const running = !!(status && status.running);
+  const m = money || {};
+  const rows = Array.isArray(identityRows) ? identityRows : [];
+  return [
+    { name: `[1]  View agents (${formatIdentitySummary(rows)})`, value: 'agents' },
+    { name: '[2]  Sign up — register a listing', value: 'add' },
+    { name: '[3]  Configure Agent Executor', value: 'executor' },
+    { name: '[4]  Configure Global LLM Default', value: 'llm' },
+    { name: '[5]  Configure Services', value: 'services' },
+    { name: '[6]  Security Setup', value: 'security' },
+    { separator: '  ── Dispatcher ──' },
+    { name: '⚡ Live Jobs (auto-refresh)', value: 'live_jobs' },
+    { name: `[7]  Start Dispatcher ${running ? '\x1b[32m(running)\x1b[0m' : ''}`, value: 'start' },
+    { name: `[8]  Stop Dispatcher ${running ? '' : '\x1b[2m(not running)\x1b[0m'}`, value: 'stop' },
+    { name: '[9]  View Logs', value: 'logs' },
+    { name: '[10] Status & Health', value: 'status' },
+    { name: '     Doctor (this machine)', value: 'doctor' },
+    { separator: '  ── Tools ──' },
+    { name: '[11] Inspect Agent (on-chain)', value: 'inspect' },
+    { name: '[12] Check Inbox', value: 'inbox' },
+    { name: '[13] Earnings Summary', value: 'earnings' },
+    { name: '[14] Docker Containers', value: 'docker' },
+    { name: '     Build job-agent + gpu-jail images', value: 'build_image' },
+    { separator: '  ── Agents ──' },
+    { name: '[15] Activate All Agents', value: 'activate_all' },
+    { name: '[16] Deactivate All Agents', value: 'deactivate_all' },
+    { separator: '  ── Marketplace ──' },
+    { name: '[17] Bounties', value: 'bounties' },
+    { name: '[18] API Endpoint Setup (resell your LLM, metered)', value: 'api_setup' },
+    { name: '     Hire a listing (this fleet as buyer)', value: 'hire' },
+    { separator: '  ── After a hire ──' },
+    { name: '     Complete a job', value: 'complete' },
+    { name: '     Review a job', value: 'review' },
+    { name: '     Fetch artifacts', value: 'artifacts' },
+    { name: '     Data setup', value: 'data_setup' },
+    { name: '     Sales mode (invite / open)', value: 'sales_mode' },
+    { separator: '  ── Money ──' },
+    { name: `[19] Wallet & Fee Tanks${m.feeTanksNeedingFunding ? ` \x1b[31m(${m.feeTanksNeedingFunding} empty)\x1b[0m` : m.feeTanksLow ? ` \x1b[33m(${m.feeTanksLow} low)\x1b[0m` : ''}`, value: 'wallet' },
+    { name: `[20] Refunds Queue${m.pendingRefunds ? ` \x1b[33m(${m.pendingRefunds} awaiting you)\x1b[0m` : ''}`, value: 'refunds' },
+    { name: `[21] Deposits${m.depositsNeedOperator ? ` \x1b[33m(${m.depositsNeedOperator} need a decision)\x1b[0m` : ''}`, value: 'deposits' },
+    { separator: undefined },
+    { name: '     Quit', value: 'quit' },
+  ];
+}
+
 async function mainMenu(inquirer) {
   const agents = getAgents();
   const status = getDispatcherStatus();
@@ -325,40 +373,11 @@ async function mainMenu(inquirer) {
     type: 'list', pageSize: 20,
     name: 'choice',
     message: 'What would you like to do?',
-    choices: [
-      { name: `[1]  View agents (${formatIdentitySummary(identityRows)})`, value: 'agents' },
-      { name: '[2]  Sign up — register a listing', value: 'add' },
-      { name: '[3]  Configure Agent Executor', value: 'executor' },
-      { name: '[4]  Configure Global LLM Default', value: 'llm' },
-      { name: '[5]  Configure Services', value: 'services' },
-      { name: '[6]  Security Setup', value: 'security' },
-      new inquirer.Separator('  ── Dispatcher ──'),
-      { name: '⚡ Live Jobs (auto-refresh)', value: 'live_jobs' },
-      { name: `[7]  Start Dispatcher ${status.running ? '\x1b[32m(running)\x1b[0m' : ''}`, value: 'start' },
-      { name: `[8]  Stop Dispatcher ${status.running ? '' : '\x1b[2m(not running)\x1b[0m'}`, value: 'stop' },
-      { name: '[9]  View Logs', value: 'logs' },
-      { name: '[10] Status & Health', value: 'status' },
-      { name: '     Doctor (this machine)', value: 'doctor' },
-      new inquirer.Separator('  ── Tools ──'),
-      { name: '[11] Inspect Agent (on-chain)', value: 'inspect' },
-      { name: '[12] Check Inbox', value: 'inbox' },
-      { name: '[13] Earnings Summary', value: 'earnings' },
-      { name: '[14] Docker Containers', value: 'docker' },
-      { name: '     Build job-agent + gpu-jail images', value: 'build_image' },
-      new inquirer.Separator('  ── Agents ──'),
-      { name: '[15] Activate All Agents', value: 'activate_all' },
-      { name: '[16] Deactivate All Agents', value: 'deactivate_all' },
-      new inquirer.Separator('  ── Marketplace ──'),
-      { name: '[17] Bounties', value: 'bounties' },
-      { name: '[18] API Endpoint Setup (resell your LLM, metered)', value: 'api_setup' },
-      { name: '     Hire a listing (this fleet as buyer)', value: 'hire' },
-      new inquirer.Separator('  ── Money ──'),
-      { name: `[19] Wallet & Fee Tanks${money.feeTanksNeedingFunding ? ` \x1b[31m(${money.feeTanksNeedingFunding} empty)\x1b[0m` : money.feeTanksLow ? ` \x1b[33m(${money.feeTanksLow} low)\x1b[0m` : ''}`, value: 'wallet' },
-      { name: `[20] Refunds Queue${money.pendingRefunds ? ` \x1b[33m(${money.pendingRefunds} awaiting you)\x1b[0m` : ''}`, value: 'refunds' },
-      { name: `[21] Deposits${money.depositsNeedOperator ? ` \x1b[33m(${money.depositsNeedOperator} need a decision)\x1b[0m` : ''}`, value: 'deposits' },
-      new inquirer.Separator(),
-      { name: '     Quit', value: 'quit' },
-    ],
+    choices: mainMenuChoices(status, money, identityRows).map((item) => (
+      Object.prototype.hasOwnProperty.call(item, 'separator')
+        ? new inquirer.Separator(item.separator)
+        : item
+    )),
   }]);
 
   return choice;
@@ -4075,6 +4094,71 @@ WantedBy=multi-user.target
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 
+async function promptBuyerAgentAndJob(inquirer) {
+  const { agentId } = await promptWithEsc(inquirer, [{
+    type: 'input', name: 'agentId',
+    message: 'Buyer agent id:',
+  }]);
+  const buyer = String(agentId || '').trim();
+  if (!buyer) return null;
+  const { jobId } = await promptWithEsc(inquirer, [{
+    type: 'input', name: 'jobId',
+    message: 'Job id:',
+  }]);
+  const job = String(jobId || '').trim();
+  if (!job) return null;
+  return { agentId: buyer, jobId: job };
+}
+
+async function completeJobScreen(inquirer) {
+  console.clear();
+  console.log('\n  ═══ Complete a job ═══\n');
+  const picked = await promptBuyerAgentAndJob(inquirer);
+  if (!picked) return;
+  console.log('');
+  await runDispatcherCli(['complete', picked.agentId, picked.jobId]);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
+async function reviewJobScreen(inquirer) {
+  console.clear();
+  console.log('\n  ═══ Review a job ═══\n');
+  const picked = await promptBuyerAgentAndJob(inquirer);
+  if (!picked) return;
+  let rating = '';
+  while (!rating) {
+    const { ratingInput } = await promptWithEsc(inquirer, [{
+      type: 'input', name: 'ratingInput',
+      message: 'Rating (1-5):',
+    }]);
+    const s = String(ratingInput || '').trim();
+    if (!/^[1-5]$/.test(s)) {
+      console.log('  Rating must be an integer 1-5.\n');
+      continue;
+    }
+    rating = s;
+  }
+  console.log('');
+  await runDispatcherCli(['review', picked.agentId, picked.jobId, '--rating', rating]);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
+async function artifactsScreen(inquirer) {
+  console.clear();
+  console.log('\n  ═══ Fetch artifacts ═══\n');
+  const picked = await promptBuyerAgentAndJob(inquirer);
+  if (!picked) return;
+  const { outDir } = await promptWithEsc(inquirer, [{
+    type: 'input', name: 'outDir',
+    message: 'Directory to write (--out):',
+  }]);
+  const out = String(outDir || '').trim();
+  if (!out) return;
+  console.log('');
+  await runDispatcherCli(['artifacts', picked.agentId, picked.jobId, '--out', out]);
+  await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
+}
+
 // ── Main Loop ──
 
 async function main() {
@@ -4298,10 +4382,8 @@ async function main() {
         // silently mute on-chain (no reviews, attestations or job records) while
         // still holding unswept earnings — see src/fee-tank.js.
         // All the arithmetic lives in wallet.js/buildEarningsRow, where it can be
-        // unit-tested. This file cannot be imported under `node --test` (it runs
-        // main() on require and needs a TTY), so anything computed inline here is
-        // untestable by construction — and a wrong number on the money screen
-        // would never be caught. Keep only layout below.
+        // unit-tested. Keep only layout below — a wrong number on the money
+        // screen must not hide inside this menu.
         const { buildEarningsRow } = require('./wallet.js');
         const agents = getAgents();
         for (const a of agents) {
@@ -4349,9 +4431,26 @@ async function main() {
       case 'deactivate_all': await withBack(() => batchActivateScreen(inquirer, false)); break;
       case 'bounties': await withBack(() => bountiesMenuScreen(inquirer)); break;
       case 'api_setup': await withBack(() => apiEndpointSetupScreen(inquirer)); break;
+      case 'complete': await withBack(() => completeJobScreen(inquirer)); break;
+      case 'review': await withBack(() => reviewJobScreen(inquirer)); break;
+      case 'artifacts': await withBack(() => artifactsScreen(inquirer)); break;
+      case 'data_setup': await withBack(async () => {
+        const id = await pickAgentId(inquirer, 'Data setup for:');
+        if (id) await dataSetupScreen(inquirer, id);
+      }); break;
+      case 'sales_mode': await withBack(async () => {
+        const id = await pickAgentId(inquirer, 'Sales mode for:');
+        if (id) await salesModeScreen(inquirer, id);
+      }); break;
       case 'quit': process.exit(0);
     }
   }
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+// Direct `node src/dashboard.js` starts the TUI. cli.js requires this file
+// and calls main() itself. A test require must not.
+if (require.main === module) {
+  main().catch(e => { console.error(e); process.exit(1); });
+}
+
+module.exports = { mainMenuChoices, main };
