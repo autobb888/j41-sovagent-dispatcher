@@ -9,10 +9,17 @@ const {
   buildAttachMessage,
   parseAttachBody,
   challengeAndAttach,
+  connectWithHello,
   attachAndDial,
   holdRemoteToLocal,
   keepOutboundUntilBuyer,
 } = require('../src/compute-edge');
+
+const HELLO = 'a'.repeat(64);
+
+function prefixOf(writes) {
+  return Buffer.concat(writes.map((chunk) => Buffer.from(chunk))).subarray(0, HELLO.length + 1).toString();
+}
 
 test('hasOutboundSshV1 is only the live token', () => {
   assert.equal(hasOutboundSshV1({ features: [COMPUTE_OUTBOUND_SSH_V1] }), true);
@@ -46,13 +53,19 @@ test('buildAttachMessage matches backend A–C', () => {
 });
 
 test('parseAttachBody requires public host and job-scoped port; same-socket dial', () => {
-  const a = parseAttachBody({ host: 'gpu.junction41.io', port: 40123, dial: 'tcp://gpu.junction41.io:40123' });
+  const a = parseAttachBody({
+    host: 'gpu.junction41.io',
+    port: 40123,
+    dial: 'tcp://gpu.junction41.io:40123',
+    token: HELLO,
+  });
   assert.equal(a.host, 'gpu.junction41.io');
   assert.equal(a.port, 40123);
   assert.equal(a.dialHost, 'gpu.junction41.io');
   assert.equal(a.dialPort, 40123);
-  assert.throws(() => parseAttachBody({ host: '192.168.1.69', port: 40123 }), /RENTAL_LAN_HOST/);
-  assert.throws(() => parseAttachBody({ host: 'gpu.junction41.io' }), /COMPUTE_EDGE_BAD_ATTACH/);
+  assert.equal(a.token, HELLO);
+  assert.throws(() => parseAttachBody({ host: '192.168.1.69', port: 40123, token: HELLO }), /RENTAL_LAN_HOST/);
+  assert.throws(() => parseAttachBody({ host: 'gpu.junction41.io', token: HELLO }), /COMPUTE_EDGE_BAD_ATTACH/);
 });
 
 test('challengeAndAttach signs the challenge and POSTs attach', async () => {
@@ -61,7 +74,7 @@ test('challengeAndAttach signs the challenge and POSTs attach', async () => {
     async request(method, path, body) {
       calls.push({ method, path, body });
       if (method === 'GET') return { message: 'J41-COMPUTE-ATTACH|Job:job-1|Ts:1700000000', timestamp: 1700000000 };
-      return { host: 'gpu.junction41.io', port: 40123, dial: 'tcp://gpu.junction41.io:40123' };
+      return { host: 'gpu.junction41.io', port: 40123, dial: 'tcp://gpu.junction41.io:40123', token: HELLO };
     },
   };
   const signed = [];
@@ -74,6 +87,7 @@ test('challengeAndAttach signs the challenge and POSTs attach', async () => {
   assert.equal(calls[1].body.signature, 'sig');
   assert.equal(calls[1].body.timestamp, 1700000000);
   assert.equal(out.port, 40123);
+  assert.equal(out.token, HELLO);
 });
 
 test('challengeAndAttach maps 402 to COMPUTE_EDGE_UNPAID', async () => {
@@ -90,14 +104,16 @@ test('challengeAndAttach maps 402 to COMPUTE_EDGE_UNPAID', async () => {
   );
 });
 
-test('attachAndDial connects to dial immediately (seller first accept)', async () => {
+test('attachAndDial writes the hello as the first bytes on the seller dial', async () => {
   const order = [];
+  const writes = [];
   const mkSock = (name) => {
     const sock = {
       name,
       pipe(other) { order.push(`pipe:${name}->${other.name}`); return other; },
       setKeepAlive(on, delay) { sock.keepAlive = { on, delay }; },
       setNoDelay() { sock.noDelay = true; },
+      write(chunk) { writes.push(chunk); },
       once(ev, fn) {
         if (ev === 'connect') queueMicrotask(fn);
         return sock;
@@ -110,7 +126,7 @@ test('attachAndDial connects to dial immediately (seller first accept)', async (
     async request(method) {
       order.push(method);
       if (method === 'GET') return { message: 'J41-COMPUTE-ATTACH|Job:job-1|Ts:1', timestamp: 1 };
-      return { host: 'gpu.junction41.io', port: 40123, dial: 'tcp://gpu.junction41.io:40123' };
+      return { host: 'gpu.junction41.io', port: 40123, dial: 'tcp://gpu.junction41.io:40123', token: HELLO };
     },
   };
   const connected = [];
@@ -128,6 +144,50 @@ test('attachAndDial connects to dial immediately (seller first accept)', async (
   assert.equal(connected.includes('127.0.0.1:2222'), false, 'jail sshd waits for the buyer');
   assert.equal(order[0], 'GET');
   assert.equal(order[1], 'POST');
+  assert.equal(prefixOf(writes), `${HELLO}\n`);
+});
+
+test('attachAndDial does not connect when the hello is missing', async () => {
+  let connects = 0;
+  const client = {
+    async request(method) {
+      if (method === 'GET') return { message: 'J41-COMPUTE-ATTACH|Job:job-1|Ts:1', timestamp: 1 };
+      return { host: 'gpu.junction41.io', port: 40123, dial: 'tcp://gpu.junction41.io:40123' };
+    },
+  };
+  await assert.rejects(
+    () => attachAndDial({
+      client,
+      jobId: 'job-1',
+      signMessage: async () => 'sig',
+      localPort: 2222,
+      connect: () => { connects += 1; },
+    }),
+    (err) => err && err.code === 'COMPUTE_EDGE_NO_HELLO',
+  );
+  assert.equal(connects, 0);
+});
+
+test('connectWithHello writes the same hello prefix', async () => {
+  const writes = [];
+  const sock = {
+    write(chunk) { writes.push(chunk); },
+    setKeepAlive() {},
+    setNoDelay() {},
+    once(ev, fn) {
+      if (ev === 'connect') queueMicrotask(fn);
+      return sock;
+    },
+    destroy() {},
+  };
+  const out = await connectWithHello({
+    host: 'gpu.junction41.io',
+    port: 40123,
+    token: HELLO,
+    connect: () => sock,
+  });
+  assert.equal(out, sock);
+  assert.equal(prefixOf(writes), `${HELLO}\n`);
 });
 
 test('attachAndDial enables TCP keepalive on the outbound socket', async () => {
@@ -137,6 +197,7 @@ test('attachAndDial enables TCP keepalive on the outbound socket', async () => {
       pipe() { return sock; },
       setKeepAlive(on, delay) { sock.keepAlive = { on, delay }; },
       setNoDelay() { sock.noDelay = true; },
+      write() {},
       once(ev, fn) {
         if (ev === 'connect') queueMicrotask(fn);
         return sock;
@@ -148,7 +209,7 @@ test('attachAndDial enables TCP keepalive on the outbound socket', async () => {
   const client = {
     async request(method) {
       if (method === 'GET') return { message: 'J41-COMPUTE-ATTACH|Job:job-1|Ts:1', timestamp: 1 };
-      return { host: 'sovcompute.junction41.io', port: 40002, dial: 'tcp://sovcompute.junction41.io:40002' };
+      return { host: 'sovcompute.junction41.io', port: 40002, dial: 'tcp://sovcompute.junction41.io:40002', token: HELLO };
     },
   };
   const edge = await attachAndDial({
@@ -172,6 +233,7 @@ test('local sshd close does not destroy the edge TCP (denied login must not drop
       pipeOpts: null,
       pipe(_other, opts) { sock.pipeOpts = opts || {}; return sock; },
       unpipe() {},
+      write() {},
       on(ev, fn) {
         handlers[ev] = handlers[ev] || [];
         handlers[ev].push(fn);
@@ -191,7 +253,7 @@ test('local sshd close does not destroy the edge TCP (denied login must not drop
   const client = {
     async request(method) {
       if (method === 'GET') return { message: 'J41-COMPUTE-ATTACH|Job:job-1|Ts:1', timestamp: 1 };
-      return { host: 'gpu.junction41.io', port: 40123, dial: 'tcp://gpu.junction41.io:40123' };
+      return { host: 'gpu.junction41.io', port: 40123, dial: 'tcp://gpu.junction41.io:40123', token: HELLO };
     },
   };
   const socks = [];

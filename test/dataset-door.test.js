@@ -1,6 +1,8 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { createOrchardDoor } = require('../src/dataset-door');
 
@@ -26,9 +28,9 @@ function job(overrides = {}) {
   };
 }
 
-function doorFor(current) {
+function doorFor(current, file = docPath) {
   return createOrchardDoor({
-    docPath,
+    docPath: file,
     secret,
     verifyMessage: (message, address, signature) => signature === `ok:${message}:${address}`,
     getJob: async () => current,
@@ -81,4 +83,33 @@ test('rows follow the paid terms and a different filter returns nothing', async 
   const other = new URLSearchParams({ color: 'green', taste: 'tart' });
   assert.equal(await door.rowsForToken(token, other), null);
   assert.equal(await door.rowsForToken('not-a-token', new URLSearchParams()), null);
+});
+
+test('dataset open returns at most 100 rows and reads the file once', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dataset-door-'));
+  const file = path.join(dir, 'apples.json');
+  try {
+    const matching = [];
+    for (let i = 0; i < 101; i += 1) {
+      matching.push({ kind: `Row ${i}`, color: 'red', taste: 'sweet' });
+    }
+    fs.writeFileSync(file, JSON.stringify({ items: matching }));
+    const door = doorFor(job(), file);
+    const { token } = await door.openGrant({
+      jobId: 'job-1', timestamp: 1,
+      signature: 'ok:J41-DATA-OPEN|Job:job-1|Ts:1|Buyer:russethire.agentplatform@:Rbuyer',
+      address: 'Rbuyer', buyer: 'russethire.agentplatform@',
+    });
+    const rows = await door.rowsForToken(token, new URLSearchParams());
+    assert.equal(rows.items.length, 100);
+    assert.equal(rows.truncated, true);
+    assert.equal(rows.count, 101);
+    fs.writeFileSync(file, '[]');
+    const again = await door.rowsForToken(token, new URLSearchParams());
+    assert.equal(again.items.length, 100);
+    assert.equal(again.truncated, true);
+    assert.equal(again.count, 101);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

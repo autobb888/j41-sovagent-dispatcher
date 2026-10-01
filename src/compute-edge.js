@@ -62,6 +62,22 @@ function parseDial(dial, fallbackHost, fallbackPort) {
   return { dialHost: fallbackHost, dialPort: fallbackPort };
 }
 
+const HELLO_HEX = /^[0-9a-fA-F]{64}$/;
+
+function helloToken(value) {
+  if (typeof value !== 'string') return null;
+  const token = value.trim();
+  return HELLO_HEX.test(token) ? token : null;
+}
+
+function requireHello(token) {
+  const hello = helloToken(token);
+  if (!hello) {
+    throw Object.assign(new Error('COMPUTE_EDGE_NO_HELLO'), { code: 'COMPUTE_EDGE_NO_HELLO' });
+  }
+  return hello;
+}
+
 function parseAttachBody(body) {
   const d = unwrapData(body);
   const host = d.host != null ? String(d.host).trim() : '';
@@ -72,7 +88,10 @@ function parseAttachBody(body) {
   assertPublicSshHost(host);
   const dialRaw = d.dial != null ? String(d.dial).trim() : `tcp://${host}:${port}`;
   const { dialHost, dialPort } = parseDial(dialRaw, host, port);
-  return { host, port, dial: dialRaw, dialHost, dialPort };
+  const parsed = { host, port, dial: dialRaw, dialHost, dialPort };
+  const token = helloToken(d.token);
+  if (token) parsed.token = token;
+  return parsed;
 }
 
 function rethrowEdgeHttp(e) {
@@ -260,11 +279,37 @@ function holdRemoteToLocal(remote, { localHost, localPort, connect }) {
   };
 }
 
-// Seller MUST be the first TCP accept on the allocated port. Call immediately after attach 200.
+function writeHello(sock, hello) {
+  if (!sock || typeof sock.write !== 'function') {
+    throw Object.assign(new Error('COMPUTE_EDGE_NO_HELLO'), { code: 'COMPUTE_EDGE_NO_HELLO' });
+  }
+  sock.write(`${hello}\n`);
+}
+
+// Connect, write the hello, and return the socket. The hello is the first line.
+async function connectWithHello({ host, port, token, connect }) {
+  const hello = requireHello(token);
+  const connectFn = typeof connect === 'function' ? connect : defaultConnect;
+  const sock = await connectOnce(connectFn, { host, port });
+  try {
+    writeHello(sock, hello);
+  } catch (e) {
+    try { sock.destroy(); } catch { /* ignore */ }
+    throw e;
+  }
+  return sock;
+}
+
+// The hello is the first line on the outbound socket. Call immediately after attach 200.
 async function attachAndDial(opts = {}) {
   const attached = await challengeAndAttach(opts);
   const connect = typeof opts.connect === 'function' ? opts.connect : defaultConnect;
-  const remote = await connectOnce(connect, { host: attached.dialHost, port: attached.dialPort });
+  const remote = await connectWithHello({
+    host: attached.dialHost,
+    port: attached.dialPort,
+    token: attached.token,
+    connect,
+  });
   const localPort = Number(opts.localPort);
   const localHost = opts.localHost || '127.0.0.1';
   if (!Number.isInteger(localPort) || localPort < 1) {
@@ -385,6 +430,7 @@ module.exports = {
   parseAttachBody,
   parseDial,
   challengeAndAttach,
+  connectWithHello,
   attachAndDial,
   holdRemoteToLocal,
   keepOutboundUntilBuyer,
