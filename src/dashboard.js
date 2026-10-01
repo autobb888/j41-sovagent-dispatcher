@@ -1355,35 +1355,56 @@ async function createCustomTemplate(inquirer, tplDir) {
   return tplName;
 }
 
+function signupStopsAtIdentity(purpose) {
+  return purpose === 'hire';
+}
+
 async function addAgentScreen(inquirer) {
   console.clear();
-  console.log('\n  ═══ Sign up — register a listing ═══\n');
-  console.log('  What are you listing?');
-  console.log(`  DeFi is off on ${NATIVE_COIN} — every kind mints as name.agentplatform@.`);
-  console.log('  Kind is stored on the identity (config.kind).\n');
-  const gpuOffered = process.platform === 'linux';
-  if (!gpuOffered) {
-    console.log('  compute (GPU rental) is a Linux NVIDIA host chapter — hidden on this OS.\n');
-  }
+  console.log('\n  ═══ Sign up ═══\n');
 
-  const kindChoices = [
-    { name: `  agent     ${KIND_BLURB.agent}`, value: 'agent' },
-  ];
-  if (gpuOffered) {
-    kindChoices.push({ name: `  compute   ${KIND_BLURB.compute}`, value: 'compute' });
-  }
-  kindChoices.push(
-    { name: `  data      ${KIND_BLURB.data}`, value: 'data' },
-    { name: `  model     ${KIND_BLURB.model}`, value: 'model' },
-  );
-
-  const { kindChoice } = await promptWithEsc(inquirer, [{
-    type: 'list', pageSize: 10, name: 'kindChoice',
-    message: 'Kind:',
-    choices: kindChoices,
+  const { purpose } = await promptWithEsc(inquirer, [{
+    type: 'list', pageSize: 10, name: 'purpose',
+    message: 'Hire or Sell:',
+    choices: [
+      { name: '  Hire', value: 'hire' },
+      { name: '  Sell', value: 'sell' },
+    ],
   }]);
-  const kind = parseListingKind(kindChoice);
-  if (!kind) return;
+  if (!purpose) return;
+
+  // A buyer is not a listing kind. The id prefix and the name check still
+  // use agent, which is what listingIdPrefix does when kind is omitted.
+  let kind = 'agent';
+  if (!signupStopsAtIdentity(purpose)) {
+    console.log('\n  ═══ Sign up — register a listing ═══\n');
+    console.log('  What are you listing?');
+    console.log(`  DeFi is off on ${NATIVE_COIN} — every kind mints as name.agentplatform@.`);
+    console.log('  Kind is stored on the identity (config.kind).\n');
+    const gpuOffered = process.platform === 'linux';
+    if (!gpuOffered) {
+      console.log('  compute (GPU rental) is a Linux NVIDIA host chapter — hidden on this OS.\n');
+    }
+
+    const kindChoices = [
+      { name: `  agent     ${KIND_BLURB.agent}`, value: 'agent' },
+    ];
+    if (gpuOffered) {
+      kindChoices.push({ name: `  compute   ${KIND_BLURB.compute}`, value: 'compute' });
+    }
+    kindChoices.push(
+      { name: `  data      ${KIND_BLURB.data}`, value: 'data' },
+      { name: `  model     ${KIND_BLURB.model}`, value: 'model' },
+    );
+
+    const { kindChoice } = await promptWithEsc(inquirer, [{
+      type: 'list', pageSize: 10, name: 'kindChoice',
+      message: 'Kind:',
+      choices: kindChoices,
+    }]);
+    kind = parseListingKind(kindChoice);
+    if (!kind) return;
+  }
 
   const agents = getAgents();
   const sameKind = agents.filter(a => (a.kind || 'agent') === kind).length;
@@ -1408,6 +1429,11 @@ async function addAgentScreen(inquirer) {
       await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
       return;
     }
+  }
+
+  if (signupStopsAtIdentity(purpose)) {
+    await hireScreen(inquirer);
+    return;
   }
 
   const tplDir = path.join(__dirname, '..', 'templates');
@@ -4453,4 +4479,4 @@ if (require.main === module) {
   main().catch(e => { console.error(e); process.exit(1); });
 }
 
-module.exports = { mainMenuChoices, main };
+module.exports = { mainMenuChoices, signupStopsAtIdentity, main };
