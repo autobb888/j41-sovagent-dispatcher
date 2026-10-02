@@ -46,6 +46,13 @@ function reviewableJobStatus(status) {
   return REVIEWABLE_JOB_STATUSES.has(status);
 }
 
+function reviewNotOpenMessage(status) {
+  if (status === 'resolved' || status === 'resolved_rejected') {
+    return `Job status is ${status}. A review is not open on this status.`;
+  }
+  return `Job status is ${status}. A review is open once the job is delivered.`;
+}
+
 function isJobCanonical(message) {
   return typeof message === 'string' && message.startsWith('J41-REVIEW|');
 }
@@ -131,7 +138,7 @@ async function submitBuyerJobReview({
     return fail('PAY_NOT_BUYER', 'This identity is not the buyer on that job.', { jobId: job.id });
   }
   if (!reviewableJobStatus(job.status)) {
-    return fail('REVIEW_NOT_COMPLETED', `Job status is ${job.status}. A review is open once the job is delivered.`, {
+    return fail('REVIEW_NOT_COMPLETED', reviewNotOpenMessage(job.status), {
       jobId: job.id,
       status: job.status,
     });
@@ -235,6 +242,7 @@ module.exports = {
   submitBuyerJobReview,
   parseRating,
   reviewableJobStatus,
+  reviewNotOpenMessage,
   getJobReviewMessage,
   readBuyerReviewInbox,
 };

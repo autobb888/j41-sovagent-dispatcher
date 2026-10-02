@@ -22,6 +22,7 @@ const {
   purgeStaleCanaries,
 } = require('./job-agent-teardown.js');
 const { isShieldedHire } = require('./shielded-hire-skip');
+const { installSealedChatFallback } = require('./chat-outbox');
 
 /** SovGuard canary id for this job, resolved after registration. */
 let _canaryId = null;
@@ -792,6 +793,14 @@ async function main() {
     iAddress: keys.iAddress,
   });
   _agent = agent;
+  let sealsKnown = false;
+  installSealedChatFallback(agent, JOB_DIR, async (jobId) => {
+    if (sealsKnown) return true;
+    if (!agent.client || typeof agent.client.getJob !== 'function') return false;
+    const current = await agent.client.getJob(jobId);
+    sealsKnown = jobHasBothSealAddresses(current);
+    return sealsKnown;
+  });
 
   // Establish authenticated API session via SDK login
   await withRetry(() => agent.authenticate(), 'authenticate');
@@ -1438,6 +1447,9 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
     }
 
     _lastActivityAt = Date.now();
+    // Armor is the buyer's sealed line. It is not a prompt. Sending it to the
+    // model made the zip a refusal of the ciphertext.
+    if (isSealArmorMessage(msg)) return;
     const buyerMessage = sanitizeInput(msg.content);
 
     // Detect platform file upload notification — download immediately, don't send to executor
@@ -1529,7 +1541,14 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
         }
         if (!isDup) {
           // processBuyerMessage dedups by id (markIfNew) → WS-delivered ones are skipped.
-          await processBuyerMessage({ id: m.id, jobId: job.id, senderVerusId: m.senderVerusId, content: m.content, createdAt: m.createdAt });
+          await processBuyerMessage({
+            id: m.id,
+            jobId: job.id,
+            senderVerusId: m.senderVerusId,
+            content: m.content,
+            contentEncoding: m.contentEncoding || m.content_encoding,
+            createdAt: m.createdAt,
+          });
         }
       }
       // Advance the high-water mark to the maximum createdAt observed across all

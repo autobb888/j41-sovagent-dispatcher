@@ -128,7 +128,7 @@ async function waitForWrittenReview({
 }
 
 function shieldedReviewStoredMessage() {
-  return 'Review stored. It stays off the public list, and chainReviewCount does not move.';
+  return 'Review stored. It stays off the public list and joins the sealed total at the next midnight.';
 }
 
 function reviewWriteMessage(result) {

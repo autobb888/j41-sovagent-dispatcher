@@ -7,6 +7,7 @@ const {
   submitBuyerJobReview,
   parseRating,
   getJobReviewMessage,
+  reviewNotOpenMessage,
 } = require('../src/buyer-review');
 
 const BUYER = {
@@ -93,6 +94,12 @@ test('a delivered job can be reviewed and a requested job cannot', async () => {
   assert.equal(early.code, 'REVIEW_NOT_COMPLETED');
   assert.equal(early.status, 'accepted');
   assert.equal(signed, 0);
+});
+
+test('a resolved job says the review is not open', () => {
+  assert.match(reviewNotOpenMessage('resolved'), /not open on this status/);
+  assert.match(reviewNotOpenMessage('resolved_rejected'), /not open on this status/);
+  assert.match(reviewNotOpenMessage('accepted'), /once the job is delivered/);
 });
 
 test('parseRating accepts 1-5 and rejects 1.5, 01, 1.0, empty, 9', () => {

@@ -7,8 +7,9 @@
  *
  *  1. UNANSWERED — the platform auto-opened a dispute, the seller has not
  *     responded, and the buyer demonstrably got nothing (no delivery, no
- *     tokens). This is the "paid and received nothing" safety net. It is
- *     deliberately narrow: a job with a real delivery or real token usage is
+ *     tokens). The signature is `platform-auto` or `system:attach-failed`.
+ *     A buyer-filed dispute stays pending so the seller can choose rework,
+ *     reject, or refund. A job with a real delivery or real token usage is
  *     NOT swept, because whether it is owed is a judgement call.
  *
  *  2. SELLER-AGREED — the seller answered `refund` and no txid exists yet.
@@ -55,6 +56,18 @@ function unwrapDispute(raw) {
  * Falls back to 100 only for the unanswered case, where the whole payment is
  * being returned by definition.
  */
+const SYSTEM_DISPUTE_SIGNATURES = new Set(['platform-auto', 'system:attach-failed']);
+
+function disputeReasonSignature(d) {
+  if (!d) return '';
+  const raw = d.reason_signature ?? d.reasonSignature;
+  return typeof raw === 'string' ? raw : '';
+}
+
+function isSystemRaisedDispute(d) {
+  return SYSTEM_DISPUTE_SIGNATURES.has(disputeReasonSignature(d));
+}
+
 function agreedRefundPercent(d) {
   const raw = d && (d.refund_percent ?? d.refundPercent);
   const n = typeof raw === 'string' ? parseFloat(raw) : raw;
@@ -87,8 +100,10 @@ function selectRefundableDisputes(jobs, disputeByJobId) {
       return false;
     }
 
-    // (1) Unanswered + buyer got nothing.
+    // (1) Platform-opened, still unanswered, and the buyer got nothing.
+    // A buyer signature is a real filing. The seller answers that one.
     if (d.action !== 'pending') return false;
+    if (!isSystemRaisedDispute(d)) return false;
     if (j.delivery != null) return false;
     if (hasPositiveTokens(j.tokenUsage)) return false;
     return true;
@@ -188,7 +203,7 @@ async function fetchSellerDisputedJobs(client, opts = {}) {
 }
 
 module.exports = {
-  hasPositiveTokens, alreadyPaid, agreedRefundPercent, unwrapDispute,
+  hasPositiveTokens, alreadyPaid, agreedRefundPercent, unwrapDispute, isSystemRaisedDispute,
   selectRefundableDisputes, buildDisputeRefundEntry, logUnselectedDisputes,
   listSellerDisputedJobs, fetchSellerDisputedJobs,
 };

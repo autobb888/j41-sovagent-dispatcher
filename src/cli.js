@@ -4133,9 +4133,9 @@ program
     }
     if (!job || !job.id) fail('REVIEW_NOT_COMPLETED', `Job ${jobId} not found.`);
     if (!buyerOwnsJob(keys, job)) fail('PAY_NOT_BUYER', 'This identity is not the buyer on that job.', { jobId: job.id });
-    const { reviewableJobStatus } = require('./buyer-review');
+    const { reviewableJobStatus, reviewNotOpenMessage } = require('./buyer-review');
     if (!reviewableJobStatus(job.status)) {
-      fail('REVIEW_NOT_COMPLETED', `Job status is ${job.status}. A review is open once the job is delivered.`, { jobId: job.id, status: job.status });
+      fail('REVIEW_NOT_COMPLETED', reviewNotOpenMessage(job.status), { jobId: job.id, status: job.status });
     }
     if (!options.yes) {
       const ok = await confirmHire({ amountText: `review ${job.id} rating ${rating}`, pay: false });
@@ -8357,6 +8357,7 @@ program
 
     // Check for completed jobs
     safeInterval(() => cleanupCompletedJobs(state), 10000, 'Cleanup');
+    safeInterval(() => relayWorkerSealedChat(state), 5000, 'SealedChat');
 
     // Re-drive owed refunds that failed to send (RPC blip, momentary funds/UTXO
     // issue). Without this, drainPendingRefunds runs ONLY at boot, so a transient
@@ -11546,9 +11547,11 @@ const OUTAGE_APOLOGY =
   'Refunding your payment in full — apologies for the inconvenience.';
 
 /**
- * Periodically find disputes this agent caused (undelivered, no tokens, dispute.action=pending)
- * and auto-respond refund 100% (honest acknowledgement — NOT owner-gated), then enqueue the
- * refund send for owner approval via `j41-dispatcher refunds approve`.
+ * Periodically find platform-opened disputes that are still unanswered, with no
+ * delivery and no tokens, and auto-respond refund 100% (honest acknowledgement —
+ * NOT owner-gated), then enqueue the refund send for owner approval via
+ * `j41-dispatcher refunds approve`. A buyer-filed dispute is not selected.
+ * A seller who already answered refund is queued and is not answered again.
  *
  * Idempotent: jobs already in the pending-refunds ledger or already refunded are skipped.
  * Per-agent failures do not abort the rest of the sweep.
@@ -14979,7 +14982,7 @@ function pruneExtensionChecks(state, jobId) {
  * gone or this call just stopped it).
  */
 async function rememberJobCanary(state, agentInfo, jobId, canaryToken) {
-  const { claimHostCanary } = require('./job-agent-teardown.js');
+  const { claimHostCanary, purgeUnhostedCanaries } = require('./job-agent-teardown.js');
   let client = null;
   try {
     const session = await getAgentSession(state, agentInfo);
@@ -14994,6 +14997,58 @@ async function rememberJobCanary(state, agentInfo, jobId, canaryToken) {
     }
   } catch (e) {
     console.warn(`[CANARY] ${String(jobId).substring(0, 8)}: host canary not saved (${e.message})`);
+  }
+  if (!client) return;
+  try {
+    const freed = await purgeUnhostedCanaries({ client, jobsDir: JOBS_DIR, keepToken: canaryToken });
+    if (freed > 0) {
+      console.log(`[CANARY] ${String(jobId).substring(0, 8)}: released ${freed} finished registration(s) with no host file`);
+    }
+  } catch (e) {
+    console.warn(`[CANARY] ${String(jobId).substring(0, 8)}: finished registrations not released (${e.message})`);
+  }
+}
+
+/**
+ * The worker has no viewing key. When both seals exist it writes plaintext
+ * lines into the job directory. This posts each new line as seal-chat.
+ */
+async function relayWorkerSealedChat(state) {
+  const { outboxHasPending, relayChatOutbox } = require('./chat-outbox');
+  const { sealChatArmor } = require('./seal-chat');
+  const hex86 = /^[0-9a-fA-F]{86}$/;
+  for (const [jobId, active] of state.active) {
+    if (!active || active.kind === 'gpu-rental' || active._chatRelayBusy) continue;
+    const jobDir = path.join(JOBS_DIR, jobId);
+    let pending = false;
+    try { pending = outboxHasPending(jobDir, JOBS_DIR, jobId); } catch { pending = false; }
+    if (!pending) continue;
+    active._chatRelayBusy = true;
+    try {
+      const session = await getAgentSession(state, active.agentInfo);
+      const client = session && (session.client || session._client);
+      if (!client || typeof client.getJob !== 'function' || typeof client.request !== 'function') continue;
+      const job = await client.getJob(jobId);
+      const theirs = job && job.buyerSealAddressHex;
+      const mine = job && job.sellerSealAddressHex;
+      if (!hex86.test(String(theirs || '')) || !hex86.test(String(mine || ''))) continue;
+      await relayChatOutbox({
+        jobDir,
+        jobsDir: JOBS_DIR,
+        jobId,
+        post: async (text) => {
+          const armor = await sealChatArmor(theirs, text);
+          await client.request('POST', `/v1/jobs/${jobId}/messages`, {
+            content: armor,
+            contentEncoding: 'j41-seal-v1',
+          });
+        },
+      });
+    } catch (e) {
+      console.warn(`[CHAT] ${String(jobId).substring(0, 8)}: sealed line not posted (${e.message})`);
+    } finally {
+      active._chatRelayBusy = false;
+    }
   }
 }
 

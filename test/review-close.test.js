@@ -143,7 +143,8 @@ test('buyer commands ask for the review without requiring complete first', () =>
 test('a shielded review is stored without saying it is public', () => {
   const { shieldedReviewStoredMessage } = require('../src/review-close');
   const line = shieldedReviewStoredMessage();
-  assert.match(line, /not move/);
+  assert.match(line, /next midnight/);
+  assert.doesNotMatch(line, /does not move/);
   assert.doesNotMatch(line, /is public/);
   assert.doesNotMatch(line, /seller accept copies the review/);
   assert.doesNotMatch(line, /not in the buyer inbox yet/);

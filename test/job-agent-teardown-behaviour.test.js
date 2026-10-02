@@ -10,6 +10,7 @@ const {
   releaseCanary,
   resolveCanaryId,
   purgeStaleCanaries,
+  purgeUnhostedCanaries,
   parseCanaryTimestamp,
   writeHostCanary,
   readHostCanary,
@@ -211,6 +212,44 @@ test('canary: Postgres space-format timestamps are read as UTC, not local', asyn
   assert.strictEqual(parseCanaryTimestamp('2026-08-04T11:00:00Z'), Date.parse('2026-08-04T11:00:00Z'));
   assert.strictEqual(parseCanaryTimestamp('garbage'), null);
   assert.strictEqual(parseCanaryTimestamp(null), null);
+});
+
+test('canary: cap purge deletes job rows with no host file and keeps a live one', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-canary-'));
+  const liveJob = 'job-live-01';
+  const live = hexToken(7);
+  const orphan = hexToken(8);
+  const custom = hexToken(9);
+  const keep = hexToken(10);
+  writeHostCanary(dir, liveJob, live);
+  const deleted = [];
+  const client = {
+    getCanaries: async () => ([
+      { id: 'live', token: live, format: 'sovguard-canary-v1' },
+      { id: 'orphan', token: orphan, format: 'sovguard-canary-v1' },
+      { id: 'custom', token: custom, format: 'custom' },
+      { id: 'keep', token: keep, format: 'sovguard-canary-v1' },
+    ]),
+    deleteCanary: async (id) => { deleted.push(id); },
+  };
+  const n = await purgeUnhostedCanaries({ client, jobsDir: dir, keepToken: keep });
+  assert.strictEqual(n, 1);
+  assert.deepStrictEqual(deleted, ['orphan']);
+
+  const blocked = await purgeUnhostedCanaries({
+    client,
+    jobsDir: dir,
+    keepToken: keep,
+    fsImpl: {
+      readdirSync() {
+        const err = new Error('denied');
+        err.code = 'EACCES';
+        throw err;
+      },
+    },
+  });
+  assert.strictEqual(blocked, 0);
+  assert.deepStrictEqual(deleted, ['orphan']);
 });
 
 test('canary: purge tolerates individual delete failures', async () => {

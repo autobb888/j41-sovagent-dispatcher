@@ -7,7 +7,7 @@ const {
   listSellerDisputedJobs, fetchSellerDisputedJobs,
 } = require('../src/dispute-sweep.js');
 
-const disp = { id: 'd1', action: 'pending', raised_by: 'iBUY' };
+const disp = { id: 'd1', action: 'pending', raised_by: 'iBUY', reason_signature: 'platform-auto' };
 const undelivered = { id: 'j1', status: 'disputed', delivery: null, tokenUsage: null, amount: 0.5, currency: 'VRSCTEST', buyerVerusId: 'iBUY' };
 
 test('selects undelivered + pending + no-tokens', () => {
@@ -128,12 +128,22 @@ test('a PARTIAL refund queues the agreed amount, not the whole job', () => {
 });
 
 test('the unanswered path still implies 100% and still requires "got nothing"', () => {
-  const e = buildDisputeRefundEntry(job(), { id: 'd', action: 'pending' }, 'agent-7', target, 'now');
+  const e = buildDisputeRefundEntry(job(), { id: 'd', action: 'pending', reason_signature: 'platform-auto' }, 'agent-7', target, 'now');
   assert.equal(e.refundPercent, 100);
   assert.equal(e.refundAmount, 0.5);
-  // and it must still refuse a delivered job
-  assert.equal(selectRefundableDisputes([job({ delivery: { hash: 'x' } })], { j1: { id: 'd', action: 'pending' } }).length, 0);
-  assert.equal(selectRefundableDisputes([job({ tokenUsage: { totalTokens: 5 } })], { j1: { id: 'd', action: 'pending' } }).length, 0);
+  const pending = { id: 'd', action: 'pending', reason_signature: 'platform-auto' };
+  assert.equal(selectRefundableDisputes([job()], { j1: pending }).length, 1);
+  assert.equal(selectRefundableDisputes([job({ delivery: { hash: 'x' } })], { j1: pending }).length, 0);
+  assert.equal(selectRefundableDisputes([job({ tokenUsage: { totalTokens: 5 } })], { j1: pending }).length, 0);
+});
+
+test('a buyer-filed dispute is not an outage refund', () => {
+  const buyer = { id: 'd', action: 'pending', reason_signature: 'buyer-signature' };
+  assert.equal(selectRefundableDisputes([job()], { j1: buyer }).length, 0);
+  const camel = { id: 'd', action: 'pending', reasonSignature: 'system:attach-failed' };
+  assert.equal(selectRefundableDisputes([job()], { j1: camel }).length, 1);
+  const agreed = { id: 'd', action: 'refund', refund_percent: 100, reason_signature: 'buyer-signature' };
+  assert.equal(selectRefundableDisputes([job()], { j1: agreed }).length, 1);
 });
 
 test('an unverified buyer address still routes to needs_review, not auto-approval', () => {

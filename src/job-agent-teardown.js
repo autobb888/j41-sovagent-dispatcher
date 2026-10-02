@@ -225,6 +225,54 @@ async function purgeStaleCanaries({ client, keepToken, now = Date.now(), maxAgeM
   return deleted;
 }
 
+const JOB_CANARY_FORMAT = 'sovguard-canary-v1';
+
+/**
+ * Tokens this host still has a file for. A failed directory read is not an
+ * empty host: deleting on that guess would drop a live job's registration.
+ */
+function hostedCanaryTokens(jobsDir, fsImpl = fs) {
+  const dir = path.join(jobsDir, '_canaries');
+  let names;
+  try {
+    names = fsImpl.readdirSync(dir);
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return { ok: true, tokens: new Set() };
+    return { ok: false, tokens: new Set() };
+  }
+  const tokens = new Set();
+  for (const name of names) {
+    const token = readHostCanary(jobsDir, name, fsImpl);
+    if (token) tokens.add(token);
+  }
+  return { ok: true, tokens };
+}
+
+/**
+ * Free cap slots held by finished jobs from this identity.
+ * A row goes only when it is a job canary and this host has no file for that
+ * token. A token that matches a host file stays, including a second live job.
+ * The 25-hour purge remains the backstop for a file this host still holds.
+ */
+async function purgeUnhostedCanaries({ client, jobsDir, keepToken, fsImpl = fs }) {
+  if (!client || typeof client.getCanaries !== 'function' || typeof client.deleteCanary !== 'function') return 0;
+  const hosted = hostedCanaryTokens(jobsDir, fsImpl);
+  if (!hosted.ok) return 0;
+  if (keepToken) hosted.tokens.add(keepToken);
+  let deleted = 0;
+  try {
+    const list = await client.getCanaries();
+    const arr = Array.isArray(list) ? list : (list && list.canaries) || [];
+    for (const c of arr) {
+      if (!c || !c.id || !c.token) continue;
+      if (hosted.tokens.has(c.token)) continue;
+      if ((c.format || c.canary_format) !== JOB_CANARY_FORMAT) continue;
+      try { await client.deleteCanary(c.id); deleted++; } catch { /* best-effort */ }
+    }
+  } catch { /* best-effort */ }
+  return deleted;
+}
+
 /**
  * Host-only copy of the token this dispatcher minted for one job.
  * The job directory is bind-mounted into the container, so the copy inside it
@@ -341,6 +389,9 @@ module.exports = {
   releaseCanary,
   resolveCanaryId,
   purgeStaleCanaries,
+  purgeUnhostedCanaries,
+  hostedCanaryTokens,
+  JOB_CANARY_FORMAT,
   parseCanaryTimestamp,
   STALE_CANARY_MS,
   CANARY_TOKEN_RE,
