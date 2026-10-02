@@ -79,6 +79,9 @@ COPY src/job-agent-teardown.js ./
 # either crashes every container with MODULE_NOT_FOUND.
 COPY src/chat-outbox.js ./
 COPY src/job-id.js ./
+# Model-abort check. job-agent.js requires it at load, and the executor
+# requires it when a call fails. Omitting it crashes the container.
+COPY src/model-outage.js ./
 RUN chmod +x container-entry.sh
 
 # ─────────────────────────────────────────

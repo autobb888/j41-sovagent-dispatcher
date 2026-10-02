@@ -81,6 +81,8 @@ cp "$DISPATCHER_DIR/src/job-agent-teardown.js" .build-temp/src/
 # every container with MODULE_NOT_FOUND.
 cp "$DISPATCHER_DIR/src/chat-outbox.js" .build-temp/src/
 cp "$DISPATCHER_DIR/src/job-id.js" .build-temp/src/
+# job-agent.js and executors/local-llm.js both require model-outage.js.
+cp "$DISPATCHER_DIR/src/model-outage.js" .build-temp/src/
 cp "$DISPATCHER_DIR/src/executors/"*.js .build-temp/src/executors/
 cp "$DISPATCHER_DIR/Dockerfile.job-agent" .build-temp/Dockerfile
 

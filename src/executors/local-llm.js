@@ -16,6 +16,7 @@ function buyerVisibleReply(msg) {
 const { Executor } = require('./base.js');
 const log = require('../logger.js');
 const { scanUntrusted } = require('../sovguard-context.js');
+const { isModelOutageText, buyerGreeting } = require('../model-outage');
 
 // ── LLM Provider Presets ──
 const LLM_PRESETS = {
@@ -137,22 +138,22 @@ class LocalLLMExecutor extends Executor {
       return;
     }
 
-    // Send greeting — use LLM if available, template fallback
-    let greeting;
+    // Send greeting — use LLM if available, template fallback.
+    // An aborted call returns a canned sentence. That is not the greeting.
+    const templateGreeting = `Hello! I'm your Verus agent. I've accepted your job: "${this.safeDescription.substring(0, 100)}". How can I help you?`;
+    let greeting = '';
     if (LLM_CONFIG.usable) {
       try {
         const greetResult = await callLLM(this.systemPrompt, [
           { role: 'user', content: `[SYSTEM: The buyer just connected. Introduce yourself briefly and ask how you can help with this job. Keep it under 2 sentences.]` },
         ]);
         this._trackUsage(greetResult.usage);
-        greeting = greetResult.content;
+        greeting = buyerGreeting(greetResult.content, '');
       } catch {
-        greeting = null;
+        greeting = '';
       }
     }
-    if (!greeting) {
-      greeting = `Hello! I'm your Verus agent. I've accepted your job: "${this.safeDescription.substring(0, 100)}". How can I help you?`;
-    }
+    if (!greeting) greeting = templateGreeting;
     // The platform rejects one chat message over 4000 characters. A long
     // greeting is sent in order, and every character is kept.
     const sent = await sendWithinChatLimit(agent, job.id, greeting);
@@ -273,6 +274,14 @@ class LocalLLMExecutor extends Executor {
       }
     } else {
       response = generateTemplateResponse(message, this.job, this.soulPrompt);
+    }
+
+    // The canned sentence is not an answer. Drop the user turn too, so a
+    // retry of this hire does not stack the same question.
+    if (isModelOutageText(response)) {
+      const last = this.conversationLog[this.conversationLog.length - 1];
+      if (last && last.role === 'user') this.conversationLog.pop();
+      return response;
     }
 
     this.conversationLog.push({ role: 'assistant', content: response });
@@ -405,6 +414,23 @@ function http1Fetch() {
   return { fetch: undici.fetch, dispatcher: _http1Agent };
 }
 
+// A timed-out HTTP/1 socket must not be reused for the next attempt.
+function dropHttp1Agent() {
+  const prev = _http1Agent;
+  _http1Agent = null;
+  if (prev && typeof prev.close === 'function') {
+    Promise.resolve().then(() => prev.close()).catch(() => {});
+  }
+}
+
+function failedTransport(err) {
+  const name = err && err.name;
+  const msg = String((err && err.message) || '');
+  return name === 'AbortError'
+    || /abort/i.test(msg)
+    || /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|fetch failed/i.test(msg);
+}
+
 // Kimi's time-to-first-byte on this host is about 91s. 60s shipped the canned
 // "temporary issue" line and the labour job never delivered. The buyer→proxy
 // hop is capped near 95s by Cloudflare. This call is the container talking to
@@ -454,11 +480,13 @@ function labourMaxTokens(env = process.env) {
 
 async function fetchChatCompletions(payload) {
   const body = JSON.stringify(payload);
-  const { fetch: doFetch, dispatcher } = http1Fetch();
   let lastErr = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
+    // A failed attempt drops the agent. The next attempt must open a new one.
+    const { fetch: doFetch, dispatcher } = http1Fetch();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), CHAT_ABORT_MS);
+    if (timer.unref) timer.unref();
     try {
       const res = await doFetch(`${LLM_CONFIG.baseUrl}/chat/completions`, {
         method: 'POST',
@@ -480,6 +508,7 @@ async function fetchChatCompletions(payload) {
       clearTimeout(timer);
       lastErr = e.message;
       log.error('LLM call failed', { error: e.message, attempt });
+      if (failedTransport(e)) dropHttp1Agent();
     }
   }
   return { ok: false, error: lastErr };

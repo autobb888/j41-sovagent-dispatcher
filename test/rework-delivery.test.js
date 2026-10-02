@@ -107,8 +107,8 @@ test('the reworked answer is posted to chat so the buyer knows rework happened',
 
   await resumeJob(JOB, agent, 'soul', ex, () => {}, REWORK, 1080);
 
-  assert.equal(agent.sent.length, 1);
-  assert.ok(agent.sent[0].includes('Concrete hazards'), 'the buyer must receive the rework in chat');
+  assert.ok(agent.sent.some((line) => line.includes('Concrete hazards')), 'the buyer must receive the rework in chat');
+  assert.equal(agent.sent.filter((line) => line.includes('Concrete hazards')).length, 1);
 });
 
 test('a genuinely budget-gated rework falls back to the transcript rather than delivering nothing', async () => {
@@ -122,7 +122,7 @@ test('a genuinely budget-gated rework falls back to the transcript rather than d
 
   assert.equal(result.hash, 'transcript-hash', 'must fall back');
   assert.ok(!/token budget/i.test(result.content), 'the budget-gate line must never be the deliverable');
-  assert.equal(agent.sent.length, 0, 'nothing to tell the buyer when no rework was produced');
+  assert.equal(agent.sent.some((line) => /token budget/i.test(line)), false, 'the budget-gate line is not posted');
 });
 
 test('an empty rework reply falls back rather than delivering an empty artifact', async () => {
@@ -132,7 +132,8 @@ test('an empty rework reply falls back rather than delivering an empty artifact'
   const result = await resumeJob(JOB, agent, 'soul', ex, () => {}, REWORK, 1080);
 
   assert.equal(result.hash, 'transcript-hash');
-  assert.equal(agent.sent.length, 0);
+  assert.equal(agent.sent.some((line) => line.trim() === ''), false);
+  assert.equal(agent.sent.filter((line) => /sinkholes|Concrete hazards/.test(line)).length, 0);
 });
 
 test('a chat failure does not lose the rework — the deliverable still carries it', async () => {
@@ -160,8 +161,8 @@ test('a chat socket that died during the dispute window is re-authenticated and 
 
   const result = await resumeJob(JOB, agent, 'soul', ex, () => {}, REWORK, 1080);
 
-  assert.equal(agent.sent.length, 1, 'the buyer must still receive the rework in chat');
-  assert.ok(agent.sent[0].includes('Concrete hazards'));
+  assert.ok(agent.sent.some((line) => line.includes('Concrete hazards')), 'the buyer must still receive the rework in chat');
+  assert.equal(agent.sent.filter((line) => line.includes('Concrete hazards')).length, 1);
   assert.deepEqual(agent.calls, ['authenticate', 'connectChat', `joinJobChat:${JOB.id}`],
     'must re-auth, reconnect, THEN join — a fresh socket is not in the room');
   assert.equal(result.content, ANSWER);
@@ -174,7 +175,7 @@ test('a live chat socket is not re-joined — re-joining a room duplicates every
   await resumeJob(JOB, agent, 'soul', ex, () => {}, REWORK, 1080);
 
   assert.deepEqual(agent.calls, [], 'no reconnect and no re-join when the socket is already live');
-  assert.equal(agent.sent.length, 1, 'exactly one copy of the rework');
+  assert.equal(agent.sent.filter((line) => line.includes('Concrete hazards')).length, 1, 'exactly one copy of the rework');
 });
 
 test('a rework job must be joined explicitly — connectChat only auto-joins accepted/in_progress', async () => {
@@ -215,6 +216,31 @@ test('rework DOES request a budget extension — the platform allows them during
   await resumeJob(JOB, agent, 'soul', ex, () => {}, REWORK, 1080);
 
   assert.ok(ex._lastExtensionAttemptAt, 'crossing the rework warning threshold must attempt an extension');
+});
+
+test('an outage sentence is not packaged as the rework', async () => {
+  const OUTAGE = 'I experienced a temporary issue. Please try sending your message again.';
+  let calls = 0;
+  let finalized = false;
+  const ex = makeExecutor({ alreadyUsed: 0, answer: OUTAGE });
+  ex.handleMessage = async () => {
+    calls += 1;
+    return OUTAGE;
+  };
+  ex.finalize = async () => {
+    finalized = true;
+    return { content: OUTAGE, hash: 'outage-hash' };
+  };
+  const agent = makeAgent();
+
+  await assert.rejects(
+    () => resumeJob(JOB, agent, 'soul', ex, () => {}, REWORK, 1080),
+    /canned fallback was not delivered/,
+  );
+
+  assert.equal(calls, 2, 'the rework retries once, then stops');
+  assert.equal(finalized, false, 'the transcript must not become the package');
+  assert.equal(agent.sent.some((line) => /temporary issue/i.test(line)), false);
 });
 
 test('staying under the warning threshold asks for nothing', async () => {

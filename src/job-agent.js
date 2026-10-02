@@ -23,6 +23,7 @@ const {
 } = require('./job-agent-teardown.js');
 const { isShieldedHire } = require('./shielded-hire-skip');
 const { installSealedChatFallback } = require('./chat-outbox');
+const { isModelOutageText, reworkAnswerUsable, holdOpenForModelOutage } = require('./model-outage');
 
 /** SovGuard canary id for this job, resolved after registration. */
 let _canaryId = null;
@@ -61,8 +62,7 @@ const ACCEPTED_QUIET_MS = 90_000;
 const ACCEPTED_IDLE_NOTE = 'This job is still accepted, so it cannot be paused. Delivering the work so far.';
 
 function isOutageReply(text) {
-  return /I experienced a temporary issue/i.test(String(text || ''))
-    || /I could not generate a response/i.test(String(text || ''));
+  return isModelOutageText(text);
 }
 
 function lastAssistantText(executor) {
@@ -1293,6 +1293,10 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   let resolveSession;
   let messageCount = 0;
   let hireAnswered = false;
+  let hireReply = '';
+  let _answeringHire = false;
+  let _holdForModelOutage = false;
+  let _hireBackoffTimer = null;
   let messageQueue = Promise.resolve(); // J4: Serialize handleMessage calls
 
   // Promise that resolves when session ends or idle timeout
@@ -1395,26 +1399,46 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   await executor.init(job, agent, soulPrompt, { isReconnect });
   // The hire description is the whole task. The greeting only introduces
   // the worker. Answer the description before the 90s close, or the zip
-  // is that introduction.
+  // is that introduction. One call already waits through three 120s aborts.
+  // A second try stays in this container. The canned sentence is not posted.
+  const HIRE_INLINE_ATTEMPTS = 2;
   if (!isReconnect && job.description && String(job.description).trim()) {
-    try {
-      const hireReply = await executor.handleMessage(String(job.description), {
-        jobId: job.id,
-        senderVerusId: job.buyer,
-      });
+    const description = String(job.description);
+    for (let attempt = 1; attempt <= HIRE_INLINE_ATTEMPTS; attempt++) {
+      _answeringHire = true;
+      try {
+        hireReply = await executor.handleMessage(description, {
+          jobId: job.id,
+          senderVerusId: job.buyer,
+        });
+      } catch (e) {
+        console.warn(`[CHAT] Hire answer failed: ${e.message}`);
+        hireReply = '';
+      } finally {
+        _answeringHire = false;
+        _lastActivityAt = Date.now();
+      }
       if (hireReply && checkCanaryLeak(hireReply)) {
         await sendChatChunked(agent, job.id, 'I\'m sorry, I can\'t share that information. How else can I help you?');
-      } else if (hireReply && !isOutageReply(hireReply)) {
-        await sendChatChunked(agent, job.id, hireReply);
+        break;
       }
-    } catch (e) {
-      console.warn(`[CHAT] Hire answer failed: ${e.message}`);
+      if (hireReply && !isOutageReply(hireReply)) {
+        await sendChatChunked(agent, job.id, hireReply);
+        break;
+      }
+      if (!isOutageReply(hireReply)) break;
+      if (attempt < HIRE_INLINE_ATTEMPTS) {
+        console.warn(`[LLM-OUTAGE] hire answer aborted (attempt ${attempt}/${HIRE_INLINE_ATTEMPTS}) — retrying in this container`);
+      }
     }
   }
+  // Those model waits finish before the idle clock exists. Stamp here so
+  // the first tick does not see a 12-minute abort as eight minutes of idle.
+  _lastActivityAt = Date.now();
   if (!isReconnect && hireAnswerStartsQuiet(executor)) {
-    _lastActivityAt = Date.now();
     hireAnswered = true;
   }
+  _holdForModelOutage = !hireAnswered && isOutageReply(hireReply);
 
   // Shared dedup set for WS handler and poll fallback (Task 3)
   const _processedMsgIds = new Set();
@@ -1474,9 +1498,15 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
         if (checkCanaryLeak(response)) {
           agent.sendChatMessage(job.id, 'I\'m sorry, I can\'t share that information. How else can I help you?');
           console.log('[CHAT] Agent: [BLOCKED — canary leak detected]');
+        } else if (isOutageReply(response)) {
+          console.warn('[CHAT] Model outage — the fallback line was not posted');
         } else {
           const parts = await sendChatChunked(agent, job.id, response);
           console.log(`[CHAT] Agent: ${response.substring(0, 80)}${parts > 1 ? ` [sent in ${parts} parts]` : ''}`);
+          if (hireAnswerStartsQuiet(executor)) {
+            hireAnswered = true;
+            _holdForModelOutage = false;
+          }
         }
 
         // After each message: if budget is exhausted and not yet delivered, deliver
@@ -1638,11 +1668,67 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   }
   scheduleWsPoll();
 
+  // Later tries are spaced. Each one is another three-abort wait, so the
+  // count stays small. While the hire is still an outage, do not pause:
+  // this job may already have two pauses, and a third starts the dispute clock.
+  const HIRE_BACKOFF_TRIES = 3;
+  const HIRE_BACKOFF_MS = 60_000;
+  let hireBackoffLeft = _holdForModelOutage ? HIRE_BACKOFF_TRIES : 0;
+  function scheduleHireBackoff() {
+    if (hireBackoffLeft <= 0 || sessionEnded || _paused || hireAnswered || !_holdForModelOutage) return;
+    _hireBackoffTimer = setTimeout(() => {
+      _hireBackoffTimer = null;
+      if (sessionEnded || _paused || hireAnswered || !_holdForModelOutage) return;
+      hireBackoffLeft -= 1;
+      _answeringHire = true;
+      _lastActivityAt = Date.now();
+      Promise.resolve()
+        .then(() => executor.handleMessage(String(job.description), {
+          jobId: job.id,
+          senderVerusId: job.buyer,
+        }))
+        .then(async (reply) => {
+          hireReply = reply || '';
+          if (hireReply && checkCanaryLeak(hireReply)) {
+            await sendChatChunked(agent, job.id, 'I\'m sorry, I can\'t share that information. How else can I help you?');
+            _holdForModelOutage = false;
+            return;
+          }
+          if (!isOutageReply(hireReply)) {
+            if (hireReply) await sendChatChunked(agent, job.id, hireReply);
+            if (hireAnswerStartsQuiet(executor)) hireAnswered = true;
+            _holdForModelOutage = false;
+            _lastActivityAt = Date.now();
+            return;
+          }
+          console.warn(`[LLM-OUTAGE] hire answer still aborted — not pausing and not delivering the fallback (${hireBackoffLeft} retries left)`);
+        })
+        .catch((e) => {
+          console.warn(`[CHAT] Hire retry failed: ${e.message}`);
+        })
+        .finally(() => {
+          _answeringHire = false;
+          _lastActivityAt = Date.now();
+          if (_holdForModelOutage && !sessionEnded && !_paused) scheduleHireBackoff();
+        });
+    }, HIRE_BACKOFF_MS);
+    if (_hireBackoffTimer.unref) _hireBackoffTimer.unref();
+  }
+  scheduleHireBackoff();
+
   // Idle timer — check periodically if we should pause (not auto-deliver)
   _idleMessageSent = false;
   let _idlePauseUnsupported = false;
   let _acceptedQuietChecked = false;
   const idleCheck = setInterval(async () => {
+    if (_holdForModelOutage && hireAnswerStartsQuiet(executor)) {
+      _holdForModelOutage = false;
+      hireAnswered = true;
+      _lastActivityAt = Date.now();
+    }
+    if (_answeringHire || holdOpenForModelOutage({ hireAnswered, outage: _holdForModelOutage })) {
+      return;
+    }
     const idleMs = Date.now() - _lastActivityAt;
     if (_idlePauseUnsupported) return;
     if (quietDeliverReady({
@@ -1745,6 +1831,7 @@ async function processJob(job, agent, soulPrompt, executor, registerSessionEndRe
   clearInterval(idleCheck);
   clearInterval(budgetCheck);
   clearInterval(_msgPoll); // stop message-poll fallback — session ended
+  if (_hireBackoffTimer) clearTimeout(_hireBackoffTimer);
   // NOTE: _ipcPoller is NOT cleared here — it must survive for post-delivery IPC (dispute/rework)
   _wsPollerStopped = true;
   if (_wsPollTimer) clearTimeout(_wsPollTimer);
@@ -2186,7 +2273,19 @@ async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndRes
 
   // handleMessage() is the existing Executor method that processes buyer messages.
   // The executor keeps its conversation history from the original job.
-  const response = await executor.handleMessage(reworkContext, { jobId: job.id, senderVerusId: 'system' });
+  // An aborted model call returns a canned sentence. Retry once in this
+  // container. If it is still that sentence, fail the rework. The caller
+  // must not publish it as answer.txt.
+  const REWORK_MODEL_ATTEMPTS = 2;
+  let response;
+  for (let attempt = 1; attempt <= REWORK_MODEL_ATTEMPTS; attempt++) {
+    response = await executor.handleMessage(reworkContext, { jobId: job.id, senderVerusId: 'system' });
+    if (!isOutageReply(response)) break;
+    console.warn(`  [LLM-OUTAGE] rework answer aborted (attempt ${attempt}/${REWORK_MODEL_ATTEMPTS}) — not packaging the fallback`);
+  }
+  if (isOutageReply(response)) {
+    throw new Error('Rework model call failed. The canned fallback was not delivered.');
+  }
 
   // Deliver the REWORKED ANSWER, not the whole transcript.
   //
@@ -2200,14 +2299,9 @@ async function resumeJob(job, agent, soulPrompt, executor, registerSessionEndRes
   //
   // Fall back to the transcript only if `response` is unusable — better a
   // clumsy deliverable than an empty one.
-  const canned = new Set([
-    'I received your message — one moment while I finish my current thought.',
-  ]);
-  const usable = typeof response === 'string'
-    && response.trim().length > 0
-    && !canned.has(response.trim())
-    && !executor._budgetGateHit
-    && !/^I've reached the token budget for this job/.test(response.trim());
+  const usable = reworkAnswerUsable(response, {
+    budgetGateHit: !!(executor && executor._budgetGateHit),
+  });
 
   if (!usable) {
     console.log(`  ⚠️  Rework produced no usable answer (${response ? 'canned/budget-gated reply' : 'empty'}) — falling back to the full transcript`);

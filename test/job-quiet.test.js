@@ -16,6 +16,9 @@ test('a real hire answer starts the 90s close; the outage line and a silent exec
   assert.equal(hireAnswerStartsQuiet({
     conversationLog: [{ role: 'assistant', content: 'I experienced a temporary issue. Please try sending your message again.' }],
   }), false);
+  assert.equal(hireAnswerStartsQuiet({
+    conversationLog: [{ role: 'assistant', content: 'I encountered an issue generating a response. Let me try to help directly — could you rephrase your question?' }],
+  }), false);
   assert.equal(hireAnswerStartsQuiet({ conversationLog: [] }), false);
   assert.equal(hireAnswerStartsQuiet(null), false);
   assert.equal(hireAnswerStartsQuiet({
@@ -56,6 +59,11 @@ test('a paid hire with only the idle notice still does the first work', () => {
   assert.equal(skipsFirstWork({
     status: 'in_progress',
     messages: [{ senderVerusId: SELLER, content: 'I experienced a temporary issue. Please try sending your message again.' }],
+    speakerIds: [SELLER],
+  }), false);
+  assert.equal(skipsFirstWork({
+    status: 'in_progress',
+    messages: [{ senderVerusId: SELLER, content: 'I encountered an issue processing your request. Please try again.' }],
     speakerIds: [SELLER],
   }), false);
   assert.equal(skipsFirstWork({
