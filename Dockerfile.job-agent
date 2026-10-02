@@ -74,6 +74,11 @@ COPY src/message-poll.js ./
 # container instantly. Extracted from job-agent.js so the teardown paths are
 # behaviourally testable (the entrypoint has no exports).
 COPY src/job-agent-teardown.js ./
+# Sealed worker lines. job-agent.js requires chat-outbox.js at module load,
+# and chat-outbox.js plus job-agent-teardown.js require job-id.js. Omitting
+# either crashes every container with MODULE_NOT_FOUND.
+COPY src/chat-outbox.js ./
+COPY src/job-id.js ./
 RUN chmod +x container-entry.sh
 
 # ─────────────────────────────────────────

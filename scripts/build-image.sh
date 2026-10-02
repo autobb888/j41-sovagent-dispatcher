@@ -76,6 +76,11 @@ cp "$DISPATCHER_DIR/src/message-poll.js" .build-temp/src/
 # Container teardown (deletion attestation + canary release) — required by
 # job-agent.js at module load. Omitting it crashes every container instantly.
 cp "$DISPATCHER_DIR/src/job-agent-teardown.js" .build-temp/src/
+# Sealed worker lines. job-agent.js requires chat-outbox.js at load, and that
+# file plus job-agent-teardown.js require job-id.js. Omitting either crashes
+# every container with MODULE_NOT_FOUND.
+cp "$DISPATCHER_DIR/src/chat-outbox.js" .build-temp/src/
+cp "$DISPATCHER_DIR/src/job-id.js" .build-temp/src/
 cp "$DISPATCHER_DIR/src/executors/"*.js .build-temp/src/executors/
 cp "$DISPATCHER_DIR/Dockerfile.job-agent" .build-temp/Dockerfile
 

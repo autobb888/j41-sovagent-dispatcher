@@ -130,6 +130,13 @@ const { findMainnetSecurityViolations, resolveIsMainnet } = require('./mainnet-g
 const { resolveLogRetention, shouldArchiveLog, applyLogCap, selectLogsToPrune, liveLogPath, archiveLogPath } = require('./job-log.js');
 const { shouldRefundOrphan, isRefundAlreadyHandled, buildAbandonedJobRefund, classifyCrashOrphan, promoteNeedsReview } = require('./refund.js');
 const { isValidJobId } = require('./job-id.js');
+const {
+  jobTimeoutStillOwns,
+  assignJobTimeout,
+  clearJobTimeout,
+  shouldReviveStrandedJob,
+  MAX_STRANDED_REVIVES,
+} = require('./job-lifetime.js');
 const { verifyInboxJobRecord } = require('./inbox-job-record.js');
 const { writeKeysFile, readKeysFile } = require('./keys-file.js');
 const keystore = require('./keystore.js');
@@ -10281,6 +10288,10 @@ async function moveJobToReactivationQueue(state, jobId, { persist = true } = {})
   const info = state.active.get(jobId);
   if (!info) return false;
   info._pausing = true; // guard: prevents cleanupCompletedJobs from respawning mid-teardown (I3)
+  // The hour timer looks the job up by id. Leaving it armed kills the container
+  // a later resume starts. Drop it, and the generation, before the entry leaves
+  // the map.
+  clearJobTimeout(info);
 
   // C1: enqueue + persist BEFORE touching the container so a crash at any point
   // leaves the job safely recoverable (never active-only, never silently dropped).
@@ -12468,6 +12479,50 @@ function queueInsertByPriority(queue, job) {
   queue.splice(idx, 0, job);
 }
 
+// A paid labour job can sit in `seen` after its worker is gone: the pause
+// freed the container, the old hour timer then killed the resume, and `seen`
+// stops the next poll from starting anything. One such job per poll, and only
+// while it is still in progress with no delivery. A paused job stays in the
+// reactivation queue and is not this case.
+async function openStrandedInProgress(state, agent, job) {
+  const ctx = {
+    seen: state.seen,
+    active: state.active,
+    inQueue: Array.isArray(state.queue) && state.queue.some(j => j && j.id === job.id),
+    inReactivation: Array.isArray(state.reactivationQueue) && rq.has(state.reactivationQueue, job.id),
+    attempts: state._strandedRevives ? (state._strandedRevives.get(job.id) || 0) : 0,
+  };
+  let verdict = shouldReviveStrandedJob(job, ctx);
+  if (verdict.confirm) {
+    if (!agent || !agent.client || typeof agent.client.getJob !== 'function') return false;
+    let full;
+    try { full = await agent.client.getJob(job.id); }
+    catch (e) {
+      console.warn(`[Poll] ${String(job.id).substring(0, 8)}: could not read delivery (${e.message})`);
+      return false;
+    }
+    verdict = shouldReviveStrandedJob(full, ctx);
+  }
+  const id8 = String(job.id).substring(0, 8);
+  if (!verdict.revive) {
+    if (verdict.why && verdict.why.startsWith('revive cap')) {
+      if (!state._strandedCapLogged) state._strandedCapLogged = new Set();
+      if (!state._strandedCapLogged.has(job.id)) {
+        state._strandedCapLogged.add(job.id);
+        console.warn(`[Poll] Job ${id8} stayed in progress with no worker after ${MAX_STRANDED_REVIVES} starts — leaving it`);
+      }
+    }
+    return false;
+  }
+  if (!state._strandedRevives) state._strandedRevives = new Map();
+  const n = (state._strandedRevives.get(job.id) || 0) + 1;
+  state._strandedRevives.set(job.id, n);
+  state.seen.delete(job.id);
+  try { saveSeenJobs(state.seen); } catch { /* the in-memory delete still lets this poll start it */ }
+  console.log(`[Poll] Job ${id8} is in progress with no worker — starting it again (${n}/${MAX_STRANDED_REVIVES})`);
+  return true;
+}
+
 // Poll for new jobs — check ALL agents, not just available ones
 // (an agent with an active job can still have new jobs queued for it)
 let _polling = false;
@@ -12501,6 +12556,7 @@ async function pollForJobs(state) {
   }
   _polling = true;
   try {
+  let revivedStrandedThisPoll = false;
   for (let i = 0; i < state.agents.length; i++) {
     const agentInfo = state.agents[i];
     // Stagger API calls — 500ms between agents to avoid rate limits at scale
@@ -12542,9 +12598,12 @@ async function pollForJobs(state) {
           continue;
         }
 
-        // Check if already handling or already processed
+        // Check if already handling or already processed.
+        // A stranded paid job is the exception: drop `seen` and fall through
+        // so this same poll starts one worker. The next seen job waits.
         if (state.seen.has(job.id)) {
-          continue;
+          if (revivedStrandedThisPoll || !(await openStrandedInProgress(state, agent, job))) continue;
+          revivedStrandedThisPoll = true;
         }
         if (state.active.has(job.id)) {
           continue;
@@ -14879,9 +14938,13 @@ async function startJobContainer(state, job, agentInfo) {
     }
 
     // Set timeout — offset +60s from container's internal timeout
-    // so the container can self-terminate and submit attestation first
+    // so the container can self-terminate and submit attestation first.
+    // The generation is this container's. A pause clears it. A resume stores
+    // a new one. A callback for an older container must not kill the new one.
+    const timeoutGeneration = (state._jobTimeoutSeq = (state._jobTimeoutSeq || 0) + 1);
     const _timeoutTimer = setTimeout(async function _onJobTimeout() {
       const active = state.active.get(job.id);
+      if (!jobTimeoutStillOwns(active, timeoutGeneration)) return;
       // L3 — do NOT kill a worker that is legitimately holding an open dispute.
       //
       // 2.17.1 taught the CONTAINER's own timer to defer for a dispute hold, and that
@@ -14895,7 +14958,7 @@ async function startJobContainer(state, job, agentInfo) {
       // call. Bounded by the container's own dispute hold (J41_DISPUTE_HOLD_MAX_MS),
       // which still ends the worker, so this cannot defer forever.
       const _st = state._lastSentStatus?.get(job.id);
-      if (active && (_st === 'disputed' || _st === 'rework')) {
+      if (_st === 'disputed' || _st === 'rework') {
         active._disputeDeferrals = (active._disputeDeferrals || 0) + 1;
         if (active._disputeDeferrals <= 12) { // 12 x (timeout+60s) ~= 12h ceiling
           console.log(`⏰ Job ${job.id.substring(0, 8)} hit the dispatcher timeout but is ${_st} — ` +
@@ -14905,16 +14968,15 @@ async function startJobContainer(state, job, agentInfo) {
         }
         console.log(`⏰ Job ${job.id.substring(0, 8)} is ${_st} but has deferred 12 times — killing.`);
       }
-      if (active) {
-        active._killed = true;
-        console.log(`⏰ Job ${job.id} timeout, killing container`);
-        await stopJobContainer(state, job.id);
-      }
+      const live = state.active.get(job.id);
+      if (!jobTimeoutStillOwns(live, timeoutGeneration)) return;
+      live._killed = true;
+      console.log(`⏰ Job ${job.id} timeout, killing container`);
+      await stopJobContainer(state, job.id);
     }, JOB_TIMEOUT_MS + 60000);
 
     // Store timer ref so it can be cleared on job cleanup
-    const activeEntry = state.active.get(job.id);
-    if (activeEntry) activeEntry._timeoutTimer = _timeoutTimer;
+    assignJobTimeout(state.active.get(job.id), _timeoutTimer, timeoutGeneration);
 
   } catch (e) {
     console.error(`❌ Failed to start container for ${job.id}:`, e.message);
@@ -15093,6 +15155,7 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   }
   if (active._stopping) return;
   active._stopping = true;
+  clearJobTimeout(active);
 
   let containerGone = false;
   try {
@@ -15111,7 +15174,11 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
     }
   }
   // A stop that did not land leaves the container running. Do not free its token.
+  // A resume may have stored a new entry under this id while the stop was in
+  // flight. Cleanup keyed only by id would tear that new worker down.
+  if (state.active.get(jobId) !== active) return;
   if (containerGone) await releaseTrackedCanary(state, active, jobId);
+  if (state.active.get(jobId) !== active) return;
 
   // Tear down the signing broker (broker mode): stop the watcher, run the
   // executor teardown (closes the cached J41Agent inside the executors), and
@@ -15143,6 +15210,10 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
     });
   }
 
+  // A resume may have taken this id while the log flush was in flight.
+  // The directory and the map entry belong to that new worker now.
+  if (state.active.get(jobId) !== active) return;
+
   // Cleanup job dir (retain for debugging if requested). Archive even when
   // keep_containers is on; the _logs/ copy is independent of the retained dir.
   const jobDir = path.join(JOBS_DIR, jobId);
@@ -15159,8 +15230,6 @@ async function stopJobContainer(state, jobId, skipReturnAgent = false) {
   } else if (!skipReturnAgent && active.paused) {
     state.retries.delete(jobId);
   }
-  // Clear timeout timer to prevent leak
-  if (active._timeoutTimer) clearTimeout(active._timeoutTimer);
 
   state.active.delete(jobId);
   persistActiveJobs(state.active);
@@ -15383,18 +15452,18 @@ async function startJobLocal(state, job, agentInfo) {
 
     log.info('Job process started', { jobId: job.id, pid: child.pid, agentId: agentInfo.id });
 
-    // Timeout
+    // Same generation rule as the container path. A pause drops this timer.
+    // A callback from the previous process must not kill the resumed one.
+    const timeoutGeneration = (state._jobTimeoutSeq = (state._jobTimeoutSeq || 0) + 1);
     const _timeoutTimer = setTimeout(async () => {
-      const active = state.active.get(job.id);
-      if (active) {
-        console.log(`⏰ Job ${job.id} timeout, killing process`);
-        await stopJobLocal(state, job.id);
-      }
+      const live = state.active.get(job.id);
+      if (!jobTimeoutStillOwns(live, timeoutGeneration)) return;
+      live._killed = true;
+      console.log(`⏰ Job ${job.id} timeout, killing process`);
+      await stopJobLocal(state, job.id);
     }, JOB_TIMEOUT_MS + 60000);
 
-    // Store timer ref so it can be cleared on job cleanup
-    const activeEntry = state.active.get(job.id);
-    if (activeEntry) activeEntry._timeoutTimer = _timeoutTimer;
+    assignJobTimeout(state.active.get(job.id), _timeoutTimer, timeoutGeneration);
 
   } catch (e) {
     console.error(`❌ Failed to start local process for ${job.id}:`, e.message);
@@ -15416,6 +15485,7 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
   }
   if (active._stopping) return;
   active._stopping = true;
+  clearJobTimeout(active);
 
   // Kill the child process. Release the canary only after it has exited:
   // SIGTERM's .killed flag is set even when the process ignores the signal,
@@ -15441,7 +15511,9 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
   } catch {
     processGone = true;
   }
+  if (state.active.get(jobId) !== active) return;
   if (processGone) await releaseTrackedCanary(state, active, jobId);
+  if (state.active.get(jobId) !== active) return;
 
   // Drain the per-job log stream before archiving. The child's exit handler
   // calls logStream.end() but that flush is async; await 'finish' so the
@@ -15454,6 +15526,9 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
       setTimeout(fin, 1000).unref(); // never block teardown on a wedged/destroyed stream
     });
   }
+
+  // A resume may have taken this id while the process was exiting.
+  if (state.active.get(jobId) !== active) return;
 
   // Cleanup job dir. Archive even when keep_containers is on; the _logs/ copy
   // is independent of the retained dir.
@@ -15472,8 +15547,6 @@ async function stopJobLocal(state, jobId, skipReturnAgent = false) {
     // Agent already in available pool from pause — just clean up retries
     state.retries.delete(jobId);
   }
-  // Clear timeout timer to prevent leak
-  if (active._timeoutTimer) clearTimeout(active._timeoutTimer);
 
   state.active.delete(jobId);
   persistActiveJobs(state.active);

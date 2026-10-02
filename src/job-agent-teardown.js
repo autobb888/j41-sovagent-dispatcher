@@ -352,7 +352,19 @@ async function claimHostCanary({ client, jobsDir, jobId, token, release = releas
   let prior = { released: true, reason: 'no previous host canary' };
   if (previous && previous !== token) {
     if (!client) prior = { released: false, reason: 'no client' };
-    else prior = await release({ client, token: previous });
+    else {
+      const result = await release({ client, token: previous });
+      // The dying container often deletes its own registration. That is the
+      // slot being free, not a release we failed to finish.
+      if (parentReleaseSucceeded(result)) {
+        prior = {
+          released: true,
+          reason: result && result.reason ? result.reason : 'released',
+        };
+      } else {
+        prior = result || { released: false, reason: 'not released' };
+      }
+    }
   }
   writeHostCanary(jobsDir, jobId, token);
   return { claimed: true, prior };

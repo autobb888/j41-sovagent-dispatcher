@@ -328,6 +328,42 @@ test('parent canary: does not follow a symlink over the host file', async () => 
   assert.strictEqual(fs.readFileSync(secret, 'utf8'), 'do-not-read');
 });
 
+test('parent canary: a registration the container already deleted counts as released', async () => {
+  const dir = tmpdir();
+  const jobId = 'job-parent-gone';
+  const previous = hexToken(8);
+  const next = hexToken(9);
+  writeHostCanary(dir, jobId, previous);
+  const claimed = await claimHostCanary({
+    client: {},
+    jobsDir: dir,
+    jobId,
+    token: next,
+    release: async () => ({ released: false, reason: 'no registration found for this token' }),
+  });
+  assert.strictEqual(claimed.prior.released, true);
+  assert.match(claimed.prior.reason, /no registration found/);
+  assert.strictEqual(readHostCanary(dir, jobId), next);
+});
+
+test('parent canary: a failed release of the previous token is still a failure', async () => {
+  const dir = tmpdir();
+  const jobId = 'job-parent-stuck';
+  const previous = hexToken(10);
+  const next = hexToken(11);
+  writeHostCanary(dir, jobId, previous);
+  const claimed = await claimHostCanary({
+    client: {},
+    jobsDir: dir,
+    jobId,
+    token: next,
+    release: async () => ({ released: false, reason: 'socket hang up' }),
+  });
+  assert.strictEqual(claimed.prior.released, false);
+  assert.match(claimed.prior.reason, /socket hang up/);
+  assert.strictEqual(readHostCanary(dir, jobId), next);
+});
+
 test('parent canary: claim releases the previous token and tracks the new one', async () => {
   const dir = tmpdir();
   const jobId = 'job-parent-5';
