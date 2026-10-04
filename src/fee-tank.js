@@ -39,8 +39,10 @@ const FEE_SATS = 10000;
 const DEFAULT_FLOOR_WRITES = 100;
 
 /**
- * Don't spend a whole fee to move a trivial amount. At 20x the fee, a sweep
- * always nets at least 19 writes of headroom.
+ * Don't spend a whole fee to move a trivial amount while the tank can still
+ * write. At 20x the fee, a top-up always nets at least 19 writes of headroom.
+ * An empty tank is different: it cannot publish a review at all, so any
+ * earnings that cover this sweep and at least one identity write may move.
  */
 const DEFAULT_MIN_SWEEP_SATS = FEE_SATS * 20;
 
@@ -159,11 +161,16 @@ function planFeeSweep({
     return { sweep: false, reason: 'below-floor-unfunded', amountSats: 0 };
   }
 
+  const amountSats = sweepableSats - txFeeSats;
   if (sweepableSats < minSweepSats) {
-    return { sweep: false, reason: 'below-min-sweep', amountSats: 0 };
+    // The comfort minimum applies while the tank can still pay a fee. When it
+    // cannot pay even one, a smaller sweep is the only way a review publishes.
+    const tankEmpty = feeSats < txFeeSats;
+    if (!(tankEmpty && amountSats >= txFeeSats)) {
+      return { sweep: false, reason: 'below-min-sweep', amountSats: 0 };
+    }
   }
 
-  const amountSats = sweepableSats - txFeeSats;
   if (amountSats <= 0) {
     return { sweep: false, reason: 'below-min-sweep', amountSats: 0 };
   }

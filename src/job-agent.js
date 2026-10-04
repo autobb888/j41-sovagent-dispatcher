@@ -360,6 +360,32 @@ function isPostDeliveryReconnect(status) {
   return POST_DELIVERY_STATUSES.has(status);
 }
 
+// A dispute deadline is days away. The worker holds for that deadline, capped,
+// instead of dying on the one-hour job clock. A respawn that is already
+// disputed never sees dispute.filed again, so the same plan runs at startup.
+const DISPUTE_GRACE_MS = 30 * 60 * 1000;
+const DEFAULT_DISPUTE_HOLD_MAX_MS = 6 * 60 * 60 * 1000;
+
+function disputeHoldMaxMs() {
+  const raw = Number(process.env.J41_DISPUTE_HOLD_MAX_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_DISPUTE_HOLD_MAX_MS;
+}
+
+function planDisputeHold({ deadlineIso, now, currentSafetyMs = 0, maxMs, graceMs = DISPUTE_GRACE_MS } = {}) {
+  const cap = Number.isFinite(maxMs) && maxMs > 0 ? maxMs : disputeHoldMaxMs();
+  let wanted = cap;
+  const t = deadlineIso ? Date.parse(deadlineIso) : NaN;
+  if (Number.isFinite(t)) {
+    wanted = Math.min(Math.max(t - now, 0) + graceMs, cap);
+  }
+  if (!(wanted > currentSafetyMs)) return null;
+  return { safetyMs: wanted, holdUntilMs: now + wanted };
+}
+
+function jobTimeoutWarningDue(now, holdUntilMs) {
+  return !(Number(holdUntilMs) > now);
+}
+
 // Item C — worker self-reports attach to the platform. Gated on non-reconnect
 // (a dispute/delivered respawn would hit the backend's 409 STATE_CONFLICT) and
 // fail-open (advisory telemetry — never block or kill the job).
@@ -1155,8 +1181,14 @@ async function main() {
   // ─────────────────────────────────────────
   // STEP 4: POST-DELIVERY WAIT (Dispute Resolution)
   // ─────────────────────────────────────────
+  let startupDisputeDeadline = null;
   if (fullJob.status === 'disputed') {
-    await surfaceDispute(job, agent).catch((e) => console.error('[DISPUTE] startup surface failed:', e.message));
+    try {
+      const surfaced = await surfaceDispute(job, agent);
+      startupDisputeDeadline = surfaced && surfaced.deadline_at;
+    } catch (e) {
+      console.error('[DISPUTE] startup surface failed:', e.message);
+    }
   }
 
   let postDeliveryResult;
@@ -1166,7 +1198,7 @@ async function main() {
   } else {
     console.log('→ Entering post-delivery review window...');
     console.log('  Container stays alive until job.completed or dispute resolution.\n');
-    postDeliveryResult = await waitForPostDelivery(job, agent, keys, fullJob, executor, soulPrompt, (resolve) => { setSessionEndResolve(resolve); }, ipcQueue, signer);
+    postDeliveryResult = await waitForPostDelivery(job, agent, keys, fullJob, executor, soulPrompt, (resolve) => { setSessionEndResolve(resolve); }, ipcQueue, signer, startupDisputeDeadline);
   }
 
   // ─────────────────────────────────────────
@@ -2130,6 +2162,10 @@ const _warningRemainingMs = Math.round((TIMEOUT_MS - _warningMs) / 60000);
 // still firing when the process stays alive (normal job-agent runtime).
 if (require.main === module) {
   setTimeout(() => {
+    if (!jobTimeoutWarningDue(Date.now(), _disputeHoldUntilMs)) {
+      console.log('⏳ Job clock warning skipped — an open dispute is holding this worker');
+      return;
+    }
     console.warn(`⚠️  Job approaching timeout — ${_warningRemainingMs} minute(s) remaining`);
     if (_agent && !_paused) {
       try { _agent.sendChatMessage(JOB_ID, `This session will end in ${_warningRemainingMs} minute(s). Wrapping up current work.`); } catch {}
@@ -2376,7 +2412,7 @@ async function surfaceDispute(job, agent) {
  * Post-delivery wait loop. Listens for IPC messages from dispatcher
  * for job completion, disputes, and rework events.
  */
-async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulPrompt, registerSessionEndResolve, ipcQueue, signer) {
+async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulPrompt, registerSessionEndResolve, ipcQueue, signer, initialDisputeDeadline = null) {
   return new Promise((resolve) => {
     let resolved = false;
     const safeResolve = (val) => { if (!resolved) { resolved = true; resolve(val); } };
@@ -2397,11 +2433,7 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
     // then exit and let the dispatcher own it (it now polls `disputed`/`rework`
     // jobs and respawns a worker when one is needed). Tunable for operators whose
     // buyers are slower, or who would rather trade RAM for a warm executor.
-    const DISPUTE_GRACE_MS = 30 * 60 * 1000;
-    const _holdEnv = Number(process.env.J41_DISPUTE_HOLD_MAX_MS);
-    const MAX_DISPUTE_HOLD_MS = Number.isFinite(_holdEnv) && _holdEnv > 0
-      ? _holdEnv
-      : 6 * 60 * 60 * 1000;
+    const MAX_DISPUTE_HOLD_MS = disputeHoldMaxMs();
 
     let currentSafetyMs = safetyMs;
 
@@ -2424,21 +2456,30 @@ async function waitForPostDelivery(job, agent, keys, fullJob, executor, soulProm
      * first one short.
      */
     function extendSafetyForDispute(deadlineIso) {
-      let wanted = MAX_DISPUTE_HOLD_MS;
-      const t = deadlineIso ? Date.parse(deadlineIso) : NaN;
-      if (Number.isFinite(t)) {
-        // Deadline in the past (clock skew, or already lapsed) → nothing to wait for.
-        wanted = Math.min(Math.max(t - Date.now(), 0) + DISPUTE_GRACE_MS, MAX_DISPUTE_HOLD_MS);
-      }
-      if (wanted <= currentSafetyMs) return;
-      currentSafetyMs = wanted;
+      const now = Date.now();
+      const plan = planDisputeHold({
+        deadlineIso,
+        now,
+        currentSafetyMs,
+        maxMs: MAX_DISPUTE_HOLD_MS,
+        graceMs: DISPUTE_GRACE_MS,
+      });
+      if (!plan) return;
+      currentSafetyMs = plan.safetyMs;
       // Tell the hard job timeout to stand down for as long as we are holding.
-      _disputeHoldUntilMs = Date.now() + currentSafetyMs;
+      _disputeHoldUntilMs = plan.holdUntilMs;
       resetSafetyTimer();
       const mins = Math.round(currentSafetyMs / 60000);
+      const t = deadlineIso ? Date.parse(deadlineIso) : NaN;
       console.log(`  ⏳ Holding this worker open for ${mins} min for the open dispute` +
         (Number.isFinite(t) ? ` (deadline ${deadlineIso})` : ' (no deadline reported — using the cap)') +
-        (wanted >= MAX_DISPUTE_HOLD_MS ? ' — capped; the dispatcher owns it after that' : ''));
+        (plan.safetyMs >= MAX_DISPUTE_HOLD_MS ? ' — capped; the dispatcher owns it after that' : ''));
+    }
+
+    // A worker spawned onto a job that is already disputed will not receive
+    // dispute.filed again. Arm the hold now, or the one-hour clock exits it.
+    if (fullJob && fullJob.status === 'disputed') {
+      extendSafetyForDispute(initialDisputeDeadline || null);
     }
 
     async function handleMessage(msg) {
@@ -2804,5 +2845,5 @@ if (require.main === module) {
 // Export testable helpers when running under NODE_ENV=test.
 // Avoids shipping a test seam in production while keeping coverage honest.
 if (process.env.NODE_ENV === 'test') {
-  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, surfaceDispute, selfReportAttach, isTerminalAttachError, ATTACH_CONFIRM_BACKOFF_MS, resumeJob, ensureChatConnected, containDownload, labourExtensionClosed, requestBudgetExtension, ACCEPTED_IDLE_NOTE, hireAnswerStartsQuiet, quietDeliverReady, skipsFirstWork, priorSellerWork, jobHasBothSealAddresses, answeredHireCanClose, ACCEPTED_QUIET_MS };
+  module.exports = { handleBudgetDelivery, nextPollSince, chunkMessage, sendChatChunked, CHAT_MAX_LEN, isPostDeliveryReconnect, planDisputeHold, jobTimeoutWarningDue, surfaceDispute, selfReportAttach, isTerminalAttachError, ATTACH_CONFIRM_BACKOFF_MS, resumeJob, ensureChatConnected, containDownload, labourExtensionClosed, requestBudgetExtension, ACCEPTED_IDLE_NOTE, hireAnswerStartsQuiet, quietDeliverReady, skipsFirstWork, priorSellerWork, jobHasBothSealAddresses, answeredHireCanClose, ACCEPTED_QUIET_MS };
 }

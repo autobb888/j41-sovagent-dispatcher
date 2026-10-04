@@ -4998,6 +4998,10 @@ program
     const text = body && body.choices && body.choices[0] && body.choices[0].message
       ? body.choices[0].message.content
       : null;
+    const { isModelOutageText } = require('./model-outage');
+    if (text && isModelOutageText(text)) {
+      fail('CHAT_PROVIDER_UNUSABLE', 'The model provider returned an unusable reply. Try the chat again.');
+    }
     if (text) say(text);
     else say(JSON.stringify(body, null, 2));
     const sessionId = chat.result && chat.result.sessionId;

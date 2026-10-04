@@ -78,8 +78,20 @@ test('below the floor with remaining writes and nothing to sweep is LOW, not EMP
   assert.strictEqual(p.reason, 'below-floor-unfunded');
 });
 
-test('does not burn a whole fee to move dust', () => {
-  const p = planFeeSweep({ feeSats: 0, sweepableSats: DEFAULT_MIN_SWEEP_SATS - 1 });
+test('an empty tank sweeps earnings that cover the fee and one identity write', () => {
+  // pippinapples: R-address 0, i-address 0.0007. The 20-write comfort minimum
+  // would leave that star unpublished. 70000 sats nets 6 writes.
+  const apples = planFeeSweep({ feeSats: 0, sweepableSats: 70000 });
+  assert.strictEqual(apples.sweep, true);
+  assert.strictEqual(apples.amountSats, 60000);
+
+  const under = planFeeSweep({ feeSats: 0, sweepableSats: (2 * FEE_SATS) - 1 });
+  assert.strictEqual(under.sweep, false);
+  assert.strictEqual(under.reason, 'below-min-sweep');
+});
+
+test('a tank that can still write does not sweep under the comfort minimum', () => {
+  const p = planFeeSweep({ feeSats: FEE_SATS, sweepableSats: DEFAULT_MIN_SWEEP_SATS - 1 });
   assert.strictEqual(p.sweep, false);
   assert.strictEqual(p.reason, 'below-min-sweep');
 });

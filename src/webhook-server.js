@@ -152,6 +152,19 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
         try {
           const query = new URL(req.url, 'http://127.0.0.1').searchParams;
           const rows = await orchardDoor.rowsForToken(token, query);
+          if (rows && rows.error) {
+            const status = rows.error === 'DATASET_TOO_LARGE' ? 413 : 400;
+            res.writeHead(status, {
+              'Content-Type': 'application/json; charset=utf-8',
+              'Cache-Control': 'private, no-store',
+            });
+            res.end(JSON.stringify({
+              error: rows.error,
+              message: rows.message,
+              maxBytes: rows.maxBytes,
+            }));
+            return;
+          }
           if (rows) body = rows;
         } catch {
           body = publicOrchardCard();

@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const readline = require('readline');
 const { normalizeDatasetTerms, datasetTermsHash } = require('./dataset-terms');
 const { mintDatasetToken, readDatasetToken } = require('./dataset-token');
 
@@ -42,33 +43,137 @@ function buyerMatches(job, ...buyers) {
   return buyers.some((buyer) => idKey(buyer) && idKey(buyer) === have);
 }
 
-// One paid open returns at most this many rows.
+// One paid response returns at most this many rows. Further rows use ?offset=.
 const MAX_DATASET_ROWS = 100;
 
-function createOrchardDoor({ getJob, secret, verifyMessage, docPath }) {
+// A JSON document above this is not parsed. A line-oriented file still pages.
+const MAX_DATASET_BYTES = 32 * 1024 * 1024;
+
+function pageOffset(query) {
+  if (!query || typeof query.get !== 'function') return 0;
+  const raw = query.get('offset');
+  if (raw == null || raw === '') return 0;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) return 0;
+  return n;
+}
+
+function rowMatches(row, terms) {
+  if (!row || typeof row !== 'object' || Array.isArray(row)) return false;
+  for (const key of ['color', 'kind', 'taste']) {
+    if (terms[key] && String(row[key] || '') !== terms[key]) return false;
+  }
+  if (terms.q) {
+    const hay = [row.kind, row.color, row.taste].join('\n').toLowerCase();
+    if (!hay.includes(terms.q.toLowerCase())) return false;
+  }
+  return true;
+}
+
+function pageOf(filtered, offset) {
+  const start = offset > filtered.length ? filtered.length : offset;
+  const items = filtered.slice(start, start + MAX_DATASET_ROWS);
+  const next = start + items.length;
+  return {
+    count: filtered.length,
+    items,
+    offset: start,
+    nextOffset: next < filtered.length ? next : null,
+    truncated: next < filtered.length,
+  };
+}
+
+function sampleLines(file, size) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(Math.min(size, 1024 * 1024));
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    return buf.toString('utf8', 0, n).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function lineIsObject(line) {
+  if (!line.startsWith('{') || !line.endsWith('}')) return false;
+  try {
+    const parsed = JSON.parse(line);
+    return !!parsed && typeof parsed === 'object' && !Array.isArray(parsed);
+  } catch {
+    return false;
+  }
+}
+
+function createOrchardDoor({ getJob, secret, verifyMessage, docPath, maxBytes } = {}) {
   const file = docPath || path.join(__dirname, '..', 'templates', 'orchard-apples.json');
+  const byteCap = Number.isSafeInteger(maxBytes) && maxBytes > 0 ? maxBytes : MAX_DATASET_BYTES;
   let cached;
+  let mode;
+
+  function classify() {
+    if (mode) return mode;
+    const size = fs.statSync(file).size;
+    const lines = sampleLines(file, size);
+    if (lines.length >= 2 && lineIsObject(lines[0]) && lineIsObject(lines[1])) {
+      mode = 'jsonl';
+      return mode;
+    }
+    if (size > byteCap) {
+      mode = 'too-big';
+      cached = {
+        error: 'DATASET_TOO_LARGE',
+        maxBytes: byteCap,
+        bytes: size,
+        message: `This dataset file is ${size} bytes. A single JSON document must stay under ${byteCap} bytes. A file of one JSON object per line can be larger, and each open returns ${MAX_DATASET_ROWS} rows.`,
+      };
+      return mode;
+    }
+    mode = 'json';
+    return mode;
+  }
 
   function readDoc() {
-    if (cached === undefined) cached = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (cached !== undefined) return cached;
+    classify();
+    if (cached !== undefined) return cached;
+    cached = JSON.parse(fs.readFileSync(file, 'utf8'));
     return cached;
   }
 
-  function rowsForTerms(terms) {
+  function rowsForTerms(terms, offset) {
     const doc = readDoc();
-    const filtered = (Array.isArray(doc.items) ? doc.items : []).filter((row) => {
-      if (!row || typeof row !== 'object') return false;
-      for (const key of ['color', 'kind', 'taste']) {
-        if (terms[key] && String(row[key] || '') !== terms[key]) return false;
+    if (doc && doc.error) return doc;
+    const filtered = (Array.isArray(doc.items) ? doc.items : []).filter((row) => rowMatches(row, terms));
+    return pageOf(filtered, offset);
+  }
+
+  async function pageJsonl(terms, offset) {
+    const stream = fs.createReadStream(file, { encoding: 'utf8' });
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    const items = [];
+    let matched = 0;
+    try {
+      for await (const line of rl) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let row;
+        try { row = JSON.parse(trimmed); } catch { continue; }
+        if (!rowMatches(row, terms)) continue;
+        if (matched >= offset && items.length < MAX_DATASET_ROWS) items.push(row);
+        matched += 1;
       }
-      if (terms.q) {
-        const hay = [row.kind, row.color, row.taste].join('\n').toLowerCase();
-        if (!hay.includes(terms.q.toLowerCase())) return false;
-      }
-      return true;
-    });
-    const items = filtered.slice(0, MAX_DATASET_ROWS);
-    return { count: filtered.length, items, truncated: filtered.length > MAX_DATASET_ROWS };
+    } finally {
+      rl.close();
+      stream.destroy();
+    }
+    const next = offset + items.length;
+    return {
+      count: matched,
+      items,
+      offset,
+      nextOffset: next < matched ? next : null,
+      truncated: next < matched,
+    };
   }
 
   async function paidJob(jobId) {
@@ -116,10 +221,16 @@ function createOrchardDoor({ getJob, secret, verifyMessage, docPath }) {
           if (!same) return null;
         }
       }
-      const rows = rowsForTerms(paid.terms.normalized);
-      return { dataset: 'orchardapples', count: rows.count, items: rows.items, truncated: rows.truncated };
+      const offset = pageOffset(query);
+      if (classify() === 'jsonl') {
+        const rows = await pageJsonl(paid.terms.normalized, offset);
+        return { dataset: 'orchardapples', ...rows };
+      }
+      const rows = rowsForTerms(paid.terms.normalized, offset);
+      if (rows && rows.error) return rows;
+      return { dataset: 'orchardapples', count: rows.count, items: rows.items, offset: rows.offset, nextOffset: rows.nextOffset, truncated: rows.truncated };
     },
   };
 }
 
-module.exports = { createOrchardDoor, windowExpiresMs, MAX_DATASET_ROWS };
+module.exports = { createOrchardDoor, windowExpiresMs, MAX_DATASET_ROWS, MAX_DATASET_BYTES };

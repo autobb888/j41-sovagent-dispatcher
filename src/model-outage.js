@@ -4,12 +4,20 @@
  * The model call returns these sentences when the provider never answers.
  * They are not a greeting, not the hire answer, and not a rework package.
  */
+function isDegenerateModelText(text) {
+  const s = String(text || '').trim();
+  if (s.length < 12) return false;
+  const alnum = s.replace(/[^A-Za-z0-9]/g, '').length;
+  return alnum / s.length < 0.2;
+}
+
 function isModelOutageText(text) {
   const s = String(text || '');
   return /I experienced a temporary issue/i.test(s)
     || /I could not generate a response/i.test(s)
     || /I encountered an issue generating a response/i.test(s)
-    || /I encountered an issue processing your request/i.test(s);
+    || /I encountered an issue processing your request/i.test(s)
+    || isDegenerateModelText(s);
 }
 
 /** What the buyer may see as the greeting. An outage sentence becomes the template. */
