@@ -105,7 +105,8 @@ test('B2: the guided rental-setup TUI wizard collects a price before running', (
   const nextFn = DASH.indexOf('async function ', start + 10);
   const body = DASH.slice(start, nextFn);
   assert.match(body, /Price per rental window/);
-  assert.match(body, /runDispatcherCli\(\['rental-setup', agentId, '--price', String\(price\)\]\)/);
+  assert.match(body, /Hours one payment holds the machine for/);
+  assert.match(body, /runDispatcherCli\(\['rental-setup', agentId, '--price', String\(price\), '--hours', String\(hours\)\]\)/);
 });
 
 // ── B3: allowlist remove must not leave a resolved i-address entry live ───

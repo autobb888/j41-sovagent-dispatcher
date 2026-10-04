@@ -2616,6 +2616,26 @@ async function rentalSetupScreen(inquirer, agentId) {
       return;
     }
   }
+  // The hours on this card are the lease. The labour job timeout is not.
+  let hours;
+  while (hours === undefined) {
+    const { hoursInput } = await promptWithEsc(inquirer, [{
+      type: 'input', name: 'hoursInput',
+      message: 'Hours one payment holds the machine for:',
+      default: '1',
+    }]);
+    if (!/^\d+$/.test(String(hoursInput == null ? '' : hoursInput).trim())) {
+      console.log('  Enter a whole number of hours from 1 to 168.\n');
+      continue;
+    }
+    const parsedHours = Number(String(hoursInput).trim());
+    if (parsedHours < 1 || parsedHours > 168) {
+      console.log('  Enter a whole number of hours from 1 to 168.\n');
+      continue;
+    }
+    hours = parsedHours;
+  }
+
   // B2 — this used to call rental-setup with no --price, and the CLI's own
   // default was '0': a first-timer following this exact wizard ended up with
   // a live rental listing at 0 VRSC. Collect the price here instead.
@@ -2643,12 +2663,12 @@ async function rentalSetupScreen(inquirer, agentId) {
 
   const { confirm } = await promptWithEsc(inquirer, [{
     type: 'confirm', name: 'confirm',
-    message: `Run rental-setup at ${price} ${NATIVE_COIN} now?`,
+    message: `Run rental-setup at ${price} ${NATIVE_COIN} for ${hours} hour(s) now?`,
     default: false,
   }]);
   if (!confirm) return;
   console.log('');
-  await runDispatcherCli(['rental-setup', agentId, '--price', String(price)]);
+  await runDispatcherCli(['rental-setup', agentId, '--price', String(price), '--hours', String(hours)]);
   await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
 }
 

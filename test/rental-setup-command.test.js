@@ -128,23 +128,28 @@ test('rental-setup fails closed without a provider bound to this agent', () => {
 });
 
 test('rentalServiceDescription is all-or-nothing and discloses Vast postpay risk only when acked', () => {
-  const d = rentalServiceDescription({ jobTimeoutMin: 60, paymentTerms: 'prepay' });
+  const d = rentalServiceDescription({ periodMin: 240, paymentTerms: 'prepay' });
   assert.match(d, /all-or-nothing/);
-  assert.match(d, /60 minutes/);
+  assert.match(d, /4 hours/);
+  assert.doesNotMatch(d, /240 minutes/);
   assert.equal(/Vast/i.test(d), false);
+  const hour = rentalServiceDescription({ jobTimeoutMin: 60, paymentTerms: 'prepay' });
+  assert.match(hour, /1 hour/);
   const v = rentalServiceDescription({ jobTimeoutMin: 45, paymentTerms: 'postpay', vastPostpayAck: true });
   assert.match(v, /45 minutes/);
   assert.match(v, /Vast\.ai/);
 });
 
 test('applyRentalAgentConfig persists rentalAckPostpayVastRisk when the ack flag is passed', () => {
-  const patched = applyRentalAgentConfig({ foo: 1 }, { ackPostpayVastRisk: true });
+  const patched = applyRentalAgentConfig({ foo: 1 }, { ackPostpayVastRisk: true, rentalPeriodMin: 240 });
   assert.equal(patched.rental, true);
   assert.equal(patched.serviceType, 'gpu-rental');
   assert.equal(patched.rentalAckPostpayVastRisk, true);
+  assert.equal(patched.rentalPeriodMin, 240);
   assert.equal(patched.foo, 1);
   const noAck = applyRentalAgentConfig({}, { ackPostpayVastRisk: false });
   assert.equal(noAck.rentalAckPostpayVastRisk, undefined);
+  assert.equal(noAck.rentalPeriodMin, undefined);
 });
 
 test('slotServicesFromAgentConfig reconstructs the slot-guard input', () => {

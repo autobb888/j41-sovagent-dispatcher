@@ -54,13 +54,14 @@ function assertSshDeliverable(ssh) {
 
 function formatRentalDeliverable(lease, { jobTimeoutMin } = {}) {
   const ssh = assertSshDeliverable(lease && lease.ssh);
+  const shown = require('./rental-period').formatRentalPeriod(jobTimeoutMin) || '1 hour';
   return {
     ssh,
     expiresAt: lease.expiresAt,
-    disclosure: `This rental runs for up to ${jobTimeoutMin || 60} minutes. Billing is all-or-nothing: `
+    disclosure: `This rental runs for up to ${shown}. Billing is all-or-nothing: `
       + 'there is no pro-rata refund for unused time and the box is released at expiry. '
-      + `To keep the box past that, request a session extension BEFORE it expires — each extension `
-      + `buys another whole ${jobTimeoutMin || 60}-minute period at the same rate, added to the time you already hold.`,
+      + 'To keep the box past that, request a session extension BEFORE it expires — each extension '
+      + `buys another whole ${shown} at the same rate, added to the time you already hold.`,
   };
 }
 

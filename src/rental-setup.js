@@ -2,6 +2,7 @@
 const { assertRentalEligibleAgent, assertProviderCanSsh } = require('./rental-job');
 const { createProvider } = require('./providers');
 const { assertTunnelHostname, assertTunnelPort, assertJailResources } = require('./providers/home-gpu');
+const { formatRentalPeriod } = require('./rental-period');
 
 function providerCfgForAgent(cfg, agentId) {
   const tables = (cfg.compute && cfg.compute.providers) || {};
@@ -16,12 +17,14 @@ function slotServicesFromAgentConfig(config) {
   return [];
 }
 
-function applyRentalAgentConfig(existing, { ackPostpayVastRisk } = {}) {
+function applyRentalAgentConfig(existing, { ackPostpayVastRisk, rentalPeriodMin } = {}) {
   const next = Object.assign({}, existing && typeof existing === 'object' ? existing : {}, {
     rental: true,
     serviceType: 'gpu-rental',
   });
   if (ackPostpayVastRisk) next.rentalAckPostpayVastRisk = true;
+  const minutes = Number(rentalPeriodMin);
+  if (Number.isInteger(minutes) && minutes >= 1 && minutes <= 10080) next.rentalPeriodMin = minutes;
   return next;
 }
 
@@ -60,9 +63,11 @@ function homeGpuConfigured(cfg) {
   return Object.values(cfg.compute.providers || {}).some((p) => p && p.type === 'home-gpu');
 }
 
-function rentalServiceDescription({ jobTimeoutMin = 60, paymentTerms, vastPostpayAck }) {
-  let d = `Raw GPU rental. Runs up to ${jobTimeoutMin} minutes. Billing is all-or-nothing: there is no pro-rata refund for unused time and the box is released at expiry.`
-    + ` You can extend mid-session: request a session extension before it expires and each whole period's price buys another ${jobTimeoutMin} minutes on the same box.`;
+function rentalServiceDescription({ periodMin, jobTimeoutMin, paymentTerms, vastPostpayAck } = {}) {
+  const minutes = periodMin != null ? periodMin : jobTimeoutMin;
+  const shown = formatRentalPeriod(minutes) || '1 hour';
+  let d = `Raw GPU rental. Runs up to ${shown}. Billing is all-or-nothing: there is no pro-rata refund for unused time and the box is released at expiry.`
+    + ` You can extend mid-session: request a session extension before it expires and each whole period's price buys another ${shown} on the same box.`;
   if (paymentTerms === 'postpay' && vastPostpayAck) {
     d += ' Seller sources this box from Vast.ai: if you do not pay, the seller still owes Vast.';
   }

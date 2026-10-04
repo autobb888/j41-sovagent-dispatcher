@@ -93,17 +93,9 @@ async function startRentalJob(opts) {
 
   assertPaidBeforePaidProvision({ job, provider, ackPostpayVastRisk });
 
-  // The rental period comes from the SELLER'S CONFIG, passed in explicitly by the caller.
-  //
-  // This used to read `job.timeoutMin ?? job.jobTimeoutMin ?? spec.jobTimeoutMin` and fall back
-  // to 60. None of those three fields exists: the backend has no timeoutMin column or field, the
-  // SDK never sends one, and the live caller passed no `spec` — so every rental was leased for 60
-  // minutes while `rental-setup` advertised the seller's configured `job_timeout_min` in the
-  // service description. A seller running 180 sold three hours, took the money under an
-  // all-or-nothing no-refund term, and the reconcile loop killed the box at one.
-  //
-  // The tests could not catch it because all four of them passed `job.timeoutMin: 60` — a field
-  // they invented. The phantom fallbacks are deliberately GONE so that can never recur.
+  // The listing period, in minutes, passed by startRentalJobWired. That caller reads the
+  // GPU card (turnaround "4 hours") and the saved rentalPeriodMin. It does not read the
+  // labour job timeout. A missing value here is only the direct-call default of 60.
   const periodMin = Number(jobTimeoutMin) > 0 ? Number(jobTimeoutMin) : 60;
   // The period price for mid-session extensions: the job amount at hire, BEFORE any paid
   // extension increments it on the platform side.

@@ -121,7 +121,7 @@ test('compute signup TUI routes to provider config then rental-setup, not straig
   // The final "run rental-setup now" confirm must default to false — this is
   // the B2 fix from this session (rental-setup used to default --price to 0
   // and this wizard never asked for one at all).
-  assert.match(rentalBody, /message: `Run rental-setup at \$\{price\} \$\{NATIVE_COIN\} now\?`,\s*\n\s*default: false,/);
+  assert.match(rentalBody, /message: `Run rental-setup at \$\{price\} \$\{NATIVE_COIN\} for \$\{hours\} hour\(s\) now\?`,\s*\n\s*default: false,/);
 });
 
 test('API Endpoint Setup and Configure Services refuse compute listings', () => {

@@ -64,7 +64,19 @@ test('the lease honours the SELLER-CONFIGURED period, not a hardcoded hour', asy
   const { lease, deliverable } = await bootRental({ jobTimeoutMin: 180 });
   assert.equal(lease.expiresAt, NOW + 180 * MIN, 'a 180-minute rental must expire 180 minutes out');
   assert.equal(lease.rentalPeriodMin, 180);
-  assert.match(deliverable.disclosure, /up to 180 minutes/);
+  assert.match(deliverable.disclosure, /up to 3 hours/);
+});
+
+test('four listing hours expire four hours out and the next extension is another four', async () => {
+  const { lease, deliverable } = await bootRental({ jobTimeoutMin: 240, amount: 0.001 });
+  assert.equal(lease.expiresAt, NOW + 240 * MIN);
+  assert.equal(lease.rentalPeriodMin, 240);
+  assert.match(deliverable.disclosure, /up to 4 hours/);
+  assert.doesNotMatch(deliverable.disclosure, /1 hour/);
+  assert.deepEqual(
+    rentalExtensionGrant({ amount: 0.001, periodAmount: lease.rentalPeriodAmount, periodMin: lease.rentalPeriodMin }),
+    { periods: 1, minutes: 240, ms: 240 * MIN },
+  );
 });
 
 test('the period falls back to 60 minutes only when the caller supplies none', async () => {
@@ -283,9 +295,13 @@ test('re-attach failure after restart keeps the paid jail and still tracks the r
 // ── Wiring. Every assertion below dies if its line is deleted from cli.js. ────────
 const CLI = fs.readFileSync(require.resolve('../src/cli.js'), 'utf8');
 
-test('cli.js passes the configured period into the rental lease', () => {
+test('cli.js leases the GPU listing period, not the labour job timeout', () => {
   const wired = CLI.slice(CLI.indexOf('async function startRentalJobWired'), CLI.indexOf('async function startJobOrRental'));
-  assert.match(wired, /jobTimeoutMin:\s*cfgNow\.jobTimeoutMin/, 'the seller config must reach startRentalJob or rentals silently revert to 60 minutes');
+  assert.match(wired, /periodMinFromTurnaround/);
+  assert.match(wired, /rentalPeriodMinOf\(agentCfg\)/);
+  assert.match(wired, /jobTimeoutMin:\s*periodMin/);
+  assert.doesNotMatch(wired, /cfgNow\.jobTimeoutMin/);
+  assert.match(wired, /RENTAL_PERIOD/);
 });
 
 test('cli.js applies a paid rental extension to the lease from BOTH delivery paths', () => {

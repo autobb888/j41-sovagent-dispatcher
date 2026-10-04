@@ -1729,7 +1729,7 @@ program
     console.log(`     ${setupCmd}`);
     if (kind === 'compute') {
       console.log(`\n  2. Attach the GPU:`);
-      console.log(`     j41-dispatcher rental-setup ${localId} --price <vrsc>`);
+      console.log(`     j41-dispatcher rental-setup ${localId} --hours <n> --price <vrsc>`);
     } else if (kind === 'model') {
       console.log(`\n  2. Attach the inference endpoint:`);
       console.log(`     j41-dispatcher api-setup ${localId} --upstream-url <url> --model '<name>:<in>:<out>' --public-url https://<dns>`);
@@ -6233,7 +6233,7 @@ program
     }
     const doneKind = parseListingKind(keys.kind) || parseListingKind(options.kind) || 'agent';
     if (doneKind === 'compute') {
-      console.log(`\n  Next: j41-dispatcher rental-setup ${agentId} --price <vrsc>`);
+      console.log(`\n  Next: j41-dispatcher rental-setup ${agentId} --hours <n> --price <vrsc>`);
     } else if (doneKind === 'model') {
       console.log(`\n  Next: j41-dispatcher api-setup ${agentId} --upstream-url <url> --model '<name>:<in>:<out>' --public-url https://<dns>`);
       console.log(`        then: j41-dispatcher start --webhook-url https://<dns>`);
@@ -6594,6 +6594,8 @@ program
 program
   .command('rental-setup <agent-id>')
   .description('Register a raw-GPU rental (Cat-1) service. All-or-nothing; contained SSH, never host SSH.')
+  .option('--hours <n>', 'Whole hours one payment holds this machine (1-168). Not the labour job timeout.')
+  .option('--minutes <n>', 'Minutes one payment holds this machine (1-10080). Use this or --hours.')
   .option('--price <vrsc>', 'Price per rental window (VRSC) — required unless --no-register')
   .option('--name <name>', 'Service name')
   .option('--service-payment-terms <terms>', 'prepay|postpay', 'prepay')
@@ -6613,6 +6615,7 @@ program
       applyRentalAgentConfig,
       slotServicesFromAgentConfig,
     } = require('./rental-setup');
+    const { parseRentalPeriod, rentalPeriodMinOf, formatRentalPeriod, planRentalServiceWrite } = require('./rental-period');
     const { assertRentalEligibleAgent } = require('./rental-job');
 
     const paymentTerms = String(options.servicePaymentTerms || 'prepay').toLowerCase();
@@ -6641,6 +6644,25 @@ program
     let config = {};
     try { if (fs.existsSync(configPath)) config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch {}
 
+    let periodMin = null;
+    if (options.hours !== undefined || options.minutes !== undefined) {
+      const parsedPeriod = parseRentalPeriod({ hours: options.hours, minutes: options.minutes });
+      if (!parsedPeriod.ok) {
+        console.error(`✗ ${parsedPeriod.error}`);
+        process.exit(1);
+      }
+      periodMin = parsedPeriod.minutes;
+    } else {
+      periodMin = rentalPeriodMinOf(config);
+    }
+    if (!periodMin) {
+      console.error('✗ RENTAL_PERIOD: pass --hours <n> or --minutes <n>.');
+      console.error('  One payment holds the machine for that long. Unused time is not refunded.');
+      console.error('  This is the GPU listing period. It is not the labour job timeout.');
+      process.exit(1);
+    }
+    const periodShown = formatRentalPeriod(periodMin);
+
     let outboundSshV1 = false;
     try {
       const { fetchOutboundSshV1 } = require('./compute-edge');
@@ -6662,7 +6684,10 @@ program
       process.exit(1);
     }
 
-    config = applyRentalAgentConfig(config, { ackPostpayVastRisk: options.ackPostpayVastRisk });
+    config = applyRentalAgentConfig(config, {
+      ackPostpayVastRisk: options.ackPostpayVastRisk,
+      rentalPeriodMin: periodMin,
+    });
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
     try { fs.chmodSync(configPath, 0o600); } catch {}
     console.log(`✓ Wrote ${configPath}`);
@@ -6686,28 +6711,41 @@ program
     });
     try {
       await agent.authenticate();
-      try {
-        const client = agent.client || agent._client;
-        if (client && typeof client.getAgentServices === 'function') {
-          const svcResp = await client.getAgentServices(keys.iAddress || keys.identity);
-          assertRentalEligibleAgent(svcResp.data || svcResp || []);
-        }
-      } catch (e) {
-        if (e && /RENTAL_SLOT_CONFLICT/.test(e.message)) throw e;
+      let listed = [];
+      const client = agent.client || agent._client;
+      if (client && typeof client.getAgentServices === 'function') {
+        const svcResp = await client.getAgentServices(keys.iAddress || keys.identity);
+        listed = svcResp.data || svcResp || [];
+        if (!Array.isArray(listed)) listed = [];
+        assertRentalEligibleAgent(listed);
       }
-      const jobTimeoutMin = _cfg.jobTimeoutMin || 60;
       const vastPostpayAck = !!(setup && setup.pcfg && setup.pcfg.type === 'vast' && options.ackPostpayVastRisk);
-      const svc = await agent.registerService({
-        name: options.name || `${keys.identity} GPU Rental`,
-        description: rentalServiceDescription({ jobTimeoutMin, paymentTerms, vastPostpayAck }),
+      const description = rentalServiceDescription({ periodMin, paymentTerms, vastPostpayAck });
+      const plan = planRentalServiceWrite({
+        services: listed,
+        description,
+        turnaround: periodShown,
         price,
-        currency: NATIVE_COIN,
+        name: options.name || null,
         paymentTerms,
-        sovguard: false,
-        serviceType: 'gpu-rental',
       });
-      console.log(`✓ Service registered on platform (id: ${svc?.id || svc?.data?.id || '?'}, price: ${price} ${NATIVE_COIN}, terms: ${paymentTerms})`);
-      console.log('Next: start the dispatcher (j41-dispatcher start) — your rental is now discoverable.');
+      if (plan.action === 'register') {
+        const svc = await agent.registerService({
+          ...plan.body,
+          name: options.name || `${keys.identity} GPU Rental`,
+          currency: NATIVE_COIN,
+        });
+        console.log(`✓ Service registered on platform (id: ${svc?.id || svc?.data?.id || '?'}, price: ${price} ${NATIVE_COIN}, period: ${periodShown}, terms: ${paymentTerms})`);
+      } else {
+        if (!client || typeof client.updateService !== 'function') {
+          throw new Error('RENTAL_PERIOD: cannot update the existing GPU listing');
+        }
+        for (const row of plan.updates) {
+          await client.updateService(row.id, row.body);
+          console.log(`✓ GPU listing ${row.id} now holds the machine for ${periodShown} at ${price} ${NATIVE_COIN}`);
+        }
+      }
+      console.log('Next: restart the dispatcher (j41-dispatcher ctl shutdown, then j41-dispatcher start) so the next hire uses this period.');
       console.log('Remember: a rental job delivers contained SSH credentials and the box is released at expiry. Never host SSH.');
     } catch (e) {
       console.error(`✗ Platform registration failed: ${e.message}`);
@@ -15698,6 +15736,26 @@ async function startRentalJobWired(state, job, agentInfo) {
   const payee = await ensurePayee(state, agentInfo, job);
   if (!job.buyerPayAddress && payee.buyerPayAddress) job.buyerPayAddress = payee.buyerPayAddress;
   if (!job.buyerVerusId && payee.buyerVerusId) job.buyerVerusId = payee.buyerVerusId;
+  const { rentalPeriodMinOf, periodMinFromTurnaround, formatRentalPeriod } = require('./rental-period');
+  let listedMin = null;
+  try {
+    const serviceId = job && (job.serviceId || job.service_id);
+    const client = agent && (agent.client || agent._client);
+    if (serviceId && client && typeof client.getService === 'function') {
+      const svc = await client.getService(serviceId);
+      const row = svc && svc.turnaround != null ? svc : (svc && svc.data);
+      listedMin = periodMinFromTurnaround(row && row.turnaround);
+    }
+  } catch (e) {
+    console.warn(`[Rental] could not read listing period for ${job && job.id}: ${e && e.message}`);
+  }
+  const periodMin = listedMin || rentalPeriodMinOf(agentCfg);
+  if (!periodMin) {
+    console.error(`✗ RENTAL_PERIOD: ${agentInfo && agentInfo.id} has no listing period. On the seller computer run: j41-dispatcher rental-setup ${agentInfo && agentInfo.id} --hours <n>`);
+    console.error('  One payment holds the machine for that many hours. The labour job timeout is a different timer and is not used.');
+    return;
+  }
+  console.log(`[Rental] ${job && job.id} holds the machine for ${formatRentalPeriod(periodMin)} (${listedMin ? 'listing' : 'saved listing period'})`);
   await startRentalJob({
     state,
     job,
@@ -15710,10 +15768,7 @@ async function startRentalJobWired(state, job, agentInfo) {
     signMessage: (message) => signer.signMessage(message),
     outboundSshV1: !!(state && state.outboundSshV1),
     ackPostpayVastRisk: !!(agentCfg && agentCfg.rentalAckPostpayVastRisk),
-    // The advertised period. `rental-setup` writes this same value into the service
-    // description ("Runs up to N minutes"), so anything else here sells one duration and
-    // delivers another under an all-or-nothing, no-refund term.
-    jobTimeoutMin: cfgNow.jobTimeoutMin || 60,
+    jobTimeoutMin: periodMin,
     now: Date.now(),
   });
 }
