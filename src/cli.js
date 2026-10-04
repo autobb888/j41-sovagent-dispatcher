@@ -3280,10 +3280,38 @@ program
       if (datasetHire && amount < 0.0001) {
         fail('BAD_AMOUNT', 'A dataset hire needs a positive amount of at least 0.0001. The price-0 placeholder is not a free job.');
       }
+      if (service && !datasetHire) {
+        const { assertPaysListing } = require('./listing-price');
+        const listed = assertPaysListing({
+          serviceType: serviceType || service.serviceType || service.service_type,
+          amount: options.amount,
+          listedPrice: service.price,
+        });
+        if (!listed.ok) fail(listed.code, listed.message);
+      }
+      let datasetQuote = null;
+      if (datasetHire) {
+        const { datasetDoorOrigin, fetchDatasetQuote } = require('./dataset-quote');
+        const { assertDatasetHireAmount } = require('./dataset-price');
+        const origin = datasetDoorOrigin(listing);
+        if (!origin) fail('DATA_URL_MISSING', 'Seller listing has no website to price the question.');
+        const fetched = await fetchDatasetQuote({ origin, terms: datasetTerms });
+        if (!fetched.ok) fail(fetched.code, fetched.message);
+        const priced = assertDatasetHireAmount({ amount: String(options.amount), quote: fetched.quote });
+        if (!priced.ok) {
+          fail(priced.code, priced.message, {
+            units: fetched.quote.units,
+            unitPrice: fetched.quote.unitPrice,
+            amount: fetched.quote.amount,
+          });
+        }
+        datasetQuote = fetched.quote;
+      }
       const description = options.description || (datasetHire ? 'Dataset hire' : ((service && service.description) || `Hire via dispatcher (${buyerAgentId})`));
       say(`\n  Buyer:  ${keys.identity} (${buyerAgentId})`);
       say(`  Seller: ${listing.qualifiedName || listing.name || seller}  kind=${sellerKind || 'agent'}`);
       if (service) say(`  Service: ${service.id}  type=${serviceType || 'agent'}  listed=${service.price} ${service.currency || ''}`);
+      if (datasetQuote) say(`  Question: ${datasetQuote.units} row(s) at ${datasetQuote.unitPrice} each`);
       say(`  Amount: ${amount} ${options.currency}`);
       say(`  Pay:    ${options.pay ? 'yes — dual output after create' : 'no — create only (seller waits for payment)'}`);
       say('');
@@ -3539,7 +3567,9 @@ program
         console.log('  Chat:   j41-dispatcher chat <buyer-id> <seller> --message "..."');
       }
       if (hasData) {
-        console.log('  Dataset hire: j41-dispatcher hire <buyer-id> <seller> --amount 0.0001 --color <color> --taste <taste> [--pay]');
+        console.log('  Dataset hire: query the seller first. The price is the matching rows times the per-row price.');
+        console.log('  j41-dispatcher query <seller> --where color=<color> --where taste=<taste>');
+        console.log('  j41-dispatcher hire <buyer-id> <seller> --amount <that price> --color <color> --taste <taste> [--pay]');
         console.log('  A data identity with no dataset service is DATA_NOT_HIREABLE.');
         console.log('  Browse: j41-dispatcher browse <seller> [--query limit=50&offset=0]');
         console.log('  Query:  j41-dispatcher query <seller> [--where color=red] [--select kind,taste]');
@@ -4711,8 +4741,9 @@ program
 
 program
   .command('data-open <buyer-agent-id> <job-id>')
-  .description('After a paid dataset delivery, fetch the bearer for that job. The token is not in the delivery notice. Asks for a review while the window is open.')
-  .option('--rating <n>', '1-5. Submits the review after the bearer. --yes and --json do not ask.')
+  .description('After a paid dataset delivery, fetch the rows that payment covered. Asks for a review while the window is open.')
+  .option('--offset <n>', 'Later page of rows already paid for')
+  .option('--rating <n>', '1-5. Submits the review after the rows. --yes and --json do not ask.')
   .option('--message <text>', 'Review text when a rating is submitted')
   .option('--json', 'One JSON object on stdout. Requires --yes.')
   .option('--yes', 'Required with --json')
@@ -4747,12 +4778,38 @@ program
       });
       const payload = await res.json().catch(() => ({}));
       if (!res.ok || !payload.token) {
-        fail(payload.error || 'DATA_OPEN_DENIED', payload.error || `data-open failed (${res.status})`, { jobId });
+        fail(payload.error || 'DATA_OPEN_DENIED', payload.message || payload.error || `data-open failed (${res.status})`, { jobId });
       }
-      if (options.json) console.log(JSON.stringify({ ok: true, jobId, token: payload.token }, null, 2));
-      else {
-        console.log(`Token for ${jobId} (not a review, not a listing):`);
-        console.log(payload.token);
+      const page = new URLSearchParams();
+      if (options.offset != null && options.offset !== '') page.set('offset', String(options.offset));
+      const rowUrl = `${origin}/j41/datasets/orchard-apples.json${page.toString() ? `?${page}` : ''}`;
+      const rowRes = await fetch(rowUrl, { headers: { Authorization: `Bearer ${payload.token}` } });
+      const rows = await rowRes.json().catch(() => ({}));
+      if (!rowRes.ok || rows.error || !Array.isArray(rows.items)) {
+        fail(rows.error || 'DATA_ROWS_DENIED', rows.message || rows.error || `rows failed (${rowRes.status})`, {
+          jobId,
+          amount: rows.amount,
+          units: rows.units,
+          unitPrice: rows.unitPrice,
+        });
+      }
+      if (options.json) {
+        console.log(JSON.stringify({
+          ok: true,
+          jobId,
+          token: payload.token,
+          count: rows.count,
+          units: rows.units,
+          unitPrice: rows.unitPrice,
+          amount: rows.amount,
+          offset: rows.offset,
+          nextOffset: rows.nextOffset,
+          items: rows.items,
+        }, null, 2));
+      } else {
+        console.log(`Paid ${rows.amount} for ${rows.units} row(s) at ${rows.unitPrice} each. This page has ${rows.items.length}.`);
+        console.log(JSON.stringify(rows.items, null, 2));
+        if (rows.nextOffset != null) console.log(`Next page: j41-dispatcher data-open ${buyerAgentId} ${jobId} --offset ${rows.nextOffset}`);
       }
       const sellerId = job && (job.sellerVerusId || job.seller);
       const review = await offerBuyerReview({
@@ -5310,10 +5367,11 @@ program
       offset: options.offset,
     });
     if (!plan.ok) fail(plan.code, plan.message);
+    const pricedQuery = plan.serverQuery ? `${plan.serverQuery}&quote=1` : 'quote=1';
     const fetched = await browseSeller({
       seller,
       path: options.path,
-      query: plan.serverQuery,
+      query: pricedQuery,
       apiUrl: J41_API_URL,
     });
     if (!fetched.ok) fail(fetched.code, fetched.message, { url: fetched.url, status: fetched.status });
@@ -6389,7 +6447,7 @@ program
 
 program
   .command('service-price <agent-id> <service-id>')
-  .description('Set one service price via PUT /v1/me/services/:id. Refuses a price below 0.0001.')
+  .description('Set one service price via PUT /v1/me/services/:id. Refuses a price below 0.0001. On a dataset service this price is per returned row.')
   .requiredOption('--price <amount>', 'Price in the service currency')
   .option('--yes', 'Send the update')
   .action(async (agentId, serviceId, options) => {
@@ -8163,6 +8221,23 @@ program
           if (!dataAgent) return null;
           const seller = await getAgentSession(state, dataAgent);
           return seller.client.getJob(jobId);
+        },
+        async getUnitPrice() {
+          const dataAgent = state.agents.find((a) => a.kind === 'data'
+            || String(a.identity || '').toLowerCase().startsWith('pippinapples'));
+          if (!dataAgent) return null;
+          try {
+            const seller = await getAgentSession(state, dataAgent);
+            const resp = await seller.client.getServices({
+              verusId: dataAgent.iAddress || dataAgent.identity,
+            });
+            const { pickDatasetService } = require('./hire.js');
+            const listed = (resp && (resp.data || resp)) || [];
+            const picked = pickDatasetService(Array.isArray(listed) ? listed : []);
+            return picked && picked.price != null ? picked.price : null;
+          } catch {
+            return null;
+          }
         },
       }));
 
@@ -12694,6 +12769,23 @@ async function pollForJobs(state) {
                   console.log(`[INVITE] ${verb} job ${String(job.id).substring(0, 8)} for ${agentInfo.id} (${decision.reason})`);
                 }
                 continue;
+              }
+              const cap = state.capabilities && state.capabilities.get(agentInfo.id);
+              const serviceId = fullJob.serviceId || fullJob.service_id;
+              const listedSvc = cap && Array.isArray(cap.services)
+                ? cap.services.find((s) => s && serviceId && (s.id === serviceId || s.serviceId === serviceId))
+                : null;
+              if (listedSvc) {
+                const { assertPaysListing } = require('./listing-price');
+                const priceGate = assertPaysListing({
+                  serviceType: listedSvc.serviceType || listedSvc.service_type,
+                  amount: fullJob.amount,
+                  listedPrice: listedSvc.price,
+                });
+                if (!priceGate.ok) {
+                  console.warn(`[PRICE] not accepting ${String(job.id).slice(0, 8)}: ${priceGate.message}`);
+                  continue;
+                }
               }
               const timestamp = Math.floor(Date.now() / 1000);
               const acceptSig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);

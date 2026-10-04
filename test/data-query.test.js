@@ -68,6 +68,34 @@ test('a top-level array is a collection, and a non-JSON body is refused', () => 
   assert.equal(bad.code, 'QUERY_NOT_JSON');
 });
 
+test('a price quote is not an empty dataset', () => {
+  const quoted = runDataQuery({
+    body: JSON.stringify({
+      quote: true, unit: 'row', unitPrice: '0.00010000', matchCount: 2, units: 2, amount: '0.00020000',
+    }),
+    where: [],
+    limit: 20,
+    offset: 0,
+  });
+  assert.equal(quoted.code, 'DATASET_QUOTED');
+  assert.match(quoted.message, /0\.00020000/);
+  assert.equal(JSON.stringify(quoted).includes('Fuji'), false);
+  const none = runDataQuery({
+    body: JSON.stringify({ quote: true, units: 0, amount: '0.00000000' }),
+    where: [],
+    limit: 20,
+    offset: 0,
+  });
+  assert.equal(none.code, 'DATASET_NO_ROWS');
+  const card = runDataQuery({
+    body: JSON.stringify({ hire: 'j41-dispatcher hire', note: 'card' }),
+    where: [],
+    limit: 20,
+    offset: 0,
+  });
+  assert.equal(card.code, 'DATASET_UNPAID');
+});
+
 test('field names cannot be a URL, a prototype key, or an empty where', () => {
   assert.equal(planDataQuery({ where: ['color=http://127.0.0.1/'] }).code, 'QUERY_BAD_WHERE');
   assert.equal(planDataQuery({ where: ['__proto__=x'] }).code, 'QUERY_BAD_WHERE');

@@ -141,31 +141,54 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
       return;
     }
 
-    // Public orchard URL. Rows are not served here, with or without a query
-    // string. The response is only how to hire the dataset.
+    // Public orchard URL. Rows are served only to a paid-job bearer.
+    // quote=1 returns the row count and the price, and never the rows.
     const datasetPath = (req.url || '').split('?')[0];
     if (req.method === 'GET' && datasetPath === '/j41/datasets/orchard-apples.json') {
       const header = req.headers.authorization || '';
       const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+      const query = new URL(req.url, 'http://127.0.0.1').searchParams;
+      const sendDatasetError = (rows) => {
+        const status = rows.error === 'DATASET_TOO_LARGE' ? 413 : (rows.error === 'PAYMENT_SHORT' ? 402 : 400);
+        const payload = { error: rows.error, message: rows.message };
+        for (const key of ['maxBytes', 'bytes', 'matchCount', 'units', 'unit', 'unitPrice', 'amount']) {
+          if (rows[key] != null) payload[key] = rows[key];
+        }
+        res.writeHead(status, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'private, no-store',
+        });
+        res.end(JSON.stringify(payload));
+      };
       let body = publicOrchardCard();
       if (token && orchardDoor && typeof orchardDoor.rowsForToken === 'function') {
         try {
-          const query = new URL(req.url, 'http://127.0.0.1').searchParams;
           const rows = await orchardDoor.rowsForToken(token, query);
           if (rows && rows.error) {
-            const status = rows.error === 'DATASET_TOO_LARGE' ? 413 : 400;
-            res.writeHead(status, {
-              'Content-Type': 'application/json; charset=utf-8',
-              'Cache-Control': 'private, no-store',
-            });
-            res.end(JSON.stringify({
-              error: rows.error,
-              message: rows.message,
-              maxBytes: rows.maxBytes,
-            }));
+            sendDatasetError(rows);
             return;
           }
           if (rows) body = rows;
+        } catch {
+          body = publicOrchardCard();
+        }
+      } else if (query.get('quote') === '1' && orchardDoor && typeof orchardDoor.quote === 'function') {
+        try {
+          const quoted = await orchardDoor.quote({
+            color: query.get('color'),
+            kind: query.get('kind'),
+            taste: query.get('taste'),
+            q: query.get('q'),
+          });
+          if (quoted && quoted.error) {
+            sendDatasetError(quoted);
+            return;
+          }
+          if (quoted && quoted.items) {
+            sendDatasetError({ error: 'DATASET_QUOTE', message: 'Quote refused because it contained rows.' });
+            return;
+          }
+          if (quoted) body = quoted;
         } catch {
           body = publicOrchardCard();
         }

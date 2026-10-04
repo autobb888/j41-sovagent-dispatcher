@@ -6,8 +6,11 @@
  */
 function isDegenerateModelText(text) {
   const s = String(text || '').trim();
-  if (s.length < 12) return false;
+  if (!s) return false;
   const alnum = s.replace(/[^A-Za-z0-9]/g, '').length;
+  // Punctuation alone is not an answer, at any length. A short real word stays.
+  if (alnum === 0) return true;
+  if (s.length < 12) return false;
   return alnum / s.length < 0.2;
 }
 

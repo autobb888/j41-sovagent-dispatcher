@@ -25,6 +25,9 @@ test('the canned model lines are outages and a real answer is not', () => {
   assert.equal(isModelOutageText(''), false);
   assert.equal(isModelOutageText('The!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'), true);
   assert.equal(isModelOutageText('!!!!!!!!!!!!'), true);
+  assert.equal(isModelOutageText('!!!!!!'), true);
+  assert.equal(isModelOutageText('???'), true);
+  assert.equal(isModelOutageText('ok'), false);
   assert.equal(isModelOutageText('Hello. The crate keeps the apple crisp.'), false);
 });
 

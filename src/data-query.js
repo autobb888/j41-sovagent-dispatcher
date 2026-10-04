@@ -120,6 +120,19 @@ function extractRows(body) {
   }
   if (Array.isArray(parsed)) return { ok: true, rows: parsed };
   if (parsed && typeof parsed === 'object') {
+    if (parsed.quote === true && !Array.isArray(parsed.items)) {
+      const units = Number(parsed.units);
+      if (!Number.isInteger(units) || units <= 0) {
+        return bad('DATASET_NO_ROWS', 'This question matches nothing, so there is nothing to charge.');
+      }
+      return bad(
+        'DATASET_QUOTED',
+        `This question matches ${parsed.units} rows at ${parsed.unitPrice} each. The price is ${parsed.amount}. Hire with --amount ${parsed.amount}, pay, then data-open. Unpaid rows are not returned.`,
+      );
+    }
+    if (typeof parsed.hire === 'string' && parsed.items == null) {
+      return bad('DATASET_UNPAID', 'This is the public hire card, not the rows. Ask for a quote, hire at that price, pay, then data-open.');
+    }
     for (const key of ROW_KEYS) {
       if (Array.isArray(parsed[key])) return { ok: true, rows: parsed[key] };
     }

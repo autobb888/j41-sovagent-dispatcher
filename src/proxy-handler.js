@@ -11,6 +11,7 @@ const { findKeyOwner, recordUsage } = require('./api-key-manager');
 const { reserveCredit, adjustCredit, refundReservation, checkAndFlagLow } = require('./credit-meter');
 const { acquire: acquireInflight, release: releaseInflight } = require('./proxy-inflight.js');
 const { loadDispatcherConfig } = require('./config-loader.js');
+const { completionText, settleTokenCounts } = require('./proxy-settle');
 
 /**
  * Resolve the worst-case output tokens to RESERVE for a request (audit H3).
@@ -786,32 +787,27 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         // was billed its reported tokens — the buyer paying for a 4xx/5xx, which is
         // the very thing M1 fixed for the no-usage case. The non-streaming path zeroes
         // on non-2xx regardless; these two must agree.
-        const _upstreamOk = proxyRes.statusCode >= 200 && proxyRes.statusCode < 300;
-        if (!_upstreamOk) {
-          // No completion was delivered. Charge nothing for output, and nothing for
-          // input either — the buyer got an error, not a service. This applies to a
-          // mid-stream abort too: the status line already told us it was an error.
-          outputTok = 0;
-          inputTok = 0;
+        const settled = settleTokenCounts({
+          statusOk: proxyRes.statusCode >= 200 && proxyRes.statusCode < 300,
+          aborted,
+          sawOutput,
+          inputTok,
+          outputTok,
+          reserveOutput,
+          text: completionText(fullResponse),
+        });
+        inputTok = settled.inputTok;
+        outputTok = settled.outputTok;
+        if (settled.reason === 'upstream-error') {
+          // No completion was delivered. Charge nothing. This applies to a
+          // mid-stream error too: the status line already told us it failed.
           console.warn(`[proxy] upstream ${proxyRes.statusCode} on a streaming request (${why}) — not billing (job ${key ? String(key).slice(0, 8) : '?'})`);
-        } else if (aborted) {
+        } else if (settled.reason === 'unusable') {
+          console.warn(`[proxy] unusable model text on a stream — not billing (job ${key ? String(key).slice(0, 8) : '?'})`);
+        } else if (settled.reason === 'abort') {
           // A 2xx whose socket died mid-stream. Bill only what a usage frame
-          // actually proved. With no usage frame that means zero OUTPUT; input still
-          // settles at the estimate, which is the one quantity we know was sent.
-          //
-          // Not the worst-case settle, deliberately. That settle is an anti-abuse
-          // measure against an upstream that returns real output while withholding
-          // its usage count — a party gaming US. An abort is a failure the BUYER did
-          // not cause and cannot cause: they have no way to make the seller's
-          // upstream drop its socket. Charging them the full `max_tokens`
-          // reservation for a broken response would be the only place in this file
-          // where the victim of a fault pays for it. The inverse risk is a seller
-          // whose upstream serves output and then kills the socket to avoid
-          // billing — that costs the seller their own revenue, so it is self-limiting.
-          if (!sawOutput) { outputTok = 0; }
+          // actually proved. With no usage frame that means zero output.
           console.warn(`[proxy] streaming abort after ${proxyRes.statusCode} — billing ${inputTok}+${outputTok} (job ${key ? String(key).slice(0, 8) : '?'})`);
-        } else if (!sawOutput) {
-          outputTok = reserveOutput;
         }
 
         const result = adjustCredit(agentId, record.buyerVerusId, model, inputTok, outputTok, creditCheck.reserved, config.modelPricing || []);
@@ -883,15 +879,20 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         //     just sets `stream:false` to get cheap unmetered output; and
         //   • an ERROR response was billed the same estimate, so the buyer paid for a
         //     503 exactly as the streaming path did.
-        const _okNS = proxyRes.statusCode >= 200 && proxyRes.statusCode < 300;
-        if (!_okNS) {
-          inputTok = 0;
-          outputTok = 0;
+        const settledNS = settleTokenCounts({
+          statusOk: proxyRes.statusCode >= 200 && proxyRes.statusCode < 300,
+          sawOutput: sawOutputNS,
+          inputTok,
+          outputTok,
+          reserveOutput,
+          text: completionText(responseBody),
+        });
+        inputTok = settledNS.inputTok;
+        outputTok = settledNS.outputTok;
+        if (settledNS.reason === 'upstream-error') {
           console.warn(`[proxy] upstream ${proxyRes.statusCode} — not billing (job ${key ? String(key).slice(0, 8) : '?'})`);
-        } else if (!sawOutputNS) {
-          // Mirror the streaming defence: settle against the declared worst case so a
-          // non-compliant upstream cannot serve a large completion for a flat estimate.
-          outputTok = reserveOutput;
+        } else if (settledNS.reason === 'unusable') {
+          console.warn(`[proxy] unusable model text — not billing (job ${key ? String(key).slice(0, 8) : '?'})`);
         }
 
         const result = adjustCredit(agentId, record.buyerVerusId, model, inputTok, outputTok, creditCheck.reserved, config.modelPricing || []);
@@ -905,8 +906,13 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
         }
 
         const safeHeaders = filterHeaders(proxyRes.headers);
-        res.writeHead(proxyRes.statusCode, { ...safeHeaders, ...j41Headers });
-        res.end(responseBody);
+        if (settledNS.reason === 'unusable') {
+          res.writeHead(502, { 'Content-Type': 'application/json', ...j41Headers });
+          res.end(JSON.stringify({ error: 'The model provider returned an unusable reply. The charge was reversed.' }));
+        } else {
+          res.writeHead(proxyRes.statusCode, { ...safeHeaders, ...j41Headers });
+          res.end(responseBody);
+        }
 
         maybeNotifyCreditLow(agentId, record.buyerVerusId, result.remaining, cfg, config);
         console.log(`[PROXY] ${agentId} ${model} ${inputTok}+${outputTok} tok, cost ${result.cost.toFixed(6)} VRSC, remaining ${result.remaining.toFixed(4)}`);

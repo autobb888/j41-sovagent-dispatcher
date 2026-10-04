@@ -5,6 +5,7 @@ const path = require('path');
 const readline = require('readline');
 const { normalizeDatasetTerms, datasetTermsHash } = require('./dataset-terms');
 const { mintDatasetToken, readDatasetToken } = require('./dataset-token');
+const { quoteDataset, paymentCoversQuote } = require('./dataset-price');
 
 function windowExpiresMs(job) {
   const raw = job && job.reviewWindowExpiresAt;
@@ -104,7 +105,7 @@ function lineIsObject(line) {
   }
 }
 
-function createOrchardDoor({ getJob, secret, verifyMessage, docPath, maxBytes } = {}) {
+function createOrchardDoor({ getJob, secret, verifyMessage, docPath, maxBytes, unitPrice, getUnitPrice } = {}) {
   const file = docPath || path.join(__dirname, '..', 'templates', 'orchard-apples.json');
   const byteCap = Number.isSafeInteger(maxBytes) && maxBytes > 0 ? maxBytes : MAX_DATASET_BYTES;
   let cached;
@@ -176,6 +177,60 @@ function createOrchardDoor({ getJob, secret, verifyMessage, docPath, maxBytes } 
     };
   }
 
+  async function countJsonl(terms) {
+    const stream = fs.createReadStream(file, { encoding: 'utf8' });
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    let matched = 0;
+    try {
+      for await (const line of rl) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let row;
+        try { row = JSON.parse(trimmed); } catch { continue; }
+        if (rowMatches(row, terms)) matched += 1;
+      }
+    } finally {
+      rl.close();
+      stream.destroy();
+    }
+    return { count: matched };
+  }
+
+  async function matchCount(terms) {
+    const kind = classify();
+    if (kind === 'too-big') return readDoc();
+    if (kind === 'jsonl') return countJsonl(terms);
+    const doc = readDoc();
+    if (doc && doc.error) return doc;
+    const filtered = (Array.isArray(doc.items) ? doc.items : []).filter((row) => rowMatches(row, terms));
+    return { count: filtered.length };
+  }
+
+  async function unitPriceNow() {
+    if (unitPrice != null && unitPrice !== '') return unitPrice;
+    if (typeof getUnitPrice === 'function') return getUnitPrice();
+    return null;
+  }
+
+  async function priceFor(terms) {
+    const counted = await matchCount(terms);
+    if (counted && counted.error) return counted;
+    const price = await unitPriceNow();
+    const quote = quoteDataset({ matchCount: counted.count, unitPrice: price });
+    if (!quote.ok) return { error: quote.code, message: quote.message };
+    return quote;
+  }
+
+  function pricedPage(page, quote) {
+    return {
+      ...page,
+      unit: quote.unit,
+      unitPrice: quote.unitPrice,
+      units: quote.units,
+      amount: quote.amount,
+    };
+  }
+
   async function paidJob(jobId) {
     const job = await getJob(jobId);
     if (!job || !job.payment || job.payment.verified !== true) return null;
@@ -221,14 +276,50 @@ function createOrchardDoor({ getJob, secret, verifyMessage, docPath, maxBytes } 
           if (!same) return null;
         }
       }
+      const priced = await priceFor(paid.terms.normalized);
+      if (priced && priced.error) return priced;
+      const cover = paymentCoversQuote({ paid: paid.job.amount, quote: priced });
+      if (!cover.ok) {
+        return {
+          error: cover.code,
+          message: cover.message,
+          unit: priced.unit,
+          unitPrice: priced.unitPrice,
+          matchCount: priced.matchCount,
+          units: priced.units,
+          amount: priced.amount,
+        };
+      }
       const offset = pageOffset(query);
       if (classify() === 'jsonl') {
         const rows = await pageJsonl(paid.terms.normalized, offset);
-        return { dataset: 'orchardapples', ...rows };
+        return { dataset: 'orchardapples', ...pricedPage(rows, priced) };
       }
       const rows = rowsForTerms(paid.terms.normalized, offset);
       if (rows && rows.error) return rows;
-      return { dataset: 'orchardapples', count: rows.count, items: rows.items, offset: rows.offset, nextOffset: rows.nextOffset, truncated: rows.truncated };
+      return {
+        dataset: 'orchardapples',
+        ...pricedPage({
+          count: rows.count,
+          items: rows.items,
+          offset: rows.offset,
+          nextOffset: rows.nextOffset,
+          truncated: rows.truncated,
+        }, priced),
+      };
+    },
+    async quote(terms) {
+      const normalized = normalizeDatasetTerms(terms || {});
+      const priced = await priceFor(normalized);
+      if (priced && priced.error) return priced;
+      return {
+        quote: true,
+        unit: priced.unit,
+        unitPrice: priced.unitPrice,
+        matchCount: priced.matchCount,
+        units: priced.units,
+        amount: priced.amount,
+      };
     },
   };
 }
