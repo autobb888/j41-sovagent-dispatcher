@@ -7,13 +7,18 @@ const path = require('path');
 const http = require('http');
 const {
   requestAndOpenAccess,
-  chatCompletions,
+  chatCompletions: chatCompletionsRaw,
   saveAccessGrant,
   loadAccessGrant,
   redactApiKey,
   listingPublicUrlHint,
   refreshGrantFromListing,
 } = require('../src/buyer-access');
+
+const PAID_JOB = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+function chatCompletions(opts) {
+  return chatCompletionsRaw({ jobId: PAID_JOB, ...opts });
+}
 const { assertAccessAllowed } = require('../src/hire');
 const { TESTNET_PLATFORM_SIGNER, FEE_TANK_NOT_SIGNER } = require('../src/platform-signer');
 const { codedError } = require('../src/buyer-proxy-url');
@@ -158,6 +163,7 @@ test('chatCompletions posts OpenAI-compatible body through callProxied', async (
   assert.equal(r.ok, true);
   assert.equal(bodies[0].model, 'duskseek');
   assert.equal(bodies[0].messages[0].content, 'hello');
+  assert.equal(bodies[0].j41JobId, PAID_JOB);
 });
 
 test('assertAccessAllowed requires serviceType api-endpoint, not kind=model', () => {
@@ -227,7 +233,7 @@ function cliAccessBlock() {
 function cliOnAccessRequest() {
   const cli = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
   const start = cli.indexOf('onAccessRequest: async (wireBody)');
-  const end = cli.indexOf('onDepositReport:', start);
+  const end = cli.indexOf('onApiAccessRevoke:', start);
   return cli.slice(start, end);
 }
 
@@ -286,7 +292,8 @@ test('start drops stale trycloudflare webhooks that are not the live host', () =
 test('poll skips labour start for api-endpoint jobs', () => {
   const src = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
   assert.match(src, /skip labour start for api-endpoint/);
-  assert.match(src, /isApiEndpointJob/);
+  assert.match(src, /jobOwnsModelWindow/);
+  assert.doesNotMatch(src, /isApiEndpointJob/);
 });
 
 test('mint payload uses mintBuyerProxyBase(publicUrl) and never cfg.endpointUrl', () => {
@@ -543,30 +550,33 @@ test('typed endpoints[].url pathname is not proof of a dispatcher', async () => 
   }
 });
 
-test('chat 402 maps to CHAT_NEEDS_DEPOSIT from statusCode/responseBody', async () => {
-  const err = new Error('Proxy call failed: Insufficient credit');
-  err.statusCode = 402;
-  err.responseBody = {
-    error: 'Insufficient credit',
-    balance: 0,
-    estimatedCost: 0.01,
-    topupAddress: 'iSellerPay',
-  };
-  err.responseHeaders = { 'x-j41-credit-suggestedtopup': '10' };
-  const r = await chatCompletions({
+test('chat 402 names extend only while the paid job is in progress or paused', async () => {
+  const closed = new Error('Proxy call failed: allowance spent');
+  closed.statusCode = 402;
+  closed.responseBody = { code: 'SESSION_EXHAUSTED', message: 'This job allowance is spent.' };
+  const spent = await chatCompletions({
     grant: { apiKey: 'sk-test', endpointUrl: 'https://foo.example/j41/proxy/v1' },
     message: 'hi',
     fetchImpl: async () => ({ ok: true, json: async () => ({ service: 'dispatcher' }) }),
-    client: { callProxied: async () => { throw err; } },
+    client: { callProxied: async () => { throw closed; } },
   });
-  assert.equal(r.ok, false);
-  assert.equal(r.code, 'CHAT_NEEDS_DEPOSIT');
-  assert.equal(r.topupAddress, 'iSellerPay');
-  assert.equal(r.estimatedCost, 0.01);
-  assert.equal(r.balance, 0);
-  assert.equal(r.suggestedTopup, '10');
-  assert.match(String(r.depositArgv || r.deposit || ''), /deposit/);
-  assert.notEqual(r.suggestedTopup, r.amount);
+  assert.equal(spent.ok, false);
+  assert.equal(spent.code, 'SESSION_EXHAUSTED');
+  assert.doesNotMatch(spent.message, /deposit|extend/i);
+  assert.equal(spent.topupAddress, undefined);
+
+  const open = new Error('Proxy call failed: allowance spent');
+  open.statusCode = 402;
+  open.responseBody = { code: 'SESSION_EXHAUSTED', status: 'paused', message: 'This job allowance is spent.' };
+  const extend = await chatCompletions({
+    grant: { apiKey: 'sk-test', endpointUrl: 'https://foo.example/j41/proxy/v1' },
+    message: 'hi',
+    fetchImpl: async () => ({ ok: true, json: async () => ({ service: 'dispatcher' }) }),
+    client: { callProxied: async () => { throw open; } },
+  });
+  assert.equal(extend.code, 'SESSION_EXHAUSTED');
+  assert.match(extend.message, /Extend this job/);
+  assert.doesNotMatch(extend.message, /deposit/i);
 });
 
 test('non-402 proxy errors stay CHAT_FAILED', async () => {

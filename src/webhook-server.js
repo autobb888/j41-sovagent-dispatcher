@@ -38,7 +38,6 @@ function verifyInboundWebhook(rawBody, headers, secret, opts = {}) {
   // Legacy fallback (dropped once all dispatchers send the timestamped header).
   return verifyWebhookSignature(rawBody, headers['x-webhook-signature'] || '', secret);
 }
-const { reportDeposit } = require('./deposit-watcher.js');
 const { loadDispatcherConfig } = require('./config-loader.js');
 const { checkAndRecordNonce } = require('./nonce-cache.js');
 
@@ -254,58 +253,6 @@ function startWebhookServer(port, agentWebhooks, onEvent, proxyContext) {
         } else {
           res.end(JSON.stringify({ error: e.message || 'Access request failed', code }));
         }
-      }
-      return;
-    }
-
-    // POST /j41/deposit/report — buyer reports a deposit txid (signed)
-    // S3 — rate-limited on the same limiter as /j41/discovery/request-access, and for
-    // the same stated reason: this route is unauthenticated and fires an outbound
-    // getIdentityKeys before the caller is proven (the lookup supplies the key we
-    // verify against, so it cannot move later). Without a limit, anyone can force
-    // unbounded RPC work. The neighbouring route was protected; this one was not.
-    if (req.method === 'POST' && req.url === '/j41/deposit/report' && proxyContext) {
-      const depositIp = req.socket?.remoteAddress || 'unknown';
-      if (!_checkDiscoveryRate(depositIp)) {
-        res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '1' });
-        res.end(JSON.stringify({ error: 'Rate limit exceeded' }));
-        return;
-      }
-      const body = await readBody(req, res);
-      if (body === null) return;
-      try {
-        const report = JSON.parse(body);
-        const { buyerVerusId, sellerVerusId, txid, amount, signature } = report || {};
-        if (!buyerVerusId || !sellerVerusId || !txid || amount == null) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Missing buyerVerusId, sellerVerusId, txid, or amount' }));
-          return;
-        }
-        // Reports MUST be signed by the buyer (anti credit-theft). Reject early
-        // if no signature is present so unauthenticated callers get 401.
-        if (!signature) {
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Missing signature — deposit reports must be signed by the buyer (buildDepositReportMessage + signMessage)' }));
-          return;
-        }
-        const result = await proxyContext.onDepositReport(report);
-        // Map authentication/verification failures to proper HTTP status codes.
-        // KEYS_UNSIGNED / KEYS_BAD_SIGNATURE are SERVER-side trust-anchor failures
-        // (the platform's signed identity-keys response is missing or tampered),
-        // not a client error — return 502 so upstream sees the platform fault.
-        const STATUS_BY_CODE = {
-          MISSING_FIELDS: 400, IDENTITY_LOOKUP_FAILED: 400, MULTISIG_UNSUPPORTED: 400,
-          STALE: 401, BAD_SIGNATURE: 403, SENDER_MISMATCH: 403, REPLAY: 409,
-          SELLER_NOT_FOUND: 404,
-          KEYS_UNSIGNED: 502, KEYS_BAD_SIGNATURE: 502,
-        };
-        const status = result && result.code && STATUS_BY_CODE[result.code] ? STATUS_BY_CODE[result.code] : 200;
-        res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(result));
-      } catch (e) {
-        console.error(`[Deposit] Report failed: ${e.message}`);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Deposit report failed' }));
       }
       return;
     }

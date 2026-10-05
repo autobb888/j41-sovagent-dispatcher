@@ -142,7 +142,7 @@ const { writeKeysFile, readKeysFile } = require('./keys-file.js');
 const keystore = require('./keystore.js');
 const { encryptAllKeys, decryptAllKeys, listPlaintextKeys } = require('./keys-migrate.js');
 const { preflightAllowsAccept } = require('./preflight-gate.js');
-const { isGpuRentalJob, isApiEndpointJob, startRentalJob, stopRentalJob, shouldTeardownRental, servicesForAgent, resolveRentalProvider, ensureComputeController, decideRentalExtension, applyRentalExtension, adoptLiveRentals } = require('./rental-worker.js');
+const { isGpuRentalJob, startRentalJob, stopRentalJob, shouldTeardownRental, servicesForAgent, resolveRentalProvider, ensureComputeController, decideRentalExtension, applyRentalExtension, adoptLiveRentals } = require('./rental-worker.js');
 const {
   assertRentalHostPublic,
   shouldRefuseLanGpuRental,
@@ -229,7 +229,7 @@ const IS_MAINNET = resolveIsMainnet(fileConfiguredNetwork(), J41_NETWORK);
 // to the literal 'VRSC' on every surface regardless of network, so a testnet
 // fleet listed VRSC-priced services — which is how our own signed J41-JOB
 // payloads ended up with inconsistent currency labels.
-const NATIVE_COIN = require('./deposit-watcher.js').networkCurrency(J41_NETWORK);
+const NATIVE_COIN = require('./wallet.js').networkCurrency(J41_NETWORK);
 const _cfg = loadConfig();
 const { computeMaxAgents, capacityLine, resolveCapacity, DEFAULTS: SIZING_DEFAULTS } = require('./hardware-sizing.js');
 
@@ -299,7 +299,7 @@ const WRITE_COST = '0.0001';
  * at its i-address.
  */
 function printFundingInstructions(address, network, { indent = '  ', seeded = false } = {}) {
-  const { networkCurrency } = require('./deposit-watcher.js');
+  const { networkCurrency } = require('./wallet.js');
   const coin = networkCurrency(network);
   const i = indent;
 
@@ -3258,6 +3258,7 @@ program
         sellerKind,
         serviceType,
         serviceId: options.service || null,
+        price: service ? service.price : null,
       });
       if (!gate.ok) {
         fail(gate.code, gate.message);
@@ -3281,13 +3282,24 @@ program
         fail('BAD_AMOUNT', 'A dataset hire needs a positive amount of at least 0.0001. The price-0 placeholder is not a free job.');
       }
       if (service && !datasetHire) {
-        const { assertPaysListing } = require('./listing-price');
+        const { assertPaysListing, serviceAmountCeiling, listingMarkup } = require('./listing-price');
         const listed = assertPaysListing({
           serviceType: serviceType || service.serviceType || service.service_type,
           amount: options.amount,
           listedPrice: service.price,
         });
         if (!listed.ok) fail(listed.code, listed.message);
+        const sessionType = serviceType || service.serviceType || service.service_type;
+        if (sessionType === 'api-endpoint' || sellerKind === 'model') {
+          const cap = serviceAmountCeiling(service.price, listingMarkup(service));
+          if (cap && amount > cap.ceiling) {
+            fail('AMOUNT_EXCEEDS_SERVICE_PRICE',
+              `Amount ${amount} is above the session ceiling ${cap.ceiling}. One extension cannot buy more than that. A bigger window is another extension while the job is open.`);
+          }
+          if (!cap) {
+            say('  Ceiling: the listing has no markup, so the API checks the 10x cap when this hire is posted.');
+          }
+        }
       }
       let datasetQuote = null;
       if (datasetHire) {
@@ -3559,12 +3571,12 @@ program
       const hasAccess = result.rows.some((r) => r.next === 'access');
       const hasData = result.rows.some((r) => r.kind === 'data');
       if (hasHire) {
-        console.log('\n  Hire labour/GPU: j41-dispatcher hire <buyer-id> <seller> --service <service-id> --amount <n> [--pay]');
+        console.log('\n  Hire: j41-dispatcher hire <buyer-id> <seller> --service <service-id> --amount <n> [--pay]');
       }
       if (hasAccess) {
-        console.log('  Models are metered inference, not labour. Do not hire.');
+        console.log('  This listing is not a hire (MODEL_NOT_A_LABOUR_JOB).');
         console.log('  Access: j41-dispatcher access <buyer-id> <seller>');
-        console.log('  Chat:   j41-dispatcher chat <buyer-id> <seller> --message "..."');
+        console.log('  Chat:   j41-dispatcher chat <buyer-id> <seller> --job <job-id> --message "..."');
       }
       if (hasData) {
         console.log('  Dataset hire: query the seller first. The price is the matching rows times the per-row price.');
@@ -4927,7 +4939,7 @@ program
         say(`   endpoint ${grant.endpointUrl}`);
         say(`   expires  ${grant.expiresAt || '—'}`);
         say(`   apiKey   ${redactApiKey(grant.apiKey)}  (full key only in --json)`);
-        say(`   Chat: j41-dispatcher chat ${buyerAgentId} ${seller} --message "..."`);
+        say(`   Chat: j41-dispatcher chat ${buyerAgentId} ${seller} --job <job-id> --message "..."`);
         if (options.json) {
           console.log(JSON.stringify({
             ok: true,
@@ -4962,7 +4974,7 @@ program
     say(`   endpoint ${grant.endpointUrl}`);
     say(`   expires  ${grant.expiresAt || '—'}`);
     say(`   apiKey   ${redactApiKey(grant.apiKey)}  (full key only in --json)`);
-    say(`   Chat: j41-dispatcher chat ${buyerAgentId} ${seller} --message "..."`);
+    say(`   Chat: j41-dispatcher chat ${buyerAgentId} ${seller} --job <job-id> --message "..."`);
     if (options.json) {
       console.log(JSON.stringify({
         ok: true,
@@ -4978,8 +4990,9 @@ program
 
 program
   .command('chat <buyer-agent-id> <seller>')
-  .description('OpenAI-compatible chat against a model grant (runs access if none saved)')
+  .description('OpenAI-compatible chat against a paid model job (runs access if none saved)')
   .requiredOption('--message <text>', 'User message')
+  .requiredOption('--job <id>', 'Paid job id. The allowance is this job only.')
   .option('--model <id>', 'Model id from the grant (default: first listed)')
   .option('--rating <n>', '1-5. Submits a session review after a paid chat. --json does not ask.')
   .option('--review-message <text>', 'Review text when a rating is submitted')
@@ -5033,6 +5046,7 @@ program
       grant,
       message: options.message,
       model: options.model,
+      jobId: options.job,
       listing,
       agentsDir: AGENTS_DIR,
       buyerId: buyerAgentId,
@@ -5040,11 +5054,8 @@ program
     });
     if (!chat.ok) {
       fail(chat.code, chat.message, {
-        topupAddress: chat.topupAddress,
-        estimatedCost: chat.estimatedCost,
-        balance: chat.balance,
-        suggestedTopup: chat.suggestedTopup,
-        depositArgv: chat.depositArgv,
+        jobId: chat.jobId || options.job,
+        status: chat.status || null,
       });
     }
     if (chat.result && chat.result.sessionId) {
@@ -5084,230 +5095,8 @@ program
         model: chat.model,
         body,
         sessionId,
-        creditRemaining: chat.result && chat.result.creditRemaining,
+        sessionRemaining: chat.result && chat.result.headers && (chat.result.headers['x-j41-session-remaining'] || null),
         ...(review && !review.skipped ? { review } : {}),
-      }, null, 2));
-    }
-  });
-
-async function confirmDeposit({ amountText, seller, reportOnly }) {
-  const readline = require('readline');
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    const q = reportOnly
-      ? `Report ${amountText} VRSC deposit to ${seller}? (y/N) `
-      : `Broadcast ${amountText} VRSC to ${seller} i-address as API credit? This spends the buyer's wallet. (y/N) `;
-    const answer = await new Promise((resolve) => rl.question(q, resolve));
-    const a = String(answer || '').trim().toLowerCase();
-    return a === 'y' || a === 'yes';
-  } finally {
-    rl.close();
-  }
-}
-
-async function buyerDepositReportAndWait({
-  options, keys, agent, seller, amount, txid, reportUrl,
-}) {
-  const {
-    buildSignedDepositReport, waitForDepositCredit, postDepositReport,
-    DEPOSIT_WAIT_TIMEOUT_MS, DEPOSIT_POLL_INTERVAL_MS,
-  } = require('./buyer-deposit');
-  const { signMessage, buildDepositReportMessage } = require('@junction41/sovagent-sdk/dist/index.js');
-  return waitForDepositCredit({
-    txid,
-    amount,
-    wait: !!options.wait,
-    timeoutMs: DEPOSIT_WAIT_TIMEOUT_MS,
-    intervalMs: process.env.NODE_ENV === 'test' ? 0 : DEPOSIT_POLL_INTERVAL_MS,
-    getTxStatus: (id) => agent.client.getTxStatus(id),
-    buildReport: async () => buildSignedDepositReport({
-      buyerVerusId: keys.identity,
-      sellerVerusId: seller,
-      txid,
-      amount,
-      wif: keys.wif,
-      network: J41_NETWORK,
-      signMessage,
-      buildMessage: buildDepositReportMessage,
-    }),
-    postReport: (body) => postDepositReport(reportUrl, body),
-  });
-}
-
-program
-  .command('deposit <buyer-id> <seller>')
-  .description('Send VRSC to the seller i-address and POST /j41/deposit/report (API credit)')
-  .requiredOption('--amount <n>', 'Positive decimal VRSC (no silent top-up default)')
-  .option('--yes', 'Skip the interactive confirmation (mainnet --yes still needs a TTY or J41_HEADLESS_MAINNET_PAY=1)')
-  .option('--wait', 'POST once, poll local getTxStatus, then POST a freshly signed report (max 180s)')
-  .option('--force', 'Ignore wallet-pending.json and broadcast anyway')
-  .option('--json', 'One JSON object on stdout. Requires --yes.')
-  .action(async (buyerAgentId, seller, options) => {
-    const fail = (code, message, extra = {}) => {
-      process.exitCode = 1;
-      buyerCliFail(options, code, message, extra);
-    };
-    const say = (line) => { if (!options.json) console.log(line); };
-    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
-    const {
-      parseDepositAmount, resolveDepositDestination, planBuyerDeposit,
-      resolveDepositReportUrl,
-    } = require('./buyer-deposit');
-    const parsed = parseDepositAmount(options.amount);
-    if (!parsed.ok) fail(parsed.code, parsed.reason);
-    const amount = parsed.amount;
-    const amountNumber = parsed.sats / 1e8;
-    const headlessMainnetPay = process.env.J41_HEADLESS_MAINNET_PAY === '1';
-    if (IS_MAINNET && options.yes && !process.stdin.isTTY && !headlessMainnetPay) {
-      fail('MAINNET_TTY_REQUIRED',
-        '--yes cannot skip deposit confirmation on mainnet without a TTY. Set J41_HEADLESS_MAINNET_PAY=1.');
-    }
-    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
-    const { loadAccessGrant } = require('./buyer-access');
-    const grant = loadAccessGrant(AGENTS_DIR, buyerAgentId, seller);
-    let listing = null;
-    try { listing = await agent.client.getAgent(seller); } catch { listing = null; }
-    const urlRes = await resolveDepositReportUrl({
-      grant, listing, buyerId: buyerAgentId, seller,
-    });
-    if (!urlRes.ok) fail(urlRes.code || 'DEPOSIT_NO_PUBLIC_URL', urlRes.message);
-    let payInfo = null;
-    try {
-      const sellerId = (listing && (listing.id || listing.verusId || listing.iAddress)) || seller;
-      payInfo = await agent.client.getAgentPaymentAddress(sellerId);
-    } catch (e) {
-      fail('DEPOSIT_NOT_SELLER', `Cannot resolve seller i-address: ${e.message}`);
-    }
-    const dest = resolveDepositDestination({ payInfo, listing });
-    if (!dest.ok) fail(dest.code || 'DEPOSIT_NOT_SELLER', dest.reason);
-    if (options.wait && !options.force) {
-      let pending = loadWalletPending(buyerAgentId);
-      const deadline = Date.now() + 180000;
-      while (Date.now() < deadline) {
-        const p = planBuyerDeposit({ pending, now: Date.now(), force: false });
-        if (p.ok) break;
-        await new Promise((r) => setTimeout(r, process.env.NODE_ENV === 'test' ? 0 : 5000));
-        pending = await resolveWalletPending(agent.client, buyerAgentId, loadWalletPending(buyerAgentId));
-      }
-    }
-    const pendingPlan = planBuyerDeposit({
-      pending: loadWalletPending(buyerAgentId),
-      now: Date.now(),
-      force: !!options.force,
-      toAddress: dest.toAddress,
-      iAddress: dest.iAddress,
-      sellerRAddress: payInfo && payInfo.address,
-    });
-    if (!pendingPlan.ok) fail(pendingPlan.code || 'PAY_PENDING', pendingPlan.reason);
-    if (!options.yes) {
-      const ok = await confirmDeposit({ amountText: amount, seller });
-      if (!ok) { console.log('Cancelled.'); process.exit(0); }
-    }
-    const autonomous = !!(options.json || headlessMainnetPay);
-    if (autonomous) {
-      // Deposit is repeat-by-design (402 → top-up loop). Do not share the
-      // single-pay job ceiling (`jobPrice === amount` → 1.1x blocks a second
-      // similar send). Size the budget so maxSendsPerJob deposits of this
-      // amount fit; the per-seller send cap / cooldown / absolute cap still bind.
-      const depositBudget = amountNumber * effectiveLimits().maxSendsPerJob;
-      const g = gateExternalSend({
-        jobId: seller,
-        toAddress: dest.toAddress,
-        amount: amountNumber,
-        jobPrice: depositBudget,
-        kind: 'deposit',
-        expectedRecipients: dest.expectedRecipients,
-      });
-      if (!g.allowed) fail('SPEND_DENIED', g.reason, { retryable: !!g.retryable });
-    }
-    const txid = await agent.sendMultiPayment([{ address: dest.toAddress, amount: amountNumber }]);
-    saveWalletPending(buyerAgentId, { txid, at: Date.now(), kind: 'deposit', amount: amountNumber });
-    if (autonomous) {
-      recordSendOutcome({
-        kind: 'deposit', jobId: seller, toAddress: dest.toAddress, amount: amountNumber, txid,
-      });
-    }
-    say(`✅ Deposit broadcast ${String(txid).substring(0, 16)}…`);
-    const result = await buyerDepositReportAndWait({
-      options, keys, agent, seller, amount, txid, reportUrl: urlRes.url,
-    });
-    // Same as hire/pay --wait: unlink wallet-pending once confirmations > 0 so a
-    // SENDER_MISMATCH (or any report outcome) does not leave a blocking stamp.
-    if (options.wait) {
-      await waitWalletPendingUnlink(agent.client, buyerAgentId, {
-        intervalMs: process.env.NODE_ENV === 'test' ? 0 : PAY_WAIT_INTERVAL_MS,
-      });
-    }
-    if (!result.ok) {
-      fail(result.code || 'DEPOSIT_REPLAY', result.message, { txid, credited: false });
-    }
-    if (result.code === 'DEPOSIT_WAIT_TIMEOUT') {
-      console.warn('DEPOSIT_WAIT_TIMEOUT: deposit broadcast but seller has not credited yet.');
-      if (options.json) {
-        console.log(JSON.stringify({ ok: true, txid, credited: false, pending: true }, null, 2));
-      }
-      return;
-    }
-    if (result.credited) say(`✅ Deposit ${String(txid).substring(0, 16)}… credited`);
-    else say(`✅ Deposit ${String(txid).substring(0, 16)}… reported`);
-    if (options.json) {
-      console.log(JSON.stringify({
-        ok: true, txid, credited: !!result.credited, amount, seller, toAddress: dest.toAddress,
-        ...(options.wait ? { pending: !!result.pending } : {}),
-        ...(result.alreadyReported ? { alreadyReported: true } : {}),
-      }, null, 2));
-    }
-  });
-
-program
-  .command('report-deposit <buyer-id> <seller>')
-  .description('POST a signed J41-DEPOSIT-REPORT to the seller /j41/deposit/report (no broadcast)')
-  .requiredOption('--txid <txid>', 'Funding transaction id')
-  .requiredOption('--amount <n>', 'Positive decimal VRSC that was sent')
-  .option('--yes', 'Skip the interactive confirmation')
-  .option('--wait', 'POST once, poll local getTxStatus, then POST a freshly signed report (max 180s)')
-  .option('--json', 'One JSON object on stdout. Requires --yes.')
-  .action(async (buyerAgentId, seller, options) => {
-    const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
-    const say = (line) => { if (!options.json) console.log(line); };
-    if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
-    const { parseDepositAmount, resolveDepositReportUrl } = require('./buyer-deposit');
-    const parsed = parseDepositAmount(options.amount);
-    if (!parsed.ok) fail(parsed.code, parsed.reason);
-    const amount = parsed.amount;
-    const txid = String(options.txid || '').trim();
-    if (!txid) fail('BAD_TXID', '--txid is required.');
-    const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
-    const { loadAccessGrant } = require('./buyer-access');
-    const grant = loadAccessGrant(AGENTS_DIR, buyerAgentId, seller);
-    let listing = null;
-    try { listing = await agent.client.getAgent(seller); } catch { listing = null; }
-    const urlRes = await resolveDepositReportUrl({
-      grant, listing, buyerId: buyerAgentId, seller,
-    });
-    if (!urlRes.ok) fail(urlRes.code, urlRes.message);
-    if (!options.yes) {
-      const ok = await confirmDeposit({ amountText: amount, seller, reportOnly: true });
-      if (!ok) { console.log('Cancelled.'); process.exit(0); }
-    }
-    const result = await buyerDepositReportAndWait({
-      options, keys, agent, seller, amount, txid, reportUrl: urlRes.url,
-    });
-    if (!result.ok) fail(result.code || 'DEPOSIT_REPLAY', result.message, { txid });
-    if (result.code === 'DEPOSIT_WAIT_TIMEOUT') {
-      console.warn('DEPOSIT_WAIT_TIMEOUT: seller has not credited the deposit yet.');
-      if (options.json) {
-        console.log(JSON.stringify({ ok: true, txid, credited: false, pending: true }, null, 2));
-      }
-      return;
-    }
-    if (result.credited) say(`✅ Deposit ${String(txid).substring(0, 16)}… credited`);
-    else say(`✅ Deposit ${String(txid).substring(0, 16)}… reported`);
-    if (options.json) {
-      console.log(JSON.stringify({
-        ok: true, txid, credited: !!result.credited, amount, seller,
-        ...(options.wait ? { pending: !!result.pending } : {}),
-        ...(result.alreadyReported ? { alreadyReported: true } : {}),
       }, null, 2));
     }
   });
@@ -7961,6 +7750,16 @@ program
               // Operator-only (not git): rewrite a priced grant model before
               // forward so a hung NIM id (e.g. DeepSeek Pro) can map to Flash.
               upstreamModelAlias: localCfg.upstreamModelAlias || {},
+              getJob: async (jobId) => {
+                const session = await getAgentSession(state, a);
+                const jobClient = session._client || session.client;
+                return jobClient.getJob(jobId);
+              },
+              getIdentityKeys: async (id) => {
+                const session = await getAgentSession(state, a);
+                const jobClient = session._client || session.client;
+                return jobClient.getIdentityKeys(id);
+              },
             });
             let egressHost = apiSvc.endpointUrl || '';
             try { egressHost = new URL(apiSvc.endpointUrl).hostname; } catch {}
@@ -8086,21 +7885,13 @@ program
               }
             }
 
-            // Mint API key against the i-address when keys resolve (meter aliases).
+            // Mint the key against the i-address when keys resolve.
             // Keys 502: mint the claimed id, do not create an empty R bucket.
             let mintBuyerId = accessRequest.buyerVerusId;
             try {
               const idKeys = await client.getIdentityKeys(accessRequest.buyerVerusId);
               const iAddr = idKeys && (idKeys.iaddress || idKeys.iAddress);
-              if (iAddr) {
-                mintBuyerId = iAddr;
-                const { linkBuyerAliasesForAgent } = require('./credit-meter');
-                linkBuyerAliasesForAgent(sellerAgent.id, iAddr, [
-                  accessRequest.buyerVerusId,
-                  iAddr,
-                  ...((idKeys.primaryAddresses) || []),
-                ]);
-              }
+              if (iAddr) mintBuyerId = iAddr;
             } catch { /* keep claimed id */ }
             const keyRecord = mintApiKey(sellerAgent.id, mintBuyerId);
 
@@ -8117,16 +7908,6 @@ program
             const envelope = mintAccessEnvelope(accessRequest, sellerAgent.wif, payload, J41_NETWORK);
             console.log(`[Discovery] Minted key for ${untrusted(accessRequest.buyerVerusId, 60)} → ${sellerAgent.id}`);
             return envelope;
-          },
-          onDepositReport: async (report) => {
-            const { reportDeposit } = require('./deposit-watcher');
-            const sellerAgent = state.agents.find(a =>
-              a.iAddress === report.sellerVerusId || a.identity === report.sellerVerusId
-            );
-            if (!sellerAgent) return { credited: false, message: 'Seller not found on this dispatcher', code: 'SELLER_NOT_FOUND' };
-            const agent = await getAgentSession(state, sellerAgent);
-            const payAddress = sellerAgent.iAddress || sellerAgent.address;
-            return reportDeposit(sellerAgent.id, agent._client || agent.client, report, payAddress, J41_NETWORK);
           },
           onApiAccessRevoke: async ({ sellerVerusId, buyerVerusId, apiKey }) => {
             // Platform → dispatcher webhook called from DELETE /v1/me/api-access/:grantId
@@ -8174,20 +7955,14 @@ program
           },
         };
 
-        // Set notify context per api-endpoint agent for J41 webhook notifications
-        const { startDepositPoller, setNotifyContext } = require('./deposit-watcher');
+        const { releaseStartupReservations } = require('./session-allowance');
         for (const a of apiAgents) {
-          setNotifyContext(a.id, {
-            sellerWif: a.wif,
-            sellerVerusId: a.iAddress || a.identity,
-            network: J41_NETWORK,
-          });
+          const released = releaseStartupReservations(a.id);
+          if (!released || released.ok === false) {
+            throw new Error(`session startup release failed for ${a.id}: ${(released && released.code) || 'SESSION_LOCK_BUSY'}`);
+          }
         }
-
-        // Start background deposit poller for pending confirmations
-        startDepositPoller(state, getAgentSession);
         console.log(`  API Proxy: ${apiAgents.length} agent(s) with api-endpoint services`);
-        console.log(`  Deposit watcher: polling every 60s for pending confirmations`);
 
         // Start upstream LLM health poller
         const { startHealthPoller } = require('./upstream-health');
@@ -12645,6 +12420,57 @@ async function openStrandedInProgress(state, agent, job) {
 let _polling = false;
 /** Cycles the poll loop skipped because the previous one overran. Surfaced on /health. */
 let _pollSkips = 0;
+function jobOwnsModelWindow(job) {
+  const { jobOwnsModelWindow: owns } = require('./session-allowance');
+  return owns(job);
+}
+
+function ensureModelSession(agentId, job) {
+  if (!jobOwnsModelWindow(job) || !job || !job.id) return;
+  if (job.status !== 'in_progress' && job.status !== 'paused') return;
+  const allowUnpriced = process.env.J41_ALLOW_UNPRICED_JOBS === '1';
+  if (!jobPaymentReady(job, { allowUnpriced })) return;
+  const { createSessionIfAbsent } = require('./session-allowance');
+  const opened = createSessionIfAbsent({ agentId, jobId: job.id });
+  if (!opened.ok) console.warn(`[session] open ${job.id} ${opened.code}`);
+}
+
+async function closeOwnedModelSession(state, agentInfo, jobId, statuses) {
+  if (!jobId || !agentInfo) return;
+  let job;
+  let client;
+  try {
+    const agent = await getAgentSession(state, agentInfo);
+    client = agent.client || agent._client;
+    job = await client.getJob(jobId);
+  } catch (e) {
+    console.warn(`[session] getJob ${String(jobId).slice(0, 8)} failed: ${e.message}`);
+    return;
+  }
+  if (!job || !statuses.includes(job.status) || !jobOwnsModelWindow(job)) return;
+  const { sellerOwnsJob, closeSession } = require('./session-allowance');
+  const owns = await sellerOwnsJob(job, agentInfo, (id) => client.getIdentityKeys(id));
+  if (!owns) return;
+  const closed = closeSession({ agentId: agentInfo.id, jobId });
+  if (!closed.ok) console.warn(`[session] close ${jobId} ${closed.code}`);
+}
+
+async function tombstoneResolvedModelSessions(agentInfo, client) {
+  const { listOpenSessionJobIds, closeSession, sellerOwnsJob, jobOwnsModelWindow: owns } = require('./session-allowance');
+  let ids = [];
+  try { ids = listOpenSessionJobIds(agentInfo.id); } catch { return; }
+  for (const jobId of ids) {
+    let job;
+    try { job = await client.getJob(jobId); } catch { continue; }
+    if (!job || (job.status !== 'resolved' && job.status !== 'resolved_rejected')) continue;
+    if (!owns(job)) continue;
+    const mine = await sellerOwnsJob(job, agentInfo, (id) => client.getIdentityKeys(id));
+    if (!mine) continue;
+    const closed = closeSession({ agentId: agentInfo.id, jobId });
+    if (!closed.ok) console.warn(`[session] tombstone ${jobId} ${closed.code}`);
+  }
+}
+
 async function pollForJobs(state) {
   // B2: once shutdown begins, stop taking on new work. `shuttingDown` used to be a
   // closure variable no other function could see, so this loop kept signing and
@@ -12708,6 +12534,7 @@ async function pollForJobs(state) {
         j.status === 'requested' || j.status === 'accepted' || j.status === 'in_progress'
       );
       console.log(`[Poll] ${agentInfo.id} jobs fetched: ${jobs.length}`);
+      await tombstoneResolvedModelSessions(agentInfo, agent.client);
 
       for (const job of jobs) {
         if (!job?.id) {
@@ -12719,6 +12546,7 @@ async function pollForJobs(state) {
         // A stranded paid job is the exception: drop `seen` and fall through
         // so this same poll starts one worker. The next seen job waits.
         if (state.seen.has(job.id)) {
+          if (jobOwnsModelWindow(job)) ensureModelSession(agentInfo.id, job);
           if (revivedStrandedThisPoll || !(await openStrandedInProgress(state, agent, job))) continue;
           revivedStrandedThisPoll = true;
         }
@@ -12752,7 +12580,7 @@ async function pollForJobs(state) {
             if (fullJob?.jobHash && fullJob?.buyerVerusId) {
               const _rentalSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
               if (shouldRefuseLanGpuRental(agentInfo.id, fullJob, _rentalSvcs, undefined, { outboundSshV1: !!state.outboundSshV1 })) continue;
-              if (!isGpuRentalJob(fullJob, _rentalSvcs) && !isDatasetJob(fullJob) && agentInfo.kind !== 'data' && !(_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
+              if (!isGpuRentalJob(fullJob, _rentalSvcs) && !isDatasetJob(fullJob) && !jobOwnsModelWindow(fullJob) && agentInfo.kind !== 'data' && !(_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
                 if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
                   console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${job.id.substring(0, 8)}, buyer not charged`);
                   state.emitEvent?.('job.declined_llm_down', { jobId: job.id, agentId: agentInfo.id });
@@ -12813,16 +12641,20 @@ async function pollForJobs(state) {
               const listedSvc = cap && Array.isArray(cap.services)
                 ? cap.services.find((s) => s && serviceId && (s.id === serviceId || s.serviceId === serviceId))
                 : null;
-              if (listedSvc) {
-                const { assertPaysListing } = require('./listing-price');
-                const priceGate = assertPaysListing({
-                  serviceType: listedSvc.serviceType || listedSvc.service_type,
-                  amount: fullJob.amount,
-                  listedPrice: listedSvc.price,
-                });
-                if (!priceGate.ok) {
-                  console.warn(`[PRICE] not accepting ${String(job.id).slice(0, 8)}: ${priceGate.message}`);
-                  continue;
+              {
+                const jobType = fullJob.serviceType || fullJob.service_type || (fullJob.kind === 'model' ? 'api-endpoint' : null);
+                const listedType = listedSvc && (listedSvc.serviceType || listedSvc.service_type);
+                if (listedSvc || jobType === 'api-endpoint' || fullJob.kind === 'model') {
+                  const { assertPaysListing } = require('./listing-price');
+                  const priceGate = assertPaysListing({
+                    serviceType: listedType || jobType || 'agent',
+                    amount: fullJob.amount,
+                    listedPrice: listedSvc ? listedSvc.price : undefined,
+                  });
+                  if (!priceGate.ok) {
+                    console.warn(`[PRICE] not accepting ${String(job.id).slice(0, 8)}: ${priceGate.message}`);
+                    continue;
+                  }
                 }
               }
               const timestamp = Math.floor(Date.now() / 1000);
@@ -12884,8 +12716,9 @@ async function pollForJobs(state) {
           continue;
         }
         if (shouldRefuseLanGpuRental(agentInfo.id, job, _startSvcs, undefined, { outboundSshV1: !!state.outboundSshV1 })) continue;
-        if (isApiEndpointJob(job, _startSvcs)) {
+        if (jobOwnsModelWindow(job)) {
           console.log(`[Poll] skip labour start for api-endpoint job ${job.id}`);
+          ensureModelSession(agentInfo.id, job);
           state.seen.set(job.id, Date.now());
           saveSeenJobs(state.seen);
           continue;
@@ -13202,7 +13035,7 @@ async function handleWebhookEvent(state, agentId, payload) {
         if (fullJob?.jobHash && fullJob?.buyerVerusId) {
           const _rentalSvcs = servicesForAgent(state, agentInfo, loadAgentConfig);
           if (shouldRefuseLanGpuRental(agentInfo.id, fullJob, _rentalSvcs, undefined, { outboundSshV1: !!state.outboundSshV1 })) return;
-          if (!isGpuRentalJob(fullJob, _rentalSvcs) && !(_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
+          if (!isGpuRentalJob(fullJob, _rentalSvcs) && !isDatasetJob(fullJob) && !jobOwnsModelWindow(fullJob) && agentInfo.kind !== 'data' && !(_rentalSvcs || []).some((s) => s && s.serviceType === 'gpu-rental')) {
             if (!(await preflightAllowsAccept(state, agentInfo, loadAgentConfig(agentInfo.id), loadDispatcherConfig()))) {
               console.log(`[PREFLIGHT] LLM unavailable for ${agentInfo.id} — declining job ${jobId.substring(0, 8)}, buyer not charged`);
               state.emitEvent?.('job.declined_llm_down', { jobId, agentId: agentInfo.id });
@@ -13259,6 +13092,25 @@ async function handleWebhookEvent(state, agentId, payload) {
             }
             return;
           }
+          const cap = state.capabilities && state.capabilities.get(agentInfo.id);
+          const serviceId = fullJob.serviceId || fullJob.service_id;
+          const listedSvc = cap && Array.isArray(cap.services)
+            ? cap.services.find((s) => s && serviceId && (s.id === serviceId || s.serviceId === serviceId))
+            : null;
+          const jobType = fullJob.serviceType || fullJob.service_type || (fullJob.kind === 'model' ? 'api-endpoint' : null);
+          const listedType = listedSvc && (listedSvc.serviceType || listedSvc.service_type);
+          if (listedSvc || jobType === 'api-endpoint' || fullJob.kind === 'model') {
+            const { assertPaysListing } = require('./listing-price');
+            const priceGate = assertPaysListing({
+              serviceType: listedType || jobType || 'agent',
+              amount: fullJob.amount,
+              listedPrice: listedSvc ? listedSvc.price : undefined,
+            });
+            if (!priceGate.ok) {
+              console.warn(`[PRICE] not accepting ${String(jobId).slice(0, 8)}: ${priceGate.message}`);
+              return;
+            }
+          }
           const timestamp = Math.floor(Date.now() / 1000);
           const sig = signMessage(agentInfo.wif, buildAcceptMessage(fullJob, timestamp), J41_NETWORK);
           await agent.client.acceptJob(jobId, sig, timestamp, agentInfo.address);
@@ -13284,7 +13136,27 @@ async function handleWebhookEvent(state, agentId, payload) {
     }
 
     case 'job.started': {
-      if (!jobId || state.active.has(jobId) || state.seen.has(jobId)) return;
+      if (!jobId) return;
+      let modelWindow = false;
+      try {
+        const agent = await getAgentSession(state, agentInfo);
+        const job = await agent.client.getJob(jobId);
+        if (jobOwnsModelWindow(job)) {
+          modelWindow = true;
+          const allowUnpricedModel = process.env.J41_ALLOW_UNPRICED_JOBS === '1';
+          if (jobPaymentReady(job, { allowUnpriced: allowUnpricedModel })) {
+            ensureModelSession(agentInfo.id, job);
+            state.seen.set(jobId, Date.now());
+            saveSeenJobs(state.seen);
+          } else {
+            console.log(`[Webhook] ⏳ Job ${jobId.substring(0, 8)} — awaiting payment (status: ${job.status})`);
+          }
+        }
+      } catch (e) {
+        console.error(`[Webhook] model session open failed: ${e.message}`);
+      }
+      if (modelWindow) break;
+      if (state.active.has(jobId) || state.seen.has(jobId)) return;
       try {
         const agent = await getAgentSession(state, agentInfo);
         const job = await agent.client.getJob(jobId);
@@ -13347,6 +13219,7 @@ async function handleWebhookEvent(state, agentId, payload) {
 
     case 'job.cancelled': {
       if (!jobId) return;
+      await closeOwnedModelSession(state, agentInfo, jobId, ['cancelled']);
       // T3 — bind lives here, not as a handleWebhookEvent preamble: job.requested
       // / job.started have no local job yet. A captured secret for agent-2 must
       // not yank agent-1's GPU rental or queued labour.
@@ -13386,7 +13259,17 @@ async function handleWebhookEvent(state, agentId, payload) {
     case 'job.disputed':
     case 'job.dispute.filed': {
       console.log(`[Webhook] ⚠️  Dispute filed for job ${jobId?.substring(0, 8)} by ${data?.disputedBy || '?'}: ${data?.reason || '?'}`);
-      await queueDisputedJobForRespawn(state, jobId, { agentId, reason: data?.reason });
+      let modelDispute = false;
+      if (jobId) {
+        try {
+          const agent = await getAgentSession(state, agentInfo);
+          const job = await agent.client.getJob(jobId);
+          modelDispute = jobOwnsModelWindow(job);
+        } catch (e) {
+          console.warn(`[session] dispute getJob ${String(jobId).slice(0, 8)} failed: ${e.message}`);
+        }
+      }
+      if (!modelDispute) await queueDisputedJobForRespawn(state, jobId, { agentId, reason: data?.reason });
       // Record that we've surfaced the dispute so the next pollForJobs cycle
       // sees the correct status and does NOT double-fire to the buyer.
       if (jobId) state._lastSentStatus.set(jobId, 'disputed');
@@ -13400,6 +13283,7 @@ async function handleWebhookEvent(state, agentId, payload) {
 
     case 'job.dispute.resolved': {
       console.log(`[Webhook] ✅ Dispute resolved for job ${jobId?.substring(0, 8)}: ${data?.action || '?'}`);
+      if (jobId) await closeOwnedModelSession(state, agentInfo, jobId, ['resolved', 'resolved_rejected']);
       const resolvedJob = state.active.get(jobId);
       // sendToJobAgent, not process.send: `.process` exists only for local forks, so
       // gating on it silently dropped this for every Docker container — the same
@@ -13421,6 +13305,7 @@ async function handleWebhookEvent(state, agentId, payload) {
 
     case 'job.completed': {
       console.log(`[Webhook] ✅ Job ${jobId?.substring(0, 8)} completed`);
+      await closeOwnedModelSession(state, agentInfo, jobId, ['completed']);
       const completedJob = state.active.get(jobId);
       if (completedJob && completedJob.kind === 'gpu-rental') {
         console.log('[Rental] credentials delivered; jail runs until expiresAt');
@@ -15784,8 +15669,9 @@ async function startJobOrRental(state, job, agentInfo) {
     await startRentalJobWired(state, job, agentInfo);
     return;
   }
-  if (isApiEndpointJob(job, services)) {
+  if (jobOwnsModelWindow(job)) {
     console.log(`[Start] skip labour container for api-endpoint job ${job && job.id}`);
+    ensureModelSession(agentInfo.id, job);
     return;
   }
   await startJob(state, job, agentInfo);
@@ -16099,8 +15985,8 @@ program
 
       // B5 — this used to submit straight to chain with no recap and no
       // confirmation, unlike every structurally similar money/dispute verb
-      // (post-bounty, wallet send/sweep, refunds approve/unblock, deposits
-      // credit/dismiss). A mistyped refund percent had nothing to catch it.
+      // (post-bounty, wallet send/sweep, refunds approve/unblock). A mistyped
+      // refund percent had nothing to catch it.
       console.log(`\n  Dispute response for job ${jobId}:`);
       console.log(`    Agent:  ${agentId}`);
       console.log(`    Action: ${action}${action === 'refund' ? ` (${refundPercent}% refund)` : ''}${action === 'rework' ? ` (rework cost: ${reworkCost || 0} ${NATIVE_COIN})` : ''}`);
@@ -16140,7 +16026,7 @@ program
 // ── Control Plane Client ──
 program
   .command('ctl <command>')
-  .description('Send command to running dispatcher: status, jobs, agents, resources, earnings, history, providers, inbox, inbox-redrive, deposits, leases, stop-rental, shutdown, canary')
+  .description('Send command to running dispatcher: status, jobs, agents, resources, earnings, history, providers, inbox, inbox-redrive, leases, stop-rental, shutdown, canary')
   .option('--agent <id>', 'Agent ID (for canary command)')
   .option('--item <id>', 'Inbox item ID (for inbox-redrive)')
   .option('--job <id>', 'Job ID (for stop-rental)')
@@ -18071,198 +17957,6 @@ program
     console.error(`❌ Unknown refunds action '${action}'. Use: list | approve | reject`);
     process.exit(1);
   });
-
-/**
- * `deposits credit|dismiss` — settle one anomaly a human has adjudicated.
- *
- * Runs out-of-band against a LIVE daemon, so every mutation goes through the
- * per-agent deposit lock in deposit-watcher.js. Without it this is an unlocked
- * read-modify-write racing the 60s poller and every proxied request's meter
- * update, which is the same lost-update bug the refund path met twice.
- *
- * @returns {Promise<number>} process exit code
- */
-async function depositsResolve(action, agentId, txid, options) {
-  // Inlined rather than shared: `refunds approve` does the same, and lifting a
-  // prompt helper out of a hardened money path to reuse it here is exactly the
-  // kind of incidental refactor that has caused regressions in this repo.
-  const confirmYesNo = async (question) => {
-    // Exits the process rather than returning a code like the rest of this
-    // function: there is no code to return to a caller that cannot be asked.
-    requireInteractiveConfirm(`deposits ${action}`);
-    const readline = require('readline');
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    const answer = await new Promise((resolve) => rl.question(`\n  ${question} (y/N) `, resolve));
-    rl.close();
-    const a = answer.trim().toLowerCase();
-    return a === 'y' || a === 'yes';
-  };
-
-  if (!agentId || !txid) {
-    console.error(`Usage: j41-dispatcher deposits ${action} <agent-id> <txid>` +
-      (action === 'dismiss' ? ' --reason "<why nothing is owed>"' : ''));
-    return 1;
-  }
-  const known = listRegisteredAgents();
-  if (!known.includes(agentId)) {
-    console.error(`Unknown agent '${agentId}'. Registered: ${known.join(', ') || '(none)'}`);
-    return 1;
-  }
-
-  const {
-    listDepositAnomaliesForAgent, creditDepositAnomaly, dismissDepositAnomaly, reconcileMeterAgainstLedger,
-  } = require('./deposit-watcher.js');
-
-  const anomaly = listDepositAnomaliesForAgent(agentId).needsOperator.find((n) => n.txid === txid);
-  if (!anomaly) {
-    console.error(`No unresolved anomaly for ${txid} on ${agentId}.`);
-    console.error('Run: j41-dispatcher deposits list — to see what is outstanding.');
-    return 1;
-  }
-
-  console.log(`\n${agentId}  ${txid}`);
-  console.log(`  buyer:  ${untrustedField(anomaly.buyerVerusId)}`);
-  console.log(`  amount: ${anomaly.amount} ${NATIVE_COIN}`);
-  console.log(`  reason: ${anomaly.reason}`);   // ours, not the buyer's
-  try {
-    const m = reconcileMeterAgainstLedger(agentId, anomaly.buyerVerusId);
-    console.log(`  meter:  balance ${m.balance ?? '—'}, totalDeposited ${m.actualTotalDeposited ?? '—'} ` +
-      `vs ledger ${m.expectedTotalDeposited} (delta ${m.delta ?? '—'})`);
-  } catch { /* advisory only */ }
-
-  if (action === 'dismiss') {
-    if (!options.reason) {
-      console.error('\n--reason is required: a dismissal has to record why nothing is owed.');
-      return 1;
-    }
-    if (!options.yes && !(await confirmYesNo(`Dismiss this anomaly for ${anomaly.buyerVerusId}? No money moves.`))) {
-      console.log('Aborted.');
-      return 1;
-    }
-    const res = await dismissDepositAnomaly(agentId, txid, { reason: options.reason });
-    if (!res.ok) { console.error(`Failed: ${res.message}`); return 1; }
-    console.log(`✅ Dismissed. No money moved. Recorded: ${options.reason}`);
-    return 0;
-  }
-
-  // credit — moves money, so it re-verifies on-chain and fails closed.
-  if (!options.yes && !(await confirmYesNo(
-    `CREDIT ${anomaly.amount} VRSC to ${anomaly.buyerVerusId}? This changes a real balance.`))) {
-    console.log('Aborted.');
-    return 1;
-  }
-
-  const state = buildRefundsState();
-  const agent = state.agents.find((a) => a.id === agentId);
-  if (!agent) { console.error(`${agentId} has no usable keys.`); return 1; }
-  let client;
-  try {
-    const session = await getAgentSession(state, agent);
-    client = session._client || session.client;
-  } catch (e) {
-    console.error(`Could not authenticate ${agentId}: ${e.message}`);
-    console.error('Crediting re-verifies the transaction on-chain first, so this cannot proceed offline.');
-    return 1;
-  }
-
-  const res = await creditDepositAnomaly(agentId, txid, { client });
-  if (!res.ok) { console.error(`Failed: ${res.message}`); return 1; }
-  console.log(`✅ Credited ${res.credited} ${NATIVE_COIN} to ${untrustedField(res.buyerVerusId, 60)} (tx confirmed at ${res.confirmations} block(s)).`);
-  return 0;
-}
-
-// ── deposits ───────────────────────────────────────────────────────────────
-// Read-only view of the 0-conf deposit ledger. Reads DISK directly rather than
-// the control socket, so it works out-of-band while the daemon runs and still
-// works when it does not — the same reason `refunds list` does.
-//
-// Commander matches on the first word of a command name, so the `refunds`
-// pattern applies here too: one `deposits [action]` rather than separate
-// registrations that would collide.
-program
-  .command('deposits [action] [agent-id] [txid]')
-  .description('0-conf deposit ledger — actions: list (default) | credit <agent-id> <txid> | dismiss <agent-id> <txid> --reason <text>')
-  .option('--all', 'list: include settled reversals, not just the last few')
-  .option('--json', 'list: raw JSON output')
-  .option('--yes', 'credit/dismiss: skip the interactive confirmation')
-  .option('--reason <text>', 'dismiss: why nothing is owed (required)')
-  .action(async (action, agentIdArg, txidArg, options) => {
-    ensureDirs();
-    action = (action || 'list').toLowerCase();
-
-    if (action === 'credit' || action === 'dismiss') {
-      await ensureKeystoreUnlockedIfEncrypted();
-      process.exitCode = await depositsResolve(action, agentIdArg, txidArg, options);
-      return;
-    }
-    if (action !== 'list') {
-      console.error(`Unknown action '${action}'. Available: list | credit | dismiss`);
-      process.exitCode = 1;
-      return;
-    }
-
-    const { listDepositAnomalies } = require('./deposit-watcher.js');
-    const surface = listDepositAnomalies(listRegisteredAgents());
-
-    if (options.json) {
-      console.log(JSON.stringify(surface, null, 2));
-      return;
-    }
-
-    const { deposits_unconfirmed_open: openCount, deposits_needs_operator: opCount } = surface.summary;
-
-    // Blocked entries are loudest — an operator scanning this wants the thing
-    // only they can resolve at the top, not buried under routine activity.
-    if (opCount > 0) {
-      console.log(`\n⚠️  ${opCount} deposit(s) NEED AN OPERATOR DECISION\n`);
-      for (const a of surface.agents) {
-        for (const n of a.needsOperator) {
-          console.log(`  ${a.agentId}  ${String(n.txid).substring(0, 16)}…  ${n.amount} ${NATIVE_COIN}  ${untrustedField(n.buyerVerusId, 60)}`);
-          console.log(`    ${n.reason}`);
-          // The flags say "check the meter against the chain". The chain half is
-          // answerable from the txid; the meter half is not, because the meter
-          // keeps no journal and its balance moves with every proxied request.
-          // totalDeposited is the one figure only deposits and reversals touch,
-          // so reconstructing it from the ledger turns this from a judgement
-          // call into arithmetic.
-          try {
-            const { reconcileMeterAgainstLedger } = require('./deposit-watcher.js');
-            const m = reconcileMeterAgainstLedger(a.agentId, n.buyerVerusId);
-            const deltaStr = m.delta === null ? 'meter not found' :
-              (m.delta === 0 ? 'matches the ledger — the adjustment did NOT run'
-                             : `off by ${m.delta > 0 ? '+' : ''}${m.delta} VRSC`);
-            console.log(`    meter: balance ${m.balance ?? '—'}, totalDeposited ${m.actualTotalDeposited ?? '—'} ` +
-              `vs ledger ${m.expectedTotalDeposited} → ${deltaStr}`);
-          } catch (e) {
-            console.log(`    meter: could not reconcile (${e.message})`);
-          }
-          console.log(`    resolve: j41-dispatcher deposits credit ${a.agentId} ${n.txid}`);
-          console.log(`         or: j41-dispatcher deposits dismiss ${a.agentId} ${n.txid} --reason "..."\n`);
-        }
-      }
-    } else {
-      console.log('\nNo deposits need an operator decision.\n');
-    }
-
-    console.log(`0-conf credits still open: ${openCount}`);
-    for (const a of surface.agents) {
-      for (const o of a.open) {
-        console.log(`  ${a.agentId}  ${String(o.txid).substring(0, 16)}…  ${o.amount} ${NATIVE_COIN}  ${untrustedField(o.buyerVerusId, 60)}  ` +
-          `[${o.state}${o.misses ? `, ${o.misses} miss(es)` : ''}]`);
-      }
-    }
-
-    const reversals = surface.agents.flatMap((a) => a.reversed.map((r) => ({ ...r, agentId: a.agentId })));
-    const shown = options.all ? reversals : reversals.filter((r) => !r.restoredAt);
-    console.log(`\nReversals${options.all ? '' : ' (unrestored)'}: ${shown.length}`);
-    for (const r of shown) {
-      const mark = r.restoring ? 'RESTORING' : (r.restoredAt ? 'restored' : 'standing');
-      console.log(`  ${r.agentId}  ${String(r.txid).substring(0, 16)}…  ${r.amount} ${NATIVE_COIN}  ${untrustedField(r.buyerVerusId, 60)}  ` +
-        `[${mark}${r.debited ? '' : ', debit NOT certain'}]`);
-    }
-    console.log('');
-  });
-
 
 // ── Entry point ──
 

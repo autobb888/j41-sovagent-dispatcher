@@ -22,13 +22,12 @@ test('TUI can build jail images, rental-setup a compute listing, and activate th
   assert.match(DASH, /Deactivate this listing/);
 });
 
-test('TUI money screens can approve refunds, credit deposits, and sweep without dumping to CLI-only', () => {
+test('TUI money screens can approve refunds and sweep without dumping to CLI-only', () => {
   assert.match(DASH, /Approve a refund/);
   assert.match(DASH, /\['refunds', action, id\]/);
-  assert.match(DASH, /Credit a deposit/);
-  assert.match(DASH, /\['deposits', action, agentId, tx\]/);
   assert.match(DASH, /\['wallet', 'sweep'/);
   assert.match(DASH, /\['wallet', 'send'/);
+  assert.doesNotMatch(DASH, /Credit a deposit/);
 });
 
 test('TUI jobs screen can accept stacked hires and respond to disputes', () => {

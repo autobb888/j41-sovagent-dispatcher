@@ -49,16 +49,19 @@ test('access is allowed only when some service is api-endpoint', () => {
   }).ok, true);
 });
 
-test('compute requires gpu-rental; model and api-endpoint are not labour jobs', () => {
+test('a priced model session is a hire; price 0 and other api-endpoint pairings are not', () => {
   assert.equal(assertHireAllowed({ sellerKind: 'compute', serviceType: 'gpu-rental', serviceId: 's1' }).ok, true);
-  assert.equal(assertHireAllowed({ sellerKind: 'compute', serviceType: 'api-endpoint', serviceId: 's1' }).ok, false);
-  const model = assertHireAllowed({ sellerKind: 'model', serviceType: 'api-endpoint', serviceId: 's1' });
-  assert.equal(model.ok, false);
-  assert.equal(model.code, 'MODEL_NOT_A_LABOUR_JOB');
-  assert.equal(assertHireAllowed({ sellerKind: 'model', serviceType: 'gpu-rental', serviceId: 's1' }).ok, false);
-  const api = assertHireAllowed({ sellerKind: 'agent', serviceType: 'api-endpoint', serviceId: 's1' });
-  assert.equal(api.ok, false);
+  assert.equal(assertHireAllowed({ sellerKind: 'compute', serviceType: 'api-endpoint', serviceId: 's1' }).code, 'MODEL_NOT_A_LABOUR_JOB');
+  const priced = assertHireAllowed({ sellerKind: 'model', serviceType: 'api-endpoint', serviceId: 's1', price: 0.01 });
+  assert.equal(priced.ok, true);
+  const zero = assertHireAllowed({ sellerKind: 'model', serviceType: 'api-endpoint', serviceId: 's1', price: 0 });
+  assert.equal(zero.code, 'MODEL_PRICE_UNSET');
+  const missing = assertHireAllowed({ sellerKind: 'model', serviceType: 'api-endpoint', serviceId: 's1' });
+  assert.equal(missing.code, 'MODEL_PRICE_UNSET');
+  assert.equal(assertHireAllowed({ sellerKind: 'model', serviceType: 'gpu-rental', serviceId: 's1' }).code, 'MODEL_NOT_A_LABOUR_JOB');
+  const api = assertHireAllowed({ sellerKind: 'agent', serviceType: 'api-endpoint', serviceId: 's1', price: 0.01 });
   assert.equal(api.code, 'MODEL_NOT_A_LABOUR_JOB');
+  assert.doesNotMatch(api.message, /POST \/v1\/proxy\/access/);
 });
 
 test('paymentOutputs refuses missing/malformed addresses and implausible fees', () => {
@@ -182,7 +185,7 @@ test('listings default limit is 100; TUI browse does not cap at 24', async () =>
   assert.match(calls[0], /limit=100/);
 });
 
-test('listings do not mark models hireable; default browse includes data identities', async () => {
+test('a priced model listing is hireable; default browse includes data identities', async () => {
   const fetchImpl = async (url) => {
     const u = String(url);
     if (u.includes('/v1/agents')) {
@@ -211,23 +214,26 @@ test('listings do not mark models hireable; default browse includes data identit
   const data = mixed.rows.find((r) => r.kind === 'data');
   assert.equal(agent.hireable, true);
   assert.equal(agent.next, 'hire');
-  assert.equal(model.hireable, false);
-  assert.equal(model.refuseCode, 'MODEL_NOT_A_LABOUR_JOB');
-  assert.equal(model.next, 'access');
+  assert.equal(model.hireable, true);
+  assert.equal(model.refuseCode, null);
+  assert.equal(model.next, 'hire');
   assert.equal(data.hireable, false);
   assert.equal(data.refuseCode, 'DATA_NOT_HIREABLE');
   assert.equal(data.qualifiedName, 'pippinapples.agentplatform@');
 
   const modelsOnly = await fetchMarketplaceListings({ apiUrl: 'https://api.example', kind: 'model', fetchImpl });
-  assert.equal(modelsOnly.rows.every((r) => r.hireable === false), true);
-  assert.equal(modelsOnly.rows.every((r) => r.next === 'access'), true);
+  assert.equal(modelsOnly.rows.every((r) => r.hireable === true), true);
+  assert.equal(modelsOnly.rows.every((r) => r.next === 'hire'), true);
 });
 
-test('CLI has access/chat; TUI does not hire models', () => {
+test('CLI chat names the paid job; a refused model pairing is still named', () => {
   const cli = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
   const dash = fs.readFileSync(path.join(__dirname, '../src/dashboard.js'), 'utf8');
   assert.match(cli, /\.command\('access <buyer-agent-id> <seller>'\)/);
   assert.match(cli, /\.command\('chat <buyer-agent-id> <seller>'\)/);
+  const chat = cli.slice(cli.indexOf(".command('chat <buyer-agent-id> <seller>')"), cli.indexOf(".command('chat <buyer-agent-id> <seller>')") + 800);
+  assert.match(chat, /--job/);
   assert.match(dash, /j41-dispatcher access/);
   assert.match(dash, /MODEL_NOT_A_LABOUR_JOB/);
+  assert.match(dash, /--job <job-id>/);
 });

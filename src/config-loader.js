@@ -54,11 +54,6 @@ const DEFAULTS = Object.freeze({
     // can't collectively over-commit a thin balance past the single-request
     // worst-case reservation. Exceeding this returns 429.
     max_inflight_per_buyer: 4,
-    suggested_topup_vrsc: 10,
-    // Credit-low notify threshold (VRSC). When a buyer's balance crosses BELOW
-    // this after a request, the dispatcher fires a one-time signed credit-low
-    // notify to J41. null = fall back to suggested_topup_vrsc at read time.
-    credit_low_threshold_vrsc: null,
     // NEW (2.1.14):
     rate_limit_rps: 10,             // tokens-per-second per buyer
     rate_limit_burst: 30,           // max bucket size per buyer
@@ -72,12 +67,6 @@ const DEFAULTS = Object.freeze({
   // path, and `start` SIGTERMs the PID in dispatcher.pid — so an operator following
   // the docs took their own fleet down.
   poll: { interval_ms: 0 },
-  // reconcile_enabled / reversal_budget_max are configurable for the same reason
-  // refund_limits are: the reconciler debits buyer balances unattended, and a
-  // limit an operator cannot raise is a limit they disable by other means. The
-  // EVIDENCE thresholds (misses, span, block advance) stay constants on purpose
-  // — making the standard of proof tunable invites weakening it at 3am.
-  deposit: { poll_interval_ms: 60000, reconcile_enabled: true, reversal_budget_max: 10 },
   // M3 — the outbound-money rate limit the README has always promised. These were
   // hardcoded constants attached to two functions with ZERO callers, so none of it
   // existed. Configurable because an operator draining a large approved backlog
@@ -154,19 +143,12 @@ const ENV_OVERRIDES = [
   ['J41_PROXY_ESTIMATED_OUTPUT','proxy.estimated_output_tokens','int'],
   ['J41_PROXY_MAX_OUTPUT_TOKENS_CAP','proxy.max_output_tokens_cap','int'],
   ['J41_PROXY_MAX_INFLIGHT_PER_BUYER','proxy.max_inflight_per_buyer','int'],
-  ['J41_PROXY_SUGGESTED_TOPUP', 'proxy.suggested_topup_vrsc','int'],
-  ['J41_PROXY_CREDIT_LOW_THRESHOLD', 'proxy.credit_low_threshold_vrsc','float'],
   ['J41_PROXY_RATE_LIMIT_RPS',         'proxy.rate_limit_rps',         'int'],
   ['J41_PROXY_RATE_LIMIT_BURST',       'proxy.rate_limit_burst',       'int'],
   ['J41_PROXY_RATE_LIMIT_MAX_BUCKETS', 'proxy.rate_limit_max_buckets', 'int'],
   ['J41_PROXY_CIRCUIT_THRESHOLD',      'proxy.circuit_threshold',      'int'],
   ['J41_PROXY_CIRCUIT_OPEN_MS',        'proxy.circuit_open_ms',        'int'],
   ['J41_POLL_INTERVAL_MS',      'poll.interval_ms',         'int'],
-  ['J41_DEPOSIT_POLL_INTERVAL', 'deposit.poll_interval_ms', 'int'],
-  // 'bool', not 'bool1': the reconciler is DEFAULT-ON, so J41_DEPOSIT_RECONCILE=true
-  // must not silently disable it — the same trap documented for J41_FEE_SWEEP.
-  ['J41_DEPOSIT_RECONCILE', 'deposit.reconcile_enabled', 'bool'],
-  ['J41_DEPOSIT_REVERSAL_BUDGET', 'deposit.reversal_budget_max', 'int'],
   ['J41_REFUND_MAX_SENDS_PER_JOB',  'refund_limits.max_sends_per_job',   'int'],
   ['J41_REFUND_MAX_VALUE_MULT',     'refund_limits.max_value_multiplier','float'],
   ['J41_REFUND_MAX_SENDS_PER_HOUR', 'refund_limits.max_sends_per_hour',  'int'],

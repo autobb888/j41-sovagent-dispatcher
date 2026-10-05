@@ -396,7 +396,7 @@ test('TUI api_review does not homemade-sign JSON onto POST /v1/reviews/api-sessi
   const dash = fs.readFileSync(path.join(__dirname, '../src/dashboard.js'), 'utf8');
   const start = dash.indexOf("if (action === 'api_review')");
   assert.ok(start > -1);
-  const next = dash.indexOf("if (action === 'api_deposits')", start);
+  const next = dash.indexOf('// ── Per-Agent Executor', start);
   const block = dash.slice(start, next > start ? next : start + 4000);
   assert.doesNotMatch(block, /api-session-\$\{agentId\}/);
   assert.doesNotMatch(block, /json-canonicalize/);

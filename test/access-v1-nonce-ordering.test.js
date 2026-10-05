@@ -28,7 +28,7 @@ function v1AccessBranch() {
   assert.ok(v2Replay > -1, 'v2 checkNonceAfterVerify must still exist');
   const elseAt = src.indexOf('} else {', v2Replay);
   assert.ok(elseAt > -1, 'v1 else branch must follow v2 nonce check');
-  const endAt = src.indexOf('// Mint API key', elseAt);
+  const endAt = src.indexOf('// Mint the key against the i-address', elseAt);
   assert.ok(endAt > -1, 'mint follows verify');
   return src.slice(elseAt, endAt);
 }

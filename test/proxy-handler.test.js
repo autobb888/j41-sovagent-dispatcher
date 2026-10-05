@@ -32,8 +32,10 @@ process.env.J41_PROXY_ESTIMATED_OUTPUT = '2000';
 process.env.J41_PROXY_MAX_OUTPUT_TOKENS_CAP = '200000';
 process.env.J41_PROXY_MAX_INFLIGHT_PER_BUYER = '2';
 
+const crypto = require('crypto');
 const { mintApiKey } = require('../src/api-key-manager.js');
-const { creditDeposit, getBalance, calculateCost } = require('../src/credit-meter.js');
+const { calculateCost, createSessionIfAbsent, readSession } = require('../src/session-allowance.js');
+const { satsOf } = require('../src/dataset-price.js');
 const { handleProxyRequest } = require('../src/proxy-handler.js');
 const inflight = require('../src/proxy-inflight.js');
 
@@ -148,12 +150,47 @@ function startUpstream() {
   });
 }
 
+const windows = new Map();
+
+function creditDeposit(agentId, buyer, amount) {
+  const jobId = crypto.randomUUID();
+  const opened = createSessionIfAbsent({ agentId, jobId });
+  if (!opened.ok) throw new Error(opened.code || 'session create failed');
+  windows.set(agentId, { jobId, amount, buyer, status: 'in_progress' });
+  return jobId;
+}
+
+function getBalance(agentId) {
+  const w = windows.get(agentId);
+  if (!w) return 0;
+  const session = readSession(agentId, w.jobId);
+  const amount = satsOf(w.amount);
+  const spent = session && Number.isInteger(session.spentSats) ? session.spentSats : 0;
+  const reserved = session && Number.isInteger(session.reservedSats) ? session.reservedSats : 0;
+  if (!amount.ok) return 0;
+  return (amount.sats - spent - reserved) / 1e8;
+}
+
 function agentConfigsFor(agentId) {
+  const w = windows.get(agentId);
   const m = new Map();
   m.set(agentId, {
     endpointUrl: `http://127.0.0.1:${upstreamPort}`,
     modelPricing: PRICING,
     payAddress: 'RpayAddr',
+    identity: 'seller.test@',
+    iAddress: 'iSellerTest',
+    getIdentityKeys: async (id) => ({ iaddress: String(id || ''), primaryAddresses: [] }),
+    getJob: async (jobId) => ({
+      id: jobId,
+      amount: w ? w.amount : 0,
+      status: w ? w.status : 'in_progress',
+      sellerVerusId: 'seller.test@',
+      buyerVerusId: w ? w.buyer : '',
+      serviceType: 'api-endpoint',
+      kind: 'model',
+      payment: { verified: true, status: 'confirmed' },
+    }),
   });
   return m;
 }
@@ -161,7 +198,8 @@ function agentConfigsFor(agentId) {
 // Minimal mock req/res that drives handleProxyRequest and resolves when done.
 function runProxy(agentId, key, bodyObj) {
   return new Promise((resolve) => {
-    const body = JSON.stringify(bodyObj);
+    const window = windows.get(agentId);
+    const body = JSON.stringify(window ? { ...bodyObj, j41JobId: window.jobId } : bodyObj);
     const req = {
       headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
       url: '/j41/proxy/v1/chat/completions',
@@ -204,7 +242,7 @@ test('H3: max_tokens:100000 is refused when balance covers only the flat estimat
   const r = await runProxy(agentId, key, { model: MODEL, max_tokens: 100000, messages: [] });
   assert.equal(r.statusCode, 402, `should be refused (402), got ${r.statusCode}: ${r.body}`);
   // Balance untouched (reservation refused, nothing deducted).
-  assert.ok(Math.abs(getBalance(agentId, buyer) - flatCost) < 1e-12);
+  assert.ok(Math.abs(getBalance(agentId, buyer) - flatCost) < 1e-6);
 });
 
 test('H3: max_tokens:100000 is admitted when balance covers the worst case', async () => {
@@ -219,9 +257,10 @@ test('H3: max_tokens:100000 is admitted when balance covers the worst case', asy
 
   const r = await runProxy(agentId, key, { model: MODEL, max_tokens: 100000, messages: [] });
   assert.equal(r.statusCode, 200, `should be admitted (200), got ${r.statusCode}: ${r.body}`);
+  assert.equal(String(lastUpstreamBody).includes('j41JobId'), false);
   // Settles down to actual usage (10 in + 20 out from the json mock).
   const actual = calculateCost(PRICING, MODEL, 10, 20);
-  assert.ok(Math.abs(getBalance(agentId, buyer) - (worst - actual)) < 1e-9,
+  assert.ok(Math.abs(getBalance(agentId, buyer) - (worst - actual)) < 1e-6,
     `balance should refund down to actual; got ${getBalance(agentId, buyer)}`);
 });
 
@@ -272,7 +311,7 @@ test('stream timeout refunds the reservation and ends the SSE', async () => {
   invalidateConfigCache();
   assert.match(r.body, /j41-wait/);
   assert.match(r.body, /Upstream endpoint timed out/);
-  assert.ok(Math.abs(getBalance(agentId, buyer) - 1000) < 1e-9,
+  assert.ok(Math.abs(getBalance(agentId, buyer) - 1000) < 1e-6,
     `reservation must be refunded, balance=${getBalance(agentId, buyer)}`);
 });
 
@@ -331,7 +370,7 @@ test('H2: missing-usage streaming settle charges max_tokens, not the flat estima
     `missing-usage stream must NOT settle at the flat estimate; remaining=${remaining}, flatCharge=${flatCharge}`);
   // And it must equal the worst-case settle (input falls back to estimate, output = max_tokens).
   const worstCharge = calculateCost(PRICING, MODEL, 4000, maxTokens);
-  assert.ok(Math.abs(remaining - (worst - worstCharge)) < 1e-9,
+  assert.ok(Math.abs(remaining - (worst - worstCharge)) < 1e-6,
     `should settle at worst case; remaining=${remaining}`);
 });
 
@@ -350,7 +389,7 @@ test('H2: streaming WITH a usage frame still settles on actual usage', async () 
 
   // Usage frame says 10 in / 20 out → settle on that, refunding the worst case.
   const actual = calculateCost(PRICING, MODEL, 10, 20);
-  assert.ok(Math.abs(getBalance(agentId, buyer) - (worst - actual)) < 1e-9,
+  assert.ok(Math.abs(getBalance(agentId, buyer) - (worst - actual)) < 1e-6,
     `should settle on the actual usage frame; got ${getBalance(agentId, buyer)}`);
 });
 
@@ -377,7 +416,7 @@ test('M1: a streaming upstream 503 bills NOTHING — not the worst-case reservat
   await new Promise((res) => setTimeout(res, 50));
 
   const remaining = getBalance(agentId, buyer);
-  assert.ok(Math.abs(remaining - worst) < 1e-9,
+  assert.ok(Math.abs(remaining - worst) < 1e-6,
     `a 503 must leave the balance untouched; deposited=${worst} remaining=${remaining}`);
 });
 
@@ -394,7 +433,7 @@ test('M2: a non-streaming upstream 503 bills NOTHING', async () => {
   await new Promise((res) => setTimeout(res, 50));
 
   const remaining = getBalance(agentId, buyer);
-  assert.ok(Math.abs(remaining - deposit) < 1e-9,
+  assert.ok(Math.abs(remaining - deposit) < 1e-6,
     `a non-streaming 503 must leave the balance untouched; deposited=${deposit} remaining=${remaining}`);
 });
 
@@ -427,7 +466,7 @@ test('M2r: a real completion_tokens:0 bills zero output, not the flat estimate',
   const honest = calculateCost(PRICING, MODEL, 10, 0);
   const overcharge = calculateCost(PRICING, MODEL, 10, 2000);
   const spent = deposit - getBalance(agentId, buyer);
-  assert.ok(Math.abs(spent - honest) < 1e-9,
+  assert.ok(Math.abs(spent - honest) < 1e-6,
     `should bill the reported 0 output; expected ${honest}, spent ${spent}`);
   assert.ok(spent < overcharge,
     'must not fall back to estimated_output when the upstream honestly reported none');
@@ -449,7 +488,7 @@ test('M2r: usage with prompt_tokens but no completion_tokens still settles worst
   // Output is unknown → charge the declared worst case, not estimated_output.
   const expected = calculateCost(PRICING, MODEL, 10, maxTokens);
   const spent = worst - getBalance(agentId, buyer);
-  assert.ok(Math.abs(spent - expected) < 1e-9,
+  assert.ok(Math.abs(spent - expected) < 1e-6,
     `unknown output must settle at max_tokens; expected ${expected}, spent ${spent}`);
 });
 
@@ -468,7 +507,7 @@ test('M2r: the same input-only usage frame settles worst-case on the streaming p
 
   const expected = calculateCost(PRICING, MODEL, 10, maxTokens);
   const spent = worst - getBalance(agentId, buyer);
-  assert.ok(Math.abs(spent - expected) < 1e-9,
+  assert.ok(Math.abs(spent - expected) < 1e-6,
     `unknown output must settle at max_tokens; expected ${expected}, spent ${spent}`);
 });
 
@@ -490,7 +529,7 @@ test('F3: a 503 that ABORTS mid-stream bills nothing, same as one that ends clea
   await new Promise((res) => setTimeout(res, 250));
 
   const remaining = getBalance(agentId, buyer);
-  assert.ok(Math.abs(remaining - worst) < 1e-9,
+  assert.ok(Math.abs(remaining - worst) < 1e-6,
     `an aborted 503 must bill nothing; deposited=${worst} remaining=${remaining}`);
 });
 
@@ -524,7 +563,7 @@ test('F3: a 2xx that aborts mid-stream bills only what a usage frame proved', as
   const expected = calculateCost(PRICING, MODEL, 4000, 0);      // 0.004
   const worstCase = calculateCost(PRICING, MODEL, 4000, maxTokens); // 2.004
   const spent = worst - getBalance(agentId, buyer);
-  assert.ok(Math.abs(spent - expected) < 1e-9,
+  assert.ok(Math.abs(spent - expected) < 1e-6,
     `an abort bills input only; expected ${expected}, spent ${spent} (worst case would be ${worstCase})`);
 });
 
@@ -541,7 +580,7 @@ test('M2r: a 503 that carries a usage frame still bills NOTHING', async () => {
   await new Promise((res) => setTimeout(res, 50));
 
   const remaining = getBalance(agentId, buyer);
-  assert.ok(Math.abs(remaining - worst) < 1e-9,
+  assert.ok(Math.abs(remaining - worst) < 1e-6,
     `an error is an error whether or not it reports usage; deposited=${worst} remaining=${remaining}`);
 });
 
@@ -565,8 +604,18 @@ test('a non-streaming RST refunds the reservation ONCE, not twice', async () => 
   await new Promise((res) => setTimeout(res, 300));
 
   const remaining = getBalance(agentId, buyer);
-  assert.ok(remaining <= deposit + 1e-9,
+  assert.ok(remaining <= deposit + 1e-6,
     `a failed request must never leave the buyer richer; deposited=${deposit} remaining=${remaining}`);
-  assert.ok(Math.abs(remaining - deposit) < 1e-9,
+  assert.ok(Math.abs(remaining - deposit) < 1e-6,
     `the reservation should be refunded exactly once; deposited=${deposit} remaining=${remaining}`);
+});
+
+test('an unknown model is 400 before a job id is required', async () => {
+  inflight._reset();
+  const agentId = 'agent-unknown-model';
+  const key = mintApiKey(agentId, 'iBuyerUnknown').key;
+  const out = await runProxy(agentId, key, { model: 'no-such-model', messages: [{ role: 'user', content: 'hi' }] });
+  assert.equal(out.statusCode, 400);
+  assert.match(out.body, /not offered/);
+  assert.doesNotMatch(out.body, /SESSION_JOB_ID/);
 });

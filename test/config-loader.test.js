@@ -167,11 +167,22 @@ test('extended schema sections load with defaults', withTmpHome(async () => {
   assert.strictEqual(cfg.proxy.default_max_tokens, 512);
   assert.strictEqual(cfg.proxy.estimated_input_tokens, 4000);
   assert.strictEqual(cfg.proxy.estimated_output_tokens, 2000);
-  assert.strictEqual(cfg.proxy.suggested_topup_vrsc, 10);
-  assert.strictEqual(cfg.deposit.poll_interval_ms, 60000);
+  assert.strictEqual(cfg.proxy.suggested_topup_vrsc, undefined);
+  assert.strictEqual(cfg.deposit, undefined);
   assert.strictEqual(cfg.health.poll_interval_ms, 60000);
   assert.strictEqual(cfg.webhook.max_body_bytes, 1048576);
   assert.strictEqual(cfg.retry.rate_limit_backoff_multiplier, 3);
+}));
+
+test('an old [deposit] table still loads', withTmpHome(async (t, tmp) => {
+  const { loadDispatcherConfig, invalidateConfigCache } = require('../src/config-loader.js');
+  invalidateConfigCache();
+  const dir = path.join(tmp, '.j41', 'dispatcher');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'config.toml'), '[deposit]\npoll_interval_ms = 60000\n');
+  const cfg = loadDispatcherConfig({ skipMigration: true });
+  assert.strictEqual(cfg.deposit.poll_interval_ms, 60000);
+  assert.strictEqual(cfg.proxy.max_inflight_per_buyer, 4);
 }));
 
 test('jailbox.enabled defaults to false (parked)', withTmpHome(async () => {

@@ -8,10 +8,24 @@ const crypto = require('crypto');
 const dns = require('dns').promises;
 const net = require('net');
 const { findKeyOwner, recordUsage } = require('./api-key-manager');
-const { reserveCredit, adjustCredit, refundReservation, checkAndFlagLow } = require('./credit-meter');
 const { acquire: acquireInflight, release: releaseInflight } = require('./proxy-inflight.js');
 const { loadDispatcherConfig } = require('./config-loader.js');
 const { completionText, settleTokenCounts } = require('./proxy-settle');
+const { jobPaymentReady } = require('./job-payment');
+const {
+  assertSessionJobId,
+  reserveForChat,
+  releaseSession,
+  settleSession,
+  estimateCostSats,
+  jobAmountSats,
+  jobSellerId,
+  jobBuyerId,
+  partiesMatch,
+  sessionHttpStatus,
+  sessionErrorBody,
+  remainingHeader,
+} = require('./session-allowance');
 
 /**
  * Resolve the worst-case output tokens to RESERVE for a request (audit H3).
@@ -36,47 +50,12 @@ function worstCaseOutputTokens(parsedBody, cfg) {
   return Math.max(estOut, Math.min(raw, cap));
 }
 
-/**
- * Resolve the seller-configured credit-low notify threshold (VRSC).
- * Defaults to suggested_topup_vrsc when unset (null/non-finite/<=0).
- */
-function resolveCreditLowThreshold(cfg) {
-  const t = cfg.proxy.credit_low_threshold_vrsc;
-  if (Number.isFinite(t) && t > 0) return t;
-  return cfg.proxy.suggested_topup_vrsc;
-}
-
-/**
- * Edge-triggered, debounced credit-low notify. Called from the post-request
- * settle path after adjustCredit. If `remaining` crossed below the threshold
- * and the buyer isn't already flagged, fires ONE seller-signed notify to J41.
- * Best-effort: never throws, never blocks the proxy response.
- */
-function maybeNotifyCreditLow(agentId, buyerVerusId, remaining, cfg, config) {
-  try {
-    const threshold = resolveCreditLowThreshold(cfg);
-    if (!checkAndFlagLow(agentId, buyerVerusId, remaining, threshold)) return;
-
-    const { getNotifyContext, notifyJ41CreditLow } = require('./deposit-watcher.js');
-    const ctx = getNotifyContext(agentId);
-    if (!ctx) {
-      // No signer context wired for this agent — can't sign the notify. The
-      // flag is already set (debounced); re-arms on next deposit. Don't spam.
-      return;
-    }
-    notifyJ41CreditLow(
-      ctx.sellerWif,
-      ctx.sellerVerusId,
-      buyerVerusId,
-      remaining,
-      threshold,
-      cfg.proxy.suggested_topup_vrsc,
-      config.payAddress || '',
-      ctx.network,
-    ).catch(() => {});
-  } catch {
-    // Never let credit-low alerting break the proxy response.
-  }
+function endSessionError(res, releaseOnce, code, extra) {
+  if (typeof releaseOnce === 'function') releaseOnce();
+  if (res.headersSent || res.writableEnded) return;
+  const status = sessionHttpStatus(code);
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(sessionErrorBody({ code, ...extra })));
 }
 
 /**
@@ -450,6 +429,8 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     return;
   }
 
+  const jobIdRaw = parsedBody.j41JobId;
+  delete parsedBody.j41JobId;
   const model = parsedBody.model || '';
   const isStreaming = parsedBody.stream === true;
   // Buyer CLI chat sends no max_tokens. NVIDIA reasoning NIMs (Flash, Kimi)
@@ -539,30 +520,76 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
     releaseInflight(agentId, record.buyerVerusId);
   };
 
-  // Reserve credit atomically (deducts upfront, adjusted after response).
-  // Audit H3: reserve the WORST CASE — the buyer must have balance covering the
-  // max output they could consume (declared max_tokens, bounded by the cap),
-  // not a flat 2000-token estimate. adjustCredit refunds down to actual usage.
+  // Reserve this job's allowance. The worst-case output is still what we hold
+  // until settle. There is no buyer balance and no deposit top-up.
   const estimatedInput = cfg.proxy.estimated_input_tokens;
   const estimatedOutput = cfg.proxy.estimated_output_tokens;
   const reserveOutput = worstCaseOutputTokens(parsedBody, cfg);
-  const creditCheck = reserveCredit(agentId, record.buyerVerusId, model, estimatedInput, reserveOutput, config.modelPricing || []);
-  if (!creditCheck.allowed) {
-    releaseOnce();
-    res.writeHead(402, {
-      'Content-Type': 'application/json',
-      'X-J41-Credit-Remaining': '0',
-      'X-J41-Credit-SuggestedTopup': String(cfg.proxy.suggested_topup_vrsc),
-      'X-J41-Seller-PayAddress': config.payAddress || '',
-    });
-    res.end(JSON.stringify({
-      error: 'Insufficient credit',
-      balance: creditCheck.balance,
-      estimatedCost: creditCheck.estimatedCost,
-      topupAddress: config.payAddress || '',
-    }));
+  const jobIdCheck = assertSessionJobId(typeof jobIdRaw === 'string' ? jobIdRaw : '');
+  if (!jobIdCheck.ok) {
+    endSessionError(res, releaseOnce, 'SESSION_JOB_ID', {});
     return;
   }
+  const jobId = jobIdCheck.jobId;
+  let job;
+  try {
+    if (typeof config.getJob !== 'function') throw new Error('no getJob');
+    job = await config.getJob(jobId);
+    if (!job || typeof job !== 'object') throw new Error('no job');
+  } catch {
+    endSessionError(res, releaseOnce, 'SESSION_PLATFORM_UNAVAILABLE', { jobId });
+    return;
+  }
+  const sellerOk = await partiesMatch({
+    left: jobSellerId(job),
+    right: config.identity,
+    also: config.iAddress,
+    getIdentityKeys: config.getIdentityKeys,
+  });
+  if (!sellerOk.ok) {
+    endSessionError(res, releaseOnce, sellerOk.code || 'SESSION_NOT_OPEN', { jobId, status: job.status });
+    return;
+  }
+  const buyerOk = await partiesMatch({
+    left: jobBuyerId(job),
+    right: record.buyerVerusId,
+    getIdentityKeys: config.getIdentityKeys,
+  });
+  if (!buyerOk.ok) {
+    const code = buyerOk.code === 'SESSION_NOT_OPEN' ? 'SESSION_NOT_OPEN' : 'SESSION_BUYER_UNRESOLVED';
+    endSessionError(res, releaseOnce, code, { jobId, status: job.status });
+    return;
+  }
+  const estimate = estimateCostSats({
+    modelPricing: config.modelPricing || [],
+    model,
+    inputTokens: estimatedInput,
+    outputTokens: reserveOutput,
+  });
+  if (!estimate.ok) {
+    endSessionError(res, releaseOnce, 'SESSION_UNPRICED', { jobId, status: job.status });
+    return;
+  }
+  const amount = jobAmountSats(job.amount);
+  if (!amount.ok) {
+    endSessionError(res, releaseOnce, 'SESSION_NOT_OPEN', { jobId, status: job.status });
+    return;
+  }
+  const creditCheck = reserveForChat({
+    agentId,
+    jobId,
+    status: job.status,
+    jobAmountSats: amount.sats,
+    estimatedCostSats: estimate.sats,
+    paymentReady: jobPaymentReady(job),
+  });
+  if (!creditCheck.ok) {
+    endSessionError(res, releaseOnce, creditCheck.code, { jobId, status: job.status });
+    return;
+  }
+  const reservedSats = estimate.sats;
+  const jobAmountHeld = amount.sats;
+  const sessionRemaining = () => remainingHeader(creditCheck.remainingSats);
 
   // Build upstream URL — SSRF protection: validate hostname matches configured endpoint
   const upstreamPath = req.url.replace(/^\/j41\/proxy/, '');
@@ -570,7 +597,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   try {
     upstreamUrl = new URL(upstreamPath, config.endpointUrl);
   } catch {
-    refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
+    releaseSession({ agentId, jobId, estimatedCostSats: reservedSats, jobAmountSats: jobAmountHeld });
     releaseOnce();
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Invalid request path' }));
@@ -580,7 +607,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   // SSRF check: resolved hostname must match configured endpoint
   const configuredHost = new URL(config.endpointUrl).hostname;
   if (upstreamUrl.hostname !== configuredHost) {
-    refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
+    releaseSession({ agentId, jobId, estimatedCostSats: reservedSats, jobAmountSats: jobAmountHeld });
     releaseOnce();
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Request path resolves to unauthorized host' }));
@@ -590,7 +617,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   // SSRF hardening: block private IPs unless J41_ALLOW_LOCAL_UPSTREAM=1 (dev)
   const safety = await checkUpstreamHostSafe(upstreamUrl.hostname, cfg, config.allowPrivate === true);
   if (!safety.safe) {
-    refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
+    releaseSession({ agentId, jobId, estimatedCostSats: reservedSats, jobAmountSats: jobAmountHeld });
     releaseOnce();
     res.writeHead(502, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: `Upstream blocked: ${safety.reason}` }));
@@ -619,7 +646,7 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
   const refundOnce = () => {
     if (_refunded) return;
     _refunded = true;
-    refundReservation(agentId, record.buyerVerusId, creditCheck.reserved);
+    releaseSession({ agentId, jobId, estimatedCostSats: reservedSats, jobAmountSats: jobAmountHeld });
   };
 
   return withUpstreamGate(agentId, async () => {
@@ -713,14 +740,9 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
 
     if (isStreaming) {
       // Stream response through, count tokens at the end.
-      // Emit X-J41-Credit-Remaining now (before the body starts) using the
-      // post-reservation balance (worst-case). adjustCredit at stream end may
-      // refund part of the reservation, so the true final balance can only be
-      // known after EOF — but headers must be sent before the first byte.
-      j41Headers['X-J41-Credit-Remaining'] = creditCheck.balance.toFixed(4);
-      if (creditCheck.balance < 1) {
-        j41Headers['X-J41-Credit-SuggestedTopup'] = String(cfg.proxy.suggested_topup_vrsc);
-        j41Headers['X-J41-Seller-PayAddress'] = config.payAddress || '';
+      const remainingNow = sessionRemaining();
+      if (remainingNow != null && job.status !== 'completed') {
+        j41Headers['X-J41-Session-Remaining'] = remainingNow;
       }
       const safeHeaders = filterHeaders(proxyRes.headers);
       if (!res.headersSent) {
@@ -740,8 +762,9 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
       // change addresses is "a control applied at one of two sites"; leaving a
       // third site with its own rules reproduces it.
       const settleStream = (why, aborted = false) => {
-        if (deducted) return;
+        if (deducted || _refunded) return;
         deducted = true;
+        _refunded = true;
 
         // Parse SSE chunks for usage data — scan each `data: {...}` frame with JSON.parse
         // so nested objects like completion_tokens_details survive (the old regex broke on them).
@@ -810,11 +833,24 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
           console.warn(`[proxy] streaming abort after ${proxyRes.statusCode} — billing ${inputTok}+${outputTok} (job ${key ? String(key).slice(0, 8) : '?'})`);
         }
 
-        const result = adjustCredit(agentId, record.buyerVerusId, model, inputTok, outputTok, creditCheck.reserved, config.modelPricing || []);
+        const actual = estimateCostSats({
+          modelPricing: config.modelPricing || [],
+          model,
+          inputTokens: inputTok,
+          outputTokens: outputTok,
+        });
+        const spent = settleSession({
+          agentId,
+          jobId,
+          estimatedCostSats: reservedSats,
+          actualSats: actual.ok ? actual.sats : 0,
+          jobAmountSats: jobAmountHeld,
+        });
         recordUsage(agentId, key, inputTok, outputTok);
         releaseOnce();
-        maybeNotifyCreditLow(agentId, record.buyerVerusId, result.remaining, cfg, config);
-        console.log(`[PROXY] ${agentId} ${model} ${inputTok}+${outputTok} tok, cost ${result.cost.toFixed(6)} VRSC, remaining ${result.remaining.toFixed(4)}`);
+        const costVrsc = (actual.ok ? actual.sats : 0) / 1e8;
+        const left = spent.remainingSats == null ? '—' : (spent.remainingSats / 1e8).toFixed(4);
+        console.log(`[PROXY] ${agentId} ${model} ${inputTok}+${outputTok} tok, cost ${costVrsc.toFixed(6)} VRSC, remaining ${left}`);
       };
 
       try {
@@ -895,14 +931,25 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
           console.warn(`[proxy] unusable model text — not billing (job ${key ? String(key).slice(0, 8) : '?'})`);
         }
 
-        const result = adjustCredit(agentId, record.buyerVerusId, model, inputTok, outputTok, creditCheck.reserved, config.modelPricing || []);
+        const actual = estimateCostSats({
+          modelPricing: config.modelPricing || [],
+          model,
+          inputTokens: inputTok,
+          outputTokens: outputTok,
+        });
+        const settled = settleSession({
+          agentId,
+          jobId,
+          estimatedCostSats: reservedSats,
+          actualSats: actual.ok ? actual.sats : 0,
+          jobAmountSats: jobAmountHeld,
+        });
         recordUsage(agentId, key, inputTok, outputTok);
         releaseOnce();
 
-        j41Headers['X-J41-Credit-Remaining'] = result.remaining.toFixed(4);
-        if (result.remaining < 1) {
-          j41Headers['X-J41-Credit-SuggestedTopup'] = String(cfg.proxy.suggested_topup_vrsc);
-          j41Headers['X-J41-Seller-PayAddress'] = config.payAddress || '';
+        const remainingNow = remainingHeader(settled.remainingSats);
+        if (remainingNow != null && job.status !== 'completed') {
+          j41Headers['X-J41-Session-Remaining'] = remainingNow;
         }
 
         const safeHeaders = filterHeaders(proxyRes.headers);
@@ -914,8 +961,9 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
           res.end(responseBody);
         }
 
-        maybeNotifyCreditLow(agentId, record.buyerVerusId, result.remaining, cfg, config);
-        console.log(`[PROXY] ${agentId} ${model} ${inputTok}+${outputTok} tok, cost ${result.cost.toFixed(6)} VRSC, remaining ${result.remaining.toFixed(4)}`);
+        const costVrsc = (actual.ok ? actual.sats : 0) / 1e8;
+        const left = settled.remainingSats == null ? '—' : (settled.remainingSats / 1e8).toFixed(4);
+        console.log(`[PROXY] ${agentId} ${model} ${inputTok}+${outputTok} tok, cost ${costVrsc.toFixed(6)} VRSC, remaining ${left}`);
     }
   }
   });
@@ -923,8 +971,6 @@ async function handleProxyRequest(req, res, agentConfigs, body) {
 
 module.exports = {
   handleProxyRequest,
-  maybeNotifyCreditLow,
-  resolveCreditLowThreshold,
   isPrivateIp,
   checkUpstreamHostSafe,
   makePinnedLookup,

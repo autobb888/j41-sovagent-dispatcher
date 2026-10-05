@@ -236,7 +236,7 @@ test('TUI [5] diverts kind=data to data-setup and kind=model away from labour ad
   assert.match(svc, /\[18\] API Endpoint Setup/);
 });
 
-test('TUI Hire prints filled browse for data and access/chat/deposit for model (no ECDH)', () => {
+test('TUI Hire prints filled browse for data and access/chat --job for an unhireable model (no ECDH)', () => {
   const hireAt = DASH.indexOf('async function hireScreen');
   const hire = DASH.slice(hireAt, DASH.indexOf('\nasync function ', hireAt + 10));
   assert.match(hire, /const seller = r\.seller \|\| r\.qualifiedName/);
@@ -244,7 +244,8 @@ test('TUI Hire prints filled browse for data and access/chat/deposit for model (
   assert.match(hire, /Browse: j41-dispatcher browse \$\{sellerId\}/);
   assert.doesNotMatch(hire, /Browse: j41-dispatcher browse \$\{sellerName\}/);
   assert.match(hire, /access \$\{buyerId\} \$\{seller\}/);
-  assert.match(hire, /deposit \$\{buyerId\} \$\{seller\} --amount/);
+  assert.match(hire, /chat \$\{buyerId\} \$\{seller\} --job <job-id>/);
+  assert.doesNotMatch(hire, /deposit /);
   assert.match(hire, /Print-argv only — no ECDH in TUI/);
   assert.doesNotMatch(hire, /requestApiAccess|openAccessEnvelope/);
 });

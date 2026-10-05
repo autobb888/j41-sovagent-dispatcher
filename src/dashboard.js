@@ -21,7 +21,7 @@ const AGENTS_DIR = path.join(DISPATCHER_DIR, 'agents');
 const CONFIG_FILE = path.join(DISPATCHER_DIR, 'config.json');
 
 const { loadDispatcherConfig, saveDispatcherConfig } = require('./config-loader.js');
-const { networkCurrency } = require('./deposit-watcher.js');
+const { networkCurrency } = require('./wallet.js');
 const { untrusted, untrustedField } = require('./untrusted.js');
 // The chain's native coin, derived once — the TUI hardcoded 'VRSCTEST' on every
 // service-pricing surface, which is the mainnet mirror of the bug the CLI had.
@@ -162,17 +162,16 @@ async function createAgent(keys) {
 // ── Money waiting on a human ────────────────────────────────────────────────
 
 /**
- * Count the things only a person can clear: refunds held for approval, and
- * deposit anomalies awaiting a credit-or-dismiss decision.
+ * Count the things only a person can clear: refunds held for approval.
  *
  * Reads the on-disk ledgers directly and never throws — this runs on the way to
  * drawing a menu, so a corrupt or missing file must degrade to "nothing to
  * report" rather than block the operator out of the TUI entirely. Undercounting
- * is the safe failure here: the counts are a prompt to look, and the [20]/[21]
- * screens are authoritative.
+ * is the safe failure here: the counts are a prompt to look, and the [20]
+ * screen is authoritative.
  */
 function readMoneyAttention(agents) {
-  const out = { pendingRefunds: 0, depositsNeedOperator: 0, feeTanksNeedingFunding: 0, feeTanksLow: 0, feeTankCheckedAt: 0 };
+  const out = { pendingRefunds: 0, feeTanksNeedingFunding: 0, feeTanksLow: 0, feeTankCheckedAt: 0 };
   try {
     const raw = fs.readFileSync(path.join(DISPATCHER_DIR, 'pending-refunds.json'), 'utf8');
     const ledger = JSON.parse(raw);
@@ -191,15 +190,6 @@ function readMoneyAttention(agents) {
     out.feeTanksLow = rows.filter((r) => r && Number(r.writes) > 0 && Number(r.writes) < 100).length;
     out.feeTankCheckedAt = Number(doc.at) || 0;
   } catch { /* absent or unreadable — report nothing */ }
-  try {
-    const { listDepositAnomaliesForAgent } = require('./deposit-watcher.js');
-    for (const a of agents || []) {
-      try {
-        const r = listDepositAnomaliesForAgent(a.id);
-        out.depositsNeedOperator += (r && r.needsOperator ? r.needsOperator.length : 0);
-      } catch { /* per-agent failure must not hide the others */ }
-    }
-  } catch { /* module unavailable — report nothing */ }
   return out;
 }
 
@@ -323,7 +313,6 @@ function mainMenuChoices(status = {}, money = {}, identityRows = []) {
     { separator: '  ── Money ──' },
     { name: `[19] Wallet & Fee Tanks${m.feeTanksNeedingFunding ? ` \x1b[31m(${m.feeTanksNeedingFunding} empty)\x1b[0m` : m.feeTanksLow ? ` \x1b[33m(${m.feeTanksLow} low)\x1b[0m` : ''}`, value: 'wallet' },
     { name: `[20] Refunds Queue${m.pendingRefunds ? ` \x1b[33m(${m.pendingRefunds} awaiting you)\x1b[0m` : ''}`, value: 'refunds' },
-    { name: `[21] Deposits${m.depositsNeedOperator ? ` \x1b[33m(${m.depositsNeedOperator} need a decision)\x1b[0m` : ''}`, value: 'deposits' },
     { separator: undefined },
     { name: '     Quit', value: 'quit' },
   ];
@@ -348,15 +337,11 @@ async function mainMenu(inquirer) {
   console.log(`  Executor: ${cfg.executor.type || 'local-llm'} (global default — per-agent overrides via [3])`);
 
   // Money that is waiting on a human belongs on the FIRST screen, not three
-  // levels down. Refunds are held until approved and deposit anomalies until
-  // settled, so both sit silently owed until somebody looks — and this menu is
-  // where a human operator actually lives.
+  // levels down. Refunds are held until approved, so they sit silently owed
+  // until somebody looks — and this menu is where a human operator actually lives.
   const money = readMoneyAttention(agents);
   if (money.pendingRefunds) {
     console.log(`  \x1b[33m⚠ ${money.pendingRefunds} refund(s) awaiting your approval — buyers are owed until you act ([20])\x1b[0m`);
-  }
-  if (money.depositsNeedOperator) {
-    console.log(`  \x1b[33m⚠ ${money.depositsNeedOperator} deposit(s) need a decision ([21])\x1b[0m`);
   }
   if (money.feeTanksNeedingFunding) {
     const age = money.feeTankCheckedAt
@@ -1089,7 +1074,7 @@ async function statusScreen(inquirer) {
   // ── Section 5: API Proxy stats (only if any api-endpoint agents) ──
   if (apiAgents.length > 0) {
     console.log(`\n  ── API Proxy ──`);
-    let totalDeposited = 0, totalSpent = 0, totalActiveKeys = 0;
+    let totalActiveKeys = 0;
     const healthMap = await fetchUpstreamHealth();
     for (const a of apiAgents) {
       const cfg = a._cfg;
@@ -1109,22 +1094,8 @@ async function statusScreen(inquirer) {
           console.log(`    API keys:  ${active.length} active`);
         }
       } catch {}
-
-      // Credit meter rollup
-      try {
-        const meterPath = path.join(AGENTS_DIR, a.id, 'credit-meters.json');
-        if (fs.existsSync(meterPath)) {
-          const data = JSON.parse(fs.readFileSync(meterPath, 'utf8'));
-          const buyers = Object.values(data.buyers || {});
-          const dep = buyers.reduce((n, b) => n + (b.totalDeposited || 0), 0);
-          const sp = buyers.reduce((n, b) => n + (b.totalSpent || 0), 0);
-          totalDeposited += dep;
-          totalSpent += sp;
-          console.log(`    Buyers:    ${buyers.length}  (deposited ${dep.toFixed(4)} ${NATIVE_COIN}, spent ${sp.toFixed(4)})`);
-        }
-      } catch {}
     }
-    console.log(`  Total:    ${totalActiveKeys} active key(s), deposited ${totalDeposited.toFixed(4)}, spent ${totalSpent.toFixed(4)} ${NATIVE_COIN}`);
+    console.log(`  Total:    ${totalActiveKeys} active key(s)`);
   }
 
   // ── Section 6: Webhook / tunnel ──
@@ -1686,9 +1657,7 @@ async function configureServicesScreen(inquirer) {
     if (hasApiServices) {
       actionChoices.push(new inquirer.Separator('  ── API Key Management ──'));
       actionChoices.push({ name: '  View active buyers & keys', value: 'api_buyers' });
-      actionChoices.push({ name: '  View credit meters', value: 'api_credits' });
       actionChoices.push({ name: '  Revoke an API key', value: 'api_revoke' });
-      actionChoices.push({ name: '  View deposits (pending + confirmed)', value: 'api_deposits' });
       actionChoices.push({ name: '  Buyer session review (review-session CLI)', value: 'api_review' });
     }
     actionChoices.push(new inquirer.Separator());
@@ -1971,28 +1940,6 @@ async function configureServicesScreen(inquirer) {
       continue;
     }
 
-    if (action === 'api_credits') {
-      const { getMetrics } = require('./credit-meter');
-      const buyers = getMetrics(agentId);
-      const buyerIds = Object.keys(buyers);
-      console.log(`\n  ── Credit Meters (${buyerIds.length} buyers) ──\n`);
-      if (buyerIds.length === 0) {
-        console.log('  No buyers with credit.\n');
-      } else {
-        for (const buyerId of buyerIds) {
-          const b = buyers[buyerId];
-          console.log(`  ${buyerId}`);
-          console.log(`    Balance: ${b.balance.toFixed(4)} ${NATIVE_COIN}  |  Deposited: ${b.totalDeposited.toFixed(4)}  |  Spent: ${b.totalSpent.toFixed(4)}`);
-          for (const [model, u] of Object.entries(b.usage || {})) {
-            console.log(`    ${model}: ${u.requests} req, ${u.inputTokens} in, ${u.outputTokens} out, ${u.cost.toFixed(6)} ${NATIVE_COIN}`);
-          }
-          console.log('');
-        }
-      }
-      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
-      continue;
-    }
-
     if (action === 'api_revoke') {
       const { listActiveKeys, revokeApiKey } = require('./api-key-manager');
       const activeKeys = listActiveKeys(agentId);
@@ -2016,18 +1963,17 @@ async function configureServicesScreen(inquirer) {
     }
 
     if (action === 'api_review') {
-      const { getMetrics } = require('./credit-meter');
-      const buyers = getMetrics(agentId);
-      const buyerIds = Object.keys(buyers);
+      const { listActiveKeys } = require('./api-key-manager');
+      const activeKeys = listActiveKeys(agentId);
+      const buyerIds = [...new Set(activeKeys.map((k) => k.buyerVerusId).filter(Boolean))];
       if (buyerIds.length === 0) {
         console.log('\n  No buyer sessions to review.\n');
         await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
         continue;
       }
       const { buyerVerusId } = await promptWithEsc(inquirer, [{ type: 'list', pageSize: 10, name: 'buyerVerusId', message: 'Which buyer session?', choices: buyerIds.map(id => {
-        const b = buyers[id];
-        const reqs = Object.values(b.usage || {}).reduce((n, u) => n + (u.requests || 0), 0);
-        return { name: `  ${id}  (${reqs} reqs, ${b.totalSpent.toFixed(4)} VRSC spent)`, value: id };
+        const reqs = activeKeys.filter((k) => k.buyerVerusId === id).reduce((n, k) => n + ((k.usage && k.usage.requests) || 0), 0);
+        return { name: `  ${id}  (${reqs} reqs)`, value: id };
       })}]);
       const { rating } = await promptWithEsc(inquirer, [{ type: 'list', name: 'rating', message: 'Rating:', choices: [{ name: '5 — excellent', value: 5 }, { name: '4 — good', value: 4 }, { name: '3 — neutral', value: 3 }, { name: '2 — poor', value: 2 }, { name: '1 — avoid', value: 1 }] }]);
       const { message } = await promptWithEsc(inquirer, [{ type: 'input', name: 'message', message: 'Review comment (optional):' }]);
@@ -2078,81 +2024,6 @@ async function configureServicesScreen(inquirer) {
           }
         }
       }
-      await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
-      continue;
-    }
-
-    if (action === 'api_deposits') {
-      const depositsPath = path.join(AGENTS_DIR, agentId, 'deposits.json');
-      let deposits = { processed: [], pending: [] };
-      try {
-        if (fs.existsSync(depositsPath)) deposits = JSON.parse(fs.readFileSync(depositsPath, 'utf8'));
-      } catch {}
-
-      console.log(`\n  ── Deposits ──\n`);
-      if (deposits.pending.length > 0) {
-        console.log(`  Pending (${deposits.pending.length}):`);
-        for (const d of deposits.pending) {
-          console.log(`    ${d.txid.substring(0, 16)}...  ${d.amount} ${NATIVE_COIN}  from ${untrustedField(d.buyerVerusId, 60)}  (needs ${d.requiredConfirmations} conf)`);
-        }
-        console.log('');
-      }
-      // Anomalies FIRST, and through the shared read model rather than this
-      // screen's own reading of the file.
-      //
-      // This screen used to print every `processed` record under "Recent
-      // confirmed" — including records still mid-credit, still unconfirmed at
-      // 0-conf, or flagged for an operator — and it never looked at `reversed`
-      // at all, so a buyer debit was invisible here. An operator standing in
-      // front of the TUI was told "confirmed" about deposits the ledger
-      // considered unresolved, which is the same "a flag nobody can see"
-      // failure the reconciler's whole surface layer exists to prevent.
-      try {
-        const { listDepositAnomaliesForAgent } = require('./deposit-watcher.js');
-        const surface = listDepositAnomaliesForAgent(agentId);
-
-        if (surface.needsOperator.length > 0) {
-          console.log(`  ⚠️  ${surface.needsOperator.length} NEED AN OPERATOR DECISION:`);
-          for (const n of surface.needsOperator) {
-            console.log(`    ${String(n.txid).substring(0, 16)}...  ${n.amount} ${NATIVE_COIN}  ${untrustedField(n.buyerVerusId, 60)}`);
-            console.log(`      ${n.reason}`);
-          }
-          console.log(`    Resolve with: j41-dispatcher deposits credit|dismiss ${agentId} <txid>`);
-          console.log('');
-        }
-        if (surface.open.length > 0) {
-          console.log(`  Still open (${surface.open.length}) — credited but not yet settled:`);
-          for (const o of surface.open) {
-            console.log(`    ${String(o.txid).substring(0, 16)}...  ${o.amount} ${NATIVE_COIN}  ${untrustedField(o.buyerVerusId, 60)}  [${o.state}]`);
-          }
-          console.log('');
-        }
-        const standing = surface.reversed.filter((r) => !r.restoredAt);
-        if (standing.length > 0) {
-          console.log(`  Reversed — credit taken back (${standing.length}):`);
-          for (const r of standing) {
-            console.log(`    ${String(r.txid).substring(0, 16)}...  ${r.amount} ${NATIVE_COIN}  ${untrustedField(r.buyerVerusId, 60)}` +
-              `${r.debited ? '' : '  [debit NOT certain]'}`);
-          }
-          console.log('');
-        }
-      } catch (e) {
-        console.log(`  (could not read the deposit ledger: ${e.message})`);
-      }
-
-      // Settled history only — anything unresolved is shown above, so this
-      // section can honestly call itself confirmed.
-      const settled = deposits.processed.filter(d => d && !d.crediting && !d.unconfirmed && !d.needsOperator);
-      const recent = settled.slice(-10);
-      if (recent.length > 0) {
-        console.log(`  Recent confirmed (${settled.length} settled, showing last 10):`);
-        for (const d of recent) {
-          console.log(`    ${d.txid.substring(0, 16)}...  ${d.amount} ${NATIVE_COIN}  from ${untrustedField(d.buyerVerusId, 60)}  at ${d.creditedAt}`);
-        }
-      } else {
-        console.log('  No settled deposits yet.');
-      }
-      console.log('');
       await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter to continue' }]);
       continue;
     }
@@ -2392,8 +2263,8 @@ async function computeProviderScreen(inquirer, agentId) {
 async function hireScreen(inquirer) {
   console.clear();
   console.log('\n  ═══ Hire a listing ═══\n');
-  console.log('  This fleet identity is the BUYER. Labour and GPU use hire.');
-  console.log('  Models use access/chat (not hire). Data is browse-only.\n');
+  console.log('  This fleet identity is the BUYER. Labour, a GPU, and a priced model use hire.');
+  console.log('  Data on this screen is browse and query. Pay for the quoted rows with hire.\n');
 
   const agents = getAgents().filter(a => a.identity && a.iAddress && a.wif);
   if (agents.length === 0) {
@@ -2436,7 +2307,7 @@ async function hireScreen(inquirer) {
       choices: [
         { name: '  agent     labour jobs (hire)', value: 'agent' },
         { name: '  compute   gpu-rental (hire)', value: 'compute' },
-        { name: '  model     metered inference (access/chat, not hire)', value: 'model' },
+        { name: '  model     priced session (hire)', value: 'model' },
         { name: '  data      browse only (not hireable)', value: 'data' },
       ],
     }]);
@@ -2469,15 +2340,15 @@ async function hireScreen(inquirer) {
       await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
       return;
     }
-    if (kindPick === 'model' || result.rows.every((r) => r.next === 'access')) {
-      console.log('\n  Models are metered inference — hire is refused (MODEL_NOT_A_LABOUR_JOB).');
+    if (result.rows.every((r) => r.next === 'access')) {
+      console.log('\n  This listing is not a hire (MODEL_NOT_A_LABOUR_JOB).');
+      console.log('  Access grants a key. Payment is the job.');
       console.log('  Print-argv only — no ECDH in TUI.\n');
       for (const r of result.rows) {
         const seller = r.qualifiedName || r.seller;
         console.log(`    ${seller}  ${r.serviceId || ''}`);
         console.log(`    Access:  j41-dispatcher access ${buyerId} ${seller}`);
-        console.log(`    Chat:    j41-dispatcher chat ${buyerId} ${seller} --message "..."`);
-        console.log(`    Deposit: j41-dispatcher deposit ${buyerId} ${seller} --amount <n>`);
+        console.log(`    Chat:    j41-dispatcher chat ${buyerId} ${seller} --job <job-id> --message "..."`);
       }
       console.log('');
       await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
@@ -2546,15 +2417,6 @@ async function hireScreen(inquirer) {
     console.log('  Data listings are browse-only — POST /v1/jobs is refused.');
     console.log(`  Browse: j41-dispatcher browse ${sellerId}`);
     console.log(`  Query:  j41-dispatcher query ${sellerId} --where color=red\n`);
-    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
-    return;
-  }
-  if (kind === 'model') {
-    console.log('  Models are metered inference — hire is refused (MODEL_NOT_A_LABOUR_JOB).');
-    console.log('  Print-argv only — no ECDH in TUI.');
-    console.log(`  Access:  j41-dispatcher access ${buyerId} ${sellerId}`);
-    console.log(`  Chat:    j41-dispatcher chat ${buyerId} ${sellerId} --message "..."`);
-    console.log(`  Deposit: j41-dispatcher deposit ${buyerId} ${sellerId} --amount <n>\n`);
     await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to go back' }]);
     return;
   }
@@ -2824,40 +2686,6 @@ async function refundsScreen(inquirer) {
     if (!id) continue;
     console.log('');
     await runDispatcherCli(['refunds', action, id]);
-    await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to continue' }]);
-  }
-}
-
-async function depositsScreen(inquirer) {
-  for (;;) {
-    console.clear();
-    console.log('\n  ═══ Deposits ═══\n');
-    await runDispatcherCli(['deposits', 'list']);
-    console.log('');
-    const { action } = await promptWithEsc(inquirer, [{
-      type: 'list', name: 'action', message: 'Deposits:',
-      choices: [
-        { name: '  Credit a deposit', value: 'credit' },
-        { name: '  Dismiss (nothing owed)', value: 'dismiss' },
-        new inquirer.Separator(),
-        { name: '  ← Back', value: '__back' },
-      ],
-    }]);
-    if (action === '__back') return;
-    const agentId = await pickAgentId(inquirer, 'Agent:');
-    if (!agentId) continue;
-    const { txid } = await promptWithEsc(inquirer, [{ type: 'input', name: 'txid', message: 'Txid:' }]);
-    const tx = String(txid || '').trim();
-    if (!tx) continue;
-    const args = ['deposits', action, agentId, tx];
-    if (action === 'dismiss') {
-      const { reason } = await promptWithEsc(inquirer, [{ type: 'input', name: 'reason', message: 'Reason (required):' }]);
-      const r = String(reason || '').trim();
-      if (!r) continue;
-      args.push('--reason', r);
-    }
-    console.log('');
-    await runDispatcherCli(args);
     await promptWithEsc(inquirer, [{ type: 'input', name: 'ok', message: 'Press Enter or ESC to continue' }]);
   }
 }
@@ -4499,7 +4327,6 @@ async function main() {
       // markers; a second copy in the TUI would be a second thing to get wrong.
       case 'wallet': await withBack(() => walletScreen(inquirer)); break;
       case 'refunds': await withBack(() => refundsScreen(inquirer)); break;
-      case 'deposits': await withBack(() => depositsScreen(inquirer)); break;
       case 'build_image': await withBack(() => buildImageScreen(inquirer)); break;
       case 'activate_all': await withBack(() => batchActivateScreen(inquirer, true)); break;
       case 'deactivate_all': await withBack(() => batchActivateScreen(inquirer, false)); break;

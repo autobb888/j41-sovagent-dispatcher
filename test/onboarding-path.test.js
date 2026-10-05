@@ -226,17 +226,19 @@ test('start prints proof the fleet is live and an honest expectation', () => {
 
 // ── B5: the TUI has a money surface ─────────────────────────────────────────
 
-test('the dashboard menu exposes wallet, refunds and deposits', () => {
-  for (const v of ["value: 'wallet'", "value: 'refunds'", "value: 'deposits'"]) {
+test('the dashboard menu exposes wallet and refunds', () => {
+  for (const v of ["value: 'wallet'", "value: 'refunds'"]) {
     assert.ok(DASH.includes(v), `menu must offer ${v}`);
   }
+  assert.equal(DASH.includes("value: 'deposits'"), false);
   assert.match(DASH, /── Money ──/);
 });
 
 test('each money menu entry has a handler', () => {
-  for (const c of ["case 'wallet':", "case 'refunds':", "case 'deposits':"]) {
+  for (const c of ["case 'wallet':", "case 'refunds':"]) {
     assert.ok(DASH.includes(c), `missing handler ${c}`);
   }
+  assert.equal(DASH.includes("case 'deposits':"), false);
 });
 
 test('money owed to buyers is surfaced on the FIRST screen, not buried', () => {
@@ -303,13 +305,11 @@ test('a drained fee tank is surfaced on the first screen, not only inside [19]',
 });
 
 // 2026-08-25: `moneyScreen(inquirer, title, cliArgs, footer)` — a single
-// read-only-render-plus-footer design — was superseded by three fuller
-// interactive screens (`walletScreen`, `refundsScreen`, `depositsScreen`,
-// each `(inquirer)` only) that let the operator act, not just read. It had
-// been dead code (defined, never called) since that rewrite; removed. These
-// two tests now assert the same properties against the screens that actually
-// run, instead of a function nothing reaches.
-const MONEY_SCREENS = ['walletScreen', 'refundsScreen', 'depositsScreen'];
+// read-only-render-plus-footer design — was superseded by fuller interactive
+// screens (`walletScreen`, `refundsScreen`, each `(inquirer)` only) that let
+// the operator act, not just read. These tests assert the same properties
+// against the screens that actually run.
+const MONEY_SCREENS = ['walletScreen', 'refundsScreen'];
 
 function moneyScreenBody(name) {
   const start = DASH.indexOf(`async function ${name}(`);

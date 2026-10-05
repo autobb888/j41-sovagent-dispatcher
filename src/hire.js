@@ -8,13 +8,34 @@
  */
 const { parseListingKind } = require('./listing-kind');
 
-function assertHireAllowed({ sellerKind, serviceType, serviceId }) {
+function assertHireAllowed({ sellerKind, serviceType, serviceId, price }) {
   const kind = parseListingKind(sellerKind);
   if (!kind) {
     return {
       ok: false,
       code: 'SELLER_KIND_UNKNOWN',
       message: 'Seller listing_kind is missing; refusing hire (no agent default).',
+    };
+  }
+  // api-endpoint is a model session only for kind=model at a positive price.
+  // This runs before the compute and data arms so a GPU or dataset listing
+  // that also carries api-endpoint is MODEL_NOT_A_LABOUR_JOB, matching the API.
+  if (serviceType === 'api-endpoint') {
+    if (kind === 'model' && serviceId) {
+      const n = Number(price);
+      if (!Number.isFinite(n) || n <= 0) {
+        return {
+          ok: false,
+          code: 'MODEL_PRICE_UNSET',
+          message: 'The seller has not set a session price.',
+        };
+      }
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      code: 'MODEL_NOT_A_LABOUR_JOB',
+      message: 'A model hire needs kind=model, service type api-endpoint, and a service id. Access grants a key. Payment is the job.',
     };
   }
   if (kind === 'data') {
@@ -37,11 +58,11 @@ function assertHireAllowed({ sellerKind, serviceType, serviceId }) {
     }
     return { ok: true };
   }
-  if (kind === 'model' || serviceType === 'api-endpoint') {
+  if (kind === 'model') {
     return {
       ok: false,
       code: 'MODEL_NOT_A_LABOUR_JOB',
-      message: 'Model / api-endpoint listings are metered inference, not labour jobs. Use POST /v1/proxy/access/:sellerVerusId — dispatcher hire will not POST /v1/jobs.',
+      message: 'A model hire needs kind=model, service type api-endpoint, and a service id. Access grants a key. Payment is the job.',
     };
   }
   return { ok: true };
@@ -200,6 +221,7 @@ function listingRowFromService(s) {
     sellerKind: kind,
     serviceType,
     serviceId: s.id,
+    price: s.price,
   });
   const blocked = s.hireable === false;
   return {

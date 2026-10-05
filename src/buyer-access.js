@@ -248,6 +248,7 @@ async function chatCompletions({
   grant,
   message,
   model,
+  jobId,
   timeoutMs,
   publicUrlHint,
   listing,
@@ -261,6 +262,11 @@ async function chatCompletions({
   }
   if (!message) {
     return { ok: false, code: 'CHAT_NO_MESSAGE', message: '--message is required.' };
+  }
+  const { assertSessionJobId } = require('./session-allowance');
+  const jobCheck = assertSessionJobId(typeof jobId === 'string' ? jobId.trim() : '');
+  if (!jobCheck.ok) {
+    return { ok: false, code: 'SESSION_JOB_ID', message: '--job must be the paid job id (36-character id).' };
   }
   if (!client || typeof client.callProxied !== 'function') {
     return { ok: false, code: 'ACCESS_CLIENT_MISSING', message: 'Authenticated client is required.' };
@@ -312,30 +318,26 @@ async function chatCompletions({
       body: {
         model: useModel,
         messages: [{ role: 'user', content: String(message) }],
+        j41JobId: jobCheck.jobId,
       },
       timeoutMs,
     });
     return { ok: true, model: useModel, result };
   } catch (e) {
-    if (e && e.statusCode === 402) {
-      const body = (e.responseBody && typeof e.responseBody === 'object') ? e.responseBody : {};
-      const headers = e.responseHeaders || {};
-      const suggested = headers['x-j41-credit-suggestedtopup']
-        || headers['X-J41-Credit-SuggestedTopup']
-        || body.suggestedTopup
-        || null;
-      return {
-        ok: false,
-        code: 'CHAT_NEEDS_DEPOSIT',
-        message: e.message || 'Insufficient credit. Deposit VRSC to the seller i-address then retry chat.',
-        topupAddress: body.topupAddress || null,
-        estimatedCost: body.estimatedCost,
-        balance: body.balance,
-        suggestedTopup: suggested,
-        depositArgv: 'j41-dispatcher deposit <buyer> <seller> --amount <n>',
-      };
-    }
-    return { ok: false, code: 'CHAT_FAILED', message: e.message || String(e) };
+    const body = (e && e.responseBody && typeof e.responseBody === 'object') ? e.responseBody : {};
+    const code = body.code || (e && e.statusCode === 402 ? 'SESSION_EXHAUSTED' : 'CHAT_FAILED');
+    const status = body.status || null;
+    const extend = code === 'SESSION_EXHAUSTED' && (status === 'in_progress' || status === 'paused');
+    const base = (body.message && typeof body.message === 'string') ? body.message : (e.message || String(e));
+    return {
+      ok: false,
+      code,
+      message: extend
+        ? `${base} Extend this job: j41-dispatcher extend ${jobCheck.jobId} --amount <n>`
+        : base,
+      status,
+      jobId: jobCheck.jobId,
+    };
   }
 }
 

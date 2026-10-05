@@ -36,6 +36,9 @@ test('a GPU hire must be the listed period, and labour can pay more but not less
   assert.equal(assertPaysListing({ serviceType: 'agent', amount: '0.20', listedPrice: '0.05' }).ok, true);
   assert.equal(assertPaysListing({ serviceType: 'agent', amount: '0.01', listedPrice: '0.05' }).code, 'LISTING_PRICE');
   assert.equal(assertPaysListing({ serviceType: 'dataset', amount: '0.0002', listedPrice: '0.0001' }).ok, true);
+  assert.equal(assertPaysListing({ serviceType: 'api-endpoint', amount: '0.0005', listedPrice: '0.001' }).code, 'LISTING_PRICE');
+  assert.equal(assertPaysListing({ serviceType: 'api-endpoint', amount: '0.001', listedPrice: 0 }).code, 'MODEL_PRICE_UNSET');
+  assert.equal(assertPaysListing({ serviceType: 'model', amount: '0.02', listedPrice: '0.001' }).ok, true);
 });
 
 test('a quote that hides rows or breaks the multiplication is refused', async () => {

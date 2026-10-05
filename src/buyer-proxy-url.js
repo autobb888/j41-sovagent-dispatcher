@@ -35,10 +35,6 @@ function callProxiedPath(endpointUrl) {
   return '/v1/chat/completions';
 }
 
-function depositReportUrl(publicOrProxyUrl) {
-  return `${originOf(publicOrProxyUrl)}/j41/deposit/report`;
-}
-
 function isDispatcherProxyBase(url) {
   try {
     const p = new URL(url).pathname.replace(/\/+$/, '');
@@ -106,7 +102,6 @@ module.exports = {
   hostsEqual,
   mintBuyerProxyBase,
   callProxiedPath,
-  depositReportUrl,
   isDispatcherProxyBase,
   assertDispatcherHealth,
   resolveListingDispatcherBase,

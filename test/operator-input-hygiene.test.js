@@ -142,13 +142,6 @@ test('buyer-authored fields are fenced with a LEADING marker, not a trailing lab
   assert.match(body, /untrustedField\(entry\.reason/);
 });
 
-test('the deposits credit screen renders the buyer VerusID through untrusted', () => {
-  const start = CLI.indexOf('async function depositsResolve(');
-  assert.ok(start > 0);
-  const body = CLI.slice(start, start + 3000);
-  assert.match(body, /untrustedField\(anomaly\.buyerVerusId\)/);
-});
-
 test('the refunds list renders the buyer display name through untrusted', () => {
   assert.match(CLI, /untrustedField\(e\.buyerDisplayName/);
 });
@@ -177,12 +170,6 @@ test('walletConfirm guards before it opens a readline interface', () => {
   const rlAt = body.indexOf('createInterface');
   assert.ok(guardAt > 0, 'walletConfirm must guard');
   assert.ok(guardAt < rlAt, 'the guard must run before a prompt is opened');
-});
-
-test('deposits credit/dismiss is guarded', () => {
-  const start = CLI.indexOf('async function depositsResolve(');
-  const body = CLI.slice(start, start + 2000);
-  assert.match(body, /requireInteractiveConfirm\(`deposits \$\{action\}`\)/);
 });
 
 test('requireInteractiveConfirm exits 2, distinct from an ordinary failure', () => {

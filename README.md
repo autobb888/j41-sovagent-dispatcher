@@ -69,7 +69,7 @@ Windows: Docker Desktop **WSL2**, then the Linux installer inside Ubuntu. See `s
    On **mainnet** the same mechanics apply with real VRSC. Testnet and mainnet
    addresses look identical, so never send mainnet coins to a testnet agent.
 
-A fresh install requires **no** `J41_*` environment variables. Every security default is already the strict one — broker signing, sandboxed containers, sender-verified deposits, local signature verification. Environment variables exist only to opt into stricter behavior or for one-shot ops overrides; none of them are needed to run.
+A fresh install requires **no** `J41_*` environment variables. Every security default is already the strict one — broker signing, sandboxed containers, local signature verification. Environment variables exist only to opt into stricter behavior or for one-shot ops overrides; none of them are needed to run.
 
 > **Recommended path:** run `j41-dispatcher setup agent-1 <name> --template <tpl>` for your first agent — it is the single-command pipeline (init + register + finalize). `init -n 9` is for operators who want to bulk-generate a pool of identities before registering them separately.
 
@@ -123,12 +123,11 @@ Running `j41-dispatcher dashboard` launches the interactive TUI:
     ── Money ──
   [19] Wallet & Fee Tanks
   [20] Refunds Queue
-  [21] Deposits
        Quit
 ```
 
-Refunds and deposits show a count in the menu when they are waiting on you — both
-are held until a human decides, so they sit silently owed otherwise.
+Refunds show a count in the menu when they are waiting on you. They are held
+until a human decides, so they sit silently owed otherwise.
 
 Arrow keys to navigate, Enter to select, **ESC to go back** from any screen.
 
@@ -185,8 +184,8 @@ exceptions — the TUI is the only way to do them today:
 - **editing or deleting a service** after it is registered
 - **configuring an executor or the global LLM default**
 
-Conversely `wallet`, `refunds`, `deposits` and `respond-dispute` are CLI-only,
-though the TUI now links to read-only views of the first three.
+Conversely `wallet`, `refunds` and `respond-dispute` are CLI-only,
+though the TUI now links to the wallet and refunds screens.
 
 Commands that confirm before spending refuse a non-interactive stdin and exit
 **2** rather than proceeding or hanging, so a script can tell "needs a terminal"
@@ -194,7 +193,7 @@ from an ordinary failure.
 
 | Command | Description |
 |---|---|
-| *(no args)* | **Interactive TUI menu** — the 21-item dashboard shown above |
+| *(no args)* | **Interactive TUI menu** — the dashboard shown above |
 | `dashboard` | Launch the interactive TUI (same as no args, explicit alias) |
 | `init -n N` | Generate N agent identities (keys + SOUL.md); default N is 9 |
 | `register <agent-id> <name>` | Register agent on-chain and create platform profile (interactive if no `--profile-name`) |
@@ -213,8 +212,7 @@ from an ordinary failure.
 | `buyers` | List local fleet identities you can hire AS (`<buyer-id>`). `--json` |
 | `listings` | List marketplace seller + service ids (`--kind`, `--service-type`, `-q`, `--json`). Data is browse-only |
 | `access <buyer-id> <seller>` | **Buyer:** request ECDH API access from a model / api-endpoint seller (not a labour hire). `--json` includes `apiKey` and requires `--yes` |
-| `chat <buyer-id> <seller>` | **Buyer:** OpenAI-compatible chat against a model grant (`--message`). Runs `access` if none saved |
-| `deposit <buyer-id> <seller>` | **Buyer:** send VRSC to the seller i-address and POST `/j41/deposit/report` (API credit). `--amount` required. Distinct from seller `deposits` (0-conf anomalies) |
+| `chat <buyer-id> <seller>` | **Buyer:** OpenAI-compatible chat against a paid model job (`--job`, `--message`). Runs `access` if none saved. The allowance is that job only |
 | `browse <seller>` | **Buyer:** GET a data listing `website` / `networkEndpoints[0]` (not a hire) |
 | `query <seller>` | **Buyer:** filter a data listing's JSON rows (`--where`, `--q`, `--select`). Not a hire |
 | `job-chat <buyer-id> <job-id>` | **Buyer:** signed labour job chat (not model grant `chat`). POST `{ content, signature, timestamp }` |
@@ -228,7 +226,6 @@ from an ordinary failure.
 | `update-profile <agent-id>` | Edit on-chain VDXF profile fields in one transaction; `--dry-run` previews |
 | `post-bounty <agent-id>` | Post a bounty (awarding a winner is TUI-only) |
 | `list-bounties` / `my-bounties <agent-id>` | Browse open bounties / your own; both support `--json` |
-| `deposits [action] [agent] [txid]` | 0-conf deposit anomalies: `list` (default), `credit`, `dismiss`. Only a human can settle these — see [Deposits](#deposits) |
 | `wallet` | Fleet fee-tank table — balances, writes affordable, sweepable earnings |
 | `wallet show <agent-id>` | One agent: both addresses and its per-UTXO breakdown |
 | `wallet sweep <agent-id>\|--all` | Force an i-address → R-address sweep now (self-funding; no floor) |
@@ -772,34 +769,6 @@ Job-ids may be typed as unambiguous prefixes from `refunds list` output.
 through the same hardened outbound-value path as everything else
 (`~/.j41/financial-allowlist.json`).
 
-## Deposit Anomalies
-
-Deposits under 2 VRSC are credited from the mempool at 0 confirmations, and a
-reconciler claws the credit back if the funding transaction never lands. Most of
-that is automatic. Two states are not, because only a human can settle them: a
-reversal that could not prove it ever debited the buyer, and a credit whose
-process died between recording the intent and moving the money.
-
-Those are counted in `/health` as `summary.deposits_needs_operator` — **alert on
-that above 0, not on `status`**, which any container crash pins to `degraded` for
-the rest of the run. Also exported as `j41_deposits_needs_operator` on `/metrics`.
-
-```bash
-j41-dispatcher deposits list                          # anomalies first, then open credits
-j41-dispatcher deposits credit <agent-id> <txid>      # the buyer IS owed it
-j41-dispatcher deposits dismiss <agent-id> <txid> --reason "..."   # nothing is owed
-```
-
-`list` reads disk directly, so it works whether or not the daemon is running, and
-prints the buyer's meter `totalDeposited` against the ledger-derived expectation —
-that number is what tells you whether the adjustment actually ran. `credit`
-re-verifies the transaction on-chain and refuses on any doubt. Both take the
-per-agent deposit lock, so they are safe to run against a live daemon.
-
-Turn the reconciler off with `J41_DEPOSIT_RECONCILE=false` (or
-`[deposit] reconcile_enabled = false`); raise or lower its fleet-wide hourly
-reversal cap with `J41_DEPOSIT_REVERSAL_BUDGET`. Both take effect on restart.
-
 ## Workspace Integration
 
 > **Parked — opt-in.** The workspace/jailbox path ("agent works inside the
@@ -838,7 +807,7 @@ Labour answers use `J41_LLM_MAX_TOKENS` (agent config `llmMaxTokens`, forwarded 
 
 ## API Endpoint Proxy
 
-Sell raw OpenAI-compatible inference time on your LLM server (local GPU, OpenRouter reseller, anything API-compatible) the same way you'd sell job-shaped work. Buyers pay-per-token, the dispatcher meters usage in VRSC, and J41 brokers discovery + access without ever seeing your upstream API key.
+Sell raw OpenAI-compatible inference time on your LLM server (local GPU, OpenRouter reseller, anything API-compatible). A buyer pays a job. While that job is open the proxy spends only that job's allowance. Complete closes the window. The next hire is a new payment.
 
 **Set up via TUI:** `j41-dispatcher dashboard` → `[18] API Endpoint Setup` walks through agent selection, upstream URL, model pricing, public URL (cloudflared tunnel auto-detected), and platform registration.
 
@@ -851,13 +820,12 @@ The proxy is **webhook-mode-only**. After `api-setup`, Next is `j41-dispatcher s
 | Route | Purpose |
 |---|---|
 | `POST /j41/discovery/request-access` | ECDH key exchange — J41 forwards from `/v1/proxy/access/:sellerVerusId`. Mints API key + encrypted envelope. |
-| `POST /j41/proxy/v1/*` | OpenAI-compatible proxy. Validates bearer key, checks credit, forwards upstream, meters response. Adds `X-J41-Session`, `X-J41-Credit-Remaining`, `X-J41-Model` headers. |
-| `POST /j41/deposit/report` | Buyer reports an on-chain VRSC deposit; dispatcher verifies via verusd RPC and credits the meter. |
+| `POST /j41/proxy/v1/*` | OpenAI-compatible proxy. Validates bearer key, reserves this job's allowance, forwards upstream, settles the real usage. Adds `X-J41-Session` and, while the window is open, `X-J41-Session-Remaining`. |
 | `GET /j41/health` | Liveness — `{service, version, status, agents, proxy}`. |
 
 **Verification is fully local and fail-closed.** Both v1 (pipe-format) and v2 (canonical) envelopes are verified against the buyer's VerusID using `bitcoinjs-message`. v2 resolves primary R-addresses via the public `/v1/identity/:idOrName/keys` endpoint and enforces the `minimumSignatures` threshold. No bypass env var exists in the codebase.
 
-**Credit metering** uses the reservation pattern: estimated cost is deducted upfront, the actual cost (computed from the upstream's `usage` response) corrects the reservation after the request completes. Streaming responses parse `usage` line-by-line via `JSON.parse` so nested fields like `completion_tokens_details` survive. Models not in the seller's `modelPricing` are rejected with a 400 listing the supported set.
+**Session allowance** uses the reservation pattern on that job only: estimated cost is held upfront, the actual cost (computed from the upstream's `usage` response) corrects the reservation after the request completes. There is no buyer balance. Streaming responses parse `usage` line-by-line via `JSON.parse` so nested fields like `completion_tokens_details` survive. Models not in the seller's `modelPricing` are rejected with a 400 listing the supported set. A 402 names `extend` only while the job is `in_progress` or `paused`.
 
 Two settle rules are worth knowing because they are deliberate, not defaults:
 

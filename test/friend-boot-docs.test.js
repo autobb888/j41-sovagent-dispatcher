@@ -43,7 +43,9 @@ test('CLAUDE.md quick reference names gpu-jail and rental-setup', () => {
   assert.match(CLAUDE, /never `0\.0\.0\.0`/);
   assert.match(CLAUDE, /j41-dispatcher access /);
   assert.match(CLAUDE, /j41-dispatcher chat /);
-  assert.match(CLAUDE, /j41-dispatcher deposit /);
+  assert.match(CLAUDE, /--job /);
+  assert.match(CLAUDE, /j41-dispatcher hire /);
+  assert.doesNotMatch(CLAUDE, /j41-dispatcher deposit /);
   assert.match(CLAUDE, /j41-dispatcher browse /);
   assert.match(CLAUDE, /j41-dispatcher job-chat /);
   assert.match(CLAUDE, /name\.agentplatform@/);
@@ -146,7 +148,7 @@ test('README CLI table lists buyer verbs that cli.js already registers', () => {
   const verbs = [
     ['access', 'access <buyer'],
     ['chat', 'chat <buyer'],
-    ['deposit', 'deposit <buyer'],
+    ['hire', 'hire <buyer'],
     ['browse', 'browse <seller'],
     ['query', 'query <seller'],
     ['job-chat', 'job-chat <buyer'],
@@ -155,6 +157,8 @@ test('README CLI table lists buyer verbs that cli.js already registers', () => {
     assert.match(CLI, new RegExp(String.raw`\.command\('` + cmd + String.raw` `));
     assert.match(README, new RegExp('\\| `' + tableCell.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   }
+  assert.doesNotMatch(README, /\| `deposit /);
+  assert.doesNotMatch(CLI, /\.command\('deposit /);
 });
 
 test('CHANGELOG Unreleased: sovmodel first-class mint; no coming-soon; no reviews shipped', () => {

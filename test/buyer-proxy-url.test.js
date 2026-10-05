@@ -7,7 +7,6 @@ const {
   hostsEqual,
   mintBuyerProxyBase,
   callProxiedPath,
-  depositReportUrl,
   isDispatcherProxyBase,
   assertDispatcherHealth,
   resolveListingDispatcherBase,
@@ -43,13 +42,6 @@ test('callProxiedPath does not double /v1', () => {
   assert.equal(callProxiedPath('https://foo.example/j41/proxy/v1/'), '/chat/completions');
   assert.equal(callProxiedPath('https://integrate.api.nvidia.com/v1'), '/chat/completions');
   assert.equal(callProxiedPath('https://foo.example/j41/proxy'), '/v1/chat/completions');
-});
-
-test('depositReportUrl is origin + /j41/deposit/report', () => {
-  assert.equal(
-    depositReportUrl('https://foo.example/j41/proxy/v1'),
-    'https://foo.example/j41/deposit/report',
-  );
 });
 
 test('isDispatcherProxyBase is a path check on the saved URL, not a minted hint', () => {

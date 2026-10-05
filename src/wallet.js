@@ -571,6 +571,10 @@ function formatEarned(n) {
  * `{data:{confirmations:n}}` stamped forever. `confirmed:true` with
  * `confirmations:0` is still mempool — the flag is not enough to unlink.
  */
+function networkCurrency(network) {
+  return network === 'verus' ? 'VRSC' : 'VRSCTEST';
+}
+
 function txConfirmations(st) {
   const nested = st && st.data && typeof st.data === 'object' && !('confirmations' in st);
   const s = nested ? st.data : st;
@@ -594,4 +598,5 @@ module.exports = {
   planFleetSend,
   executeSend,
   txConfirmations,
+  networkCurrency,
 };
