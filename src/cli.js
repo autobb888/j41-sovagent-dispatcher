@@ -150,6 +150,16 @@ const {
   formatBuyerCompleteOutput,
 } = require('./ssh-host');
 const {
+  installBuyerJsonMode,
+  emitBuyerJson,
+  publishView,
+  presentWitness,
+  readReceipt,
+  writeReceipt,
+  decideCompleteReceipt,
+} = require('./buyer-contract');
+if (process.argv.includes('--json')) installBuyerJsonMode();
+const {
   decideAutoAccept,
   loadBuyerAllowlist,
   addBuyerAllowlistEntry,
@@ -3189,7 +3199,7 @@ program
     // stable `code`, so a caller branches on the code instead of pattern-matching prose — and the
     // FULL txid is reported, which the human line truncates to 16 chars and therefore loses.
     const fail = (code, message, extra = {}) => {
-      if (options.json) console.log(JSON.stringify({ ok: false, code, message, ...extra }, null, 2));
+      if (options.json) emitBuyerJson({ ok: false, code, message, ...extra });
       else console.error(`❌ ${message}`);
       process.exitCode = 1;
       process.exit(1);
@@ -3474,8 +3484,9 @@ program
       }
 
       if (options.json) {
-        console.log(JSON.stringify({
+        emitBuyerJson({
           ok: true,
+          code: 'HIRED',
           jobId: job.id,
           status: job.status,
           buyer: { agentId: buyerAgentId, identity: keys.identity, iAddress: keys.iAddress || null },
@@ -3491,7 +3502,7 @@ program
           txid, // FULL txid. The human line above truncates to 16 chars, which loses it entirely.
           outputs,
           ...(options.pay && options.wait ? { pending: stillPending } : {}),
-        }, null, 2));
+        });
       }
     } catch (e) {
       // hire.js throws `CODE: message` for its own refusals; keep the code rather than flattening
@@ -3512,7 +3523,7 @@ program
     const { localBuyers } = require('./hire.js');
     const rows = localBuyers(listRegisteredAgents(), (id) => loadAgentKeys(id));
     if (options.json) {
-      console.log(JSON.stringify({ data: rows }, null, 2));
+      emitBuyerJson({ ok: true, code: 'BUYERS', data: rows });
       return;
     }
     if (rows.length === 0) {
@@ -3539,7 +3550,8 @@ program
   .action(async (options) => {
     const { fetchMarketplaceListings } = require('./hire.js');
     if (options.kind && !parseListingKind(options.kind)) {
-      console.error('❌ --kind must be agent, compute, data, or model');
+      if (options.json) emitBuyerJson({ ok: false, code: 'LISTINGS_KIND', message: '--kind must be agent, compute, data, or model' });
+      else console.error('❌ --kind must be agent, compute, data, or model');
       process.exit(1);
     }
     try {
@@ -3551,7 +3563,7 @@ program
         limit: options.limit,
       });
       if (options.json) {
-        console.log(JSON.stringify(result, null, 2));
+        emitBuyerJson({ ...result, ok: true, code: 'LISTINGS' });
         return;
       }
       if (result.browseOnly) {
@@ -3589,13 +3601,14 @@ program
       if (hasHire) console.log('  Buyer ids: j41-dispatcher buyers\n');
       else console.log('');
     } catch (e) {
-      console.error(`❌ ${e.message}`);
+      if (options.json) emitBuyerJson({ ok: false, code: 'LISTINGS_FAILED', message: e.message || String(e) });
+      else console.error(`❌ ${e.message}`);
       process.exit(1);
     }
   });
 
 function buyerCliFail(options, code, message, extra = {}) {
-  if (options && options.json) console.log(JSON.stringify({ ok: false, code, message, ...extra }, null, 2));
+  if (options && options.json) emitBuyerJson({ ok: false, code, message, ...extra });
   else console.error(`❌ ${message}`);
   process.exitCode = 1;
   process.exit(1);
@@ -3707,10 +3720,14 @@ program
       say('   Wait until wallet show drops the spent UTXO before another pay.');
     }
     if (options.json) {
-      console.log(JSON.stringify({
-        ok: true, jobId: job.id, txid, outputs,
+      emitBuyerJson({
+        ok: true,
+        code: 'PAID',
+        jobId: job.id,
+        txid,
+        outputs,
         ...(options.wait ? { pending: stillPending } : {}),
-      }, null, 2));
+      });
     }
   });
 
@@ -4043,44 +4060,61 @@ async function runBuyerComplete(keys, agent, jobId, options, buyerAgentId) {
   const job = await agent.client.getJob(jobId);
   if (!job || !job.id) fail('COMPLETE_NOT_DELIVERED', `Job ${jobId} not found.`);
   if (!buyerOwnsJob(keys, job)) fail('PAY_NOT_BUYER', 'This identity is not the buyer on that job.');
-  if (job.status === 'completed') fail('COMPLETE_ALREADY', 'Job is already completed.', { jobId: job.id });
-  if (job.status !== 'delivered') {
+  const already = job.status === 'completed';
+  if (!already && job.status !== 'delivered') {
     fail('COMPLETE_NOT_DELIVERED', `Job status is ${job.status}, not delivered.`, { jobId: job.id, status: job.status });
   }
-  if (!options.yes) {
+  if (!already && !options.yes) {
     const ok = await confirmHire({ amountText: `complete ${job.id}`, pay: false });
     if (!ok) { console.log('Cancelled.'); process.exit(0); }
   }
-  const shieldedHire = isShieldedHire(job);
-  const done = await agent.completeJob(job.id);
-  // Observe rental the way the buyer can: try getRentalAccess. ssh.host →
-  // honesty (LAN leftover must not print the success checkmark). 404 / no host
-  // → labour. Do not gate on job.serviceType / job.kind — SDK Job has serviceId.
-  const honesty = await leftoverCompleteHonesty(
-    (id) => agent.client.getRentalAccess(id),
-    job.id,
-  );
-  const warning = honesty && honesty.warning;
+  let warning = null;
+  let doneStatus = job.status;
+  if (!already) {
+    const done = await agent.completeJob(job.id);
+    doneStatus = (done && done.status) || 'completed';
+    // Observe rental the way the buyer can: try getRentalAccess. ssh.host →
+    // honesty (LAN leftover must not print the success checkmark). 404 / no host
+    // → labour. Do not gate on job.serviceType / job.kind — SDK Job has serviceId.
+    const honesty = await leftoverCompleteHonesty(
+      (id) => agent.client.getRentalAccess(id),
+      job.id,
+    );
+    warning = honesty && honesty.warning;
+  }
+  let finished = job;
+  if (!already) {
+    try {
+      finished = await agent.client.getJob(job.id);
+    } catch {
+      finished = { ...job, status: doneStatus };
+    }
+  }
+  const shieldedHire = isShieldedHire(finished);
   let witness = null;
   if (!shieldedHire) {
     try {
-      witness = await agent.client.getJobWitness(job.id);
+      witness = await agent.client.getJobWitness(finished.id);
     } catch (e) {
-      if (!warning) say(`   Witness not ready yet (${e.message}). Retry inspect later.`);
+      if (!warning) say(`   Witness not ready yet (${e.message}). Retry complete later.`);
     }
   }
-  const out = formatBuyerCompleteOutput({
-    jobId: job.id,
-    status: done.status || 'completed',
-    warning,
-    witness,
-  });
-  say(out.human);
-  if (witness && !options.json && !warning) {
-    const rec = witness.data || witness;
-    say(`   Witness signedByName=${(rec.witness && rec.witness.signedByName) || rec.signedByName || '—'}`);
+  if (already) {
+    say(`Job ${finished.id} is already completed.`);
+  } else {
+    const out = formatBuyerCompleteOutput({
+      jobId: finished.id,
+      status: finished.status || doneStatus,
+      warning,
+      witness,
+    });
+    say(out.human);
+    if (witness && !options.json && !warning) {
+      const block = (witness.witness) || witness;
+      say(`   Witness signedByName=${block.signedByName || '—'}`);
+    }
   }
-  if (options.json) console.log(JSON.stringify(out.json, null, 2));
+  return { job: finished, warning, witness, already, shieldedHire };
 }
 
 program
@@ -4140,22 +4174,62 @@ program
     }
     refuseUnsignedPlatform(options);
     const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
-    await runBuyerComplete(keys, agent, jobId, options, buyerAgentId);
-    const job = await agent.client.getJob(jobId);
-    const seller = job && (job.sellerVerusId || job.seller);
+    const ran = await runBuyerComplete(keys, agent, jobId, options, buyerAgentId);
+    const finished = ran.job;
+    const seller = finished && (finished.sellerVerusId || finished.seller);
     const review = await offerBuyerReview({
-      options, say, keys, agent, buyerAgentId, mode: 'job', jobId, seller,
+      options, say, keys, agent, buyerAgentId, mode: 'job', jobId: finished.id, seller,
     });
-    const finished = await agent.client.getJob(jobId);
-    const shieldedHire = isShieldedHire(finished);
-    if (!(review && review.buyerInbox) && !shieldedHire) {
-      await publishBuyerContentMaps({
+    const shieldedHire = ran.shieldedHire;
+    let published = null;
+    if (review && review.buyerInbox) published = review.buyerInbox;
+    else if (!shieldedHire) {
+      published = await publishBuyerContentMaps({
         agent, buyerAgentId, options, say,
-        watch: await jobContentWatch(agent, jobId, ['job_record']),
+        watch: await jobContentWatch(agent, finished.id, ['job_record']),
       });
+    } else {
+      published = {
+        ok: true,
+        code: 'BUYER_INBOX_SHIELDED',
+        pending: 0,
+        accepted: { job_record: 0, review: 0, attestation: 0 },
+        txids: [],
+        items: [],
+      };
     }
     if (review && review.code === 'REVIEW_BAD_RATING') fail(review.code, review.message);
     reportReviewWrite(review, options);
+    const jobHash = (finished && finished.jobHash)
+      || (ran.witness && ran.witness.record && ran.witness.record.jobHash)
+      || null;
+    const publish = publishView({ result: published, jobId: finished.id, jobHash });
+    let stored = null;
+    try { stored = readReceipt(AGENTS_DIR, buyerAgentId, finished.id); } catch { stored = null; }
+    const decision = decideCompleteReceipt({
+      already: ran.already,
+      shielded: shieldedHire,
+      publish,
+      stored,
+    });
+    const body = decision.useStored
+      ? { ...stored, ok: true, code: 'COMPLETE_ALREADY' }
+      : {
+        ok: decision.ok,
+        code: decision.code,
+        jobId: finished.id,
+        jobHash,
+        status: (finished && finished.status) || 'completed',
+        ...(ran.warning ? { warning: ran.warning } : {}),
+        witness: presentWitness(ran.witness),
+        publish,
+      };
+    if (decision.save) {
+      try { writeReceipt(AGENTS_DIR, buyerAgentId, finished.id, body); } catch { /* folder name or job id refused */ }
+    }
+    if (options.json) emitBuyerJson(body);
+    else if (publish.txid) say(`Receipt ${publish.txid}`);
+    if (decision.exitCode) process.exit(decision.exitCode);
   });
 
 program
@@ -4349,10 +4423,16 @@ program
     if (pending.length === 0) {
       const empty = {
         ok: true, code: 'BUYER_INBOX_EMPTY', pending: 0,
-        accepted: { job_record: 0, review: 0, attestation: 0 }, txids: [],
+        accepted: { job_record: 0, review: 0, attestation: 0 }, txids: [], items: [],
       };
-      if (options.json) console.log(JSON.stringify(empty, null, 2));
-      else say('Buyer inbox has no pending job_record, review, or attestation.');
+      if (options.json) {
+        emitBuyerJson({
+          ok: true,
+          code: 'BUYER_INBOX_EMPTY',
+          publish: publishView({ result: empty }),
+          message: 'Buyer inbox has no pending job_record, review, or attestation.',
+        });
+      } else say('Buyer inbox has no pending job_record, review, or attestation.');
       return;
     }
     if (!options.yes) {
@@ -4368,14 +4448,13 @@ program
     });
     if (!result.ok) process.exitCode = 1;
     if (options.json) {
-      console.log(JSON.stringify({
-        ok: !!result.ok,
-        code: result.code,
-        pending: result.pending,
-        accepted: result.accepted,
-        txids: result.txids,
+      const publish = publishView({ result });
+      emitBuyerJson({
+        ok: !!publish.ok,
+        code: publish.code,
+        publish,
         message: drainMessage(result),
-      }, null, 2));
+      });
     }
   });
 
@@ -4657,8 +4736,9 @@ program
       say('   Wait until wallet show drops the spent UTXO before another pay (~one block).');
     }
     if (options.json) {
-      console.log(JSON.stringify({
+      emitBuyerJson({
         ok: true,
+        code: 'EXTENDED',
         jobId: result.jobId,
         extensionId: result.extensionId,
         amount: result.amount,
@@ -4667,7 +4747,7 @@ program
         outputs: result.outputs,
         gpu: !!result.gpu,
         ...(options.wait ? { pending: !!result.pending } : {}),
-      }, null, 2));
+      });
     }
   });
 
@@ -4689,7 +4769,7 @@ program
     const result = await cancelBuyerJob({ client: agent.client, keys, jobId });
     if (!result.ok) fail(result.code, result.message, { jobId: result.jobId, status: result.status });
     say(`✅ Job ${result.jobId} cancelled (status=${result.status})`);
-    if (options.json) console.log(JSON.stringify({ ok: true, jobId: result.jobId, status: result.status }, null, 2));
+    if (options.json) emitBuyerJson({ ok: true, code: 'CANCELLED', jobId: result.jobId, status: result.status });
   });
 
 program
@@ -4719,7 +4799,7 @@ program
     });
     if (!result.ok) fail(result.code, result.message, { jobId: result.jobId, status: result.status });
     say(`✅ Dispute opened on ${result.jobId} (status=${result.status})`);
-    if (options.json) console.log(JSON.stringify({ ok: true, jobId: result.jobId, status: result.status }, null, 2));
+    if (options.json) emitBuyerJson({ ok: true, code: 'DISPUTED', jobId: result.jobId, status: result.status });
   });
 
 program
@@ -4747,7 +4827,7 @@ program
     });
     if (!result.ok) fail(result.code, result.message, { jobId: result.jobId, status: result.status });
     say(`✅ Rework accepted on ${result.jobId} (status=${result.status})`);
-    if (options.json) console.log(JSON.stringify({ ok: true, jobId: result.jobId, status: result.status }, null, 2));
+    if (options.json) emitBuyerJson({ ok: true, code: 'REWORK_ACCEPTED', jobId: result.jobId, status: result.status });
   });
 
 
@@ -4774,54 +4854,40 @@ program
       const job = await agent.client.getJob(jobId);
       const seller = job && (job.sellerVerusId || job.seller);
       const listing = seller ? await agent.client.getAgent(seller) : null;
-      const base = listing && (listing.website || (listing.endpoints && listing.endpoints[0] && listing.endpoints[0].url));
-      if (!base) fail('DATA_URL_MISSING', 'Seller listing has no website to open the dataset.');
-      const origin = new URL(base).origin;
-      const buyer = keys.identity && keys.identity.endsWith('@') ? keys.identity : `${keys.identity}@`;
-      const timestamp = Math.floor(Date.now() / 1000);
-      const message = `J41-DATA-OPEN|Job:${jobId}|Ts:${timestamp}|Buyer:${buyer}`;
-      const signature = signMessage(keys.wif, message, J41_NETWORK);
-      const res = await fetch(`${origin}/j41/datasets/open`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jobId, timestamp, signature, address: keys.address, buyer, iAddress: keys.iAddress,
-        }),
+      const { datasetDoorOrigin, fetchDatasetPage } = require('./dataset-fetch');
+      const origin = datasetDoorOrigin(listing);
+      const page = await fetchDatasetPage({
+        origin,
+        jobId,
+        keys,
+        network: J41_NETWORK,
+        offset: options.offset,
+        signMessage,
       });
-      const payload = await res.json().catch(() => ({}));
-      if (!res.ok || !payload.token) {
-        fail(payload.error || 'DATA_OPEN_DENIED', payload.message || payload.error || `data-open failed (${res.status})`, { jobId });
-      }
-      const page = new URLSearchParams();
-      if (options.offset != null && options.offset !== '') page.set('offset', String(options.offset));
-      const rowUrl = `${origin}/j41/datasets/orchard-apples.json${page.toString() ? `?${page}` : ''}`;
-      const rowRes = await fetch(rowUrl, { headers: { Authorization: `Bearer ${payload.token}` } });
-      const rows = await rowRes.json().catch(() => ({}));
-      if (!rowRes.ok || rows.error || !Array.isArray(rows.items)) {
-        fail(rows.error || 'DATA_ROWS_DENIED', rows.message || rows.error || `rows failed (${rowRes.status})`, {
+      if (!page.ok) {
+        fail(page.code, page.message, {
           jobId,
-          amount: rows.amount,
-          units: rows.units,
-          unitPrice: rows.unitPrice,
+          ...(page.amount != null ? { amount: page.amount, units: page.units, unitPrice: page.unitPrice } : {}),
         });
       }
       if (options.json) {
-        console.log(JSON.stringify({
+        emitBuyerJson({
           ok: true,
+          code: 'DATA_OPEN',
           jobId,
-          token: payload.token,
-          count: rows.count,
-          units: rows.units,
-          unitPrice: rows.unitPrice,
-          amount: rows.amount,
-          offset: rows.offset,
-          nextOffset: rows.nextOffset,
-          items: rows.items,
-        }, null, 2));
+          token: page.token,
+          count: page.count,
+          units: page.units,
+          unitPrice: page.unitPrice,
+          amount: page.amount,
+          offset: page.offset,
+          nextOffset: page.nextOffset,
+          items: page.items,
+        });
       } else {
-        console.log(`Paid ${rows.amount} for ${rows.units} row(s) at ${rows.unitPrice} each. This page has ${rows.items.length}.`);
-        console.log(JSON.stringify(rows.items, null, 2));
-        if (rows.nextOffset != null) console.log(`Next page: j41-dispatcher data-open ${buyerAgentId} ${jobId} --offset ${rows.nextOffset}`);
+        console.log(`Paid ${page.amount} for ${page.units} row(s) at ${page.unitPrice} each. This page has ${page.items.length}.`);
+        console.log(JSON.stringify(page.items, null, 2));
+        if (page.nextOffset != null) console.log(`Next page: j41-dispatcher data-open ${buyerAgentId} ${jobId} --offset ${page.nextOffset}`);
       }
       const sellerId = job && (job.sellerVerusId || job.seller);
       const review = await offerBuyerReview({
@@ -4843,15 +4909,16 @@ program
 
 program
   .command('artifacts <buyer-agent-id> <job-id>')
-  .description('Write the seller delivery package into --out. Labour files plus the delivery notice. Fetch before complete. GPU has no file package. Dataset rows use data-open.')
+  .description('Write the seller delivery into --out. Labour files plus the delivery notice, or dataset.json. Fetch before complete. A GPU rental has no file package.')
   .requiredOption('--out <dir>', 'Directory to write. Created if missing.')
+  .option('--offset <n>', 'Later page of dataset rows already paid for')
   .option('--json', 'One JSON object on stdout. Requires --yes.')
   .option('--yes', 'Required with --json')
   .action(async (buyerAgentId, jobId, options) => {
     const fail = (code, message, extra = {}) => buyerCliFail(options, code, message, extra);
     const say = (line) => { if (!options.json) console.log(line); };
     if (options.json && !options.yes) fail('JSON_REQUIRES_YES', '--json requires --yes.');
-    const { fetchArtifacts, classifyArtifactJob } = require('./artifacts');
+    const { fetchArtifacts, classifyArtifactJob, planArtifacts, writeDatasetArtifacts } = require('./artifacts');
     const { keys, agent } = await loadBuyerSession(buyerAgentId, options);
     let job;
     try {
@@ -4865,29 +4932,55 @@ program
     const view = { ...job };
     if (kind.gpu) view.serviceType = 'gpu-rental';
     else if (kind.dataset) view.serviceType = job.serviceType || job.service_type || 'dataset';
-    let files = [];
-    if (!kind.gpu && !kind.dataset) {
-      try {
-        const listed = await agent.listFiles(job.id);
-        files = (listed && listed.data) || [];
-      } catch (e) {
-        fail('ARTIFACTS_LIST_FAILED', e.message || String(e), { jobId: job.id, status: job.status });
-      }
-    }
     let result;
-    try {
-      result = await fetchArtifacts({
-        job: view,
-        files,
-        outDir: options.out,
-        downloadFile: (fileId) => agent.downloadFile(job.id, fileId),
+    if (kind.dataset) {
+      const plan = planArtifacts(view, []);
+      if (!plan.ok) fail(plan.code, plan.message, { jobId: job.id, status: plan.status, artifactsVersion: plan.artifactsVersion, sealed: false });
+      const seller = job.sellerVerusId || job.seller;
+      const listing = seller ? await agent.client.getAgent(seller) : null;
+      const { datasetDoorOrigin, fetchDatasetPage } = require('./dataset-fetch');
+      const { signMessage } = require('@junction41/sovagent-sdk/dist/identity/signer.js');
+      const page = await fetchDatasetPage({
+        origin: datasetDoorOrigin(listing),
+        jobId: job.id,
+        keys,
+        network: J41_NETWORK,
+        offset: options.offset,
+        signMessage,
       });
-    } catch (e) {
-      fail(e.code || 'ARTIFACTS_LIST_FAILED', e.message || String(e), { jobId: job.id, status: job.status });
+      if (!page.ok) fail(page.code, page.message, { jobId: job.id, status: job.status });
+      try {
+        result = writeDatasetArtifacts({ job: view, outDir: options.out, page });
+      } catch (e) {
+        fail(e.code || 'ARTIFACTS_LIST_FAILED', e.message || String(e), { jobId: job.id, status: job.status });
+      }
+    } else {
+      let files = [];
+      if (!kind.gpu) {
+        try {
+          const listed = await agent.listFiles(job.id);
+          files = (listed && listed.data) || [];
+        } catch (e) {
+          fail('ARTIFACTS_LIST_FAILED', e.message || String(e), { jobId: job.id, status: job.status });
+        }
+      }
+      try {
+        result = await fetchArtifacts({
+          job: view,
+          files,
+          outDir: options.out,
+          downloadFile: (fileId) => agent.downloadFile(job.id, fileId),
+        });
+      } catch (e) {
+        fail(e.code || 'ARTIFACTS_LIST_FAILED', e.message || String(e), { jobId: job.id, status: job.status });
+      }
     }
     if (!result.ok) fail(result.code, result.message, { jobId: job.id, status: result.status, artifactsVersion: result.artifactsVersion, sealed: false });
     say(`Wrote ${result.files.length} file(s) to ${result.out}. ${result.summary || ''}`);
-    if (options.json) console.log(JSON.stringify(result, null, 2));
+    if (options.json) {
+      const { token, ...safe } = result;
+      emitBuyerJson(safe);
+    }
   });
 
 program
@@ -5241,13 +5334,14 @@ program
       if (!options.json) say(`Review check skipped (${e.message}).`);
     }
     if (options.json) {
-      console.log(JSON.stringify({
+      emitBuyerJson({
         ok: !review || !!review.ok || !!review.skipped,
+        code: 'JOB_CHAT',
         jobId: result.jobId,
         sellerReply: result.sellerReply || null,
         timedOut: !!result.timedOut,
         ...(review && !review.skipped ? { review } : {}),
-      }, null, 2));
+      });
     }
   });
 
@@ -5451,13 +5545,14 @@ program
       const snap = await inspectBuyerJob({ client: agent.client, keys, jobId });
       if (!snap.ok) fail(snap.code, snap.message, { jobId: snap.jobId, status: snap.status });
       if (options.json) {
-        console.log(JSON.stringify({
+        emitBuyerJson({
           ok: true,
+          code: 'INSPECT',
           jobId: snap.jobId,
           status: snap.status,
           dispute: snap.disputeAction,
           refund_txid: snap.refundTxid,
-        }, null, 2));
+        });
         return;
       }
       console.log(`  status: ${snap.status}`);
@@ -9282,10 +9377,16 @@ program
 program
   .command('reactivate <buyer-agent-id> <job-id>')
   .description('Buyer resumes a paused hire. A zero reactivation fee sends no payment.')
-  .option('--json', 'Print the API result as JSON')
+  .option('--yes', 'Skip confirmation')
+  .option('--json', 'One JSON object on stdout. Requires --yes.')
   .action(async (buyerAgentId, jobId, options) => {
+    if (options.json && !options.yes) {
+      emitBuyerJson({ ok: false, code: 'JSON_REQUIRES_YES', message: '--json requires --yes.' });
+      process.exit(1);
+    }
     if (!/^[0-9a-f-]{36}$/i.test(String(jobId || ''))) {
-      console.error('REACTIVATE_JOB');
+      if (options.json) emitBuyerJson({ ok: false, code: 'REACTIVATE_JOB', message: 'Job id is not a uuid.' });
+      else console.error('REACTIVATE_JOB');
       process.exit(1);
     }
     await ensureKeystoreUnlockedIfEncrypted();
@@ -9293,12 +9394,18 @@ program
     try {
       const body = await agent.client.request('POST', `/v1/jobs/${encodeURIComponent(jobId)}/reactivate`, {});
       const data = body && body.data ? body.data : body;
-      if (options.json) process.stdout.write(`${JSON.stringify(data)}\n`);
-      else console.log(data && data.status ? data.status : 'in_progress');
+      const status = data && data.status ? data.status : 'in_progress';
+      if (options.json) emitBuyerJson({ ok: true, code: 'REACTIVATED', jobId, status });
+      else console.log(status);
       process.exit(0);
     } catch (error) {
-      console.error(error && error.code ? error.code : 'REACTIVATE_FAILED');
-      if (error && error.message) console.error(error.message);
+      const code = error && error.code ? error.code : 'REACTIVATE_FAILED';
+      const message = (error && error.message) || code;
+      if (options.json) emitBuyerJson({ ok: false, code, message, jobId });
+      else {
+        console.error(code);
+        if (error && error.message) console.error(error.message);
+      }
       process.exit(1);
     }
   });

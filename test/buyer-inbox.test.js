@@ -112,6 +112,10 @@ test('one batch publishes and waits until the identity write is confirmed', asyn
   assert.equal(result.code, 'BUYER_INBOX_PUBLISHED');
   assert.equal(result.accepted.job_record, 1);
   assert.deepEqual(result.txids, ['tx1']);
+  assert.equal(result.items[0].type, 'job_record');
+  assert.equal(result.items[0].txid, 'tx1');
+  assert.equal(result.items[0].jobHash, 'h1');
+  assert.equal(result.items[0].identityHeight, null);
   assert.deepEqual(s.calls[0], ['j1']);
   assert.deepEqual(s.calls[1], []);
   assert.deepEqual(s.calls[2], []);

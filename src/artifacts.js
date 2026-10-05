@@ -8,7 +8,39 @@ const { isDatasetJob } = require('./job-payment');
 const { isGpuRentalJob, jobIsGpuRental } = require('./buyer-extend');
 
 const ARTIFACTS_VERSION = 1;
-const NOT_READY = new Set(['requested', 'accepted', 'paused', 'in_progress', 'rework']);
+const NOT_READY = new Set(['requested', 'accepted', 'in_progress', 'rework']);
+
+function refuseBeforeDelivery(base) {
+  const status = base.status;
+  if (status === 'paused') {
+    return {
+      ...base,
+      ok: false,
+      code: 'ARTIFACTS_PAUSED',
+      message: 'Job status is paused. The package is not listed. Reactivate or dispute.',
+    };
+  }
+  if (status === 'rework') {
+    return {
+      ...base,
+      ok: false,
+      code: 'ARTIFACTS_NOT_READY',
+      message: 'Job status is rework. The previous zip stays until the new deliver is accepted.',
+    };
+  }
+  if (NOT_READY.has(status) || !status) {
+    const waiting = status === 'accepted' || status === 'in_progress';
+    return {
+      ...base,
+      ok: false,
+      code: 'ARTIFACTS_NOT_READY',
+      message: waiting
+        ? `Job status is ${status}. The seller may have started delivery. The zip is not listed yet.`
+        : `Job status is ${status || 'unknown'}. The package is available after delivery.`,
+    };
+  }
+  return null;
+}
 
 function signedHash(job) {
   const hash = job && job.delivery && job.delivery.hash;
@@ -43,36 +75,16 @@ function planArtifacts(job, files) {
     };
   }
   if (isDatasetJob(job)) {
-    return {
-      ...base,
-      ok: false,
-      code: 'ARTIFACTS_DATASET_USE_DATA_OPEN',
-      message: 'Dataset rows are fetched with data-open while the review window is open. complete ends that bearer.',
-    };
+    const early = refuseBeforeDelivery(base);
+    if (early) return early;
+    return { ...base, ok: true, dataset: true, code: 'ARTIFACTS_DATASET' };
   }
+  const early = refuseBeforeDelivery(job, base);
+  if (early) return early;
   const list = Array.isArray(files) ? files : [];
   const notice = job && job.delivery && typeof job.delivery.message === 'string'
     ? job.delivery.message
     : '';
-  if (status === 'rework') {
-    return {
-      ...base,
-      ok: false,
-      code: 'ARTIFACTS_NOT_READY',
-      message: 'Job status is rework. The previous zip stays until the new deliver is accepted.',
-    };
-  }
-  if (NOT_READY.has(status) || !status) {
-    const waiting = status === 'accepted' || status === 'in_progress';
-    return {
-      ...base,
-      ok: false,
-      code: 'ARTIFACTS_NOT_READY',
-      message: waiting
-        ? `Job status is ${status}. The seller may have started delivery. The zip is not listed yet.`
-        : `Job status is ${status || 'unknown'}. The package is available after delivery.`,
-    };
-  }
   const hash = signedHash(job);
   const file = hash ? selectPackageFile(list, hash) : null;
   if (!file && !notice) {
@@ -119,9 +131,49 @@ function safeJoin(root, entryName) {
  * Bytes are written as stored. A zip of README.txt and seal.bin is sealed.
  * This command does not decrypt seal.bin.
  */
+function datasetDocument(page) {
+  return {
+    items: page && Array.isArray(page.items) ? page.items : [],
+    count: page ? page.count : null,
+    units: page ? page.units : null,
+    unitPrice: page ? page.unitPrice : null,
+    amount: page ? page.amount : null,
+    offset: page ? page.offset : null,
+    nextOffset: page ? page.nextOffset : null,
+  };
+}
+
+function writeDatasetArtifacts({ job, outDir, page }) {
+  const doc = datasetDocument(page);
+  const buf = Buffer.from(`${JSON.stringify(doc, null, 2)}\n`);
+  fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
+  const root = path.resolve(outDir);
+  const dest = path.join(root, 'dataset.json');
+  fs.writeFileSync(dest, buf, { mode: 0o600 });
+  const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
+  return {
+    ok: true,
+    code: 'ARTIFACTS_WRITTEN',
+    artifactsVersion: ARTIFACTS_VERSION,
+    jobId: job && job.id,
+    status: job && job.status ? String(job.status) : '',
+    out: root,
+    sealed: false,
+    deliveryHash: null,
+    files: [{ name: 'dataset.json', bytes: buf.length, sha256 }],
+    noticeFile: null,
+    summary: `Wrote dataset.json (${doc.items.length} row(s)).`,
+  };
+}
+
 async function fetchArtifacts({ job, files, outDir, downloadFile }) {
   const plan = planArtifacts(job, files);
   if (!plan.ok) return plan;
+  if (plan.dataset) {
+    const err = new Error('Dataset rows are written with writeDatasetArtifacts.');
+    err.code = 'ARTIFACTS_DATASET';
+    throw err;
+  }
   fs.mkdirSync(outDir, { recursive: true });
   const root = path.resolve(outDir);
   const written = [];
@@ -177,6 +229,7 @@ async function fetchArtifacts({ job, files, outDir, downloadFile }) {
       : 'sha256 matched delivery.hash.');
   return {
     ok: true,
+    code: 'ARTIFACTS_WRITTEN',
     artifactsVersion: ARTIFACTS_VERSION,
     jobId: job.id,
     status: plan.status,
@@ -195,4 +248,6 @@ module.exports = {
   planArtifacts,
   safeBasename,
   fetchArtifacts,
+  writeDatasetArtifacts,
+  datasetDocument,
 };

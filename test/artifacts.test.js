@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { planArtifacts, fetchArtifacts, safeBasename, classifyArtifactJob } = require('../src/artifacts');
+const { planArtifacts, fetchArtifacts, safeBasename, classifyArtifactJob, writeDatasetArtifacts } = require('../src/artifacts');
 
 test('gpu rental has no file package', () => {
   const plan = planArtifacts({ status: 'delivered', serviceType: 'gpu-rental', delivery: { message: 'up' } }, []);
@@ -15,14 +15,24 @@ test('gpu rental has no file package', () => {
   assert.equal(plan.sealed, false);
 });
 
-test('dataset points at data-open', () => {
+test('a delivered dataset is a row file, not a labour zip', () => {
   const plan = planArtifacts({ status: 'delivered', serviceType: 'dataset' }, []);
-  assert.equal(plan.code, 'ARTIFACTS_DATASET_USE_DATA_OPEN');
+  assert.equal(plan.ok, true);
+  assert.equal(plan.dataset, true);
+  assert.equal(plan.code, 'ARTIFACTS_DATASET');
 });
 
-test('paused with nothing is not ready', () => {
+test('paused labour names ARTIFACTS_PAUSED', () => {
   const plan = planArtifacts({ status: 'paused', delivery: null }, []);
-  assert.equal(plan.code, 'ARTIFACTS_NOT_READY');
+  assert.equal(plan.ok, false);
+  assert.equal(plan.code, 'ARTIFACTS_PAUSED');
+});
+
+test('a paused dataset is ARTIFACTS_PAUSED and a paused rental stays a lease', () => {
+  const data = planArtifacts({ status: 'paused', serviceType: 'dataset' }, []);
+  assert.equal(data.code, 'ARTIFACTS_PAUSED');
+  const gpu = planArtifacts({ status: 'paused', serviceType: 'gpu-rental' }, []);
+  assert.equal(gpu.code, 'ARTIFACTS_NONE_LEASE');
 });
 
 test('accepted tells the buyer the zip is not listed yet', () => {
@@ -47,7 +57,35 @@ test('buyer inputs before delivery are not the package', () => {
 
 test('a dataset is recognized from datasetTerms', () => {
   const plan = planArtifacts({ status: 'delivered', datasetTerms: { rows: 1 } }, []);
-  assert.equal(plan.code, 'ARTIFACTS_DATASET_USE_DATA_OPEN');
+  assert.equal(plan.dataset, true);
+});
+
+test('dataset.json is the row page and does not contain the bearer', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'j41-art-'));
+  const result = writeDatasetArtifacts({
+    job: { id: 'job-1', status: 'delivered', serviceType: 'dataset' },
+    outDir: dir,
+    page: {
+      token: 'bearer-secret',
+      items: [{ color: 'red' }],
+      count: 1,
+      units: 1,
+      unitPrice: 0.0001,
+      amount: 0.0001,
+      offset: 0,
+      nextOffset: null,
+    },
+  });
+  const raw = fs.readFileSync(path.join(dir, 'dataset.json'), 'utf8');
+  const doc = JSON.parse(raw);
+  assert.equal(result.code, 'ARTIFACTS_WRITTEN');
+  assert.equal(doc.items[0].color, 'red');
+  assert.equal(Object.prototype.hasOwnProperty.call(doc, 'token'), false);
+  assert.equal(raw.includes('bearer-secret'), false);
+  assert.equal(JSON.stringify(result).includes('bearer-secret'), false);
+  assert.equal(result.files[0].name, 'dataset.json');
+  assert.equal(result.files[0].sha256, crypto.createHash('sha256').update(raw).digest('hex'));
+  fs.rmSync(dir, { recursive: true });
 });
 
 test('a compute listing is a rental, including a service-id lookup', async () => {

@@ -92,6 +92,24 @@ function wroteAny(counts) {
   return counts.job_record + counts.review + counts.attestation > 0;
 }
 
+function publishedItem(it, txid, watch) {
+  const details = it && it.jobDetails;
+  const vdxf = it && it.vdxfData;
+  let jobId = (it && (it.jobId || (details && details.id) || (vdxf && vdxf.jobId))) || null;
+  let jobHash = (it && (it.jobHash || (details && details.jobHash))) || null;
+  if (watch && matchesWatch(it, watch)) {
+    if (!jobId && watch.jobId) jobId = watch.jobId;
+    if (!jobHash && watch.jobHash) jobHash = watch.jobHash;
+  }
+  return {
+    type: it.type,
+    txid: txid || null,
+    jobId,
+    jobHash,
+    identityHeight: null,
+  };
+}
+
 /** One live row of each content-map key. Dead-lettered ids are not fetched again. */
 function selectInboxWriteSet(pending, isDead, types = BUYER_INBOX_TYPES) {
   const picked = {};
@@ -176,6 +194,7 @@ async function drainBuyerInbox({
 
   const accepted = emptyCounts();
   const txids = [];
+  const publishedItems = [];
   let pending = [];
   let cycles = 0;
   let sawWatch = false;
@@ -191,6 +210,7 @@ async function drainBuyerInbox({
     pending: pending.length,
     accepted,
     txids,
+    items: publishedItems,
     buyerId,
   });
 
@@ -233,8 +253,14 @@ async function drainBuyerInbox({
 
     const ordered = preferWatched(pending, watch);
     const byId = new Map(ordered.map((it) => [it.id, it.type]));
+    const byItem = new Map(ordered.map((it) => [it.id, it]));
     const res = await processOnce(ordered);
     if (res && res.txid && !txids.includes(res.txid)) txids.push(res.txid);
+    const tx = res && res.txid ? String(res.txid) : null;
+    for (const id of (res && res.acked) || []) {
+      const it = byItem.get(id);
+      if (it && it.type) publishedItems.push(publishedItem(it, tx, watch));
+    }
     addCounts(accepted, countAcked(res && res.acked, byId));
     if (typeof onProgress === 'function') {
       onProgress({
@@ -253,6 +279,7 @@ async function drainBuyerInbox({
         quarantined: res.quarantined || [],
         accepted,
         txids,
+        items: publishedItems,
         buyerId,
       };
     }
@@ -272,6 +299,7 @@ async function drainBuyerInbox({
         pending: pending.length,
         accepted,
         txids,
+        items: publishedItems,
         buyerId,
       };
     }

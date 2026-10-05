@@ -40,6 +40,15 @@ function parseJsonStdout(stdout) {
 
 // --------------------------------------------------------------- the JSON contract
 
+test('--json stdout is one object and carries contractVersion', () => {
+  const r = runHire(['buyer1', 'seller1', '--amount', '1', '--json']);
+  assert.equal(r.status, 1);
+  const out = parseJsonStdout(r.stdout);
+  assert.equal(out.contractVersion, 1);
+  assert.equal(out.code, 'JSON_REQUIRES_YES');
+  assert.doesNotMatch(r.stdout, /\[J41\]/);
+});
+
 test('--json without --yes refuses instead of blocking on the confirm prompt', () => {
   // confirmHire() reads stdin. Without this guard the combination waits forever, which for an
   // autonomous caller is worse than an error: it hangs the agent rather than failing it.
